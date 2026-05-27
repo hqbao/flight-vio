@@ -29,7 +29,7 @@ from .depthai_vo import _M_FLU_TO_NED, _rot_to_quat_wxyz
 class OakBasaltSlamSource(PoseSource):
     """OAK-D + BasaltVIO + RTABMapSLAM -> loop-closed NED pose stream."""
 
-    def __init__(self, width: int = 640, height: int = 400, fps: int = 30,
+    def __init__(self, width: int = 640, height: int = 400, fps: int = 20,
                  imu_rate_hz: int = 200,
                  database_path: str | None = None,
                  load_database: bool = False) -> None:
@@ -65,10 +65,13 @@ class OakBasaltSlamSource(PoseSource):
             imu.setMaxBatchReports(10)
             vio.setImuUpdateRate(self.imu_rate_hz)
 
-            # Stereo: rectified-left aligned depth for SLAM
+            # Stereo: rectified-left aligned depth for SLAM.
+            # NOTE: setSubpixel(True) doubles VPU load and pushed the OAK-D W
+            # into firmware crashes when combined with 4 image streams + IMU.
+            # 1-pixel disparity is plenty for RTABMap loop closure.
             stereo.setExtendedDisparity(False)
             stereo.setLeftRightCheck(True)
-            stereo.setSubpixel(True)
+            stereo.setSubpixel(False)
             stereo.setRectifyEdgeFillColor(0)
             stereo.enableDistortionCorrection(True)
             stereo.initialConfig.setLeftRightCheckThreshold(10)
