@@ -488,8 +488,6 @@ class PoseTab(QWidget):
         info.setObjectName("HeaderSub")
         lay.addWidget(info)
 
-        split = QSplitter(Qt.Orientation.Horizontal)
-
         # --- 3D trajectory ---
         gl_widget = gl.GLViewWidget()
         gl_widget.setBackgroundColor(theme.BG)
@@ -544,67 +542,8 @@ class PoseTab(QWidget):
         )
         legend.setStyleSheet(f"color:{theme.TEXT}; padding:4px;")
 
-        left_pane = QWidget()
-        lp = QVBoxLayout(left_pane); lp.setContentsMargins(0, 0, 0, 0)
-        lp.addWidget(legend); lp.addWidget(gl_widget, 1)
-        split.addWidget(left_pane)
-
-        # --- timeseries ---
-        pg.setConfigOption("background", theme.BG)
-        pg.setConfigOption("foreground", theme.TEXT)
-
-        ts_panel = QWidget()
-        tsv = QVBoxLayout(ts_panel); tsv.setContentsMargins(0, 0, 0, 0)
-
-        self.p_pos = pg.PlotWidget(title="POSITION (m, FLU)")
-        self.p_pos.showGrid(x=True, y=True, alpha=0.3); self.p_pos.addLegend()
-        self.p_quat = pg.PlotWidget(title="QUATERNION (wxyz)")
-        self.p_quat.showGrid(x=True, y=True, alpha=0.3); self.p_quat.addLegend()
-        self.p_quat.setXLink(self.p_pos)
-
-        def add_pos(ts, pos, label: str, style) -> None:
-            if not len(ts):
-                return
-            for i, (axis, color) in enumerate(
-                (("x", theme.AXIS_N), ("y", theme.AXIS_E), ("z", theme.AXIS_U))
-            ):
-                self.p_pos.plot(
-                    ts, pos[:, i],
-                    pen=pg.mkPen(color, width=1, style=style),
-                    name=f"{label}.{axis}",
-                )
-
-        def add_quat(ts, quat, label: str, style) -> None:
-            if not len(ts):
-                return
-            for i, (axis, color) in enumerate((
-                ("w", theme.TEXT_DIM), ("x", theme.AXIS_N),
-                ("y", theme.AXIS_E), ("z", theme.AXIS_U),
-            )):
-                self.p_quat.plot(
-                    ts, quat[:, i],
-                    pen=pg.mkPen(color, width=1, style=style),
-                    name=f"{label}.{axis}",
-                )
-
-        add_pos(self._vio_ts, vio["pos"], "vio", Qt.PenStyle.SolidLine)
-        add_pos(self._slam_ts, slam["pos"], "slam", Qt.PenStyle.DashLine)
-        add_quat(self._vio_ts, vio["quat"], "vio", Qt.PenStyle.SolidLine)
-        add_quat(self._slam_ts, slam["quat"], "slam", Qt.PenStyle.DashLine)
-
-        cursor_pen = pg.mkPen(theme.ACCENT, width=1, style=Qt.PenStyle.DashLine)
-        self._cursors = []
-        for p in (self.p_pos, self.p_quat):
-            ln = pg.InfiniteLine(pos=0.0, angle=90, pen=cursor_pen, movable=False)
-            p.addItem(ln, ignoreBounds=True)
-            self._cursors.append(ln)
-
-        ts_split = QSplitter(Qt.Orientation.Vertical)
-        ts_split.addWidget(self.p_pos); ts_split.addWidget(self.p_quat)
-        tsv.addWidget(ts_split, 1)
-        split.addWidget(ts_panel)
-        split.setStretchFactor(0, 1); split.setStretchFactor(1, 1)
-        lay.addWidget(split, 1)
+        lay.addWidget(legend)
+        lay.addWidget(gl_widget, 1)
 
     @staticmethod
     def _interp_pos(ts: np.ndarray, pos: np.ndarray, t: float) -> np.ndarray:
@@ -620,8 +559,6 @@ class PoseTab(QWidget):
         return ((1 - a) * pos[i - 1] + a * pos[i]).astype(np.float32)
 
     def on_time(self, t_s: float) -> None:
-        for ln in self._cursors:
-            ln.setPos(t_s)
         self._mark_vio.setData(
             pos=self._interp_pos(self._vio_ts, self._vio_pos, t_s)[None, :]
         )
@@ -900,7 +837,7 @@ class SessionViewer(QMainWindow):
         tabs.addTab(self.tab_overview, "Overview")
         tabs.addTab(self.tab_frame, "C0 · Frame")
         tabs.addTab(self.tab_imu, "C1 · IMU")
-        tabs.addTab(self.tab_pose, "C2/C3 · Pose")
+        tabs.addTab(self.tab_pose, "C2/C3 · Pose 3D")
         tabs.addTab(self.tab_events, "C5/C6 · Events")
 
         bar = PlaybackBar(self.playhead)
