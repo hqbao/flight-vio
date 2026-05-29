@@ -12,7 +12,8 @@ oak-d/
     sources/           pose providers
       base.py          PoseSource ABC
       fake.py          procedural figure-8 trajectory (UI bring-up)
-      depthai_vo.py    TODO: real visual-inertial odometry from OAK-D
+      depthai_vo.py    real stereo-inertial VIO (dai.node.BasaltVIO)
+      depthai_slam.py  VIO + SLAM with loop closure (BasaltVIO + RTABMapSLAM)
     ui/
       theme.py         military dark palette (mirrors flight-controller/_ui.py)
       viewer3d.py      pyqtgraph GLViewWidget — trajectory, drone triad, grid
@@ -47,13 +48,25 @@ This gives camera-frame axes (right-handed, OpenCV convention):
 ```bash
 ./run.sh                       # launches viewer with fake pose source
 ./run.sh --source fake         # explicit
-./run.sh --source oak          # not implemented yet (Phase 2)
+./run.sh --source oak          # real VIO (BasaltVIO, low latency, no loop closure)
+./run.sh --source slam         # VIO + SLAM with loop closure (BasaltVIO + RTABMapSLAM)
 ```
 
 ## Status
 
 - [x] Project scaffold + dark 3D viewer
 - [x] Fake pose source (figure-8) for UI bring-up
-- [ ] Real visual-inertial odometry from OAK-D
+- [x] Real visual-inertial odometry from OAK-D (BasaltVIO)
+- [x] SLAM with loop closure (RTABMapSLAM)
 - [ ] UDP / UART link to flight-controller
+- [ ] Persistent SLAM database (save / reload map across sessions)
+- [ ] Tracking-lost UI badge
+- [ ] Logging + offline replay source
+- [ ] Calibration check tool
 - [ ] Port to RPi5
+
+## Long-term
+
+See [docs/SKYSLAM_ROADMAP.md](docs/SKYSLAM_ROADMAP.md) for the plan to rewrite
+the SLAM stack from scratch in C99 targeting custom hardware (no Basalt /
+RTAB-Map / depthai at runtime).
