@@ -127,7 +127,9 @@ Same schema as C2, `source = rtabmap_slam` hoặc `sky_slam`.
 
 - Detect bằng cách tap output `RTABMapSLAM.odomCorrection` (map←odom transform)
   và đo delta giữa hai sample liên tiếp. Jump lớn (default
-  `pos > 5 cm` hoặc `rot > 2°`) = loop closure đã apply correction.
+  `pos > 10 cm` hoặc `rot > 5°`) = loop closure đã apply correction.
+- Bỏ qua `LOOP_WARMUP_S` (default 3s) đầu tiên vì RTABMap publish correction
+  bất định khi map đang khởi tạo (sẽ gây hàng chục false-positive).
 - Schema BoW (`kf_query`, `score`, `inliers`) chỉ available qua SQLite database
   post-run — sẽ thêm khi viết `extract_kf_from_db.py`.
 - Raw stream được dump song song ở `basalt/odom_correction.jsonl` để debug.

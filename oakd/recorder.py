@@ -268,20 +268,31 @@ class SessionRecorder:
     # ---------------- event derivation ----------------
 
     # Threshold above which a jump in odomCorrection is treated as a loop closure.
-    LOOP_POS_JUMP_M = 0.05
-    LOOP_ROT_JUMP_DEG = 2.0
+    LOOP_POS_JUMP_M = 0.10
+    LOOP_ROT_JUMP_DEG = 5.0
+    # Ignore the first N seconds of odom_correction: RTABMap publishes a
+    # rapidly-changing map<-odom transform while it builds the initial map,
+    # which would otherwise show up as a swarm of false loop closures.
+    LOOP_WARMUP_S = 3.0
     # If two consecutive SLAM poses are further apart than this in time, the
     # tracking is considered lost between them.
     TRACK_GAP_S = 0.5
 
     def _derive_loop_events(self) -> int:
         """Scan odomCorrection stream; emit a loop_event whenever the
-        correction jumps more than the threshold from the previous sample."""
+        correction jumps more than the threshold from the previous sample.
+        Samples within ``LOOP_WARMUP_S`` of recorder start are skipped because
+        RTABMap's initial map<-odom transform is unstable during map init.
+        """
         path = self.basalt_dir / "loop_events.jsonl"
         n_events = 0
         prev_p, prev_q = None, None
+        warmup_ns = int(self.LOOP_WARMUP_S * 1e9)
         with path.open("w") as f:
             for ts, p, q in self._corr_log:
+                if ts < warmup_ns:
+                    prev_p, prev_q = p, q
+                    continue
                 if prev_p is None:
                     prev_p, prev_q = p, q
                     continue
