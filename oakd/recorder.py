@@ -15,9 +15,12 @@ Folder layout follows ``docs/PIPELINE_CHECKPOINTS.md``::
         odom_correction.jsonl         (raw map<-odom transform stream)
         loop_events.jsonl             (C5: derived in close() from odom_correction)
         track_events.jsonl            (C6: derived in close() from slam pose gaps)
-        features.jsonl                (C7: 2D tracked features per frame)
         pointcloud.jsonl              (index of point cloud emissions)
         pointcloud/000000.f32 ...     (Nx3 float32, world frame)
+
+No C7 (frontend features) here — the depthai BasaltVIO blob does NOT
+expose its internal feature tracks. C7 will only be wired up when
+skyslam frontend is implemented and can publish them directly.
 
 All ``ts_ns`` values are host-monotonic nanoseconds from the recorder's t0.
 All poses are stored in the **FLU world** frame as emitted by Basalt /
@@ -63,7 +66,6 @@ class SessionRecorder:
         self._f_vio = (self.basalt_dir / "vio_pose.jsonl").open("w", buffering=1)
         self._f_slam = (self.basalt_dir / "slam_pose.jsonl").open("w", buffering=1)
         self._f_corr = (self.basalt_dir / "odom_correction.jsonl").open("w", buffering=1)
-        self._f_feat = (self.basalt_dir / "features.jsonl").open("w", buffering=1)
         self._f_pcl_idx = (self.basalt_dir / "pointcloud.jsonl").open("w", buffering=1)
         self.pcl_dir = self.basalt_dir / "pointcloud"
         self.pcl_dir.mkdir(exist_ok=True)
@@ -73,7 +75,6 @@ class SessionRecorder:
         self._vio_seq = 0
         self._slam_seq = 0
         self._corr_seq = 0
-        self._feat_seq = 0
         self._pcl_seq = 0
         self._closed = False
 
@@ -234,28 +235,6 @@ class SessionRecorder:
         }
         self._f_corr.write(json.dumps(rec) + "\n")
 
-    # ---------------- C7: tracked features (2D, on rectified left) ----------------
-
-    def on_features(
-        self,
-        feats: Sequence[tuple[float, float, int, int]],
-        ts_ns: int | None = None,
-    ) -> None:
-        """feats = list of (x_px, y_px, track_id, age). One record per frame."""
-        with self._lock:
-            if self._closed:
-                return
-            seq = self._feat_seq
-            self._feat_seq += 1
-            ts = self.now_ns() if ts_ns is None else int(ts_ns)
-        rec = {
-            "ts_ns": ts,
-            "seq": seq,
-            "n": len(feats),
-            "pts": [[float(x), float(y), int(i), int(a)] for x, y, i, a in feats],
-        }
-        self._f_feat.write(json.dumps(rec) + "\n")
-
     # ---------------- point cloud (RTABMap obstacle/ground) ----------------
 
     def on_pointcloud(
@@ -294,8 +273,7 @@ class SessionRecorder:
             self._closed = True
             duration_s = self.now_ns() / 1e9
             for fp in (self._f_imu, self._f_frames, self._f_vio,
-                       self._f_slam, self._f_corr, self._f_feat,
-                       self._f_pcl_idx):
+                       self._f_slam, self._f_corr, self._f_pcl_idx):
                 try:
                     fp.flush()
                     fp.close()
@@ -319,7 +297,6 @@ class SessionRecorder:
                 "odom_corrections": self._corr_seq,
                 "loop_events": loop_n,
                 "tracking_events": track_n,
-                "feature_frames": self._feat_seq,
                 "pointclouds": self._pcl_seq,
             },
             "params": self._params,

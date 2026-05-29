@@ -11,7 +11,7 @@ Tabs
 - Overview   : meta.json + calib summary + record counts
 - C0 Frame   : rectified-left, rectified-right, depth colormap
 - C1 IMU     : 6-channel gyro + accel time series
-- C2/C3 Pose : 3D trajectory (VIO vs SLAM overlay) + pos/quat timeseries
+- C2/C3 Pose : 3D trajectory (VIO vs SLAM) + RTABMap dense point cloud
 - C5/C6 Evts : loop closures (odom_correction jumps) + tracking-lost gaps
 
 Playback bar at the bottom drives all tabs from a shared timeline
@@ -90,17 +90,6 @@ def _stack_imu(records: list[dict]) -> dict[str, np.ndarray]:
 def _frame_ts_array(frames: list[dict]) -> np.ndarray:
     return (np.array([r["ts_ns"] for r in frames], dtype=np.float64) / 1e9
             if frames else np.zeros(0))
-
-
-def _load_features(path: Path) -> tuple[np.ndarray, list[np.ndarray]]:
-    """Returns (ts_s array, list of Nx2 px arrays — one per frame)."""
-    recs = _load_jsonl(path)
-    if not recs:
-        return np.zeros(0), []
-    ts = np.array([r["ts_ns"] for r in recs], dtype=np.float64) / 1e9
-    pts = [np.array([[p[0], p[1]] for p in r["pts"]], dtype=np.float32)
-           if r["n"] else np.zeros((0, 2), dtype=np.float32) for r in recs]
-    return ts, pts
 
 
 def _load_pointcloud_stream(
@@ -236,21 +225,17 @@ class OverviewTab(QWidget):
 class FrameTab(QWidget):
     """C0: stereo left + right + depth colormap; driven by Playhead.
 
-    If ``features`` is provided, tracked corners are overlaid on the left
-    image (green circles) — nearest record by timestamp.
+    Shows ONLY what the depthai pipeline actually emits — no synthetic
+    overlays. Internal features/landmarks of BasaltVIO are not exposed by
+    the blob, so they're intentionally NOT displayed here.
     """
 
     def __init__(self, session_dir: Path, frames: list[dict],
-                 t_offset: float,
-                 feat_ts: np.ndarray | None = None,
-                 feat_pts: list[np.ndarray] | None = None,
-                 parent=None) -> None:
+                 t_offset: float, parent=None) -> None:
         super().__init__(parent)
         self.session_dir = session_dir
         self.frames = frames
         self.ts = _frame_ts_array(frames) - t_offset
-        self.feat_ts = (feat_ts - t_offset) if feat_ts is not None and len(feat_ts) else np.zeros(0)
-        self.feat_pts = feat_pts or []
         self._last_idx = -1
 
         lay = QVBoxLayout(self)
@@ -260,22 +245,14 @@ class FrameTab(QWidget):
         self.info.setObjectName("HeaderSub")
         lay.addWidget(self.info)
 
-        # Big hero view: LEFT with feature overlay.
-        self.lbl_main = self._make_img_label("LEFT + FEATURES")
-        self.lbl_main["img"].setMinimumSize(640, 400)
-        lay.addWidget(self.lbl_main["frame"], 1)
-
-        # Small thumbnails: L / R / D for context.
         img_row = QHBoxLayout()
         img_row.setSpacing(6)
-        self.lbl_left = self._make_img_label("LEFT")
-        self.lbl_right = self._make_img_label("RIGHT")
-        self.lbl_depth = self._make_img_label("DEPTH")
+        self.lbl_left = self._make_img_label("LEFT (rectified)")
+        self.lbl_right = self._make_img_label("RIGHT (rectified)")
+        self.lbl_depth = self._make_img_label("DEPTH (StereoDepth)")
         for grp in (self.lbl_left, self.lbl_right, self.lbl_depth):
-            grp["img"].setMinimumSize(220, 140)
-            grp["img"].setMaximumHeight(180)
             img_row.addWidget(grp["frame"], 1)
-        lay.addLayout(img_row, 0)
+        lay.addLayout(img_row, 1)
 
         if frames:
             self.on_time(0.0)
@@ -321,44 +298,6 @@ class FrameTab(QWidget):
         right = cv2.imread(str(base / rec["right_path"]), cv2.IMREAD_GRAYSCALE)
         depth = np.fromfile(base / rec["depth_path"], dtype="<u2").reshape(h, w)
 
-        # Overlay tracked features on the BIG view (lbl_main); the small
-        # LEFT thumbnail stays raw for reference.
-        left_disp = cv2.cvtColor(left, cv2.COLOR_GRAY2BGR)
-        n_feat = 0
-        if len(self.feat_ts):
-            fi = int(np.searchsorted(self.feat_ts, t_query))
-            if fi >= len(self.feat_ts):
-                fi = len(self.feat_ts) - 1
-            elif fi > 0 and (t_query - self.feat_ts[fi - 1]) < (self.feat_ts[fi] - t_query):
-                fi -= 1
-            pts = self.feat_pts[fi]
-            n_feat = len(pts)
-            if n_feat:
-                xs = np.clip(pts[:, 0].astype(np.int32), 1, w - 2)
-                ys = np.clip(pts[:, 1].astype(np.int32), 1, h - 2)
-                depths_mm = np.zeros(n_feat, dtype=np.uint16)
-                for k, (x, y) in enumerate(zip(xs, ys)):
-                    patch = depth[y - 1:y + 2, x - 1:x + 2]
-                    valid = patch[patch > 0]
-                    if valid.size:
-                        depths_mm[k] = int(valid.min())
-                d_min_mm, d_max_mm = 500, 6000
-                for (x_, y_), d_mm in zip(pts, depths_mm):
-                    cx, cy = int(x_), int(y_)
-                    if d_mm == 0:
-                        fill = (140, 140, 140)  # gray = no depth
-                    else:
-                        # Map depth -> dark red (near) ... white (far).
-                        # BGR: near (0,0,128), far (255,255,255).
-                        t = (np.clip(d_mm, d_min_mm, d_max_mm) - d_min_mm) \
-                            / (d_max_mm - d_min_mm)
-                        b = int(t * 255)
-                        g = int(t * 255)
-                        r = int(128 + t * 127)
-                        fill = (b, g, r)
-                    cv2.circle(left_disp, (cx, cy), 3, fill, -1, cv2.LINE_AA)
-
-        self._set_bgr(self.lbl_main["img"], left_disp)
         self._set_gray(self.lbl_left["img"], left)
         self._set_gray(self.lbl_right["img"], right)
         self._set_depth(self.lbl_depth["img"], depth)
@@ -370,19 +309,8 @@ class FrameTab(QWidget):
             f"t={ts_frame:7.3f}s ({skew_ms:+.0f}ms)   {w}x{h}   "
             f"depth: valid={int((depth > 0).sum())}/{w*h}  "
             f"min={int(depth[depth>0].min()) if (depth>0).any() else 0}mm  "
-            f"max={int(depth.max())}mm   feats={n_feat}"
+            f"max={int(depth.max())}mm"
         )
-
-    @staticmethod
-    def _set_bgr(label: QLabel, img: np.ndarray) -> None:
-        h, w = img.shape[:2]
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        qimg = QImage(rgb.tobytes(), w, h, 3 * w, QImage.Format.Format_RGB888)
-        pm = QPixmap.fromImage(qimg).scaled(
-            label.size(), Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        label.setPixmap(pm)
 
     @staticmethod
     def _set_gray(label: QLabel, img: np.ndarray | None) -> None:
@@ -830,7 +758,6 @@ class SessionViewer(QMainWindow):
         slam = _stack_poses(_load_jsonl(session_dir / "basalt" / "slam_pose.jsonl"))
         loop_events = _load_jsonl(session_dir / "basalt" / "loop_events.jsonl")
         track_events = _load_jsonl(session_dir / "basalt" / "track_events.jsonl")
-        feat_ts, feat_pts = _load_features(session_dir / "basalt" / "features.jsonl")
         pcl_ts, pcl_kinds, pcl_clouds = _load_pointcloud_stream(session_dir)
 
         # Shared timeline rebased to 0
@@ -851,8 +778,7 @@ class SessionViewer(QMainWindow):
             imu_n=len(imu["ts_s"]), frame_n=len(frames),
             vio_n=len(vio["ts_s"]), slam_n=len(slam["ts_s"]),
         )
-        self.tab_frame = FrameTab(session_dir, frames, t_offset,
-                                  feat_ts=feat_ts, feat_pts=feat_pts)
+        self.tab_frame = FrameTab(session_dir, frames, t_offset)
         self.tab_imu = IMUTab(imu, t_offset)
         self.tab_pose = PoseTab(vio, slam, t_offset,
                                 pcl_ts=pcl_ts, pcl_kinds=pcl_kinds,
