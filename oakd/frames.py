@@ -70,12 +70,18 @@ def rpy_to_quat(roll: float, pitch: float, yaw: float) -> np.ndarray:
 def rot_ned_to_enu(R_ned: np.ndarray) -> np.ndarray:
     """Rotate a body-attitude rotation matrix from NED-world to ENU-world.
 
-    R_ned maps body vectors into the NED world. The transform we need for the
-    GL scene is R_enu = P @ R_ned @ P^T with P = diag(swap_N_E, flip_D).
+    ``R_ned`` maps body vectors into the NED world (its columns are the body
+    axes expressed in NED). To re-express those same body axes in the ENU scene
+    we only change the *world* frame, i.e. left-multiply by the NED->ENU world
+    rotation ``C = [[0,1,0],[1,0,0],[0,0,-1]]`` (det +1): ``R_enu = C @ R_ned``.
+
+    (The previous ``C @ R_ned @ C^T`` form additionally permuted the *body*
+    input axes, which made the triad's forward arrow track the body right axis
+    and vice-versa.)
     """
-    P = np.array([
+    C = np.array([
         [0.0, 1.0, 0.0],   # E_enu = E_ned
         [1.0, 0.0, 0.0],   # N_enu = N_ned
         [0.0, 0.0, -1.0],  # U_enu = -D_ned
     ], dtype=np.float64)
-    return P @ R_ned @ P.T
+    return C @ R_ned

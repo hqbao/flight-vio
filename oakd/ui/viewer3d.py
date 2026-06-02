@@ -100,8 +100,8 @@ class _DroneTriad:
         L = self.length
         self.fwd.setData(pos=np.stack([p_enu, p_enu + L * fwd_dir]))
         self.right.setData(pos=np.stack([p_enu, p_enu + L * right_dir]))
-        # show "down" axis flipped so it reads as "up" in the scene
-        self.down.setData(pos=np.stack([p_enu, p_enu - L * down_dir]))
+        # down_dir already points downward in the scene (-Z when level)
+        self.down.setData(pos=np.stack([p_enu, p_enu + L * down_dir]))
         self.dot.setData(pos=p_enu.reshape(1, 3))
 
 
