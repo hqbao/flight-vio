@@ -22,6 +22,13 @@ viewer we therefore remap with::
 i.e. ``M_opt->ned = [[0,0,-1],[1,0,0],[0,-1,0]]``. Using +z/+y here flips the
 North and Down axes (the symptom: moving up shows the marker going down).
 
+For the **attitude** triad the viewer expects body columns ``[forward, right,
+down]``, but our VO's rotation columns are the optical axes ``[right, down,
+forward]``. So the body attitude is ``M @ R_opt @ P`` with ``P`` reordering the
+columns to ``[optical_z, optical_x, optical_y]`` — not the naive conjugation
+``M @ R_opt @ M.T`` (which leaves the forward+down arrows pointing 180 off,
+only the right arrow lining up). Verified vs Basalt (all body axes +0.97..+1.0).
+
 Note: the gyro rotation prior is a measured no-op on well-synced data (see
 ``oakd/vio/imu.py``), so this live source runs pure vision for simplicity.
 """
@@ -43,6 +50,20 @@ _M_OPT_TO_NED = np.array(
     [[0.0, 0.0, -1.0],
      [1.0, 0.0, 0.0],
      [0.0, -1.0, 0.0]]
+)
+
+# Column reorder optical (right, down, fwd) -> body FRD (fwd, right, down).
+# The viewer triad expects the attitude columns to be [forward, right, down],
+# but our VO's rotation columns are the optical axes [right, down, fwd]. The
+# body attitude in NED is therefore the camera axes mapped to NED with the
+# columns picked as [optical_z, optical_x, optical_y] -> M @ R_opt @ P. Using
+# the naive conjugation M @ R_opt @ M.T leaves the forward+down arrows 180
+# off (only the right axis happens to line up). Verified vs Basalt (all body
+# axes +0.97..+1.0 cos).
+_P_OPT_TO_FRD = np.array(
+    [[0.0, 1.0, 0.0],
+     [0.0, 0.0, 1.0],
+     [1.0, 0.0, 0.0]]
 )
 
 
@@ -231,7 +252,8 @@ class OakOursVioSource(PoseSource):
                 R_opt = pose[:3, :3]
 
                 pos_ned = _M_OPT_TO_NED @ pos_opt
-                R_ned = _M_OPT_TO_NED @ R_opt @ _M_OPT_TO_NED.T
+                # Body axes [forward, right, down] in NED for the viewer triad.
+                R_ned = _M_OPT_TO_NED @ R_opt @ _P_OPT_TO_FRD
                 q_ned = _rot_to_quat_wxyz(R_ned)
 
                 now = time.monotonic()
