@@ -21,7 +21,7 @@ def _build_source(name: str):
     if name == "fake":
         return FakePoseSource(rate_hz=100.0, radius_m=3.0, period_s=12.0)
     if name == "oak":
-        from oakd.sources.depthai_vo import OakBasaltVioSource
+        from oakd.sources.depthai_vio import OakBasaltVioSource
         return OakBasaltVioSource()
     if name == "slam":
         from oakd.sources.depthai_slam import OakBasaltSlamSource

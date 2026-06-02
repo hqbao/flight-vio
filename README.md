@@ -12,7 +12,7 @@ oak-d/
     sources/           pose providers
       base.py          PoseSource ABC
       fake.py          procedural figure-8 trajectory (UI bring-up)
-      depthai_vo.py    real stereo-inertial VIO (dai.node.BasaltVIO)
+      depthai_vio.py   real stereo-inertial VIO (dai.node.BasaltVIO)
       depthai_slam.py  VIO + SLAM with loop closure (BasaltVIO + RTABMapSLAM)
     ui/
       theme.py         military dark palette (mirrors flight-controller/_ui.py)

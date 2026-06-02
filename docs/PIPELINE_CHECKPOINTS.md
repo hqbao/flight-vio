@@ -6,7 +6,7 @@ compare each stage's output against the baseline for debugging and accuracy
 measurement.
 
 **Created**: 2026-05-29 (rewrite, principle: "only show real data")
-**Reference pipeline**: `oakd/sources/depthai_slam.py` (live) + `depthai_vo.py` (VIO-only)
+**Reference pipeline**: `oakd/sources/depthai_slam.py` (live) + `depthai_vio.py` (VIO-only)
 **Comparison target**: `skyslam/` (not written yet — detailed plan in `docs/SKYSLAM_RESEARCH.md`)
 
 ---
@@ -484,7 +484,7 @@ Skyslam work — see **`docs/SKYSLAM_RESEARCH.md`** Part 3 for plan v3
 - Gold regression suite: `docs/GOLD_SESSIONS.md` + `docs/GOLD_BASELINE.md`
 - Long-term hardware/FC vision: `docs/SKYSLAM_ROADMAP.md`
 - Current SLAM source: `oakd/sources/depthai_slam.py`
-- Current VIO source: `oakd/sources/depthai_vo.py`
+- Current VIO source: `oakd/sources/depthai_vio.py`
 - Pose data structure: `oakd/pose.py`
 
 ---
