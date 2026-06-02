@@ -270,6 +270,7 @@ class OakOursVioSource(PoseSource):
             accel_n = 0
             accel_used = 0
             last_tilt_log = t0
+            accel_ema: np.ndarray | None = None
 
             while not self._stop.is_set() and p.isRunning():
                 # Drain each queue to its most recent frame; drop the backlog so
@@ -309,6 +310,20 @@ class OakOursVioSource(PoseSource):
                         latest_a = np.array([a.x, a.y, a.z], dtype=np.float64)
                     imsg = q_imu.tryGet()
                 accel_cam = None if latest_a is None else R_imu_cam @ latest_a
+
+                # Smooth the accelerometer with an EMA before using it for
+                # leveling. Per-sample accel noise and the transient linear
+                # acceleration of handheld motion are ~zero-mean, so a short
+                # EMA averages them out and stops the body frame from jittering,
+                # while the steady gravity component passes through. The EMA
+                # still tracks a real re-orientation within a few frames, so big
+                # flips recover fast (the adaptive gain keys off the tilt error).
+                if accel_cam is not None:
+                    if accel_ema is None:
+                        accel_ema = accel_cam.copy()
+                    else:
+                        accel_ema += 0.2 * (accel_cam - accel_ema)
+                    accel_cam = accel_ema
 
                 # Level the f2f world frame too, so the BA map is fed gravity-
                 # consistent poses (keeps the tracker frame sane long term).

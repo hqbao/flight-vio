@@ -27,7 +27,7 @@ from .frontend import FrontendConfig, KLTFrontend
 
 def level_attitude(R: np.ndarray, accel_cam: np.ndarray,
                    g_ref: float | None = None,
-                   alpha: float = 0.03, alpha_max: float = 0.5,
+                   alpha: float = 0.01, alpha_max: float = 0.5,
                    g_tol: float = 0.25) -> tuple[np.ndarray, bool, float]:
     """Gravity-level a camera->world rotation's roll/pitch from accelerometer.
 
@@ -121,7 +121,7 @@ class RGBDVisualOdometry:
         self._g_ref = float(np.linalg.norm(accel_cam))
 
     def correct_tilt(self, accel_cam: np.ndarray,
-                     alpha: float = 0.03, alpha_max: float = 0.5,
+                     alpha: float = 0.01, alpha_max: float = 0.5,
                      g_tol: float = 0.25) -> bool:
         """Continuously level the attitude roll/pitch from gravity (per frame).
 
