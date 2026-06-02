@@ -75,12 +75,6 @@ _MOUNT_R0 = np.array(
      [-0.000018, -0.009146, +0.999958]]
 )
 
-# Reject startup if the gravity-leveled attitude is more than this far from the
-# recorded level mount baseline. With per-frame ``correct_tilt`` the attitude
-# self-levels, so this is only a startup *warning* threshold (not a hard abort)
-# to flag that the camera was held grossly off level when Start was pressed.
-_MAX_STARTUP_TILT_DEG = 90.0
-
 # Column reorder optical (right, down, fwd) -> body FRD (fwd, right, down).
 # The viewer triad expects the attitude columns to be [forward, right, down],
 # but our VO's rotation columns are the optical axes [right, down, fwd]. The
@@ -240,19 +234,14 @@ class OakOursVioSource(PoseSource):
                 vo.align_to_gravity(accel_cam)
                 # Sanity-log how the live measurement compares to the recorded
                 # mount baseline. The per-frame ``correct_tilt`` below keeps the
-                # attitude pinned to gravity afterward, so a startup offset is no
-                # longer fatal -- it self-corrects within a few frames. We only
-                # warn (not abort) if the start is grossly off level.
+                # attitude pinned to gravity at any orientation, so a startup
+                # offset (or even an upside-down hold) self-corrects within a few
+                # frames -- no need to gate on it.
                 dR = vo.pose[:3, :3] @ _MOUNT_R0.T
                 ang = np.degrees(np.arccos(
                     np.clip((np.trace(dR) - 1.0) * 0.5, -1.0, 1.0)))
-                if ang > _MAX_STARTUP_TILT_DEG:
-                    print(f"[ours-vio] WARNING: startup attitude {ang:.0f} deg "
-                          f"off level -- accel will level roll/pitch over the "
-                          f"next few frames (yaw stays free)")
-                else:
-                    print(f"[ours-vio] gravity-leveled startup; "
-                          f"{ang:.1f} deg from recorded mount baseline")
+                print(f"[ours-vio] gravity-leveled startup; "
+                      f"{ang:.1f} deg from recorded mount baseline")
             else:
                 vo.pose = np.eye(4)
                 vo.pose[:3, :3] = _MOUNT_R0
