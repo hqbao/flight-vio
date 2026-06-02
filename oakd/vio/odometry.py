@@ -64,22 +64,26 @@ class RGBDVisualOdometry:
         self._g_ref = float(np.linalg.norm(accel_cam))
 
     def correct_tilt(self, accel_cam: np.ndarray,
-                     alpha: float = 0.04, g_tol: float = 0.12) -> bool:
+                     alpha: float = 0.03, alpha_max: float = 0.5,
+                     g_tol: float = 0.12) -> bool:
         """Continuously level the attitude roll/pitch from gravity (per frame).
 
-        Complementary filter: rotate the world attitude estimate by a small
-        fraction ``alpha`` so the gravity direction *implied* by the current
-        attitude lines up with the measured accelerometer ``accel_cam`` (in the
-        camera optical frame). The correction axis is horizontal (perpendicular
-        to gravity) so it only nudges roll/pitch -- yaw is left to vision (there
-        is no magnetometer, so absolute yaw is unobservable).
+        Complementary filter: rotate the world attitude estimate by a fraction
+        of the way so the gravity direction *implied* by the current attitude
+        lines up with the measured accelerometer ``accel_cam`` (in the camera
+        optical frame). The correction axis is horizontal (perpendicular to
+        gravity) so it only nudges roll/pitch -- yaw is left to vision (there is
+        no magnetometer, so absolute yaw is unobservable).
 
-        This removes any slow attitude drift and makes the startup offset
-        irrelevant (it self-corrects within a few frames). It does **not** force
-        the camera level: when the drone is genuinely pitched, the measured
-        gravity already matches the (correct) attitude, so the correction is ~0.
-        Samples taken during strong linear acceleration (``|accel|`` outside the
-        gravity band) are skipped so thrust/translation does not corrupt tilt.
+        The gain is **adaptive**: a small base ``alpha`` for steady-state (trusts
+        vision, stays smooth), ramped up toward ``alpha_max`` as the tilt error
+        grows so a large discrepancy -- e.g. after the camera was flipped through
+        a big rotation and vision drifted -- snaps back to gravity within a few
+        frames instead of crawling. It still corrects only the *error*, so a
+        genuinely pitched drone keeps its true pitch (measured gravity already
+        matches the attitude => ~zero correction). Samples taken during strong
+        linear acceleration (``|accel|`` outside the gravity band) are skipped so
+        thrust/translation does not corrupt tilt.
 
         Returns ``True`` if the sample was usable (in the gravity band).
         """
@@ -88,7 +92,7 @@ class RGBDVisualOdometry:
         if na < 1e-6:
             return False
         g_ref = self._g_ref or na
-        if abs(na - g_ref) > g_tol * g_ref:    # not ~free-fall-of-g: accelerating
+        if abs(na - g_ref) > g_tol * g_ref:    # not ~1g: linear acceleration
             return False
         down_cam = -a / na                     # gravity dir in camera frame
         g_est = self.pose[:3, :3] @ down_cam   # world-down implied by attitude
@@ -99,7 +103,10 @@ class RGBDVisualOdometry:
             return True
         ang = float(np.arctan2(s, float(np.dot(g_est, target))))
         axis = v / s
-        th = alpha * ang
+        # Adaptive gain: base alpha for small errors, ramping to alpha_max as the
+        # error approaches ~30 deg so large discrepancies recover in a few frames.
+        gain = alpha + (alpha_max - alpha) * min(ang / np.deg2rad(30.0), 1.0)
+        th = gain * ang
         Kx = np.array([[0.0, -axis[2], axis[1]],
                        [axis[2], 0.0, -axis[0]],
                        [-axis[1], axis[0], 0.0]])

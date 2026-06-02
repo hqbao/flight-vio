@@ -198,13 +198,15 @@ class WindowedRGBDOdometry:
         self.pose = self.vo.pose.copy()
 
     def correct_tilt(self, accel_cam: np.ndarray,
-                     alpha: float = 0.04, g_tol: float = 0.12) -> bool:
+                     alpha: float = 0.03, alpha_max: float = 0.5,
+                     g_tol: float = 0.12) -> bool:
         """Per-frame gravity leveling of attitude (delegates to the f2f core).
 
         Mirrors the corrected rotation onto our own pose so the keyframe map
         stays in the same continuously-leveled world frame.
         """
-        used = self.vo.correct_tilt(accel_cam, alpha=alpha, g_tol=g_tol)
+        used = self.vo.correct_tilt(accel_cam, alpha=alpha,
+                                    alpha_max=alpha_max, g_tol=g_tol)
         if used:
             self.pose[:3, :3] = self.vo.pose[:3, :3]
         return used
