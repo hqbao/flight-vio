@@ -324,10 +324,34 @@ different axes — they never compete**, because each owns only what it can obse
   as relative + loop constraints (tight on yaw, loosening on tilt). A single
   estimator (EKF or sliding-window BA with a gravity term + IMU bias) then yields
   "tilt from accel, yaw from SLAM" automatically — no hand-coded "who wins" rule.
-- **Reduced form** (what the prototype does today, and a valid stepping stone):
-  a one-axis complementary filter (`level_attitude`) corrects only roll/pitch
-  toward gravity and leaves yaw untouched. It is gravity's marginal of the proper
-  fusion above.
+- **IMPLEMENTED in the from-scratch VIO prototype (2026-06-03, "Phase 4")**: the
+  gravity term now lives *inside* the sliding-window BA. Each at-rest keyframe
+  adds the residual `r_g = R_cw · g_world − (−â_meas)`, whitened by a small
+  `σ ≈ 0.05 rad` with a Huber kernel and an `|accel|` band gate. Its Jacobian
+  `∂r_g/∂φ = −[R_cw · g_world]_×` has no landmark coupling and no translation
+  term, so it only feeds the rotation block of that free camera's Hessian and
+  bites on roll/pitch only — yaw rotates about `g_world` and leaves `r_g`
+  invariant (verified: residual identical under a 30° yaw). This keeps the
+  *keyframe map* from tilt-drifting. Verified on a low-parallax synthetic scene
+  (the real corridor failure mode): plain reprojection BA leaves 16.1° tilt
+  while fitting at 0.24 px (reprojection is blind to absolute tilt); the gravity
+  prior pulls it to 2.4° while keeping reprojection at 0.28 px. Default off, so
+  the offline path stays byte-identical. Code: `oakd/vio/bundle.py`
+  (`BAConfig.use_gravity`, `optimize(grav_meas, grav_world, grav_gref)`),
+  `oakd/vio/windowed.py` (`add_keyframe(accel_cam=…)`).
+- **Reduced form** (also live in the prototype, on the DISPLAY pose): a one-axis
+  complementary filter (`level_attitude`) corrects only roll/pitch toward gravity
+  and leaves yaw untouched. It is gravity's marginal of the proper fusion above.
+  The two are complementary, not redundant: the in-BA prior keeps the *map*
+  level long-term (driving the BA correction toward level), while the display
+  filter guarantees the *shown* attitude is level *now* regardless of how well BA
+  converged on the latest keyframe. Both touch only roll/pitch and pull toward
+  gravity, so they never fight; yaw stays vision-owned.
+- **A world-frame leveling rotation must be applied to BOTH attitude and
+  position** (`pose ← diag(R)·pose`), never only the rotation block — otherwise
+  the triad rotates by the leveling angle but the trajectory does not, and camera
+  motion stops tracking the body axes (a real bug hit 2026-06-03: moving forward
+  no longer followed the forward arrow until position was rotated too).
 - **CRITICAL ordering rule**: loop closure will *snap* the pose to repair drift.
   Let it own **position + yaw** freely, but **re-apply gravity leveling as the
   very last step each frame** (after the SLAM/BA correction), so a loop-closure
