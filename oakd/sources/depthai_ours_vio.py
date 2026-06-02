@@ -283,6 +283,7 @@ class OakOursVioSource(PoseSource):
             accel_used = 0
             last_tilt_log = t0
             accel_ema: np.ndarray | None = None
+            grav_corr = np.eye(3)   # stateful world-frame gravity correction
 
             while not self._stop.is_set() and p.isRunning():
                 # Drain each queue to its most recent frame; drop the backlog so
@@ -386,26 +387,33 @@ class OakOursVioSource(PoseSource):
                     C_applied = _ease_se3(C_applied, C_target, 0.15)
                     pose = C_applied @ pose
 
-                # Gravity-level the FINAL displayed attitude from accel, only
-                # while the camera is at rest. We level it FULLY (gain 1.0) here,
-                # not partially: the displayed ``pose`` is rebuilt fresh every
-                # frame as ``C_applied @ vo.pose``, where the BA correction
-                # ``C_applied`` carries the (drifted) map attitude and re-tilts
-                # the already-leveled f2f pose. A partial complementary gain on a
-                # freshly-rebuilt quantity never converges -- it settles at
-                # ``(1-gain)*tilt`` (this is exactly why roll sat at ~-10deg). At
-                # rest the displayed tilt should simply equal gravity, so snap it
-                # fully; smoothing comes from the accel EMA + rest gate, and yaw
-                # is untouched (level_attitude only moves roll/pitch).
+                # Gravity-level the FINAL displayed attitude with a STATEFUL
+                # correction that eases in -- not a full snap. The display pose is
+                # rebuilt fresh each frame as ``C_applied @ vo.pose`` and the BA
+                # correction re-tilts it, so we keep a persistent world-frame
+                # rotation ``grav_corr`` and apply ``pose = grav_corr @ pose``.
+                # Each at-rest frame we nudge ``grav_corr`` by a small gain toward
+                # whatever cancels the residual tilt (complementary filter on a
+                # STATEFUL accumulator, so a partial gain *does* converge -- unlike
+                # a partial gain on the freshly-rebuilt pose, which sat stuck).
+                # When moving we freeze ``grav_corr`` (keep the last correction)
+                # so the body frame never jumps -- that on/off snapping at the
+                # rest-gate boundary was the jitter. yaw is untouched
+                # (level_attitude only rotates about horizontal axes).
+                R_pre = pose[:3, :3]
+                R_disp = grav_corr @ R_pre
+                used = False
+                tilt_deg = 0.0
                 if accel_cam is not None and at_rest:
                     R_lvl, used, tilt_deg = level_attitude(
-                        pose[:3, :3], accel_cam, g_ref=vo._g_ref,
-                        alpha=1.0, alpha_max=1.0)
+                        R_disp, accel_cam, g_ref=vo._g_ref,
+                        alpha=0.05, alpha_max=0.25)
                     if used:
-                        pose[:3, :3] = R_lvl
-                else:
-                    used = False
-                    tilt_deg = 0.0
+                        # delta = the small rotation level_attitude applied this
+                        # frame; fold it into the persistent correction.
+                        grav_corr = (R_lvl @ R_disp.T) @ grav_corr
+                        R_disp = grav_corr @ R_pre
+                pose[:3, :3] = R_disp
 
                 # Accelerometer-ONLY attitude (gravity-leveled, yaw=0) for live
                 # side-by-side comparison in the UI -- computed every frame
