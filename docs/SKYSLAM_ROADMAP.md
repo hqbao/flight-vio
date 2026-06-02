@@ -52,6 +52,11 @@
 5. **Test-driven**: each module has unit tests with a numerical oracle (compared against Eigen/OpenVINS in dev, not shipped).
 6. **Spec-first workflow**: write `spec.md` before coding each phase to avoid rewrites.
 7. **Dataset-driven validation**: EuRoC + TUM-VI + TUM RGB-D + ICL-NUIM before any hardware test.
+8. **Attitude authority is split by observability, never by module**: gravity
+   (accel) owns roll/pitch — it is an absolute, non-drifting reference; vision/SLAM
+   owns yaw + position — gravity cannot observe yaw (no magnetometer). The two
+   never fight because they constrain orthogonal subspaces. See
+   [§5 Phase 4 — "Attitude authority when SLAM and accel meet"](#phase-4--slam--loop-closure-libskyslam-46-days-code--24-weeks).
 
 ---
 
@@ -300,6 +305,40 @@ typedef struct {
 - `slam_orchestrator.c`: VIO odometry → KF selection → loop detect → optimise → correct.
 
 **Reference**: RTAB-Map architecture, DBoW3.
+
+**Attitude authority when SLAM and accel meet** (decided 2026-06-03, from the
+OAK-D from-scratch VIO):
+
+When SLAM is added it will also produce an attitude, so the question is "does the
+body-frame attitude obey accel or the SLAM pose graph?". The answer is **both, on
+different axes — they never compete**, because each owns only what it can observe:
+
+| Attitude component | Owner | Why |
+|---|---|---|
+| **roll / pitch (tilt)** | **accel (gravity)** | Gravity is an absolute reference that never drifts. Any visual estimator accumulates tilt error over time. |
+| **yaw (heading)** | **SLAM / vision + loop closure** | Gravity does not observe yaw. Without a magnetometer only vision can anchor heading. |
+| **position** | **SLAM** | Loop closure + pose graph fix translation drift. |
+
+- **Proper form** (the eventual target): feed accel as a gravity constraint with
+  small covariance on roll/pitch and *infinite* covariance on yaw, and SLAM pose
+  as relative + loop constraints (tight on yaw, loosening on tilt). A single
+  estimator (EKF or sliding-window BA with a gravity term + IMU bias) then yields
+  "tilt from accel, yaw from SLAM" automatically — no hand-coded "who wins" rule.
+- **Reduced form** (what the prototype does today, and a valid stepping stone):
+  a one-axis complementary filter (`level_attitude`) corrects only roll/pitch
+  toward gravity and leaves yaw untouched. It is gravity's marginal of the proper
+  fusion above.
+- **CRITICAL ordering rule**: loop closure will *snap* the pose to repair drift.
+  Let it own **position + yaw** freely, but **re-apply gravity leveling as the
+  very last step each frame** (after the SLAM/BA correction), so a loop-closure
+  snap can never drag tilt off gravity. This is the same "leveling is the final
+  step" ordering that fixed the BA-undo bug in the prototype (the BA correction
+  carried the drifted map attitude and re-tilted the body frame until leveling
+  was moved after it).
+- **Accel must be rest-gated, not magnitude-gated**: only trust accel for leveling
+  when the camera is at rest (motion residual below threshold). A magnitude gate
+  cannot reject lateral linear acceleration — a sideways push barely changes
+  `|accel|` yet tilts the gravity *direction* by `atan(a_lat/g)`, biasing tilt.
 
 **Test**:
 - TUM-VI room1/2: loop detection rate > 80%, post-loop drift < 1% path length.
@@ -584,6 +623,7 @@ skyslam/
 | 2026-05-27 | First draft | Bao + Copilot |
 | 2026-05-29 | Mark SW plan superseded by SKYSLAM_RESEARCH.md | Bao + Copilot |
 | 2026-05-29 | Translate document to English | Bao + Copilot |
+| 2026-06-03 | Add attitude-authority principle (accel owns tilt, SLAM owns yaw+pos; leveling is the final step; rest-gate accel) — design principle 8 + Phase 4 | Bao + Copilot |
 
 ---
 
