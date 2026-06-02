@@ -11,13 +11,16 @@ Pipeline (same front-end as the recorder):
     Camera CAM_B/CAM_C -> StereoDepth (depthAlign=left)
         -> rectifiedLeft (uint8 gray) + depth (uint16 mm)
 
-Our odometry produces poses in the **camera optical** frame
-(+x right, +y down, +z forward), world = first frame. For the NED 3D viewer we
-remap optical -> NED with::
+Our odometry's pose translation comes out in a **(right, up, back)** camera
+frame (x right, y up, z backward) -- verified empirically against Basalt's FLU
+poses on the gold sessions (per-axis correlation +0.9..+1.0). It is *not* the
+OpenCV optical (right, down, forward) frame one might assume. For the NED 3D
+viewer we therefore remap with::
 
-    NED = [ +z_opt (forward=North), +x_opt (right=East), +y_opt (down=Down) ]
+    NED = [ -z_opt (back->North=forward), +x_opt (right=East), -y_opt (up->Down) ]
 
-i.e. ``M_opt->ned = [[0,0,1],[1,0,0],[0,1,0]]``.
+i.e. ``M_opt->ned = [[0,0,-1],[1,0,0],[0,-1,0]]``. Using +z/+y here flips the
+North and Down axes (the symptom: moving up shows the marker going down).
 
 Note: the gyro rotation prior is a measured no-op on well-synced data (see
 ``oakd/vio/imu.py``), so this live source runs pure vision for simplicity.
@@ -33,11 +36,13 @@ from ..vio import OdometryConfig, RGBDVisualOdometry
 from .base import PoseSource
 
 
-# Camera optical (x right, y down, z forward) -> world NED (North, East, Down).
+# Our VO pose frame is empirically (x right, y up, z back) -> world NED.
+# North = -z (back->forward), East = +x (right), Down = -y (up->down).
+# Verified vs Basalt FLU on gold sessions (all axes +corr). See module docstring.
 _M_OPT_TO_NED = np.array(
-    [[0.0, 0.0, 1.0],
+    [[0.0, 0.0, -1.0],
      [1.0, 0.0, 0.0],
-     [0.0, 1.0, 0.0]]
+     [0.0, -1.0, 0.0]]
 )
 
 
