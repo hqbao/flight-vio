@@ -29,11 +29,7 @@ import time
 import numpy as np
 
 from ..pose import Pose
-from ..vio import (
-    OdometryConfig,
-    RGBDVisualOdometry,
-    WindowedRGBDOdometry,
-)
+from ..vio import OdometryConfig, RGBDVisualOdometry
 from .base import PoseSource
 
 
@@ -115,8 +111,11 @@ class OakOursVioSource(PoseSource):
             left.requestOutput((self.width, self.height)).link(stereo.left)
             right.requestOutput((self.width, self.height)).link(stereo.right)
 
-            q_left = stereo.rectifiedLeft.createOutputQueue()
-            q_depth = stereo.depth.createOutputQueue()
+            # Non-blocking queues so a slow consumer never stalls the device
+            # (a stalled XLink read is what triggers X_LINK_ERROR). We keep a
+            # small buffer and always consume the *latest* frame below.
+            q_left = stereo.rectifiedLeft.createOutputQueue(maxSize=4, blocking=False)
+            q_depth = stereo.depth.createOutputQueue(maxSize=4, blocking=False)
 
             p.start()
 
@@ -127,18 +126,51 @@ class OakOursVioSource(PoseSource):
                 dtype=np.float64,
             )
 
-            vo = (WindowedRGBDOdometry(K) if self.backend == "ba"
-                  else RGBDVisualOdometry(K, OdometryConfig()))
+            p.start()
+
+            # Pull rectified-left intrinsics for the metric back-projection.
+            ch = p.getDefaultDevice().readCalibration()
+            K = np.array(
+                ch.getCameraIntrinsics(left_socket, self.width, self.height),
+                dtype=np.float64,
+            )
+
+            # The displayed pose is ALWAYS produced by the fast frame-to-frame
+            # VO, so the read loop never blocks on BA and the UI stays smooth.
+            vo = RGBDVisualOdometry(K, OdometryConfig())
+
+            # In BA mode, a background thread refines a sliding window of
+            # keyframes and publishes a world-frame correction ``C`` that we
+            # left-multiply onto the f2f pose: P_disp = C @ P_f2f. ``C`` updates
+            # only at keyframe cadence with small steps, so the trajectory stays
+            # smooth while still getting BA's drift/scale correction.
+            ba_state = None
+            if self.backend == "ba":
+                ba_state = self._start_ba_worker(K)
 
             t0 = time.monotonic()
             prev_pos_ned = np.zeros(3)
             prev_t: float | None = None
             frames = 0
+            kf_count = 0
             last_fps_t = t0
 
             while not self._stop.is_set() and p.isRunning():
+                # Drain each queue to its most recent frame; drop the backlog so
+                # that if anything briefly stalls we skip stale frames instead of
+                # falling progressively further behind (stays real time).
                 ld = q_left.tryGet()
+                while True:
+                    nxt = q_left.tryGet()
+                    if nxt is None:
+                        break
+                    ld = nxt
                 dd = q_depth.tryGet()
+                while True:
+                    nxt = q_depth.tryGet()
+                    if nxt is None:
+                        break
+                    dd = nxt
                 if ld is None or dd is None:
                     time.sleep(0.002)
                     continue
@@ -149,7 +181,25 @@ class OakOursVioSource(PoseSource):
                 depth_mm = dd.getCvFrame()
                 depth_m = depth_mm.astype(np.float32) / 1000.0
 
-                pose = vo.process(gray, depth_m)  # 4x4, camera-optical world
+                pose = vo.process(gray, depth_m).copy()  # camera-optical world
+
+                if ba_state is not None:
+                    # Hand a keyframe snapshot to the BA worker every kf_every
+                    # frames (non-blocking: overwrite any pending one).
+                    kf_count += 1
+                    if kf_count >= ba_state["kf_every"]:
+                        kf_count = 0
+                        st = vo.frontend.tracks
+                        ba_state["submit"](
+                            np.linalg.inv(pose),          # T_cw (world->cam)
+                            st.ids.copy(), st.points.copy(),
+                            depth_m.copy(),
+                        )
+                    # Apply the latest BA correction to the displayed pose.
+                    with ba_state["lock"]:
+                        C = ba_state["corr"]
+                    pose = C @ pose
+
                 pos_opt = pose[:3, 3]
                 R_opt = pose[:3, :3]
 
@@ -181,3 +231,70 @@ class OakOursVioSource(PoseSource):
                     self.fps = frames / (now - last_fps_t)
                     frames = 0
                     last_fps_t = now
+
+            if ba_state is not None:
+                ba_state["stop"].set()
+                ba_state["event"].set()
+                ba_state["thread"].join(timeout=1.0)
+
+    # ----------------------------------------------------------------------- #
+    def _start_ba_worker(self, K: np.ndarray) -> dict:
+        """Spawn the background sliding-window BA thread.
+
+        Returns a small state dict the read loop uses to submit keyframe
+        snapshots and read the current correction. The worker keeps the entire
+        BA map in the *raw f2f* world frame (it is always fed raw f2f poses), so
+        the published correction ``C = inv(T_ba) @ T_cw`` maps that frame onto
+        the BA-refined one and is small (the window anchor is a raw f2f pose).
+        """
+        import threading
+
+        from ..vio import WindowedBAMap, WindowedConfig
+        from ..vio.bundle import BAConfig
+
+        cfg = WindowedConfig(window=6, kf_every=5,
+                             ba=BAConfig(max_iters=5, huber_px=2.0))
+        ba_map = WindowedBAMap(K, cfg)
+
+        lock = threading.Lock()
+        snap_lock = threading.Lock()
+        event = threading.Event()
+        stop = threading.Event()
+        state = {
+            "corr": np.eye(4),
+            "lock": lock,
+            "event": event,
+            "stop": stop,
+            "kf_every": cfg.kf_every,
+            "_pending": None,
+        }
+
+        def submit(T_cw, ids, pts, depth_m):
+            with snap_lock:
+                state["_pending"] = (T_cw, ids, pts, depth_m)
+            event.set()
+
+        def worker():
+            while not stop.is_set():
+                event.wait()
+                event.clear()
+                if stop.is_set():
+                    break
+                with snap_lock:
+                    snap = state["_pending"]
+                    state["_pending"] = None
+                if snap is None:
+                    continue
+                T_cw, ids, pts, depth_m = snap
+                ba_map.add_keyframe(T_cw, ids, pts, depth_m)
+                post = ba_map.run_ba()
+                if post is not None:
+                    C = np.linalg.inv(post) @ T_cw
+                    with lock:
+                        state["corr"] = C
+
+        th = threading.Thread(target=worker, name="OursBAWorker", daemon=True)
+        th.start()
+        state["thread"] = th
+        state["submit"] = submit
+        return state

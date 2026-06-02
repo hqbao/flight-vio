@@ -65,27 +65,24 @@ class WindowedConfig:
     ba: BAConfig = field(default_factory=lambda: BAConfig(max_iters=8, huber_px=2.0))
 
 
-class WindowedRGBDOdometry:
-    """Frame-to-frame tracking with sliding-window keyframe bundle adjustment."""
+class WindowedBAMap:
+    """Sliding-window keyframe map + bundle adjustment, tracker-agnostic.
 
-    def __init__(self, K: np.ndarray, cfg: WindowedConfig | None = None,
-                 frontend: KLTFrontend | None = None,
-                 odom_cfg: OdometryConfig | None = None):
+    This owns *only* the keyframe/landmark bookkeeping and the BA solve. It does
+    not run any visual odometry itself: the caller supplies, at each keyframe,
+    the current ``T_cw`` pose (from whatever front-end) plus a snapshot of the
+    live tracks and the depth map. Keeping it decoupled lets the same backend
+    run **synchronously** inside :class:`WindowedRGBDOdometry` (offline) and on a
+    **background thread** in the live source, with no duplicated map logic.
+    """
+
+    def __init__(self, K: np.ndarray, cfg: WindowedConfig | None = None):
         self.K = np.asarray(K, dtype=np.float64)
         self.cfg = cfg or WindowedConfig()
-        fe = frontend or KLTFrontend(FrontendConfig())
-        self.vo = RGBDVisualOdometry(self.K, odom_cfg or OdometryConfig(), frontend=fe)
-        self.frontend = self.vo.frontend
-
-        # World-frame map. landmarks[tid] = (3,) point; keyframes hold T_cw + obs.
         self.landmarks: dict[int, np.ndarray] = {}
         self.keyframes: list[dict] = []
-        self._frames_since_kf = 0
-        self._frame_idx = -1
-        self.pose = np.eye(4)         # T_world_cur (camera->world)
         self.last_info: dict = {}
 
-    # --------------------------------------------------------------------- #
     def _backproject_world(self, T_cw: np.ndarray, u: float, v: float,
                            z: float) -> np.ndarray:
         fx, fy = self.K[0, 0], self.K[1, 1]
@@ -94,12 +91,12 @@ class WindowedRGBDOdometry:
         R, t = T_cw[:3, :3], T_cw[:3, 3]
         return R.T @ (Xc - t)   # inv(T_cw) applied to Xc
 
-    def _add_keyframe(self, depth_m: np.ndarray) -> None:
-        T_cw = np.linalg.inv(self.pose)
-        state = self.frontend.tracks
+    def add_keyframe(self, T_cw: np.ndarray, ids: np.ndarray,
+                     pts: np.ndarray, depth_m: np.ndarray) -> None:
+        """Register a keyframe from a track snapshot + its depth map."""
         h, w = depth_m.shape
         obs: dict[int, np.ndarray] = {}
-        for tid, px in zip(state.ids, state.points):
+        for tid, px in zip(ids, pts):
             tid = int(tid)
             u, v = float(px[0]), float(px[1])
             pu, pv = int(round(u)), int(round(v))
@@ -111,9 +108,8 @@ class WindowedRGBDOdometry:
                 if not z_ok:
                     continue
                 self.landmarks[tid] = self._backproject_world(T_cw, u, v, z)
-            # store pixel + measured depth (0 = no usable depth this view)
             obs[tid] = np.array([u, v, z if z_ok else 0.0])
-        self.keyframes.append({"T_cw": T_cw, "obs": obs})
+        self.keyframes.append({"T_cw": np.asarray(T_cw, float).copy(), "obs": obs})
         self._marginalize()
 
     def _marginalize(self) -> None:
@@ -127,11 +123,11 @@ class WindowedRGBDOdometry:
             if tid not in live:
                 del self.landmarks[tid]
 
-    def _run_ba(self) -> None:
+    def run_ba(self) -> np.ndarray | None:
+        """Optimise the window; return the refined latest ``T_cw`` (or None)."""
         kfs = self.keyframes
         if len(kfs) < 2:
-            return
-        # Count how many window keyframes see each landmark.
+            return None
         cnt = Counter()
         for kf in kfs:
             for tid in kf["obs"]:
@@ -139,7 +135,7 @@ class WindowedRGBDOdometry:
                     cnt[tid] += 1
         ba_tids = [t for t, c in cnt.items() if c >= self.cfg.min_ba_views]
         if len(ba_tids) < 6:
-            return
+            return None
         lm_index = {t: j for j, t in enumerate(ba_tids)}
         landmarks_arr = np.array([self.landmarks[t] for t in ba_tids])
 
@@ -156,23 +152,50 @@ class WindowedRGBDOdometry:
                 obs_uv.append(uvz[:2])
                 obs_depth.append(uvz[2])
         if len(obs_cam) < 12:
-            return
+            return None
 
         res = optimize(
             self.K, poses, fixed, landmarks_arr,
             np.array(obs_cam), np.array(obs_lm), np.array(obs_uv),
             obs_depth=np.array(obs_depth), cfg=self.cfg.ba,
         )
-        # Write back refined poses + landmarks.
         for kf, P in zip(kfs, res.poses):
             kf["T_cw"] = P
         for t, j in lm_index.items():
             self.landmarks[t] = res.landmarks[j]
 
-        self.last_info["ba_kfs"] = len(kfs)
-        self.last_info["ba_lms"] = len(ba_tids)
-        self.last_info["ba_obs"] = len(obs_cam)
-        self.last_info["ba_reproj_px"] = res.mean_reproj_px
+        self.last_info = {
+            "ba_kfs": len(kfs), "ba_lms": len(ba_tids),
+            "ba_obs": len(obs_cam), "ba_reproj_px": res.mean_reproj_px,
+        }
+        return kfs[-1]["T_cw"].copy()
+
+
+class WindowedRGBDOdometry:
+    """Frame-to-frame tracking with sliding-window keyframe bundle adjustment."""
+
+    def __init__(self, K: np.ndarray, cfg: WindowedConfig | None = None,
+                 frontend: KLTFrontend | None = None,
+                 odom_cfg: OdometryConfig | None = None):
+        self.K = np.asarray(K, dtype=np.float64)
+        self.cfg = cfg or WindowedConfig()
+        fe = frontend or KLTFrontend(FrontendConfig())
+        self.vo = RGBDVisualOdometry(self.K, odom_cfg or OdometryConfig(), frontend=fe)
+        self.frontend = self.vo.frontend
+        self.map = WindowedBAMap(self.K, self.cfg)
+        self._frames_since_kf = 0
+        self._frame_idx = -1
+        self.pose = np.eye(4)         # T_world_cur (camera->world)
+        self.last_info: dict = {}
+
+    # convenience pass-throughs (some tools inspect these)
+    @property
+    def landmarks(self) -> dict[int, np.ndarray]:
+        return self.map.landmarks
+
+    @property
+    def keyframes(self) -> list[dict]:
+        return self.map.keyframes
 
     # --------------------------------------------------------------------- #
     def process(self, gray: np.ndarray, depth_m: np.ndarray) -> np.ndarray:
@@ -187,14 +210,15 @@ class WindowedRGBDOdometry:
         is_kf = (not self.keyframes) or (self._frames_since_kf >= self.cfg.kf_every)
         if is_kf:
             self._frames_since_kf = 0
-            self._add_keyframe(depth_m)
+            state = self.frontend.tracks
+            self.map.add_keyframe(np.linalg.inv(self.pose),
+                                  state.ids, state.points, depth_m)
             # 3) sliding-window BA, then inject the correction.
-            pre = self.keyframes[-1]["T_cw"].copy()
-            self._run_ba()
-            post = self.keyframes[-1]["T_cw"]
-            if not np.allclose(pre, post):
+            post = self.map.run_ba()
+            if post is not None:
                 self.pose = np.linalg.inv(post)
                 self.vo.pose = self.pose.copy()  # keep tracker consistent
+                self.last_info.update(self.map.last_info)
             self.last_info["is_kf"] = True
         else:
             self.last_info["is_kf"] = False

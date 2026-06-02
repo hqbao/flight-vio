@@ -13,7 +13,7 @@ from .geometry import backproject, valid_mask
 from .imu import GyroPreintegrator, so3_exp
 from .odometry import OdometryConfig, RGBDVisualOdometry
 from .reader import CameraCalib, Frame, SessionReader, StereoCalib
-from .windowed import WindowedConfig, WindowedRGBDOdometry
+from .windowed import WindowedBAMap, WindowedConfig, WindowedRGBDOdometry
 
 __all__ = [
     "CameraCalib",
@@ -31,4 +31,5 @@ __all__ = [
     "so3_exp",
     "WindowedConfig",
     "WindowedRGBDOdometry",
+    "WindowedBAMap",
 ]
