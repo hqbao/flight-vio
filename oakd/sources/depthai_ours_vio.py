@@ -76,10 +76,9 @@ _MOUNT_R0 = np.array(
 )
 
 # Reject startup if the gravity-leveled attitude is more than this far from the
-# recorded level mount baseline. The user levels the drone before pressing
-# Start, so a large tilt here means the camera is held wrong (e.g. on its side)
-# and the VO world frame would be seeded upside-down -- abort instead of
-# producing a silently-wrong trajectory.
+# recorded level mount baseline. With per-frame ``correct_tilt`` the attitude
+# self-levels, so this is only a startup *warning* threshold (not a hard abort)
+# to flag that the camera was held grossly off level when Start was pressed.
 _MAX_STARTUP_TILT_DEG = 90.0
 
 # Column reorder optical (right, down, fwd) -> body FRD (fwd, right, down).
@@ -240,18 +239,20 @@ class OakOursVioSource(PoseSource):
             if accel_cam is not None:
                 vo.align_to_gravity(accel_cam)
                 # Sanity-log how the live measurement compares to the recorded
-                # mount baseline (large drift here means the mount has changed).
+                # mount baseline. The per-frame ``correct_tilt`` below keeps the
+                # attitude pinned to gravity afterward, so a startup offset is no
+                # longer fatal -- it self-corrects within a few frames. We only
+                # warn (not abort) if the start is grossly off level.
                 dR = vo.pose[:3, :3] @ _MOUNT_R0.T
                 ang = np.degrees(np.arccos(
                     np.clip((np.trace(dR) - 1.0) * 0.5, -1.0, 1.0)))
                 if ang > _MAX_STARTUP_TILT_DEG:
-                    self._fail(
-                        f"startup attitude {ang:.0f} deg off level "
-                        f"(limit {_MAX_STARTUP_TILT_DEG:.0f} deg) -- "
-                        f"level the drone and press Start again")
-                    return
-                print(f"[ours-vio] gravity-leveled startup; "
-                      f"{ang:.1f} deg from recorded mount baseline")
+                    print(f"[ours-vio] WARNING: startup attitude {ang:.0f} deg "
+                          f"off level -- accel will level roll/pitch over the "
+                          f"next few frames (yaw stays free)")
+                else:
+                    print(f"[ours-vio] gravity-leveled startup; "
+                          f"{ang:.1f} deg from recorded mount baseline")
             else:
                 vo.pose = np.eye(4)
                 vo.pose[:3, :3] = _MOUNT_R0
@@ -304,7 +305,23 @@ class OakOursVioSource(PoseSource):
                 depth_mm = dd.getCvFrame()
                 depth_m = depth_mm.astype(np.float32) / 1000.0
 
-                pose = vo.process(gray, depth_m).copy()  # camera-optical world
+                vo.process(gray, depth_m)  # advance camera-optical world pose
+
+                # Continuously level the attitude roll/pitch from gravity: drain
+                # the IMU queue to the newest accel sample and nudge the world
+                # attitude toward it (yaw is left to vision -- no magnetometer).
+                # This kills slow tilt drift and makes the startup offset moot.
+                latest_a = None
+                imsg = q_imu.tryGet()
+                while imsg is not None:
+                    for pkt in imsg.packets:
+                        a = pkt.acceleroMeter
+                        latest_a = np.array([a.x, a.y, a.z], dtype=np.float64)
+                    imsg = q_imu.tryGet()
+                if latest_a is not None:
+                    vo.correct_tilt(R_imu_cam @ latest_a)
+
+                pose = vo.pose.copy()  # camera-optical world (gravity-leveled)
 
                 if ba_state is not None:
                     # Submit a keyframe snapshot every kf_every frames. Drop if

@@ -47,6 +47,7 @@ class RGBDVisualOdometry:
         self._prev_obs: dict[int, np.ndarray] = {}
         self._prev_depth: np.ndarray | None = None
         self.last_info: dict = {}
+        self._g_ref: float | None = None      # |gravity| from startup accel
 
     def align_to_gravity(self, accel_cam: np.ndarray) -> None:
         """Seed the initial attitude from gravity (call before the first frame).
@@ -60,6 +61,52 @@ class RGBDVisualOdometry:
         from .imu import gravity_aligned_R0
         self.pose = np.eye(4)
         self.pose[:3, :3] = gravity_aligned_R0(accel_cam)
+        self._g_ref = float(np.linalg.norm(accel_cam))
+
+    def correct_tilt(self, accel_cam: np.ndarray,
+                     alpha: float = 0.04, g_tol: float = 0.12) -> bool:
+        """Continuously level the attitude roll/pitch from gravity (per frame).
+
+        Complementary filter: rotate the world attitude estimate by a small
+        fraction ``alpha`` so the gravity direction *implied* by the current
+        attitude lines up with the measured accelerometer ``accel_cam`` (in the
+        camera optical frame). The correction axis is horizontal (perpendicular
+        to gravity) so it only nudges roll/pitch -- yaw is left to vision (there
+        is no magnetometer, so absolute yaw is unobservable).
+
+        This removes any slow attitude drift and makes the startup offset
+        irrelevant (it self-corrects within a few frames). It does **not** force
+        the camera level: when the drone is genuinely pitched, the measured
+        gravity already matches the (correct) attitude, so the correction is ~0.
+        Samples taken during strong linear acceleration (``|accel|`` outside the
+        gravity band) are skipped so thrust/translation does not corrupt tilt.
+
+        Returns ``True`` if the sample was usable (in the gravity band).
+        """
+        a = np.asarray(accel_cam, dtype=np.float64)
+        na = float(np.linalg.norm(a))
+        if na < 1e-6:
+            return False
+        g_ref = self._g_ref or na
+        if abs(na - g_ref) > g_tol * g_ref:    # not ~free-fall-of-g: accelerating
+            return False
+        down_cam = -a / na                     # gravity dir in camera frame
+        g_est = self.pose[:3, :3] @ down_cam   # world-down implied by attitude
+        target = np.array([0.0, 1.0, 0.0])     # true world-down (optical +y)
+        v = np.cross(g_est, target)
+        s = float(np.linalg.norm(v))
+        if s < 1e-9:                           # already aligned (or anti-aligned)
+            return True
+        ang = float(np.arctan2(s, float(np.dot(g_est, target))))
+        axis = v / s
+        th = alpha * ang
+        Kx = np.array([[0.0, -axis[2], axis[1]],
+                       [axis[2], 0.0, -axis[0]],
+                       [-axis[1], axis[0], 0.0]])
+        R_corr = np.eye(3) + np.sin(th) * Kx + (1.0 - np.cos(th)) * (Kx @ Kx)
+        self.pose[:3, :3] = R_corr @ self.pose[:3, :3]
+        return True
+
 
     def _backproject_px(self, u: float, v: float, z: float) -> np.ndarray:
         fx, fy = self.K[0, 0], self.K[1, 1]
