@@ -348,6 +348,16 @@ class OakOursVioSource(PoseSource):
                     accel_cam = accel_ema
                     motion = float(np.linalg.norm(accel_raw - accel_ema))
                     at_rest = motion < _REST_MOTION_THRESH
+                    # Track the true gravity magnitude from the at-rest samples.
+                    # The startup g_ref can be captured during motion (it read
+                    # 10.15 vs a real ~8.9 here), which would skew the inner
+                    # magnitude gate; refresh it whenever we are actually still.
+                    if at_rest:
+                        na = float(np.linalg.norm(accel_cam))
+                        if vo._g_ref is None:
+                            vo._g_ref = na
+                        else:
+                            vo._g_ref += 0.05 * (na - vo._g_ref)
 
                 # Level the f2f world frame too (only at rest), so the BA map is
                 # fed gravity-consistent poses over the long term.
@@ -377,11 +387,20 @@ class OakOursVioSource(PoseSource):
                     pose = C_applied @ pose
 
                 # Gravity-level the FINAL displayed attitude from accel, only
-                # while the camera is at rest (see the rest gate above). roll/pitch
-                # follow the IMU; yaw is left to vision (no magnetometer).
+                # while the camera is at rest. We level it FULLY (gain 1.0) here,
+                # not partially: the displayed ``pose`` is rebuilt fresh every
+                # frame as ``C_applied @ vo.pose``, where the BA correction
+                # ``C_applied`` carries the (drifted) map attitude and re-tilts
+                # the already-leveled f2f pose. A partial complementary gain on a
+                # freshly-rebuilt quantity never converges -- it settles at
+                # ``(1-gain)*tilt`` (this is exactly why roll sat at ~-10deg). At
+                # rest the displayed tilt should simply equal gravity, so snap it
+                # fully; smoothing comes from the accel EMA + rest gate, and yaw
+                # is untouched (level_attitude only moves roll/pitch).
                 if accel_cam is not None and at_rest:
                     R_lvl, used, tilt_deg = level_attitude(
-                        pose[:3, :3], accel_cam, g_ref=vo._g_ref)
+                        pose[:3, :3], accel_cam, g_ref=vo._g_ref,
+                        alpha=1.0, alpha_max=1.0)
                     if used:
                         pose[:3, :3] = R_lvl
                 else:
