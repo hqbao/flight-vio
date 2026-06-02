@@ -69,10 +69,20 @@ def level_attitude(R: np.ndarray, accel_cam: np.ndarray,
         return R, False, tilt_deg
     v = np.cross(g_est, target)
     s = float(np.linalg.norm(v))
-    if s < 1e-9:                            # already aligned (or anti-aligned)
-        return R, True, tilt_deg
-    ang = float(np.arctan2(s, float(np.dot(g_est, target))))
-    axis = v / s
+    dot = float(np.dot(g_est, target))
+    if s < 1e-9:
+        if dot > 0.0:                       # already aligned -> nothing to do
+            return R, True, tilt_deg
+        # Anti-aligned (implied gravity points straight UP, ~180 deg off). The
+        # rotation axis is undefined here, so pick any horizontal axis (perp to
+        # the world-down target) and rotate toward gravity. Without this the
+        # filter sits stuck at the singularity until the camera is perturbed --
+        # the "I have to shake it before it levels" symptom.
+        axis = np.array([1.0, 0.0, 0.0])
+        ang = np.pi
+    else:
+        ang = float(np.arctan2(s, dot))
+        axis = v / s
     gain = alpha + (alpha_max - alpha) * min(ang / np.deg2rad(30.0), 1.0)
     th = gain * ang
     Kx = np.array([[0.0, -axis[2], axis[1]],
