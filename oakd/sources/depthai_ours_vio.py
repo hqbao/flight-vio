@@ -49,7 +49,7 @@ import numpy as np
 from ..pose import Pose
 from ..frames import quat_to_rpy
 from ..vio import (
-    OdometryConfig, RGBDVisualOdometry, gravity_aligned_R0, level_attitude,
+    OdometryConfig, RGBDVisualOdometry, gravity_aligned_R0,
 )
 from .base import PoseSource
 
@@ -283,7 +283,6 @@ class OakOursVioSource(PoseSource):
             accel_used = 0
             last_tilt_log = t0
             accel_ema: np.ndarray | None = None
-            grav_corr = np.eye(3)   # stateful world-frame gravity correction
 
             while not self._stop.is_set() and p.isRunning():
                 # Drain each queue to its most recent frame; drop the backlog so
@@ -324,8 +323,13 @@ class OakOursVioSource(PoseSource):
                 while imsg is not None:
                     for pkt in imsg.packets:
                         a = pkt.acceleroMeter
-                        acc_sum += (a.x, a.y, a.z)
-                        acc_cnt += 1
+                        v = (a.x, a.y, a.z)
+                        # Reject NaN/inf sentinel packets: a single bad sample
+                        # would poison the EMA permanently (it never recovers from
+                        # NaN), which then corrupts the pose into NaN forever.
+                        if np.all(np.isfinite(v)):
+                            acc_sum += v
+                            acc_cnt += 1
                     imsg = q_imu.tryGet()
                 accel_raw = None if acc_cnt == 0 else R_imu_cam @ (acc_sum / acc_cnt)
 
@@ -378,6 +382,13 @@ class OakOursVioSource(PoseSource):
                             np.linalg.inv(pose),          # T_cw (world->cam)
                             st.ids.copy(), st.points.copy(),
                             depth_m.copy(),
+                            # Only hand BA a gravity measurement when the camera
+                            # is at rest; during motion lateral acceleration would
+                            # bias the gravity direction, so the keyframe carries
+                            # no gravity prior (None) and BA levels it from its
+                            # at-rest neighbours in the window.
+                            accel_cam.copy() if (accel_cam is not None
+                                                 and at_rest) else None,
                         )
                     # Pull the latest correction from the worker (drain to last).
                     newC = ba_state["poll"]()
@@ -387,33 +398,21 @@ class OakOursVioSource(PoseSource):
                     C_applied = _ease_se3(C_applied, C_target, 0.15)
                     pose = C_applied @ pose
 
-                # Gravity-level the FINAL displayed attitude with a STATEFUL
-                # correction that eases in -- not a full snap. The display pose is
-                # rebuilt fresh each frame as ``C_applied @ vo.pose`` and the BA
-                # correction re-tilts it, so we keep a persistent world-frame
-                # rotation ``grav_corr`` and apply ``pose = grav_corr @ pose``.
-                # Each at-rest frame we nudge ``grav_corr`` by a small gain toward
-                # whatever cancels the residual tilt (complementary filter on a
-                # STATEFUL accumulator, so a partial gain *does* converge -- unlike
-                # a partial gain on the freshly-rebuilt pose, which sat stuck).
-                # When moving we freeze ``grav_corr`` (keep the last correction)
-                # so the body frame never jumps -- that on/off snapping at the
-                # rest-gate boundary was the jitter. yaw is untouched
-                # (level_attitude only rotates about horizontal axes).
-                R_pre = pose[:3, :3]
-                R_disp = grav_corr @ R_pre
-                used = False
+                # Gravity leveling is now owned by (a) the f2f tracker's
+                # ``correct_tilt`` (which levels ``vo.pose`` at rest, between
+                # keyframes) and (b) the in-BA gravity prior (which levels the
+                # keyframe map so the BA correction ``C`` keeps the displayed
+                # pose level). No display-side correction is applied here -- the
+                # old stateful ``grav_corr`` hack (which re-leveled the final
+                # pose and drifted out of SO(3) into NaN) is gone. We only
+                # measure the residual tilt for diagnostics.
                 tilt_deg = 0.0
-                if accel_cam is not None and at_rest:
-                    R_lvl, used, tilt_deg = level_attitude(
-                        R_disp, accel_cam, g_ref=vo._g_ref,
-                        alpha=0.05, alpha_max=0.25)
-                    if used:
-                        # delta = the small rotation level_attitude applied this
-                        # frame; fold it into the persistent correction.
-                        grav_corr = (R_lvl @ R_disp.T) @ grav_corr
-                        R_disp = grav_corr @ R_pre
-                pose[:3, :3] = R_disp
+                if accel_cam is not None:
+                    na = float(np.linalg.norm(accel_cam))
+                    if na > 1e-6:
+                        g_est = pose[:3, :3] @ (-accel_cam / na)
+                        tilt_deg = float(np.degrees(np.arccos(
+                            np.clip(float(g_est[1]), -1.0, 1.0))))
 
                 # Accelerometer-ONLY attitude (gravity-leveled, yaw=0) for live
                 # side-by-side comparison in the UI -- computed every frame
@@ -532,8 +531,14 @@ class OakOursVioSource(PoseSource):
         from ..vio import WindowedBAMap, WindowedConfig
         from ..vio.bundle import BAConfig
 
+        # use_gravity=True adds the accelerometer leveling prior INSIDE the
+        # sliding-window BA, so the optimised map keeps its roll/pitch pinned to
+        # real gravity (no display-side correction needed). Only at-rest accel
+        # samples are submitted per keyframe (see the read loop), so a moving
+        # keyframe simply carries no gravity constraint.
         cfg = WindowedConfig(window=6, kf_every=5,
-                             ba=BAConfig(max_iters=5, huber_px=2.0))
+                             ba=BAConfig(max_iters=5, huber_px=2.0,
+                                         use_gravity=True))
         ba_map = WindowedBAMap(K, cfg)
 
         snap_lock = threading.Lock()
@@ -548,9 +553,9 @@ class OakOursVioSource(PoseSource):
             "_corr": None,
         }
 
-        def submit(T_cw, ids, pts, depth_m):
+        def submit(T_cw, ids, pts, depth_m, accel):
             with snap_lock:
-                state["_pending"] = (T_cw, ids, pts, depth_m)
+                state["_pending"] = (T_cw, ids, pts, depth_m, accel)
             event.set()
 
         def poll():
@@ -570,8 +575,8 @@ class OakOursVioSource(PoseSource):
                     state["_pending"] = None
                 if snap is None:
                     continue
-                T_cw, ids, pts, depth_m = snap
-                ba_map.add_keyframe(T_cw, ids, pts, depth_m)
+                T_cw, ids, pts, depth_m, accel = snap
+                ba_map.add_keyframe(T_cw, ids, pts, depth_m, accel_cam=accel)
                 post = ba_map.run_ba()
                 if post is not None:
                     with out_lock:

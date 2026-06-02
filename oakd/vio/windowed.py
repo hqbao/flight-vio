@@ -92,8 +92,15 @@ class WindowedBAMap:
         return R.T @ (Xc - t)   # inv(T_cw) applied to Xc
 
     def add_keyframe(self, T_cw: np.ndarray, ids: np.ndarray,
-                     pts: np.ndarray, depth_m: np.ndarray) -> None:
-        """Register a keyframe from a track snapshot + its depth map."""
+                     pts: np.ndarray, depth_m: np.ndarray,
+                     accel_cam: np.ndarray | None = None) -> None:
+        """Register a keyframe from a track snapshot + its depth map.
+
+        ``accel_cam`` (optional) is the accelerometer vector in the camera
+        optical frame at this keyframe, supplied only when the camera was at
+        rest. When present (and ``cfg.ba.use_gravity``) it adds the gravity
+        prior that keeps the keyframe's roll/pitch leveled inside BA.
+        """
         h, w = depth_m.shape
         obs: dict[int, np.ndarray] = {}
         for tid, px in zip(ids, pts):
@@ -109,7 +116,10 @@ class WindowedBAMap:
                     continue
                 self.landmarks[tid] = self._backproject_world(T_cw, u, v, z)
             obs[tid] = np.array([u, v, z if z_ok else 0.0])
-        self.keyframes.append({"T_cw": np.asarray(T_cw, float).copy(), "obs": obs})
+        kf = {"T_cw": np.asarray(T_cw, float).copy(), "obs": obs}
+        kf["accel"] = (None if accel_cam is None
+                       else np.asarray(accel_cam, float).copy())
+        self.keyframes.append(kf)
         self._marginalize()
 
     def _marginalize(self) -> None:
@@ -154,10 +164,20 @@ class WindowedBAMap:
         if len(obs_cam) < 12:
             return None
 
+        grav_meas = None
+        if self.cfg.ba.use_gravity:
+            grav_meas = np.full((len(kfs), 3), np.nan)
+            for i, kf in enumerate(kfs):
+                a = kf.get("accel")
+                if a is not None:
+                    grav_meas[i] = a
+
         res = optimize(
             self.K, poses, fixed, landmarks_arr,
             np.array(obs_cam), np.array(obs_lm), np.array(obs_uv),
-            obs_depth=np.array(obs_depth), cfg=self.cfg.ba,
+            obs_depth=np.array(obs_depth),
+            grav_meas=grav_meas, grav_world=np.array([0.0, 1.0, 0.0]),
+            cfg=self.cfg.ba,
         )
         for kf, P in zip(kfs, res.poses):
             kf["T_cw"] = P

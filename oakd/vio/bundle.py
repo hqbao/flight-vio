@@ -90,6 +90,22 @@ class BAConfig:
     use_depth: bool = True
     depth_sigma_coeff: float = 0.02   # sigma_z = coeff * z^2  (metres)
     depth_huber: float = 0.10         # robust threshold on depth residual (m)
+    # --- gravity prior (accelerometer leveling inside BA) -------------------
+    # Pure reprojection (+depth) BA optimises all 6-DoF of every keyframe but has
+    # NO gravity awareness, so absolute roll/pitch slowly tilt-drifts with the
+    # map. When a keyframe has a trustworthy at-rest accelerometer reading we add
+    # a soft constraint pulling its world-down direction (rotated into the
+    # camera) onto the measured gravity. This pins roll/pitch (NOT yaw -- rotating
+    # about gravity leaves the constraint unchanged), so the map stays level
+    # without a display-side hack. Off by default to keep the offline path
+    # byte-identical; the live source opts in. ``sigma`` is the 1-sigma on the
+    # unit-vector direction residual (~radians of tilt), ``huber`` the robust
+    # threshold (rad), ``band`` the fractional |accel| window around the gravity
+    # magnitude outside which the sample is treated as accelerating (rejected).
+    use_gravity: bool = False
+    gravity_sigma_rad: float = 0.05   # ~2.9 deg; smaller => trust accel more
+    gravity_huber: float = 0.2        # robust threshold on tilt residual (rad)
+    gravity_band: float = 0.15        # accept |a| within +/- this frac of g_ref
 
 
 @dataclass
@@ -121,6 +137,9 @@ def optimize(
     obs_lm: np.ndarray,
     obs_uv: np.ndarray,
     obs_depth: np.ndarray | None = None,
+    grav_meas: np.ndarray | None = None,
+    grav_world: np.ndarray | None = None,
+    grav_gref: float | None = None,
     cfg: BAConfig | None = None,
 ) -> BAResult:
     """Refine ``poses`` (world->cam) and ``landmarks`` by reprojection BA.
@@ -137,6 +156,14 @@ def optimize(
     obs_depth: (N,) float or None. Measured metric depth (m) for each
                observation; values <= 0 or NaN are treated as "no depth". When
                provided (and ``cfg.use_depth``) these anchor the metric scale.
+    grav_meas: (nC,3) float or None. Per-keyframe accelerometer vector in the
+               camera optical frame (m/s^2). Rows that are NaN/inf mean "no
+               gravity measurement for this keyframe". Used (with
+               ``cfg.use_gravity``) to add the gravity-leveling prior.
+    grav_world: (3,) unit world-down direction in the map frame; defaults to the
+               optical-world down ``[0, 1, 0]``.
+    grav_gref: reference gravity magnitude for the |accel| band gate; defaults
+               to the median of the valid ``grav_meas`` norms.
     """
     cfg = cfg or BAConfig()
     fx, fy = float(K[0, 0]), float(K[1, 1])
@@ -170,6 +197,42 @@ def optimize(
     uv1 = obs_uv[:, 1]
     has_depth = use_depth & (obs_depth > 0)
 
+    # --- gravity prior precompute ------------------------------------------
+    # For each keyframe with a trustworthy at-rest accel reading we constrain
+    # ``R_cw @ g_world`` (world-down in the camera) to match the measured
+    # down ``-accel/|accel|``. This is a 3-vector direction residual that only
+    # bites on roll/pitch (yaw rotates about g_world, leaving it invariant). It
+    # couples to no landmark, so it adds only to the per-camera Hessian blocks.
+    use_grav = bool(cfg.use_gravity and grav_meas is not None)
+    if use_grav:
+        GA = np.asarray(grav_meas, np.float64)
+        gw_world = (np.asarray(grav_world, np.float64)
+                    if grav_world is not None else np.array([0.0, 1.0, 0.0]))
+        gw_world = gw_world / max(float(np.linalg.norm(gw_world)), 1e-12)
+        g_nrm = np.linalg.norm(GA, axis=1)
+        g_finite = np.all(np.isfinite(GA), axis=1) & (g_nrm > 1e-6)
+        if grav_gref is not None:
+            g_ref = float(grav_gref)
+        elif g_finite.any():
+            g_ref = float(np.median(g_nrm[g_finite]))
+        else:
+            g_ref = 0.0
+        g_band_ok = np.abs(g_nrm - g_ref) <= cfg.gravity_band * max(g_ref, 1e-9)
+        fixed_arr = np.asarray(fixed, dtype=bool)
+        grav_active = g_finite & g_band_ok & (~fixed_arr)   # free cameras only
+        down_meas = np.zeros((nC, 3))
+        if g_finite.any():
+            down_meas[g_finite] = -GA[g_finite] / g_nrm[g_finite, None]
+        g_sig = max(cfg.gravity_sigma_rad, 1e-6)
+        g_thr = cfg.gravity_huber / g_sig
+        grav_rows = np.nonzero(grav_active)[0]
+    else:
+        grav_rows = np.array([], dtype=np.int64)
+        gw_world = np.array([0.0, 1.0, 0.0])
+        down_meas = np.zeros((nC, 3))
+        g_sig = 1.0
+        g_thr = 0.0
+
     def _stack(poses_):
         Rs = np.stack([p[:3, :3] for p in poses_])    # (nC,3,3)
         ts = np.stack([p[:3, 3] for p in poses_])     # (nC,3)
@@ -199,6 +262,17 @@ def optimize(
             dcost = np.where(dsmall, 0.5 * rz * rz,
                              thr * (np.abs(rz) - 0.5 * thr))
             cost += float(np.where(dm, dcost, 0.0).sum())
+        if use_grav and grav_rows.size:
+            gc = 0.0
+            for i in grav_rows:
+                gwc = poses_[i][:3, :3] @ gw_world
+                rg = gwc - down_meas[i]
+                e_rho = float(np.linalg.norm(rg)) / g_sig
+                if e_rho <= g_thr:
+                    gc += 0.5 * e_rho * e_rho
+                else:
+                    gc += g_thr * (e_rho - 0.5 * g_thr)
+            cost += gc
         return cost, mean_e
 
     # Pre-group free-camera observations by landmark (for the Schur S block).
@@ -295,6 +369,27 @@ def optimize(
                 np.add.at(Hcc_blk, fc_obs[fm],
                           np.einsum('ni,nj->nij', Jcz_sw[fm], Jcz_sw[fm]))
                 np.add.at(bc_blk, fc_obs[fm], Jcz_sw[fm] * (wz * rz)[fm, None])
+
+        # --- gravity prior rows (camera-only, one 3-vector per keyframe) ----
+        # Residual r_g = R_cw @ g_world - down_meas. With the left SE3
+        # perturbation Exp(xi) @ T_cw the rotation updates as Exp(phi) @ R_cw, so
+        # d r_g / d phi = -[R_cw @ g_world]_x and d r_g / d rho = 0 (no landmark
+        # coupling). Whitened by 1/sigma with a Huber sqrt-weight, this adds only
+        # to the rotation block (cols/rows 3:6) of the free camera's Hessian.
+        if use_grav and grav_rows.size and nf > 0:
+            for i in grav_rows:
+                fcc = free_col[i]
+                if fcc < 0:
+                    continue
+                gwc = Rs[i] @ gw_world
+                rg = gwc - down_meas[i]
+                e_rho = float(np.linalg.norm(rg)) / g_sig
+                wh = 1.0 if e_rho <= g_thr else np.sqrt(
+                    g_thr / max(e_rho, 1e-12))
+                c = (wh / g_sig) ** 2
+                Sg = skew(gwc)
+                Hcc_blk[fcc][3:, 3:] += c * (Sg.T @ Sg)
+                bc_blk[fcc][3:] += c * (Sg @ rg)
 
         # --- LM damping ----------------------------------------------------
         di = np.arange(3)
