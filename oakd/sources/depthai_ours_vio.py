@@ -11,23 +11,24 @@ Pipeline (same front-end as the recorder):
     Camera CAM_B/CAM_C -> StereoDepth (depthAlign=left)
         -> rectifiedLeft (uint8 gray) + depth (uint16 mm)
 
-Our odometry's pose translation comes out in a **(right, up, back)** camera
-frame (x right, y up, z backward) -- verified empirically against Basalt's FLU
-poses on the gold sessions (per-axis correlation +0.9..+1.0). It is *not* the
-OpenCV optical (right, down, forward) frame one might assume. For the NED 3D
-viewer we therefore remap with::
+Our odometry produces poses in the standard OpenCV **camera optical** frame
+(x right, y down, z forward), world = first frame (assumed level at start, since
+vision-only VO has no gravity reference). For the NED 3D viewer we remap optical
+-> NED with the textbook mapping::
 
-    NED = [ -z_opt (back->North=forward), +x_opt (right=East), -y_opt (up->Down) ]
+    North = +z_opt (forward),  East = +x_opt (right),  Down = +y_opt (down)
 
-i.e. ``M_opt->ned = [[0,0,-1],[1,0,0],[0,-1,0]]``. Using +z/+y here flips the
-North and Down axes (the symptom: moving up shows the marker going down).
+i.e. ``M_opt->ned = [[0,0,1],[1,0,0],[0,1,0]]``. Combined with the attitude
+column reorder ``P`` below this gives an *identity* startup attitude
+(roll=pitch=yaw=0) and a physically self-consistent display: moving the camera
+up moves the marker up, moving it forward moves it North, moving it right moves
+it East. (An earlier flipped mapping ``[[0,0,-1],[1,0,0],[0,-1,0]]`` baked in a
+spurious 180 roll -- the symptom was the green 'right' arrow pointing left and
+upward camera motion showing as downward marker motion.)
 
-For the **attitude** triad the viewer expects body columns ``[forward, right,
-down]``, but our VO's rotation columns are the optical axes ``[right, down,
-forward]``. So the body attitude is ``M @ R_opt @ P`` with ``P`` reordering the
-columns to ``[optical_z, optical_x, optical_y]`` — not the naive conjugation
-``M @ R_opt @ M.T`` (which leaves the forward+down arrows pointing 180 off,
-only the right arrow lining up). Verified vs Basalt (all body axes +0.97..+1.0).
+Note: absolute North/Down here are *not* gravity-aligned (no IMU leveling); the
+frame is anchored to the first camera pose. Trajectory accuracy (ATE) is
+Umeyama-aligned so it is unaffected by this convention choice.
 
 Note: the gyro rotation prior is a measured no-op on well-synced data (see
 ``oakd/vio/imu.py``), so this live source runs pure vision for simplicity.
@@ -43,13 +44,14 @@ from ..vio import OdometryConfig, RGBDVisualOdometry
 from .base import PoseSource
 
 
-# Our VO pose frame is empirically (x right, y up, z back) -> world NED.
-# North = -z (back->forward), East = +x (right), Down = -y (up->down).
-# Verified vs Basalt FLU on gold sessions (all axes +corr). See module docstring.
+# Standard OpenCV optical (x right, y down, z forward) -> world NED.
+# North = +z (forward), East = +x (right), Down = +y (down). With the column
+# reorder P below this yields an identity startup attitude (roll=pitch=yaw=0)
+# and a self-consistent display (up->up, forward->N, right->E).
 _M_OPT_TO_NED = np.array(
-    [[0.0, 0.0, -1.0],
+    [[0.0, 0.0, 1.0],
      [1.0, 0.0, 0.0],
-     [0.0, -1.0, 0.0]]
+     [0.0, 1.0, 0.0]]
 )
 
 # Column reorder optical (right, down, fwd) -> body FRD (fwd, right, down).
