@@ -52,12 +52,26 @@ def _read_calib(device, width: int, height: int, left_socket, right_socket) -> d
         except Exception as e:
             return {"error": str(e)}
 
+    def imu_to_cam(dst_sock):
+        """4x4 IMU->camera transform, translation in METRES."""
+        try:
+            T = np.array(ch.getImuToCameraExtrinsics(dst_sock))
+            T[:3, 3] *= 0.01  # cm -> m (depthai returns cm by default)
+            return T.tolist()
+        except Exception as e:
+            return {"error": str(e)}
+
     return {
         "left_socket": str(left_socket),
         "right_socket": str(right_socket),
         "intrinsics_left": cam_intr(left_socket),
         "intrinsics_right": cam_intr(right_socket),
         "T_left_right": extr(left_socket, right_socket),
+        # IMU<->camera extrinsics (translation in metres). Depth is aligned to
+        # the left socket, so T_imu_left is the one the VIO needs to rotate IMU
+        # measurements into the (left) camera frame.
+        "T_imu_left": imu_to_cam(left_socket),
+        "T_imu_right": imu_to_cam(right_socket),
     }
 
 
@@ -67,6 +81,22 @@ def _quat_from_transform(td) -> tuple[list[float], list[float]]:
     qf = td.getQuaternion()
     return ([float(tr.x), float(tr.y), float(tr.z)],
             [float(qf.qw), float(qf.qx), float(qf.qy), float(qf.qz)])
+
+
+def _ts_dev_ns(msg) -> int | None:
+    """Device timestamp of a message in nanoseconds, or None if unavailable.
+
+    All camera and IMU messages stamp their samples on the *device* clock, so
+    using this (instead of host arrival time) puts frames and IMU on a single
+    common timeline -- which is exactly what VIO needs for IMU<->image sync.
+    ``getTimestampDevice()`` returns a ``datetime.timedelta`` (microsecond
+    resolution since device boot).
+    """
+    try:
+        td = msg.getTimestampDevice()
+    except Exception:
+        return None
+    return (td.days * 86_400 + td.seconds) * 1_000_000_000 + td.microseconds * 1_000
 
 
 def main() -> int:
@@ -217,7 +247,8 @@ def main() -> int:
                 seq = int(msg.getSequenceNum())
             except Exception:
                 seq = 0
-            ts = rec.now_ns()
+            ts_dev = _ts_dev_ns(msg)
+            ts = ts_dev if ts_dev is not None else rec.now_ns()
             entry = pending.setdefault(seq, {"ts": ts})
             if kind == "L":
                 entry["L"] = msg.getCvFrame()
@@ -225,7 +256,9 @@ def main() -> int:
                 entry["R"] = msg.getCvFrame()
             elif kind == "D":
                 entry["D"] = msg.getFrame()  # uint16 depth
-            entry["ts"] = ts
+                entry["ts"] = ts  # depth defines the frame's device timestamp
+            elif "ts" not in entry or entry.get("ts") is None:
+                entry["ts"] = ts
             _consume_synced(seq)
 
         last_log = t_start
@@ -251,11 +284,13 @@ def main() -> int:
             imu_msg = q_imu.tryGet()
             if imu_msg is not None:
                 got_any = True
-                ts_ns = rec.now_ns()
                 for pkt in imu_msg.packets:
                     try:
                         a = pkt.acceleroMeter
                         g = pkt.gyroscope
+                        # per-sample device timestamp (same clock as frames);
+                        # fall back to gyro/host if a report lacks one.
+                        ts_ns = _ts_dev_ns(g) or _ts_dev_ns(a) or rec.now_ns()
                         rec.on_imu(
                             gyro_xyz=(g.x, g.y, g.z),
                             accel_xyz=(a.x, a.y, a.z),
@@ -268,19 +303,22 @@ def main() -> int:
             if vio_msg is not None:
                 got_any = True
                 pos, quat = _quat_from_transform(vio_msg)
-                rec.on_vio_pose(pos, quat, ts_ns=rec.now_ns())
+                rec.on_vio_pose(pos, quat,
+                                ts_ns=_ts_dev_ns(vio_msg) or rec.now_ns())
 
             slam_msg = q_slam.tryGet()
             if slam_msg is not None:
                 got_any = True
                 pos, quat = _quat_from_transform(slam_msg)
-                rec.on_slam_pose(pos, quat, ts_ns=rec.now_ns())
+                rec.on_slam_pose(pos, quat,
+                                 ts_ns=_ts_dev_ns(slam_msg) or rec.now_ns())
 
             corr_msg = q_corr.tryGet()
             if corr_msg is not None:
                 got_any = True
                 pos, quat = _quat_from_transform(corr_msg)
-                rec.on_odom_correction(pos, quat, ts_ns=rec.now_ns())
+                rec.on_odom_correction(pos, quat,
+                                       ts_ns=_ts_dev_ns(corr_msg) or rec.now_ns())
 
             for q, kind in (
                 (q_obs_pcl, "obstacle"),

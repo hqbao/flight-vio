@@ -26,13 +26,17 @@ def _build_source(name: str):
     if name == "slam":
         from oakd.sources.depthai_slam import OakBasaltSlamSource
         return OakBasaltSlamSource()
-    raise SystemExit(f"unknown --source '{name}' (expected: fake|oak|slam)")
+    if name == "ours":
+        from oakd.sources.depthai_ours_vio import OakOursVioSource
+        return OakOursVioSource()
+    raise SystemExit(f"unknown --source '{name}' (expected: fake|oak|slam|ours)")
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="OAK-D 3D pose viewer")
-    ap.add_argument("--source", default="fake", choices=("fake", "oak", "slam"),
-                    help="pose provider")
+    ap.add_argument("--source", default="fake",
+                    choices=("fake", "oak", "slam", "ours"),
+                    help="pose provider (ours = our from-scratch RGB-D VIO)")
     args = ap.parse_args()
 
     history = PoseHistory(capacity=8192)

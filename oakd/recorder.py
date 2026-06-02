@@ -22,7 +22,10 @@ No C7 (frontend features) here — the depthai BasaltVIO blob does NOT
 expose its internal feature tracks. C7 will only be wired up when
 skyslam frontend is implemented and can publish them directly.
 
-All ``ts_ns`` values are host-monotonic nanoseconds from the recorder's t0.
+All ``ts_ns`` values are **device-clock nanoseconds** when the caller supplies
+them (the recorder falls back to host-monotonic ns only if a message lacks a
+device timestamp). Using the device clock puts frames, IMU and poses on one
+common timeline, which is what VIO needs for IMU<->image synchronisation.
 All poses are stored in the **FLU world** frame as emitted by Basalt /
 RTABMap — NED conversion is a viewer-side concern and would lose
 information for comparison purposes.
