@@ -61,6 +61,20 @@ _M_OPT_TO_NED = np.array(
      [0.0, 1.0, 0.0]]
 )
 
+# Measured mounted-pose attitude (camera->world), used only as a FALLBACK when
+# the device reports no accelerometer. Captured 2026-06-02 with the camera in
+# its drone-mount pose via ``tools/measure_mount_attitude.py`` (avg of 760 raw
+# accel samples, per-axis std ~0.02 m/s^2 -> tilt good to <0.05 deg): the mount
+# is essentially level (roll +0.1, pitch -0.5, lens looking horizontally
+# forward). The live path still prefers a fresh accel measurement at startup, so
+# this only matters on IMU-less devices. Re-run the tool and update this if the
+# physical mount changes.
+_MOUNT_R0 = np.array(
+    [[+0.999998, -0.002003, +0.000000],
+     [+0.002003, +0.999956, +0.009146],
+     [-0.000018, -0.009146, +0.999958]]
+)
+
 # Column reorder optical (right, down, fwd) -> body FRD (fwd, right, down).
 # The viewer triad expects the attitude columns to be [forward, right, down],
 # but our VO's rotation columns are the optical axes [right, down, fwd]. The
@@ -213,9 +227,22 @@ class OakOursVioSource(PoseSource):
             # Gravity-level the initial attitude: average the accelerometer over
             # a short static startup window, rotate it into the camera optical
             # frame, and seed the VO world frame so its "down" is real gravity.
+            # If the device has no accelerometer, fall back to the measured
+            # mounted pose ``_MOUNT_R0`` so we still start from a known attitude.
             accel_cam = self._collect_startup_accel(q_imu, R_imu_cam)
             if accel_cam is not None:
                 vo.align_to_gravity(accel_cam)
+                # Sanity-log how the live measurement compares to the recorded
+                # mount baseline (large drift here means the mount has changed).
+                dR = vo.pose[:3, :3] @ _MOUNT_R0.T
+                ang = np.degrees(np.arccos(
+                    np.clip((np.trace(dR) - 1.0) * 0.5, -1.0, 1.0)))
+                print(f"[ours-vio] gravity-leveled startup; "
+                      f"{ang:.1f} deg from recorded mount baseline")
+            else:
+                vo.pose = np.eye(4)
+                vo.pose[:3, :3] = _MOUNT_R0
+                print("[ours-vio] no accelerometer; using recorded mount R0")
 
             # In BA mode, a background *process* refines a sliding window of
             # keyframes and publishes a world-frame correction ``C``. We ease
