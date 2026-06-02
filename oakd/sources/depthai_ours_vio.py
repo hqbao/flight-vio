@@ -75,6 +75,15 @@ _MOUNT_R0 = np.array(
      [-0.000018, -0.009146, +0.999958]]
 )
 
+# Accel leveling only runs when the camera is at rest, detected from the residual
+# of the raw accelerometer against its EMA (recent motion energy, m/s^2). Below
+# this threshold the camera is still and the accel reads pure gravity; above it
+# there is translation/rotation whose lateral linear acceleration would bias the
+# gravity DIRECTION (a magnitude gate cannot catch that), so leveling is skipped
+# and vision holds the attitude. ~0.35 m/s^2 sits above the sensor noise floor
+# (~0.02-0.15) and below the accel of deliberate handheld motion.
+_REST_MOTION_THRESH = 0.35
+
 # Column reorder optical (right, down, fwd) -> body FRD (fwd, right, down).
 # The viewer triad expects the attitude columns to be [forward, right, down],
 # but our VO's rotation columns are the optical axes [right, down, fwd]. The
@@ -300,8 +309,8 @@ class OakOursVioSource(PoseSource):
 
                 vo.process(gray, depth_m)  # advance camera-optical world pose
 
-                # Drain the IMU queue to the newest accelerometer sample (camera
-                # optical frame). We level the *displayed* attitude with it below.
+                # Drain the IMU queue to the newest accelerometer sample and
+                # bring it into the camera optical frame.
                 latest_a = None
                 imsg = q_imu.tryGet()
                 while imsg is not None:
@@ -309,25 +318,36 @@ class OakOursVioSource(PoseSource):
                         a = pkt.acceleroMeter
                         latest_a = np.array([a.x, a.y, a.z], dtype=np.float64)
                     imsg = q_imu.tryGet()
-                accel_cam = None if latest_a is None else R_imu_cam @ latest_a
+                accel_raw = None if latest_a is None else R_imu_cam @ latest_a
 
-                # Smooth the accelerometer with an EMA before using it for
-                # leveling. Per-sample accel noise and the transient linear
-                # acceleration of handheld motion are ~zero-mean, so a short
-                # EMA averages them out and stops the body frame from jittering,
-                # while the steady gravity component passes through. The EMA
-                # still tracks a real re-orientation within a few frames, so big
-                # flips recover fast (the adaptive gain keys off the tilt error).
-                if accel_cam is not None:
+                # --- accelerometer leveling, gated on the camera being at rest --
+                # A magnitude gate alone CANNOT reject lateral linear
+                # acceleration: a sideways push barely changes |accel| (it adds in
+                # quadrature with the ~9.8 gravity term) yet tilts the measured
+                # gravity DIRECTION by several degrees. Locking the attitude onto
+                # that biased direction is what left the body frame slightly tilted
+                # while moving, only settling level when fully still.
+                #
+                # So we only trust accel for leveling when the camera is actually
+                # at rest. The motion signal is the residual of the raw sample
+                # against its EMA (recent motion energy): tiny at rest (sensor
+                # noise), large during any translation/rotation. When moving we
+                # skip leveling and let vision hold the attitude (fine short-term);
+                # when still, accel pulls roll/pitch back to true gravity.
+                accel_cam = None
+                at_rest = False
+                if accel_raw is not None:
                     if accel_ema is None:
-                        accel_ema = accel_cam.copy()
+                        accel_ema = accel_raw.copy()
                     else:
-                        accel_ema += 0.2 * (accel_cam - accel_ema)
+                        accel_ema += 0.2 * (accel_raw - accel_ema)
                     accel_cam = accel_ema
+                    motion = float(np.linalg.norm(accel_raw - accel_ema))
+                    at_rest = motion < _REST_MOTION_THRESH
 
-                # Level the f2f world frame too, so the BA map is fed gravity-
-                # consistent poses (keeps the tracker frame sane long term).
-                if accel_cam is not None:
+                # Level the f2f world frame too (only at rest), so the BA map is
+                # fed gravity-consistent poses over the long term.
+                if accel_cam is not None and at_rest:
                     vo.correct_tilt(accel_cam)
 
                 pose = vo.pose.copy()  # camera-optical world
@@ -352,25 +372,28 @@ class OakOursVioSource(PoseSource):
                     C_applied = _ease_se3(C_applied, C_target, 0.15)
                     pose = C_applied @ pose
 
-                # Gravity-level the FINAL displayed attitude from accel. Doing it
-                # here (after any BA correction) guarantees the body frame the
-                # user sees always tracks gravity -- the BA correction carries the
-                # drifted map attitude and would otherwise re-tilt it. roll/pitch
+                # Gravity-level the FINAL displayed attitude from accel, only
+                # while the camera is at rest (see the rest gate above). roll/pitch
                 # follow the IMU; yaw is left to vision (no magnetometer).
-                if accel_cam is not None:
+                if accel_cam is not None and at_rest:
                     R_lvl, used, tilt_deg = level_attitude(
                         pose[:3, :3], accel_cam, g_ref=vo._g_ref)
                     if used:
                         pose[:3, :3] = R_lvl
-                    # Rate-limited diagnostics so we can see, on the device,
-                    # whether samples are being accepted and the tilt is closing.
+                else:
+                    used = False
+                    tilt_deg = 0.0
+                # Rate-limited diagnostics so we can see, on the device, whether
+                # the rest gate is firing and the tilt is closing.
+                if accel_cam is not None:
                     accel_n += 1
-                    if used:
+                    if at_rest:
                         accel_used += 1
                     if time.monotonic() - last_tilt_log >= 1.0:
                         rate = accel_used / max(accel_n, 1)
+                        mtn = float(np.linalg.norm(accel_raw - accel_ema))
                         print(f"[ours-vio] tilt={tilt_deg:5.1f}deg "
-                              f"accel_used={100*rate:3.0f}% "
+                              f"at_rest={100*rate:3.0f}% motion={mtn:.2f} "
                               f"|a|={np.linalg.norm(accel_cam):.2f} "
                               f"g_ref={vo._g_ref or 0:.2f}")
                         accel_n = 0
