@@ -356,12 +356,6 @@ class OakOursVioSource(PoseSource):
             prev_t: float | None = None
             frames = 0
             kf_count = 0
-            # OR of "tracking was lost since the last keyframe we submitted to the
-            # SLAM map". A PnP failure freezes the f2f pose, so the odometry edge
-            # spanning the loss would be garbage; we flag it so the SLAM map can
-            # BREAK the pose-graph chain there (the segment then floats until a
-            # loop closure re-anchors it) instead of trusting the bad edge.
-            track_lost_run = False
             last_fps_t = t0
             accel_n = 0
             accel_used = 0
@@ -396,11 +390,6 @@ class OakOursVioSource(PoseSource):
                 depth_m = depth_mm.astype(np.float32) / 1000.0
 
                 vo.process(gray, depth_m)  # advance camera-optical world pose
-                # Flag a tracking loss (PnP failed / too few points) so the next
-                # SLAM keyframe breaks the graph chain across it. "bootstrap" (the
-                # very first frame, no previous obs) is not a loss.
-                if vo.last_info.get("reason") in ("pnp_failed", "too_few_points"):
-                    track_lost_run = True
 
                 # Drain the IMU queue and AVERAGE every accelerometer packet in
                 # the batch this frame (not just the last sample). Averaging the
@@ -496,8 +485,7 @@ class OakOursVioSource(PoseSource):
                     if kf_count >= slam_state["kf_every"]:
                         kf_count = 0
                         slam_state["submit"](pose.copy(), gray.copy(),
-                                             depth_m.copy(), track_lost_run)
-                        track_lost_run = False     # consumed by this keyframe
+                                             depth_m.copy())
                     # Pull the latest loop-closure correction (drain to last) and
                     # ease it on, exactly like the BA correction.
                     newC = slam_state["poll"]()
@@ -771,9 +759,9 @@ class OakOursVioSource(PoseSource):
             "_corr": None,
         }
 
-        def submit(T_wc, gray, depth_m, track_lost=False):
+        def submit(T_wc, gray, depth_m):
             with snap_lock:
-                state["_pending"] = (T_wc, gray, depth_m, bool(track_lost))
+                state["_pending"] = (T_wc, gray, depth_m)
             event.set()
 
         def poll():
@@ -795,9 +783,8 @@ class OakOursVioSource(PoseSource):
                     state["_pending"] = None
                 if snap is None:
                     continue
-                T_wc, gray, depth_m, track_lost = snap
-                events = slam.add_keyframe(T_wc, gray, depth_m,
-                                           tracking_lost=track_lost)
+                T_wc, gray, depth_m = snap
+                events = slam.add_keyframe(T_wc, gray, depth_m)
                 if events:
                     slam.optimize()
                     for ev in events:
