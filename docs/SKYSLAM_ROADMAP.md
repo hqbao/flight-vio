@@ -306,6 +306,41 @@ typedef struct {
 
 **Reference**: RTAB-Map architecture, DBoW3.
 
+**PROTOTYPED in the from-scratch VIO (2026-06-03, "Phase 5", commit `ec080a7`)** —
+a pure-NumPy offline version of the loop-closure stack now exists and measurably
+cuts drift on the gold sessions:
+- `oakd/vio/posegraph.py`: SE(3) pose graph (`se3_log` / `se3_adjoint` / `se3_inv`,
+  Gauss-Newton + LM, Grisetti linearisation `J_r^{-1} ≈ I`, anchor node pinned).
+  A Huber robust kernel down-weights **loop** edges only.
+- `oakd/vio/loopclosure.py`: ORB (no trained vocabulary yet — brute-force match
+  against earlier keyframes) + Lowe ratio → **fundamental-matrix RANSAC
+  pre-filter** → PnP-RANSAC geometric verification using the old keyframe's
+  metric depth, yielding the relative `T_cur_old` loop constraint.
+- `oakd/vio/slam.py`: `SlamMap` orchestrator — keyframes, odometry edges from the
+  VO relative motion, top-3 loop edges per keyframe, PGO, pose correction.
+- `tools/vio_run.py --backend slam` scores it; `tools/posegraph_selftest.py`
+  validates the Lie helpers + loop-closure drift reduction + the Huber kernel.
+
+  **Results** (ATE %path, BA → SLAM; end-start drift cm pre → post): corridor
+  `0.82 → 0.61` (drift `59.2 → 3.9`, 196 loops), lab_loop `0.55 → 0.53`
+  (`10.5 → 4.2`), lab_straight `1.11 → 1.11` (0 loops — correct, it never
+  revisits), quick_motion `1.97 → 2.22` (drift `19.4 → 7.7` but ATE up: fast
+  motion produced a few false loops). `f2f` / `ba` backends stay byte-identical
+  (loop closure is opt-in).
+
+  **Key lesson — perceptual aliasing**: the first naive ORB+PnP front-end fired
+  236 *false* loops on the repetitive corridor and made ATE *worse*
+  (`0.82 → 2.27`). The **fundamental-matrix pre-filter + strict inlier gates** is
+  the *primary* false-loop defence (it recovered corridor to `0.61`). The Huber
+  back-end kernel is only a *secondary* net: a gross outlier the graph cannot
+  absorb is down-weighted, but a moderate false loop the solver bends to
+  self-minimises its residual so Huber never engages. **Reject false loops in the
+  front-end (geometry), do not rely on a robust kernel.** (Also: `cv2.findFundamentalMat`
+  needs a `≥ 8`-point and non-degenerate guard or it crashes on static scenes.)
+
+  Still **offline-only**; not yet wired to a live `--source ours-slam` (the
+  ordering rule below applies when it is).
+
 **Attitude authority when SLAM and accel meet** (decided 2026-06-03, from the
 OAK-D from-scratch VIO):
 
@@ -648,6 +683,7 @@ skyslam/
 | 2026-05-29 | Mark SW plan superseded by SKYSLAM_RESEARCH.md | Bao + Copilot |
 | 2026-05-29 | Translate document to English | Bao + Copilot |
 | 2026-06-03 | Add attitude-authority principle (accel owns tilt, SLAM owns yaw+pos; leveling is the final step; rest-gate accel) — design principle 8 + Phase 4 | Bao + Copilot |
+| 2026-06-03 | Mark Phase 5 loop-closure stack prototyped (SE(3) pose graph + ORB/F-matrix/PnP front-end; corridor ATE 0.82→0.61%) — `ec080a7` | Bao + Copilot |
 
 ---
 
