@@ -88,16 +88,6 @@ _MOUNT_R0 = np.array(
 # (~0.02-0.15) and below the accel of deliberate handheld motion.
 _REST_MOTION_THRESH = 0.35
 
-# Per-frame cap on the eased SLAM loop-closure correction (anti-teleport). When
-# a loop closes after large drift -- or a tracking-loss segment is re-anchored --
-# the published correction can be tens of cm / many degrees at once. Easing alone
-# (alpha=0.15) still steps ~15% of that in the first frame, a visible jump. These
-# caps bound the correction to a smooth slide: a big snap eases in over several
-# frames instead of one teleport. 2 cm + 0.5 deg per frame at 20 fps = up to
-# 40 cm/s, 10 deg/s of correction -- imperceptible yet catches up between loops.
-_SLAM_MAX_TRANS_PER_FRAME = 0.02
-_SLAM_MAX_ROT_PER_FRAME = float(np.radians(0.5))
-
 # Column reorder optical (right, down, fwd) -> body FRD (fwd, right, down).
 # The viewer triad expects the attitude columns to be [forward, right, down],
 # but our VO's rotation columns are the optical axes [right, down, fwd]. The
@@ -113,28 +103,16 @@ _P_OPT_TO_FRD = np.array(
 )
 
 
-def _ease_se3(C_cur: np.ndarray, C_tgt: np.ndarray, alpha: float,
-              max_trans: float = 0.0, max_rot: float = 0.0) -> np.ndarray:
+def _ease_se3(C_cur: np.ndarray, C_tgt: np.ndarray, alpha: float) -> np.ndarray:
     """Move ``C_cur`` a fraction ``alpha`` toward ``C_tgt`` (smooth correction).
 
     Rotation eases along the geodesic (scaled axis-angle); translation eases
     linearly. Keeps the applied correction continuous so BA updates never snap
     the displayed trajectory.
-
-    ``max_trans`` (metres) / ``max_rot`` (radians), when > 0, additionally CAP
-    the per-frame step so even a large loop-closure correction can never
-    teleport the display: the translation moves at most ``max_trans`` and the
-    rotation at most ``max_rot`` this frame (the fraction is reduced as needed).
-    A big correction then eases in smoothly over several frames instead of one
-    visible jump.
     """
     R_cur, R_tgt = C_cur[:3, :3], C_tgt[:3, :3]
     dR = R_tgt @ R_cur.T
     ang = np.arccos(np.clip((np.trace(dR) - 1.0) * 0.5, -1.0, 1.0))
-    # Per-component eased fraction, optionally capped to an absolute step.
-    a_rot = alpha
-    if max_rot > 0.0 and alpha * ang > max_rot:
-        a_rot = max_rot / ang
     out = np.eye(4)
     if ang < 1e-8:
         out[:3, :3] = R_tgt
@@ -142,18 +120,13 @@ def _ease_se3(C_cur: np.ndarray, C_tgt: np.ndarray, alpha: float,
         axis = np.array([dR[2, 1] - dR[1, 2],
                          dR[0, 2] - dR[2, 0],
                          dR[1, 0] - dR[0, 1]]) / (2.0 * np.sin(ang))
-        a = a_rot * ang
+        a = alpha * ang
         K_ = np.array([[0, -axis[2], axis[1]],
                        [axis[2], 0, -axis[0]],
                        [-axis[1], axis[0], 0]])
         R_step = np.eye(3) + np.sin(a) * K_ + (1.0 - np.cos(a)) * (K_ @ K_)
         out[:3, :3] = R_step @ R_cur
-    dt = C_tgt[:3, 3] - C_cur[:3, 3]
-    dist = float(np.linalg.norm(dt))
-    a_trans = alpha
-    if max_trans > 0.0 and alpha * dist > max_trans:
-        a_trans = max_trans / dist
-    out[:3, 3] = C_cur[:3, 3] + a_trans * dt
+    out[:3, 3] = (1.0 - alpha) * C_cur[:3, 3] + alpha * C_tgt[:3, 3]
     return out
 
 
@@ -526,15 +499,11 @@ class OakOursVioSource(PoseSource):
                                              depth_m.copy(), track_lost_run)
                         track_lost_run = False     # consumed by this keyframe
                     # Pull the latest loop-closure correction (drain to last) and
-                    # ease it on. Rate-capped (anti-teleport): a large loop snap
-                    # or a re-anchored tracking-loss segment slides in over a few
-                    # frames instead of jumping.
+                    # ease it on, exactly like the BA correction.
                     newC = slam_state["poll"]()
                     if newC is not None:
                         C_target = newC
-                    C_applied = _ease_se3(C_applied, C_target, 0.15,
-                                          max_trans=_SLAM_MAX_TRANS_PER_FRAME,
-                                          max_rot=_SLAM_MAX_ROT_PER_FRAME)
+                    C_applied = _ease_se3(C_applied, C_target, 0.15)
                     pose = C_applied @ pose
 
                 # FINAL display leveling -- accel is the "trum cuoi" (last word)
