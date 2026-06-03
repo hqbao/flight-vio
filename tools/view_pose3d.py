@@ -56,11 +56,11 @@ def main() -> int:
                     help="camera frame rate (ours/ours-ba/ours-slam) [20]")
     ap.add_argument("--own-klt", action="store_true", dest="own_klt",
                     help="use our own pure-NumPy KLT + corner detector for the "
-                         "LIVE display (library-free). Runs a lighter preset "
-                         "(~38-58ms/frame, at/near the 20fps budget) so it stays "
-                         "usable live; ATE is essentially unchanged. Default OFF: "
-                         "live uses cv2 (~3ms/frame). Offline scoring "
-                         "(tools/vio_run.py) always uses our own full-quality.")
+                         "LIVE display (library-free). With Numba installed the "
+                         "KLT inner loop is JIT-compiled and runs full quality at "
+                         "~15ms/frame (real time); without Numba it falls back to "
+                         "a lighter preset. Default OFF: live uses cv2 (~3ms). "
+                         "Offline scoring (tools/vio_run.py) always uses our own.")
     # SLAM tuning (ours-slam)
     ap.add_argument("--slam-kf-every", type=int, default=5, dest="slam_kf_every",
                     help="SLAM update cadence: insert+loop-detect every N frames "

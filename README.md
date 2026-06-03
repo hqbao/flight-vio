@@ -83,12 +83,11 @@ with their defaults):
 ./run.sh --source ours --fps 20                    # camera frame rate (any ours-* source)
 
 # Optical flow tracking AND corner detection have our own pure-NumPy
-# implementations (pyramidal Lucas-Kanade + Shi-Tomasi, no library). Offline
-# scoring (tools/vio_run.py) uses the full-quality config by default. The LIVE
-# viewer defaults to cv2 (~3 ms/frame) for a smooth real-time display; pass
-# --own-klt to run the library-free path live with a lighter preset (win=13,
-# level=2, 200 corners -> ~38-58 ms/frame, at/near the 20fps budget). ATE is
-# essentially unchanged either way:
+# implementations (pyramidal Lucas-Kanade + Shi-Tomasi, no library). The KLT
+# inner loop is JIT-compiled with Numba (optional dep) so our own frontend runs
+# in real time live (~15 ms/frame, vs ~140 ms pure-NumPy); without numba it
+# falls back to a lighter live preset. Offline scoring uses the full config.
+# The live viewer defaults to cv2; pass --own-klt to run our own frontend live:
 ./run.sh --source ours --own-klt                   # library-free frontend, live
 ```
 
@@ -127,7 +126,8 @@ in the numbers instead of as lag on the device.
       `tools/vio_run.py` (corridor ATE 0.61%, see `docs/SKYSLAM_ROADMAP.md`)
 - [x] Own pure-NumPy optical flow (pyramidal Lucas-Kanade, `oakd/vio/klt.py`)
       and corner detection (Shi-Tomasi, `oakd/vio/corners.py`) replacing cv2;
-      full-quality default offline, `--own-klt` runs a lighter preset live
+      KLT inner loop JIT-accelerated with Numba (`oakd/vio/klt_numba.py`,
+      optional) so the library-free frontend runs live (~15 ms/frame)
 - [x] Logging + offline replay (`tools/record_session.py` + `tools/viz_session.py`)
 - [x] Persistent SLAM database (auto save `rtabmap.db` + extract KF/loop via `tools/extract_kf_from_db.py`)
 - [x] Gold regression suite (6 sessions, see `docs/GOLD_SESSIONS.md`)
