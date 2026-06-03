@@ -56,11 +56,11 @@ def main() -> int:
                     help="camera frame rate (ours/ours-ba/ours-slam) [20]")
     ap.add_argument("--own-klt", action="store_true", dest="own_klt",
                     help="use our own pure-NumPy KLT + corner detector for the "
-                         "LIVE display. It is library-free but ~2x over the "
-                         "20fps budget (~104ms/frame), so the viewer drops/skips "
-                         "frames and tracking can be lost. Default OFF: live uses "
-                         "cv2 for a real-time display. Offline scoring "
-                         "(tools/vio_run.py) always uses our own.")
+                         "LIVE display (library-free). Runs a lighter preset "
+                         "(~38-58ms/frame, at/near the 20fps budget) so it stays "
+                         "usable live; ATE is essentially unchanged. Default OFF: "
+                         "live uses cv2 (~3ms/frame). Offline scoring "
+                         "(tools/vio_run.py) always uses our own full-quality.")
     # SLAM tuning (ours-slam)
     ap.add_argument("--slam-kf-every", type=int, default=5, dest="slam_kf_every",
                     help="SLAM update cadence: insert+loop-detect every N frames "

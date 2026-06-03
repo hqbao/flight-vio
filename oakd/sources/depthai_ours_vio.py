@@ -277,10 +277,17 @@ class OakOursVioSource(PoseSource):
 
             # The displayed pose is ALWAYS produced by the fast frame-to-frame
             # VO, so the read loop never blocks on BA and the UI stays smooth.
+            # When the user opts into our own library-free frontend live
+            # (use_own_klt), use the LIGHTER ``live_own`` preset (smaller window/
+            # pyramid/corner budget): the full offline config costs ~120 ms/frame
+            # (~2x over the 50 ms budget at 20 fps) and makes the read loop skip
+            # frames -> tracking loss. The preset runs at ~38-58 ms with ATE
+            # essentially unchanged. cv2 (use_own_klt False) stays the smooth
+            # default at ~3 ms/frame.
+            fe_cfg = (FrontendConfig.live_own() if self.use_own_klt
+                      else FrontendConfig(use_own_klt=False))
             vo = RGBDVisualOdometry(
-                K, OdometryConfig(),
-                frontend=KLTFrontend(FrontendConfig(
-                    use_own_klt=self.use_own_klt)))
+                K, OdometryConfig(), frontend=KLTFrontend(fe_cfg))
 
             # Gravity-level the initial attitude: average the accelerometer over
             # a short static startup window, rotate it into the camera optical

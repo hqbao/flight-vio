@@ -39,6 +39,23 @@ class FrontendConfig:
     # falls back to OpenCV for both tracking and detection (faster live display).
     use_own_klt: bool = True
 
+    @classmethod
+    def live_own(cls) -> "FrontendConfig":
+        """Lighter library-free preset for *live* use of our own KLT.
+
+        The full-quality config (``win_size=21``, ``max_level=3``,
+        ``max_corners=400``) costs ~120 ms/frame for our pure-NumPy
+        forward-backward KLT -- ~2x over the 50 ms budget at 20 fps, so the live
+        read loop falls behind, skips frames and loses tracking. A smaller
+        window + pyramid + corner budget drops the per-frame cost to ~38-58 ms
+        (at/under budget) while keeping ATE essentially unchanged offline
+        (lab_loop 1.27->1.25%, quick_motion 2.14->2.59%). Use this when the user
+        opts into the library-free path live (viewer ``--own-klt``); offline
+        scoring keeps the full-quality default.
+        """
+        return cls(use_own_klt=True, win_size=13, max_level=2, max_corners=200)
+
+
 
 @dataclass
 class TrackState:
