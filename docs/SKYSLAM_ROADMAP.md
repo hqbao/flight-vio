@@ -245,9 +245,19 @@ typedef struct {
 
 **Success**: on EuRoC MH_01, median tracking length ≥ 30 frames, outlier rate < 10%.
 
----
+**PROTOTYPED in the from-scratch VIO (2026-06-03, commit `7312e50`)** — the
+pyramidal Lucas-Kanade tracker is already implemented library-free in pure NumPy
+(`oakd/vio/klt.py`, Bouguet formulation, separable Gaussian pyramid, central-diff
+gradients, forward-additive Gauss-Newton with a min-eigenvalue gate and
+active-set masking). It is a drop-in for `cv2.calcOpticalFlowPyrLK`, agrees with
+it to sub-pixel (lab_loop adjacent-frame mean 0.025 px) and keeps ATE parity
+(corridor 0.66→0.70%). It is the default frontend tracker now; `--cv2-klt` falls
+back to OpenCV for a faster live display (the pure-NumPy version is ~25× slower).
+This is the reference to port to NEON-optimised `klt_tracker.c`. Corner detection
+(`goodFeaturesToTrack`/Shi-Tomasi) is still the one remaining cv2 call to replace
+(→ `fast_detector.c`).
 
-### Phase 3a — MSCKF VIO (3–5 days code | 2–3 weeks debug)
+--- (3–5 days code | 2–3 weeks debug)
 
 **Goal**: working VIO on EuRoC, ATE < 0.2 m on MH_01.
 
