@@ -278,14 +278,19 @@ class OakOursVioSource(PoseSource):
             # The displayed pose is ALWAYS produced by the fast frame-to-frame
             # VO, so the read loop never blocks on BA and the UI stays smooth.
             # When the user opts into our own library-free frontend live
-            # (use_own_klt), use the LIGHTER ``live_own`` preset (smaller window/
-            # pyramid/corner budget): the full offline config costs ~120 ms/frame
-            # (~2x over the 50 ms budget at 20 fps) and makes the read loop skip
-            # frames -> tracking loss. The preset runs at ~38-58 ms with ATE
-            # essentially unchanged. cv2 (use_own_klt False) stays the smooth
-            # default at ~3 ms/frame.
-            fe_cfg = (FrontendConfig.live_own() if self.use_own_klt
-                      else FrontendConfig(use_own_klt=False))
+            # (use_own_klt), pick the config by whether Numba is available:
+            #   * with Numba, the JIT core tracks the FULL-quality config in
+            #     ~15 ms/frame (well under the 50 ms budget at 20 fps), so use it.
+            #   * without Numba the pure-NumPy path costs ~140 ms/frame, so fall
+            #     back to the lighter ``live_own`` preset (~38-58 ms) to stay
+            #     roughly real time.
+            # cv2 (use_own_klt False) stays the default at ~3 ms/frame.
+            if self.use_own_klt:
+                from ..vio.klt_numba import HAVE_NUMBA
+                fe_cfg = (FrontendConfig(use_own_klt=True) if HAVE_NUMBA
+                          else FrontendConfig.live_own())
+            else:
+                fe_cfg = FrontendConfig(use_own_klt=False)
             vo = RGBDVisualOdometry(
                 K, OdometryConfig(), frontend=KLTFrontend(fe_cfg))
 

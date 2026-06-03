@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from .klt_numba import HAVE_NUMBA, _track_level
+
 # Separable 5-tap Gaussian kernel ([1 4 6 4 1] / 16) used for pyramid
 # downsampling -- the same low-pass OpenCV uses before decimating by 2.
 _G5 = np.array([1.0, 4.0, 6.0, 4.0, 1.0], dtype=np.float32) / 16.0
@@ -100,6 +102,7 @@ def calc_optical_flow_pyr_lk(
     iters: int = 30,
     eps: float = 0.01,
     min_eig: float = 1e-4,
+    use_numba: bool | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Track ``prev_pts`` from ``prev_gray`` into ``cur_gray`` with pyramidal LK.
 
@@ -108,7 +111,16 @@ def calc_optical_flow_pyr_lk(
     ``status`` is ``(N,)`` uint8 (1 = tracked, 0 = lost). Points whose structure
     tensor is rank-deficient (min eigenvalue below ``min_eig``) or that leave the
     image are marked lost.
+
+    ``use_numba`` selects the per-point inner-loop backend: ``True`` uses the
+    Numba-JIT scalar core (``klt_numba``), ``False`` the pure-NumPy vectorised
+    path. ``None`` (default) auto-picks Numba when it is installed -- same
+    algorithm and (to floating-point tolerance) same result, just ~10x faster.
     """
+    if use_numba is None:
+        use_numba = HAVE_NUMBA
+    use_numba = use_numba and HAVE_NUMBA
+
     prev_pts = np.asarray(prev_pts, dtype=np.float32).reshape(-1, 2)
     N = prev_pts.shape[0]
     if N == 0:
@@ -116,8 +128,12 @@ def calc_optical_flow_pyr_lk(
 
     pyr_p = build_pyramid(prev_gray, max_level)
     pyr_c = build_pyramid(cur_gray, max_level)
-
     hw = win_size // 2
+
+    if use_numba:
+        return _calc_flow_numba(pyr_p, pyr_c, prev_pts, hw, max_level,
+                                iters, eps, min_eig, prev_gray.shape)
+
     off = np.arange(-hw, hw + 1, dtype=np.float32)
     ox, oy = np.meshgrid(off, off)
     ox = ox.reshape(-1)[None, :]          # (1, P)
@@ -187,3 +203,38 @@ def calc_optical_flow_pyr_lk(
                  & (nxt[:, 1] >= 0) & (nxt[:, 1] < H))
     status = (~bad) & in_bounds
     return nxt.astype(np.float32), status.astype(np.uint8)
+
+
+def _calc_flow_numba(pyr_p, pyr_c, prev_pts, hw, max_level,
+                     iters, eps, min_eig, shape):
+    """Numba-backed coarse-to-fine driver (same algorithm as the NumPy path).
+
+    Builds per-level gradients with NumPy (whole-image, fast) then hands the
+    sequential per-point Gauss-Newton refinement to the JIT-compiled
+    :func:`klt_numba._track_level`, which is where the speed-up lives.
+    """
+    N = prev_pts.shape[0]
+    prev_x = np.ascontiguousarray(prev_pts[:, 0], dtype=np.float64)
+    prev_y = np.ascontiguousarray(prev_pts[:, 1], dtype=np.float64)
+    guess_x = np.zeros(N, dtype=np.float64)
+    guess_y = np.zeros(N, dtype=np.float64)
+    bad = np.zeros(N, dtype=np.bool_)
+
+    for lvl in range(max_level, -1, -1):
+        scale = 1.0 / (2 ** lvl)
+        Ip = np.ascontiguousarray(pyr_p[lvl], dtype=np.float64)
+        Ic = np.ascontiguousarray(pyr_c[lvl], dtype=np.float64)
+        Ix, Iy = _gradients(Ip)
+        _track_level(Ip, Ic, np.ascontiguousarray(Ix), np.ascontiguousarray(Iy),
+                     prev_x, prev_y, guess_x, guess_y, bad,
+                     scale, hw, iters, eps, min_eig)
+
+    nxt = np.empty((N, 2), dtype=np.float32)
+    nxt[:, 0] = prev_x + guess_x
+    nxt[:, 1] = prev_y + guess_y
+    H, W = shape
+    in_bounds = ((nxt[:, 0] >= 0) & (nxt[:, 0] < W)
+                 & (nxt[:, 1] >= 0) & (nxt[:, 1] < H))
+    status = (~bad) & in_bounds
+    return nxt, status.astype(np.uint8)
+

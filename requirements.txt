@@ -5,3 +5,7 @@ pyqtgraph>=0.13
 PyQt6>=6.6
 PyOpenGL>=3.1
 pyserial>=3.5
+# Optional: JIT-accelerates our own pure-NumPy optical flow (oakd/vio/klt.py) so
+# the library-free frontend runs in real time (~15ms/frame vs ~140ms without).
+# Not required -- klt.py falls back to the pure-NumPy path when numba is absent.
+numba>=0.61

@@ -218,6 +218,33 @@ def test_agreement_real() -> bool:
     return corner_ok and flow_ok
 
 
+def test_backend_agreement() -> bool:
+    """The Numba and pure-NumPy backends must give the same flow (faithful JIT).
+
+    Numba only accelerates our own algorithm; it must not change the result. If
+    numba is not installed both calls take the NumPy path and this is trivially
+    true, which is the point -- the fallback is exercised either way.
+    """
+    print("== 1b. numba vs numpy backend agreement ==")
+    from oakd.vio.klt_numba import HAVE_NUMBA
+    img0 = make_texture(seed=5)
+    img1 = translate(img0, 2.1, -1.3)
+    g0, g1 = img0.astype(np.uint8), img1.astype(np.uint8)
+    pts = good_features_to_track(g0, max_corners=300, quality_level=0.01,
+                                 min_distance=12.0, block_size=7)
+    n_nb, s_nb = calc_optical_flow_pyr_lk(g0, g1, pts, use_numba=True)
+    n_np, s_np = calc_optical_flow_pyr_lk(g0, g1, pts, use_numba=False)
+    both = s_nb.astype(bool) & s_np.astype(bool)
+    d = np.linalg.norm(n_nb[both] - n_np[both], axis=1)
+    status_ok = bool((s_nb == s_np).all())
+    diff_ok = (d.max() < 0.01) if d.size else True
+    passed = status_ok and diff_ok
+    print(f"  numba installed={HAVE_NUMBA}  status match={status_ok}  "
+          f"endpoint diff max={d.max() if d.size else 0:.4f}px "
+          f"-> {'PASS' if passed else 'FAIL'}")
+    return passed
+
+
 def _time_ms(fn, n=5) -> float:
     fn()  # warm
     t = time.perf_counter()
@@ -274,10 +301,11 @@ def report_timing() -> None:
 
 def main() -> int:
     r1 = test_correctness()
+    rb = test_backend_agreement()
     r2 = test_agreement_synthetic()
     r3 = test_agreement_real()
     report_timing()
-    ok = r1 and r2 and r3
+    ok = r1 and rb and r2 and r3
     print()
     print("RESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
