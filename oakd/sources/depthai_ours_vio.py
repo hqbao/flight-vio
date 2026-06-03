@@ -49,7 +49,8 @@ import numpy as np
 from ..pose import Pose
 from ..frames import quat_to_rpy
 from ..vio import (
-    OdometryConfig, RGBDVisualOdometry, gravity_aligned_R0, level_attitude,
+    FrontendConfig, KLTFrontend, OdometryConfig, RGBDVisualOdometry,
+    gravity_aligned_R0, level_attitude,
 )
 from .base import PoseSource
 
@@ -183,7 +184,8 @@ class OakOursVioSource(PoseSource):
     def __init__(self, width: int = 640, height: int = 400, fps: int = 20,
                  backend: str = "f2f", slam_kf_every: int = 5,
                  slam_radius_m: float = 0.0, ba_window: int = 6,
-                 ba_kf_every: int = 5, ba_iters: int = 5) -> None:
+                 ba_kf_every: int = 5, ba_iters: int = 5,
+                 use_own_klt: bool = True) -> None:
         super().__init__()
         self.width = int(width)
         self.height = int(height)
@@ -204,6 +206,12 @@ class OakOursVioSource(PoseSource):
         self.ba_window = int(ba_window)
         self.ba_kf_every = int(ba_kf_every)
         self.ba_iters = int(ba_iters)
+        # Optical-flow backend for the display front-end: our own pure-NumPy
+        # pyramidal LK (default, library-free) or cv2's. Ours tracks the same
+        # corners to sub-pixel agreement but is ~25x slower, so on a slow host
+        # the live display fps may drop -- pass cv2 (use_own_klt=False) for
+        # smooth live if needed. The recorded-offline scoring always uses ours.
+        self.use_own_klt = bool(use_own_klt)
 
     def _run(self) -> None:
         import cv2
@@ -263,7 +271,10 @@ class OakOursVioSource(PoseSource):
 
             # The displayed pose is ALWAYS produced by the fast frame-to-frame
             # VO, so the read loop never blocks on BA and the UI stays smooth.
-            vo = RGBDVisualOdometry(K, OdometryConfig())
+            vo = RGBDVisualOdometry(
+                K, OdometryConfig(),
+                frontend=KLTFrontend(FrontendConfig(
+                    use_own_klt=self.use_own_klt)))
 
             # Gravity-level the initial attitude: average the accelerometer over
             # a short static startup window, rotate it into the camera optical

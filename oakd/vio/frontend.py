@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
+from .klt import calc_optical_flow_pyr_lk
+
 
 @dataclass
 class FrontendConfig:
@@ -30,6 +32,9 @@ class FrontendConfig:
     fb_threshold: float = 1.0
     # re-detect when tracked count drops below this fraction of max_corners
     redetect_ratio: float = 0.6
+    # use our own pure-NumPy pyramidal LK (klt.py) instead of cv2's. Tracks the
+    # same corners to sub-pixel agreement with cv2; slower but library-free.
+    use_own_klt: bool = True
 
 
 @dataclass
@@ -57,6 +62,37 @@ class KLTFrontend:
     @property
     def tracks(self) -> TrackState:
         return self._state
+
+    def _track(self, prev_gray: np.ndarray, gray: np.ndarray,
+               prev_pts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Forward+backward KLT; returns (next_pts, status_bool).
+
+        Uses our own :func:`calc_optical_flow_pyr_lk` when ``use_own_klt`` is set
+        (the default, library-free), otherwise ``cv2.calcOpticalFlowPyrLK``. Both
+        return the same ``(N, 2) float32`` / ``(N,) status`` contract.
+        """
+        if self.cfg.use_own_klt:
+            nxt, st = calc_optical_flow_pyr_lk(
+                prev_gray, gray, prev_pts,
+                win_size=self.cfg.win_size, max_level=self.cfg.max_level)
+            back, st2 = calc_optical_flow_pyr_lk(
+                gray, prev_gray, nxt,
+                win_size=self.cfg.win_size, max_level=self.cfg.max_level)
+        else:
+            nxt, st, _ = cv2.calcOpticalFlowPyrLK(
+                prev_gray, gray, prev_pts, None, **self._lk_params)
+            back, st2, _ = cv2.calcOpticalFlowPyrLK(
+                gray, prev_gray, nxt, None, **self._lk_params)
+        fb_err = np.linalg.norm(prev_pts - back, axis=1)
+        st = st.reshape(-1).astype(bool)
+        st2 = st2.reshape(-1).astype(bool)
+        h, w = gray.shape
+        in_bounds = (
+            (nxt[:, 0] >= 0) & (nxt[:, 0] < w)
+            & (nxt[:, 1] >= 0) & (nxt[:, 1] < h)
+        )
+        good = st & st2 & (fb_err < self.cfg.fb_threshold) & in_bounds
+        return nxt, good
 
     def _detect(self, gray: np.ndarray, existing: np.ndarray) -> np.ndarray:
         """Detect new corners, masking out neighbourhoods of existing points."""
@@ -97,21 +133,7 @@ class KLTFrontend:
         prev_pts = self._state.points
         prev_ids = self._state.ids
         if prev_pts.shape[0] > 0:
-            nxt, st, _ = cv2.calcOpticalFlowPyrLK(
-                self._prev_gray, gray, prev_pts, None, **self._lk_params
-            )
-            back, st2, _ = cv2.calcOpticalFlowPyrLK(
-                gray, self._prev_gray, nxt, None, **self._lk_params
-            )
-            fb_err = np.linalg.norm(prev_pts - back, axis=1)
-            st = st.reshape(-1).astype(bool)
-            st2 = st2.reshape(-1).astype(bool)
-            h, w = gray.shape
-            in_bounds = (
-                (nxt[:, 0] >= 0) & (nxt[:, 0] < w)
-                & (nxt[:, 1] >= 0) & (nxt[:, 1] < h)
-            )
-            good = st & st2 & (fb_err < self.cfg.fb_threshold) & in_bounds
+            nxt, good = self._track(self._prev_gray, gray, prev_pts)
             tracked_pts = nxt[good].astype(np.float32)
             tracked_ids = prev_ids[good]
         else:
