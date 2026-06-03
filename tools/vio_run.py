@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from oakd.vio import (  # noqa: E402
     GyroPreintegrator,
+    OdometryConfig,
     RGBDVisualOdometry,
     SessionReader,
     SlamMap,
@@ -116,17 +117,20 @@ def main() -> int:
     ap.add_argument("--slam-max-kf", type=int, default=0, dest="slam_max_kf",
                     help="SLAM hard cap on stored keyframes (drops oldest when "
                          "exceeded). 0 = unlimited [0]")
+    ap.add_argument("--no-gyro", action="store_true",
+                    help="disable the gyro complementary rotation fusion")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
     use_imu = not args.no_imu
+    use_gyro = not args.no_gyro
     if args.all:
         return run_all(use_imu, backend=args.backend,
                        slam_kf_every=args.slam_kf_every,
                        slam_radius_m=args.slam_radius,
                        slam_kf_min_trans=args.slam_kf_min_trans,
                        slam_kf_min_rot=args.slam_kf_min_rot,
-                       slam_max_kf=args.slam_max_kf)
+                       slam_max_kf=args.slam_max_kf, use_gyro=use_gyro)
 
     score_session(Path(args.session), args.max_frames, args.verbose,
                   use_imu=use_imu, backend=args.backend,
@@ -134,7 +138,7 @@ def main() -> int:
                   slam_radius_m=args.slam_radius,
                   slam_kf_min_trans=args.slam_kf_min_trans,
                   slam_kf_min_rot=args.slam_kf_min_rot,
-                  slam_max_kf=args.slam_max_kf)
+                  slam_max_kf=args.slam_max_kf, use_gyro=use_gyro)
     return 0
 
 
@@ -156,7 +160,7 @@ def basalt_ref_is_broken(positions: dict[int, np.ndarray]) -> bool:
 def run_all(use_imu: bool = True, backend: str = "f2f",
             slam_kf_every: int = 5, slam_radius_m: float = 0.0,
             slam_kf_min_trans: float = 0.0, slam_kf_min_rot: float = 0.0,
-            slam_max_kf: int = 0) -> int:
+            slam_max_kf: int = 0, use_gyro: bool = True) -> int:
     gold = Path("sessions/gold")
     rows = []
     for d in sorted(gold.iterdir()):
@@ -170,7 +174,8 @@ def run_all(use_imu: bool = True, backend: str = "f2f",
                                                 slam_radius_m=slam_radius_m,
                                                 slam_kf_min_trans=slam_kf_min_trans,
                                                 slam_kf_min_rot=slam_kf_min_rot,
-                                                slam_max_kf=slam_max_kf)
+                                                slam_max_kf=slam_max_kf,
+                                                use_gyro=use_gyro)
         rows.append((d.name, res, note))
         print(f"  {d.name:18s} done")
 
@@ -210,27 +215,34 @@ def score_session(session_dir: Path, max_frames: int, verbose: bool,
                   quiet: bool = False, use_imu: bool = True,
                   backend: str = "f2f", slam_kf_every: int = 5,
                   slam_radius_m: float = 0.0, slam_kf_min_trans: float = 0.0,
-                  slam_kf_min_rot: float = 0.0, slam_max_kf: int = 0):
+                  slam_kf_min_rot: float = 0.0, slam_max_kf: int = 0,
+                  use_gyro: bool = True):
     reader = SessionReader(session_dir)
     n = len(reader) if max_frames <= 0 else min(max_frames, len(reader))
+    # Gyro complementary fusion: the gyro owns the inter-frame rotation and
+    # vision only corrects it (weighted by inlier confidence), so fast turns --
+    # especially yaw, which gravity cannot recover -- keep the attitude right
+    # even when KLT briefly loses tracks. It is a no-op where vision is healthy
+    # (see gold ATE parity), so it is safe to leave on for every backend.
+    odom_cfg = OdometryConfig(gyro_fuse=use_gyro)
     slam = None
     if backend in ("ba", "slam"):
-        vo = WindowedRGBDOdometry(reader.K)
-        use_imu = False  # BA/SLAM backends do not use the gyro prior
+        vo = WindowedRGBDOdometry(reader.K, odom_cfg=odom_cfg)
         if backend == "slam":
             slam = SlamMap(reader.K, SlamConfig(
                 loop_search_radius_m=slam_radius_m,
+                loop_max_odom_rot_deg=30.0,
                 kf_min_trans_m=slam_kf_min_trans,
                 kf_min_rot_deg=slam_kf_min_rot,
                 max_keyframes=slam_max_kf))
     else:
-        vo = RGBDVisualOdometry(reader.K)
+        vo = RGBDVisualOdometry(reader.K, odom_cfg)
 
     # Build a gyro preintegrator when the session has IMU extrinsics, so we can
     # feed a rotation prior to PnP. Sessions recorded before extrinsics were
     # captured (T_imu_left is None) silently fall back to pure vision.
     pre = None
-    if use_imu and reader.calib.has_imu_extrinsics:
+    if use_gyro and reader.calib.has_imu_extrinsics:
         imu = reader.load_imu()
         if imu["ts_ns"].size > 1:
             pre = GyroPreintegrator(imu["ts_ns"], imu["gyro"],
@@ -263,13 +275,10 @@ def score_session(session_dir: Path, max_frames: int, verbose: bool,
     anchors: dict[int, tuple[int, np.ndarray]] = {}
     for i in range(n):
         f = reader.load_frame(i)
-        if backend in ("ba", "slam"):
-            pose = vo.process(f.gray_left, f.depth_m)
-        else:
-            R_prior = None
-            if pre is not None and prev_ts is not None:
-                R_prior = pre.delta_rotation(prev_ts, f.ts_ns)
-            pose = vo.process(f.gray_left, f.depth_m, R_prior=R_prior)
+        R_prior = None
+        if pre is not None and prev_ts is not None:
+            R_prior = pre.delta_rotation(prev_ts, f.ts_ns)
+        pose = vo.process(f.gray_left, f.depth_m, R_prior=R_prior)
         prev_ts = f.ts_ns
         est[f.seq] = pose[:3, 3].copy()
         if vo.last_info.get("ok"):

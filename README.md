@@ -68,9 +68,19 @@ This gives camera-frame axes (right-handed, OpenCV convention):
 ```
 
 Both `ours-ba` and `ours-slam` run their heavy optimisation on a background
-thread, so the display stays smooth; gravity (accel) levels roll/pitch as the
-final step while vision owns yaw + position. Tuning knobs (all optional, shown
-with their defaults):
+thread, so the display stays smooth. The accelerometer levels roll/pitch to
+gravity at rest, while the **gyroscope** drives the inter-frame rotation prior:
+vision (PnP) corrects that rotation weighted by its inlier confidence, *and* by
+how far it disagrees with the gyro — so when a fast yaw makes the KLT tracker
+slip (PnP still reports inliers but under-rotates) the gyro takes over the
+rotation. When vision fails outright during the hardest part of a turn (too few
+tracks to even attempt PnP) the gyro still propagates the rotation, so the body
+frame keeps turning instead of freezing. On a healthy frame (plenty of inliers,
+small disagreement) the fusion collapses to pure vision, so there is no accuracy
+cost on good data. Position is still vision-only — this is loosely-coupled VIO,
+not Basalt's tight-coupled optimisation.
+
+Tuning knobs (all optional, shown with their defaults):
 
 ```bash
 # SLAM update cadence — the main lever. Lower = more frequent loop closure AND a
@@ -132,6 +142,10 @@ in the numbers instead of as lag on the device.
 - [x] From-scratch RGB-D VIO (`ours` f2f → `ours-ba` windowed BA → `ours-slam`
       ORB loop closure + SE(3) pose graph); gravity-leveled, scored vs Basalt in
       `tools/vio_run.py` (corridor ATE 0.61%, see `docs/SKYSLAM_ROADMAP.md`)
+- [x] Gyro complementary fusion (loosely-coupled): gyro rotation prior +
+      vision correction gated on inliers AND vision/gyro disagreement; gyro
+      propagates rotation when vision fails, so fast yaw no longer freezes the
+      pose. No-op on well-tracked frames (gold ATE unchanged)
 - [x] Own pure-NumPy optical flow (pyramidal Lucas-Kanade, `oakd/vio/klt.py`)
       and corner detection (Shi-Tomasi, `oakd/vio/corners.py`) replacing cv2;
       KLT inner loop JIT-accelerated with Numba (`oakd/vio/klt_numba.py`,

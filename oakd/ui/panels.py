@@ -97,7 +97,7 @@ class TelemetryPanel(QWidget):
     # ----------------------------------------------------------------------
 
     def _refresh(self) -> None:
-        traj, latest = self.history.snapshot()
+        traj, _flags, latest = self.history.snapshot()
 
         if latest is not None:
             p = latest.pos_ned

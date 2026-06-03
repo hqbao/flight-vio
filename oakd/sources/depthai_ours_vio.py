@@ -42,6 +42,7 @@ Note: the gyro rotation prior is a measured no-op on well-synced data (see
 """
 from __future__ import annotations
 
+import threading
 import time
 
 import numpy as np
@@ -179,6 +180,13 @@ class OakOursVioSource(PoseSource):
     self-consistent over the whole trajectory; gravity leveling is still applied
     as the final display step (the ordering rule: loop closure owns position+yaw,
     accel re-levels tilt last).
+
+    **Gyro complementary fusion:** the gyroscope is integrated each frame into an
+    inter-frame rotation prior that is handed to the odometry (``gyro_fuse``).
+    Vision (PnP) corrects this rotation weighted by its inlier confidence, so a
+    fast yaw turn that makes the KLT tracker lose features no longer under-rotates
+    the pose. On a healthy frame the fusion collapses to pure vision (no accuracy
+    cost on good data). Translation stays vision-only.
     """
 
     def __init__(self, width: int = 640, height: int = 400, fps: int = 20,
@@ -231,6 +239,60 @@ class OakOursVioSource(PoseSource):
         # and ATE is at parity (lab_loop f2f 1.18 vs 1.27%).
         self.use_own_klt = bool(use_own_klt)
 
+        # --- live SLAM overlay (read by the 3D viewer) ----------------------
+        # Thread-safe snapshot of the SLAM map for the UI: keyframe dots, the
+        # matched (revisited) keyframes, and the loop-closure links. All in NED
+        # so the viewer only has to apply its NED->ENU display transform. These
+        # are REAL SlamMap outputs (corrected keyframe poses + confirmed loop
+        # events), not a parallel/derived pipeline. Empty for non-SLAM backends.
+        self._slam_lock = threading.Lock()
+        self._slam_kf_ned = np.zeros((0, 3), dtype=np.float32)
+        self._slam_match_ned = np.zeros((0, 3), dtype=np.float32)
+        self._slam_loop_ned: list[np.ndarray] = []
+        # Flash counter: bumped each time a NEW loop closes, so the viewer can
+        # detect a fresh teleport and play a short fade-out (instead of drawing
+        # the whole accumulated loop history, which turns into a magenta mess).
+        self._slam_flash_id = 0
+
+        # Set by the UI "clear keyframes" button; the read loop picks it up,
+        # wipes the SLAM map + the loop-closure correction + the overlay, so a
+        # test run can be restarted without relaunching the pipeline.
+        self._slam_reset = threading.Event()
+
+        # Gyro zero-rate bias (rad/s, IMU frame), measured over the static
+        # startup window by ``_collect_startup_accel``. None until startup runs
+        # (or if the device has no IMU), in which case gyro integration uses a
+        # zero bias.
+        self._gyro_bias: np.ndarray | None = None
+
+    def slam_overlay_snapshot(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, list[np.ndarray], int]:
+        """Latest SLAM overlay for the viewer (all positions in NED).
+
+        Returns ``(kf_ned, match_ned, loop_segs, flash_id)`` where ``kf_ned`` is
+        every keyframe position (Nx3), ``match_ned`` the keyframes revisited by
+        the MOST RECENT loop closure (Mx3), ``loop_segs`` its ``[cur, old]``
+        teleport segments, and ``flash_id`` a counter the viewer watches to know
+        a new loop just closed (so it can flash then fade the link). The match /
+        loop fields hold only the latest closure, not the full history.
+        """
+        with self._slam_lock:
+            return (self._slam_kf_ned.copy(),
+                    self._slam_match_ned.copy(),
+                    [s.copy() for s in self._slam_loop_ned],
+                    self._slam_flash_id)
+
+    def clear_slam_map(self) -> None:
+        """Forget every SLAM keyframe (UI "clear keyframes" button).
+
+        Signals the read loop, which wipes the map worker-side and resets the
+        loop-closure correction + overlay. Safe to call from the UI thread; a
+        no-op for non-SLAM backends. Does NOT touch the displayed trajectory or
+        the f2f/gyro odometry — only the SLAM keyframe map and its corrections.
+        """
+        self._slam_reset.set()
+
     def _run(self) -> None:
         import cv2
         import depthai as dai  # lazy: --source fake works without depthai/device
@@ -252,10 +314,13 @@ class OakOursVioSource(PoseSource):
             stereo.initialConfig.setLeftRightCheckThreshold(10)
             stereo.setDepthAlign(left_socket)
 
-            # Accelerometer only: used once at startup to gravity-level the
-            # initial attitude (so "down" is real gravity, not the arbitrary
-            # camera tilt at launch). We do not fuse it per-frame.
-            imu.enableIMUSensor([dai.IMUSensor.ACCELEROMETER_RAW], 100)
+            # Accelerometer (gravity leveling) + gyroscope (the inter-frame
+            # rotation prior for the complementary fusion). The gyro is what
+            # keeps yaw correct through fast turns where vision under-rotates;
+            # accel cannot recover yaw. 200 Hz gyro >> the ~20 fps frame rate so
+            # each frame integrates ~10 samples.
+            imu.enableIMUSensor([dai.IMUSensor.ACCELEROMETER_RAW,
+                                 dai.IMUSensor.GYROSCOPE_RAW], 200)
             imu.setBatchReportThreshold(1)
             imu.setMaxBatchReports(10)
 
@@ -304,7 +369,7 @@ class OakOursVioSource(PoseSource):
             else:
                 fe_cfg = FrontendConfig(use_own_klt=False)
             vo = RGBDVisualOdometry(
-                K, OdometryConfig(), frontend=KLTFrontend(fe_cfg))
+                K, OdometryConfig(gyro_fuse=True), frontend=KLTFrontend(fe_cfg))
 
             # Gravity-level the initial attitude: average the accelerometer over
             # a short static startup window, rotate it into the camera optical
@@ -363,6 +428,17 @@ class OakOursVioSource(PoseSource):
             accel_ema: np.ndarray | None = None
             grav_corr = np.eye(3)   # stateful display-frame gravity correction
 
+            # Gyro complementary-fusion state. ``gyro_bias`` is the mean gyro over
+            # the static startup window (rad/s, IMU frame); each frame we
+            # integrate the gyro samples drained from the IMU queue into an
+            # inter-frame rotation and hand it to ``vo.process`` as the rotation
+            # prior. ``so3_exp`` is the same exponential map the offline
+            # GyroPreintegrator uses, so live and offline share one convention.
+            from ..vio.imu import so3_exp
+            gyro_bias = (self._gyro_bias if self._gyro_bias is not None
+                         else np.zeros(3))
+            gyro_last_ts: float | None = None
+
             while not self._stop.is_set() and p.isRunning():
                 # Drain each queue to its most recent frame; drop the backlog so
                 # that if anything briefly stalls we skip stale frames instead of
@@ -389,15 +465,16 @@ class OakOursVioSource(PoseSource):
                 depth_mm = dd.getCvFrame()
                 depth_m = depth_mm.astype(np.float32) / 1000.0
 
-                vo.process(gray, depth_m)  # advance camera-optical world pose
-
-                # Drain the IMU queue and AVERAGE every accelerometer packet in
-                # the batch this frame (not just the last sample). Averaging the
-                # ~5-6 samples per frame rejects per-sample noise and gives a
-                # stable gravity magnitude; taking a single last sample made the
-                # motion residual jump and the |g| estimate bounce.
+                # Drain the IMU queue ONCE per frame, BEFORE odometry, so we have
+                # this frame's gyro rotation prior ready for PnP. We both (a)
+                # average the accelerometer (gravity leveling, below) and (b)
+                # integrate the gyro into an inter-frame rotation. Averaging the
+                # ~10 accel samples/frame rejects per-sample noise; integrating
+                # every gyro sample with its own dt preserves fast rotation.
                 acc_sum = np.zeros(3)
                 acc_cnt = 0
+                R_imu_accum = np.eye(3)
+                gyro_cnt = 0
                 imsg = q_imu.tryGet()
                 while imsg is not None:
                     for pkt in imsg.packets:
@@ -409,8 +486,32 @@ class OakOursVioSource(PoseSource):
                         if np.all(np.isfinite(v)):
                             acc_sum += v
                             acc_cnt += 1
+                        g = pkt.gyroscope
+                        w = np.array([g.x, g.y, g.z], dtype=np.float64)
+                        if np.all(np.isfinite(w)):
+                            try:
+                                ts = g.getTimestampDevice().total_seconds()
+                            except Exception:
+                                ts = None
+                            if ts is not None:
+                                if gyro_last_ts is not None:
+                                    dt = ts - gyro_last_ts
+                                    if 0.0 < dt < 0.1:   # skip gaps/duplicates
+                                        R_imu_accum = R_imu_accum @ so3_exp(
+                                            (w - gyro_bias) * dt)
+                                        gyro_cnt += 1
+                                gyro_last_ts = ts
                     imsg = q_imu.tryGet()
                 accel_raw = None if acc_cnt == 0 else R_imu_cam @ (acc_sum / acc_cnt)
+
+                # Inter-frame gyro rotation in the camera frame (prev<-cur
+                # convention, matching GyroPreintegrator). None until we have a
+                # spanned interval, so the very first frame stays pure vision.
+                R_prior = (R_imu_cam @ R_imu_accum @ R_imu_cam.T
+                           if gyro_cnt > 0 else None)
+
+                vo.process(gray, depth_m, R_prior=R_prior)  # camera-optical world
+
 
                 # --- accelerometer leveling, gated on the camera being at rest --
                 # We only trust accel for leveling when the camera is actually at
@@ -450,6 +551,11 @@ class OakOursVioSource(PoseSource):
 
                 pose = vo.pose.copy()  # camera-optical world
 
+                # Set True when a loop-closure correction slews the pose this
+                # frame (a teleport while the camera is ~still). Coloured
+                # distinctly in the path so the jump reads as a map correction.
+                teleport = False
+
                 if ba_state is not None:
                     # Submit a keyframe snapshot every kf_every frames. Drop if
                     # the worker is busy (non-blocking) — never stall the loop.
@@ -478,6 +584,21 @@ class OakOursVioSource(PoseSource):
                     pose = C_applied @ pose
 
                 if slam_state is not None:
+                    # UI "clear keyframes": wipe the map worker-side and snap our
+                    # local loop-closure correction + overlay buffers back to
+                    # empty so the displayed path detaches from the old map at
+                    # once (no eased slew back through a stale correction).
+                    if self._slam_reset.is_set():
+                        self._slam_reset.clear()
+                        slam_state["reset_map"]()
+                        C_target = np.eye(4)
+                        C_applied = np.eye(4)
+                        kf_count = 0
+                        with self._slam_lock:
+                            self._slam_kf_ned = np.zeros((0, 3), np.float32)
+                            self._slam_match_ned = np.zeros((0, 3), np.float32)
+                            self._slam_loop_ned = []
+                            self._slam_flash_id += 1
                     # Hand a keyframe (raw f2f pose + image + depth) to the SLAM
                     # map every kf_every frames; drop if the worker is still busy
                     # on the previous one (non-blocking) — never stall the loop.
@@ -491,7 +612,16 @@ class OakOursVioSource(PoseSource):
                     newC = slam_state["poll"]()
                     if newC is not None:
                         C_target = newC
+                    C_prev = C_applied
                     C_applied = _ease_se3(C_applied, C_target, 0.15)
+                    # Teleport displacement = how far THIS pose moves purely from
+                    # the correction slewing (same vo pose, only the correction
+                    # changed). Real camera motion never enters this delta, so a
+                    # non-trivial value means the loop-closure correction is
+                    # dragging the displayed point back onto the remembered place.
+                    corr_step = float(np.linalg.norm(
+                        (C_applied @ pose)[:3, 3] - (C_prev @ pose)[:3, 3]))
+                    teleport = corr_step > 0.01   # 1 cm/frame from correction
                     pose = C_applied @ pose
 
                 # FINAL display leveling -- accel is the "trum cuoi" (last word)
@@ -534,6 +664,39 @@ class OakOursVioSource(PoseSource):
                 # keeps displacement and triad consistent.
                 pose[:3, :3] = R_disp
                 pose[:3, 3] = grav_corr @ pose[:3, 3]
+
+                # Refresh the SLAM overlay for the viewer when the worker has a
+                # new map snapshot. Apply the SAME world-frame transform as the
+                # displayed path (grav_corr in optical, then optical->NED) so the
+                # keyframe dots and loop links line up with the trajectory.
+                if slam_state is not None:
+                    ov = slam_state["overlay"]()
+                    if ov is not None:
+                        kf_opt, match_opt, loop_pairs, has_new = ov
+
+                        def _to_ned(p):
+                            return (_M_OPT_TO_NED @ (grav_corr @ p)).astype(
+                                np.float32)
+
+                        kf_ned = (np.array([_to_ned(p) for p in kf_opt],
+                                           dtype=np.float32)
+                                  if len(kf_opt) else
+                                  np.zeros((0, 3), np.float32))
+                        with self._slam_lock:
+                            self._slam_kf_ned = kf_ned
+                            # Only refresh the flash (matched dot + teleport
+                            # link) when a NEW loop actually closed; otherwise
+                            # leave the previous flash to fade out in the viewer.
+                            if has_new:
+                                self._slam_match_ned = (
+                                    np.array([_to_ned(p) for p in match_opt],
+                                             dtype=np.float32)
+                                    if len(match_opt) else
+                                    np.zeros((0, 3), np.float32))
+                                self._slam_loop_ned = [
+                                    np.stack([_to_ned(a), _to_ned(b)])
+                                    for a, b in loop_pairs]
+                                self._slam_flash_id += 1
 
                 # Accelerometer-ONLY attitude (gravity-leveled, yaw=0) for live
                 # side-by-side comparison in the UI -- computed every frame
@@ -590,6 +753,7 @@ class OakOursVioSource(PoseSource):
                     vel_ned=vel_ned,
                     quat_wxyz=q_ned,
                     tracking_ok=ok,
+                    teleport=teleport,
                     accel_quat_wxyz=accel_q_ned,
                 ))
 
@@ -619,8 +783,15 @@ class OakOursVioSource(PoseSource):
         frame (ready for :meth:`RGBDVisualOdometry.align_to_gravity`), or ``None``
         if no IMU samples arrived within ``timeout_s`` (older device / no IMU) —
         in which case the caller falls back to an identity (unleveled) start.
+
+        As a side effect, the mean gyro over the same static window is stored in
+        ``self._gyro_bias`` (rad/s, IMU frame). The device is assumed motionless
+        at startup, so this is the gyro zero-rate offset; subtracting it before
+        integration keeps the rotation prior from drifting when the camera is
+        still. Left ``None`` if no IMU samples arrived.
         """
         samples: list[np.ndarray] = []
+        gyro: list[np.ndarray] = []
         t_start = time.monotonic()
         t_first: float | None = None
         while time.monotonic() - t_start < timeout_s:
@@ -631,10 +802,16 @@ class OakOursVioSource(PoseSource):
             for pkt in msg.packets:
                 a = pkt.acceleroMeter
                 samples.append(np.array([a.x, a.y, a.z], dtype=np.float64))
+                g = pkt.gyroscope
+                w = np.array([g.x, g.y, g.z], dtype=np.float64)
+                if np.all(np.isfinite(w)):
+                    gyro.append(w)
             if t_first is None:
                 t_first = time.monotonic()
             elif time.monotonic() - t_first >= window_s:
                 break
+        if gyro:
+            self._gyro_bias = np.mean(gyro, axis=0)
         if not samples:
             return None
         accel_imu = np.mean(samples, axis=0)
@@ -743,6 +920,7 @@ class OakOursVioSource(PoseSource):
         # configured keyframe cadence stays sustainable on the background thread.
         slam = SlamMap(K, SlamConfig(
             loop_search_radius_m=self.slam_radius_m,
+            loop_max_odom_rot_deg=30.0,
             kf_min_trans_m=self.slam_kf_min_trans,
             kf_min_rot_deg=self.slam_kf_min_rot,
             max_keyframes=self.slam_max_kf))
@@ -751,12 +929,15 @@ class OakOursVioSource(PoseSource):
         out_lock = threading.Lock()
         event = threading.Event()
         stop = threading.Event()
+        reset = threading.Event()
         state = {
             "event": event,
             "stop": stop,
+            "reset": reset,
             "kf_every": self.slam_kf_every,
             "_pending": None,
             "_corr": None,
+            "_overlay": None,
         }
 
         def submit(T_wc, gray, depth_m):
@@ -764,11 +945,22 @@ class OakOursVioSource(PoseSource):
                 state["_pending"] = (T_wc, gray, depth_m)
             event.set()
 
+        def reset_map():
+            # Ask the worker to forget every keyframe on its next wake.
+            reset.set()
+            event.set()
+
         def poll():
             with out_lock:
                 C = state["_corr"]
                 state["_corr"] = None
             return C
+
+        def overlay():
+            with out_lock:
+                ov = state["_overlay"]
+                state["_overlay"] = None
+            return ov
 
         def worker():
             from ..vio.posegraph import se3_inv
@@ -778,6 +970,19 @@ class OakOursVioSource(PoseSource):
                 event.clear()
                 if stop.is_set():
                     break
+                if reset.is_set():
+                    reset.clear()
+                    slam.reset()
+                    with snap_lock:
+                        state["_pending"] = None
+                    with out_lock:
+                        # Identity correction (no loop) + an empty overlay marked
+                        # "new" so the read loop drops the keyframe dots and the
+                        # loop flash on its next refresh.
+                        state["_corr"] = np.eye(4)
+                        state["_overlay"] = (np.zeros((0, 3)),
+                                             np.zeros((0, 3)), [], True)
+                    continue
                 with snap_lock:
                     snap = state["_pending"]
                     state["_pending"] = None
@@ -793,15 +998,39 @@ class OakOursVioSource(PoseSource):
                 # Publish the correction for the latest keyframe (identity until
                 # a loop has closed). The current display pose hangs off it.
                 last = len(slam.kf_orig) - 1
+                C = None
                 if last >= 0:
                     C = slam.kf_pose[last] @ se3_inv(slam.kf_orig[last])
-                    with out_lock:
-                        state["_corr"] = C
+                # Snapshot the map for the UI overlay: every keyframe position,
+                # the revisited (matched) keyframes to highlight, and the loop
+                # links as [cur, old] segments. Positions are the CURRENT
+                # (PGO-corrected) keyframe poses in the camera-optical world
+                # frame; the read loop maps them to NED. These are real SlamMap
+                # outputs, so the dots/links always reflect the actual graph.
+                kf_opt = (
+                    np.array([p[:3, 3] for p in slam.kf_pose], dtype=np.float64)
+                    if slam.kf_pose else np.zeros((0, 3)))
+                # Flash ONLY the loops confirmed at THIS keyframe (``events``),
+                # i.e. the teleport that just happened -- not the whole history.
+                match_opt = (
+                    np.array([slam.kf_pose[ev["old"]][:3, 3] for ev in events],
+                             dtype=np.float64)
+                    if events else np.zeros((0, 3)))
+                loop_pairs = [
+                    (slam.kf_pose[ev["cur"]][:3, 3].copy(),
+                     slam.kf_pose[ev["old"]][:3, 3].copy())
+                    for ev in events]
+                with out_lock:
+                    state["_corr"] = C
+                    state["_overlay"] = (kf_opt, match_opt, loop_pairs,
+                                         bool(events))
 
         th = threading.Thread(target=worker, name="OursSlamWorker", daemon=True)
         th.start()
         state["thread"] = th
         state["submit"] = submit
         state["poll"] = poll
+        state["overlay"] = overlay
+        state["reset_map"] = reset_map
         return state
 

@@ -241,11 +241,12 @@ class WindowedRGBDOdometry:
         return self.map.keyframes
 
     # --------------------------------------------------------------------- #
-    def process(self, gray: np.ndarray, depth_m: np.ndarray) -> np.ndarray:
+    def process(self, gray: np.ndarray, depth_m: np.ndarray,
+                R_prior: np.ndarray | None = None) -> np.ndarray:
         """Advance one frame; return the current 4x4 world pose (camera->world)."""
         self._frame_idx += 1
         # 1) frame-to-frame tracking (also advances the shared frontend).
-        self.pose = self.vo.process(gray, depth_m).copy()
+        self.pose = self.vo.process(gray, depth_m, R_prior=R_prior).copy()
         self.last_info = dict(self.vo.last_info)
         self._frames_since_kf += 1
 

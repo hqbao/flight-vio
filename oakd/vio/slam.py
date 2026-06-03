@@ -44,6 +44,19 @@ class SlamConfig:
     # update rate can be raised without the worker falling behind. It can only
     # *miss* a loop if drift already exceeds the radius by revisit time.
     loop_search_radius_m: float = 0.0
+    # Rotation-consistency gate against odometry (degrees, 0 = disabled). A
+    # confirmed loop's relative rotation between the two keyframes must roughly
+    # agree with what odometry already estimates for that pair. Visual odometry
+    # accumulates TRANSLATION drift quickly but ROTATION drift slowly (it is
+    # gravity-levelled, and yaw creeps only gradually), so a TRUE revisit has a
+    # loop rotation within a few-degree band of the odometry relative rotation.
+    # A perceptual-aliasing FALSE loop (a different place that merely looks the
+    # same) typically claims the camera is oriented very differently from what
+    # odometry says -> large disagreement -> rejected. This is the main guard
+    # against "teleport across untravelled space". Set generously (e.g. 30-45)
+    # so genuine loops with some yaw drift still pass. Translation is NOT gated
+    # this way (correcting translation drift is the whole point of loop closure).
+    loop_max_odom_rot_deg: float = 0.0
     # --- keyframe budget (long-run memory / compute bound) ------------------
     # Motion-gated insertion: skip a new keyframe unless the camera has moved at
     # least ``kf_min_trans_m`` metres OR rotated ``kf_min_rot_deg`` degrees since
@@ -80,6 +93,24 @@ class SlamMap:
         self.kf_app: list = []                   # KeyframeAppearance
         self.kf_seq: list[int] = []
         self.loop_events: list[dict] = []        # {"cur","old","inliers","matches"}
+
+    # ------------------------------------------------------------------ #
+    def reset(self) -> None:
+        """Forget every keyframe and start a fresh, empty map.
+
+        Drops all keyframes, the pose graph, and the loop history, and rebuilds
+        the loop detector so no stale appearance descriptors survive. Used by the
+        UI "clear keyframes" control so a test run can be restarted without
+        relaunching the whole pipeline. The world frame is re-seeded by the next
+        keyframe inserted (its pose becomes the new origin of the graph).
+        """
+        self.detector = LoopDetector(self.K, self.cfg.loop)
+        self.graph = PoseGraph()
+        self.kf_orig.clear()
+        self.kf_pose.clear()
+        self.kf_app.clear()
+        self.kf_seq.clear()
+        self.loop_events.clear()
 
     # ------------------------------------------------------------------ #
     def _needs_keyframe(self, T_wc: np.ndarray) -> bool:
@@ -167,6 +198,18 @@ class SlamMap:
                 res = self.detector.verify(app, self.kf_app[old])
                 if res is not None:
                     T_cur_old, ninl, nmatch = res
+                    # Rotation-consistency gate: reject loops whose relative
+                    # rotation disagrees with odometry by more than the band
+                    # (odometry rotation drifts slowly, so a real revisit agrees;
+                    # an aliasing false match usually does not).
+                    rmax = self.cfg.loop_max_odom_rot_deg
+                    if rmax > 0.0:
+                        T_odom = se3_inv(self.kf_orig[idx]) @ self.kf_orig[old]
+                        dR = T_cur_old[:3, :3] @ T_odom[:3, :3].T
+                        c = (np.trace(dR) - 1.0) * 0.5
+                        ang = float(np.degrees(np.arccos(np.clip(c, -1.0, 1.0))))
+                        if ang > rmax:
+                            continue
                     cands.append((ninl, old, T_cur_old, nmatch))
             cands.sort(reverse=True)             # strongest (most inliers) first
             for ninl, old, T_cur_old, nmatch in cands[:self.cfg.max_loops_per_kf]:

@@ -77,6 +77,13 @@ class MainWindow(QMainWindow):
         self.clear_act.triggered.connect(self.history.clear)
         tb.addAction(self.clear_act)
 
+        # Wipe the SLAM keyframe map (only when the source keeps one). Handy for
+        # restarting a loop-closure test without relaunching the pipeline.
+        if hasattr(source, "clear_slam_map"):
+            self.clear_kf_act = QAction("CLEAR KEYFRAMES", self)
+            self.clear_kf_act.triggered.connect(source.clear_slam_map)
+            tb.addAction(self.clear_kf_act)
+
         self.addToolBar(QtCore.Qt.ToolBarArea.TopToolBarArea, tb)
 
         # ---- central layout ----------------------------------------------
@@ -92,6 +99,10 @@ class MainWindow(QMainWindow):
         bh.setSpacing(6)
 
         self.viewer = Viewer3D(history)
+        # Live SLAM map overlay (keyframe dots + loop-closure links), only when
+        # the source publishes one (backend='slam'); harmless no-op otherwise.
+        if hasattr(source, "slam_overlay_snapshot"):
+            self.viewer.set_overlay_source(source.slam_overlay_snapshot)
         self.panel = TelemetryPanel(history, source_fps_getter=lambda: source.fps)
         self.panel.setFixedWidth(260)
 

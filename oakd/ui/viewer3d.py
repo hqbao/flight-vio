@@ -7,6 +7,9 @@ Renders, in ENU display coordinates (positions converted from internal NED):
 """
 from __future__ import annotations
 
+from collections.abc import Callable
+import time
+
 import numpy as np
 import pyqtgraph.opengl as gl
 from PyQt6 import QtCore, QtGui
@@ -148,6 +151,40 @@ class Viewer3D(gl.GLViewWidget):
         for it in self._drone.items():
             self.addItem(it)
 
+        # ---- SLAM keyframe overlay (optional) ----------------------------
+        # Populated only when the source exposes a SLAM overlay (set via
+        # ``set_overlay_source``). Three layers, all fed REAL SlamMap outputs:
+        #   * amber dots  -> every keyframe position
+        #   * red dots    -> matched (revisited) keyframes, drawn bigger on top
+        #   * magenta line-> loop-closure (teleport) links cur<->old, in a
+        #                    distinct colour so they read as map corrections,
+        #                    NOT part of the VIO trajectory.
+        # ---- SLAM keyframe overlay (optional) ----------------------------
+        # Populated only when the source exposes a SLAM overlay (set via
+        # ``set_overlay_source``). Two layers, both fed REAL SlamMap outputs:
+        #   * amber dots -> every keyframe position (the persistent map)
+        #   * red dot    -> the keyframe just revisited; blink-fades on each new
+        #                   loop closure to show WHERE the pose snapped back to.
+        # The teleport MOTION itself is drawn by recolouring the trajectory
+        # segment magenta (see _refresh), so no separate link line is needed.
+        self._overlay_getter: Callable[[], tuple] | None = None
+        self._slam_kf = gl.GLScatterPlotItem(
+            pos=np.zeros((0, 3), dtype=np.float32),
+            color=_qcolor(theme.WARN, 0.85), size=8.0, pxMode=True,
+        )
+        self._slam_kf_match = gl.GLScatterPlotItem(
+            pos=np.zeros((0, 3), dtype=np.float32),
+            color=_qcolor(theme.BAD, 1.0), size=16.0, pxMode=True,
+        )
+        self.addItem(self._slam_kf)
+        self.addItem(self._slam_kf_match)
+        # Flash state: the matched dot blink-fades when a NEW loop closes
+        # (flash_id changes), then clears — so the highlight tracks the latest
+        # revisit instead of piling up the whole loop history.
+        self._flash_id = 0
+        self._flash_t0 = 0.0
+        self._flash_match = np.zeros((0, 3), dtype=np.float32)
+
         # ---- follow-cam state --------------------------------------------
         self._follow = False
         self.set_view("ISO")
@@ -171,17 +208,68 @@ class Viewer3D(gl.GLViewWidget):
     def set_follow(self, on: bool) -> None:
         self._follow = bool(on)
 
+    def set_overlay_source(self, getter: Callable[[], tuple]) -> None:
+        """Register a callable returning the live SLAM overlay.
+
+        ``getter()`` must return ``(kf_ned, match_ned, loop_segs)`` (positions
+        in NED): keyframe dots, matched keyframes, and ``[cur, old]`` loop
+        segments. Polled each refresh; pass ``None`` to disable.
+        """
+        self._overlay_getter = getter
+
     # ---- internal --------------------------------------------------------
 
     def _refresh(self) -> None:
-        traj, latest = self.history.snapshot()
+        traj, flags, latest = self.history.snapshot()
         if traj.shape[0] >= 2:
             # convert the whole trajectory NED -> ENU in one shot
             traj_enu = frames.ned_to_enu(traj.astype(np.float64)).astype(np.float32)
-            self._traj.setData(pos=traj_enu)
+            # Per-vertex colour: normal odometry green, loop-closure teleport
+            # segments magenta so the "swoosh back to memory" reads as a map
+            # correction rather than real camera motion. A line-strip segment
+            # is coloured teleport if EITHER endpoint is a teleport sample.
+            col = np.tile(np.array(_qcolor(theme.TRACE_PATH, 0.95),
+                                   dtype=np.float32), (traj_enu.shape[0], 1))
+            tp = np.asarray(flags, dtype=bool)
+            seg = tp.copy()
+            seg[:-1] |= tp[1:]   # also colour the vertex leading INTO a teleport
+            col[seg] = np.array((1.0, 0.2, 1.0, 0.95), dtype=np.float32)
+            self._traj.setData(pos=traj_enu, color=col)
         if latest is not None:
             self._drone.update(latest)
             if self._follow:
                 p_enu = frames.ned_to_enu(latest.pos_ned)
                 self.opts["center"] = QtGui.QVector3D(*p_enu.astype(float))
                 self.update()
+        self._refresh_overlay()
+
+    def _refresh_overlay(self) -> None:
+        if self._overlay_getter is None:
+            return
+        kf_ned, match_ned, _loop_segs, flash_id = self._overlay_getter()
+        empty = np.zeros((0, 3), dtype=np.float32)
+        # Amber dots: every keyframe, always on.
+        self._slam_kf.setData(
+            pos=(frames.ned_to_enu(kf_ned.astype(np.float64)).astype(np.float32)
+                 if len(kf_ned) else empty))
+
+        now = time.monotonic()
+        # A new loop just closed -> start a fresh flash on the revisited dot.
+        if flash_id != self._flash_id:
+            self._flash_id = flash_id
+            self._flash_t0 = now
+            self._flash_match = (
+                frames.ned_to_enu(match_ned.astype(np.float64)).astype(
+                    np.float32) if len(match_ned) else empty)
+
+        # Blink (3 Hz) under a linear fade over the flash duration, then clear.
+        dur = 1.8
+        t = now - self._flash_t0
+        if t > dur or not len(self._flash_match):
+            self._slam_kf_match.setData(pos=empty)
+            return
+        fade = 1.0 - t / dur
+        blink = 0.5 + 0.5 * float(np.cos(2.0 * np.pi * 3.0 * t))
+        a = float(np.clip(fade * blink, 0.0, 1.0))
+        self._slam_kf_match.setData(
+            pos=self._flash_match, color=_qcolor(theme.BAD, a), size=16.0)

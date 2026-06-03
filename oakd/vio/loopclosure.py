@@ -92,17 +92,27 @@ class LoopDetector:
         return KeyframeAppearance(gray, depth_m, self.K, self.orb, self.cfg)
 
     def _good_matches(self, a: KeyframeAppearance, b: KeyframeAppearance):
-        """Lowe-ratio matches from a.desc -> b.desc; returns list of (ia, ib)."""
+        """Lowe-ratio matches from a.desc -> b.desc; returns list of (ia, ib).
+
+        Symmetric (mutual) check: a pair is kept only if ``a[i] -> b[j]`` passes
+        the ratio test AND ``b[j]``'s best match back in ``a`` is ``i``. The
+        cross-check cheaply removes one-sided descriptor coincidences (a common
+        source of perceptual-aliasing false loops) before the geometry stages.
+        """
         if len(a.desc) < 2 or len(b.desc) < 2:
             return []
         knn = self.matcher.knnMatch(a.desc, b.desc, k=2)
+        # Best a-index for each b-index (for the mutual check).
+        rev = self.matcher.match(b.desc, a.desc)
+        best_ba = {m.queryIdx: m.trainIdx for m in rev}
         good = []
         for pair in knn:
             if len(pair) < 2:
                 continue
             m, n = pair
             if m.distance < self.cfg.ratio * n.distance:
-                good.append((m.queryIdx, m.trainIdx))
+                if best_ba.get(m.trainIdx, -1) == m.queryIdx:   # mutual
+                    good.append((m.queryIdx, m.trainIdx))
         return good
 
     def verify(self, cur: KeyframeAppearance, old: KeyframeAppearance):
