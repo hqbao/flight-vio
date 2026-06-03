@@ -30,8 +30,10 @@ from oakd.vio import (  # noqa: E402
     GyroPreintegrator,
     RGBDVisualOdometry,
     SessionReader,
+    SlamMap,
     WindowedRGBDOdometry,
 )
+from oakd.vio.posegraph import se3_inv  # noqa: E402
 
 
 def load_basalt_positions(session_dir: Path) -> dict[int, np.ndarray]:
@@ -89,8 +91,9 @@ def main() -> int:
                     help="0 = all frames")
     ap.add_argument("--all", action="store_true",
                     help="run every gold session and print a summary table")
-    ap.add_argument("--backend", choices=("f2f", "ba"), default="f2f",
-                    help="f2f = frame-to-frame VO; ba = windowed bundle adjustment")
+    ap.add_argument("--backend", choices=("f2f", "ba", "slam"), default="f2f",
+                    help="f2f = frame-to-frame VO; ba = windowed bundle "
+                         "adjustment; slam = ba + loop closure + pose graph")
     ap.add_argument("--no-imu", action="store_true",
                     help="disable the gyro rotation prior (pure vision)")
     ap.add_argument("--verbose", action="store_true")
@@ -135,6 +138,24 @@ def run_all(use_imu: bool = True, backend: str = "f2f") -> int:
 
     print()
     print(f"backend: {backend}")
+    if backend == "slam":
+        print(f"{'session':18s} {'path(m)':>8s} {'ATE RMSE':>10s} {'%path':>7s} "
+              f"{'scale':>6s} {'loops':>6s} {'drift cm (pre>post)':>20s}")
+        print("-" * 80)
+        for name, res, note in rows:
+            if res is None:
+                tag = f"  <- {note}" if note else "  (too short / no overlap)"
+                print(f"{name:18s} {'--':>8s} {'--':>10s} {'--':>7s} "
+                      f"{'--':>6s} {'--':>6s}{tag}")
+                continue
+            db = res.get("drift_before")
+            da = res.get("drift_after")
+            drift = (f"{db*100:6.1f} > {da*100:6.1f}"
+                     if db is not None else "--")
+            print(f"{name:18s} {res['path']:8.2f} {res['rmse']*1000:8.1f}mm "
+                  f"{100*res['rmse']/res['path']:6.2f}% {res['scale']:6.3f} "
+                  f"{res.get('loops', 0):6d} {drift:>20s}")
+        return 0
     print(f"{'session':18s} {'path(m)':>8s} {'ATE RMSE':>10s} {'%path':>7s} {'scale':>6s}")
     print("-" * 54)
     for name, res, note in rows:
@@ -152,9 +173,12 @@ def score_session(session_dir: Path, max_frames: int, verbose: bool,
                   backend: str = "f2f"):
     reader = SessionReader(session_dir)
     n = len(reader) if max_frames <= 0 else min(max_frames, len(reader))
-    if backend == "ba":
+    slam = None
+    if backend in ("ba", "slam"):
         vo = WindowedRGBDOdometry(reader.K)
-        use_imu = False  # BA backend does not use the gyro prior
+        use_imu = False  # BA/SLAM backends do not use the gyro prior
+        if backend == "slam":
+            slam = SlamMap(reader.K)
     else:
         vo = RGBDVisualOdometry(reader.K)
 
@@ -187,9 +211,16 @@ def score_session(session_dir: Path, max_frames: int, verbose: bool,
     est: dict[int, np.ndarray] = {}
     n_ok = 0
     prev_ts = None
+    # SLAM bookkeeping: keyframe cadence + per-frame anchor (which keyframe a
+    # frame hangs off + its relative transform), so that after pose-graph
+    # optimisation every frame can be rewritten as kf_corrected @ rel.
+    slam_kf_every = 5
+    frames_since_kf = 0
+    last_kf_idx = -1
+    anchors: dict[int, tuple[int, np.ndarray]] = {}
     for i in range(n):
         f = reader.load_frame(i)
-        if backend == "ba":
+        if backend in ("ba", "slam"):
             pose = vo.process(f.gray_left, f.depth_m)
         else:
             R_prior = None
@@ -200,12 +231,42 @@ def score_session(session_dir: Path, max_frames: int, verbose: bool,
         est[f.seq] = pose[:3, 3].copy()
         if vo.last_info.get("ok"):
             n_ok += 1
+
+        if slam is not None:
+            is_kf = (last_kf_idx < 0) or (frames_since_kf >= slam_kf_every)
+            if is_kf:
+                frames_since_kf = 0
+                slam.add_keyframe(pose, f.gray_left, f.depth_m, seq=f.seq)
+                last_kf_idx = len(slam.kf_orig) - 1
+            else:
+                frames_since_kf += 1
+            rel = se3_inv(slam.kf_orig[last_kf_idx]) @ pose
+            anchors[f.seq] = (last_kf_idx, rel)
+
         if verbose and i % 50 == 0:
             inf = vo.last_info
             print(f"  f{i:4d} tracks={inf.get('n_tracks', 0):3d} "
                   f"pnp={inf.get('n_pnp', 0):3d} "
                   f"inliers={inf.get('n_inliers', 0):3d} ok={inf.get('ok')} "
                   f"pos={pose[:3,3]}")
+
+    # --- SLAM: close loops + pose-graph optimise, then rewrite the trajectory.
+    n_loops = 0
+    drift_before = drift_after = None
+    if slam is not None:
+        seqs_sorted = sorted(est)
+        p0, p1 = est[seqs_sorted[0]], est[seqs_sorted[-1]]
+        drift_before = float(np.linalg.norm(p1 - p0))
+        n_loops = len(slam.loop_events)
+        slam.optimize()
+        for seq, (kidx, rel) in anchors.items():
+            est[seq] = (slam.kf_pose[kidx] @ rel)[:3, 3].copy()
+        p0, p1 = est[seqs_sorted[0]], est[seqs_sorted[-1]]
+        drift_after = float(np.linalg.norm(p1 - p0))
+        if not quiet:
+            print(f"SLAM: {len(slam.kf_orig)} keyframes, {n_loops} loop closures")
+            print(f"  end-start drift: {drift_before*100:.1f} cm "
+                  f"-> {drift_after*100:.1f} cm")
 
     basalt = load_basalt_positions(reader.dir)
     common = sorted(set(est) & set(basalt))
@@ -222,6 +283,9 @@ def score_session(session_dir: Path, max_frames: int, verbose: bool,
     traj_len = float(np.linalg.norm(np.diff(dst, axis=0), axis=1).sum())
     rigid["path"] = traj_len
     rigid["scale"] = sim["scale"]
+    rigid["loops"] = n_loops
+    rigid["drift_before"] = drift_before
+    rigid["drift_after"] = drift_after
 
     if not quiet:
         print(f"VO ok on {n_ok}/{n-1} motion steps")
