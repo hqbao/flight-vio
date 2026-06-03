@@ -338,8 +338,15 @@ cuts drift on the gold sessions:
   front-end (geometry), do not rely on a robust kernel.** (Also: `cv2.findFundamentalMat`
   needs a `≥ 8`-point and non-degenerate guard or it crashes on static scenes.)
 
-  Still **offline-only**; not yet wired to a live `--source ours-slam` (the
-  ordering rule below applies when it is).
+  Still **offline-scored** in `tools/vio_run.py --backend slam`, and now also
+  wired **live** as `--source ours-slam` (commit `5d93e66`): the read loop runs
+  fast f2f VO for the display while a background thread owns the persistent
+  `SlamMap` (fed the *raw* f2f poses so its odometry edges stay self-consistent),
+  closes loops and publishes the world-frame correction, which is eased onto the
+  trajectory like the BA correction. Gravity leveling stays the final step (the
+  ordering rule below). Validated off-device by driving the worker with the
+  recorded `lab_loop_30s` stream (loops close on the return to start, final
+  correction ≈ 13 cm of snapped-out drift); the on-device run is the user's test.
 
 **Attitude authority when SLAM and accel meet** (decided 2026-06-03, from the
 OAK-D from-scratch VIO):
