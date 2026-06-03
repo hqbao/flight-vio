@@ -82,11 +82,13 @@ with their defaults):
 ./run.sh --source ours-ba --ba-window 6 --ba-kf-every 5 --ba-iters 5
 ./run.sh --source ours --fps 20                    # camera frame rate (any ours-* source)
 
-# Optical flow tracking AND corner detection are our own pure-NumPy
-# implementations by default (pyramidal Lucas-Kanade + Shi-Tomasi, no library).
-# They are ~25x slower than cv2, so for a smoother live display you can opt back
-# into cv2 (offline ATE is unaffected either way):
-./run.sh --source ours --cv2-klt                   # use cv2 flow + corners (faster live)
+# Optical flow tracking AND corner detection have our own pure-NumPy
+# implementations (pyramidal Lucas-Kanade + Shi-Tomasi, no library), used by
+# default for OFFLINE scoring (tools/vio_run.py). They cost ~104 ms/frame --
+# ~2x over the 20fps budget -- so the LIVE viewer defaults to cv2 (3 ms/frame)
+# to stay real time; pass --own-klt to watch the library-free path live (it will
+# lag and may drop tracks). ATE is at parity either way:
+./run.sh --source ours --own-klt                   # library-free frontend, live (slow)
 ```
 
 Offline scoring of the same backends against the Basalt reference:
@@ -110,7 +112,7 @@ Offline scoring of the same backends against the Basalt reference:
       `tools/vio_run.py` (corridor ATE 0.61%, see `docs/SKYSLAM_ROADMAP.md`)
 - [x] Own pure-NumPy optical flow (pyramidal Lucas-Kanade, `oakd/vio/klt.py`)
       and corner detection (Shi-Tomasi, `oakd/vio/corners.py`) replacing cv2;
-      default on, `--cv2-klt` falls back for faster live display
+      default for offline scoring, `--own-klt` to run it live (~2x slower)
 - [x] Logging + offline replay (`tools/record_session.py` + `tools/viz_session.py`)
 - [x] Persistent SLAM database (auto save `rtabmap.db` + extract KF/loop via `tools/extract_kf_from_db.py`)
 - [x] Gold regression suite (6 sessions, see `docs/GOLD_SESSIONS.md`)
