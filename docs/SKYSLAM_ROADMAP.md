@@ -348,6 +348,22 @@ cuts drift on the gold sessions:
   recorded `lab_loop_30s` stream (loops close on the return to start, final
   correction ≈ 13 cm of snapped-out drift); the on-device run is the user's test.
 
+  **Tuning (commit `6e52c71`)**: the live source and `vio_run.py` expose CLI
+  knobs, all defaulting to the previous hardcoded values (so omitting them
+  changes nothing): `--slam-kf-every` (SLAM update cadence), `--slam-radius`
+  (optional spatial loop gate, 0 = check all), and `--ba-window` /
+  `--ba-kf-every` / `--ba-iters` / `--fps`. The **main lever for the SLAM update
+  rate is `--slam-kf-every`** — fewer keyframes means both more responsive loop
+  closure *and* a smaller, cheaper pose graph (the dominant end-of-run cost is
+  PGO on the growing graph, ~500 ms at ~240 keyframes, not loop detection). A
+  `kf_every` sweep on `lab_loop_30s` (drift cm / ATE %path): `3 →` 150 KF /
+  `10.5→3.7` / `0.53%`, `5 →` 100 KF / `10.5→4.2` / `0.53%` (default), `8 →`
+  67 KF / `10.5→3.4` / `0.48%`. **More frequent is not strictly better** — the
+  sparser cadence scored slightly best here while being lighter. The spatial gate
+  was measured to help little at these scales (the ORB appearance gate already
+  rejects distant keyframes cheaply), so it defaults off and is a safety bound
+  for very long runs only.
+
 **Attitude authority when SLAM and accel meet** (decided 2026-06-03, from the
 OAK-D from-scratch VIO):
 
