@@ -5,7 +5,7 @@ VIO differs from the BasaltVIO black box we are replacing*, so that future work
 to close the gap (or to deliberately keep a difference) has a concrete basis and
 does not have to re-derive it.
 
-**Last updated**: 2026-06-04
+**Last updated**: 2026-06-05
 **Our code**: `oakd/sources/depthai_ours_vio.py` (live) + `oakd/vio/*`
 **Basalt (reference)**: `dai.node.BasaltVIO` consumed in `oakd/sources/depthai_vio.py`
 **Scoring**: `tools/vio_run.py` (offline, vs recorded Basalt poses) + `tools/live_replay.py`
@@ -139,6 +139,45 @@ by `tools/vio_ba_selftest.py` scenario C (tilt-locked yaw+pos recovery) and
 `tools/vio_scale_probe.py --measure-b`. **`vio` is still opt-in / experimental
 and touches no production path.**
 
+### 4.1 Live `--source ours-vio`: VPU-free depth + a real-time background solve
+
+`oakd/sources/depthai_ours_vio.py` runs the tight-coupled window **live** with
+two deliberate properties, both **measured** (no device-only guesses):
+
+1. **Fully portable depth (no VPU / no `StereoDepth`).** The source taps the two
+   **RAW** mono cameras and does *everything* itself: our own `LeftRectifier` +
+   `RightRectifier` (library-free, verified to ~1e-7 vs `cv2.stereoRectify`) →
+   our own dense **SGM** matcher (`oakd/vio/stereo.py`, census + N-path
+   Hirschmüller, numba-accelerated) → metric depth. The chip stereo/depth
+   engine is never used, so this front-end ports unchanged to any 2-camera +
+   CPU target. The chip depth survives **only** as the offline oracle
+   (`tools/stereo_selftest.py`, `tools/vio_run.py --depth chip`).
+   - **Grid invariant (bug fixed 2026-06-04):** depth is defined on the
+     RECTIFIED-left grid, so tracking MUST run on the rectified left too.
+     `dense_depth_rectified_left()` returns `(rectified_left, depth)` and the
+     live loop tracks on that. Feeding the *raw* left to PnP while depth was
+     rectified read every feature's depth at the wrong pixel (raw→rectified
+     displacement: median 27 px, p95 85 px) → garbage 3D points → PnP churn.
+
+2. **The background VIO solve no longer starves the camera loop.** `run_ba()`
+   runs on a worker thread. Two fixes made it real-time:
+   - **Worker trim** (window 5→**4**, LM iters 6→**3**): ~320 ms → ~125 ms solve
+     (~30% duty at the kf-every-5 cadence), ATE on gold essentially unchanged
+     (lab_loop 184→190 mm, straight 212→236, quick 112→117; all <0.1% of path).
+   - **Vectorised `optimize_vio` (2026-06-05).** The projection/depth factor
+     assembly was a scalar Python finite-difference loop that **held the GIL**
+     for the whole solve → blocked the live read loop → frame drops → feature
+     loss on fast motion ("chỉ ăn một đoạn ngắn"). It is now batched numpy
+     (einsum + `np.add.at` scatter) that releases the GIL; the IMU factor loop
+     evaluates the 10 adjacent nav vectors directly (no per-column state copy).
+     **Validated numerically identical** to the old scalar version (A/B on the
+     self-test worlds: iters equal, cost1 diff 6e-18, state maxabs ~1e-13;
+     `vio_ba_selftest` A/B/C all PASS). Measured effect: max contiguous
+     main-thread stall while a solve runs dropped from ~120 ms (≈3–4 dropped
+     frames) to **3.45 ms** — below one frame interval, so no frame-length
+     stall. This mirrors the earlier BA + PGO GIL vectorisations; `optimize_vio`
+     was the last un-vectorised solver.
+
 ---
 
 ## 5. Concrete roadmap to "be Basalt" (ordered, each independently testable)
@@ -155,6 +194,10 @@ Do these on the `vio` path (`vio_window.py`) so production `ours` stays safe.
 3. **Analytic Jacobians.** Replace the finite-difference `optimize_vio` inner
    loop with analytic reprojection + IMU Jacobians (reuse the structure in
    `bundle.py`). Gate: matches/beats `ba` on healthy gold + ~10× faster.
+   - *Done so far (2026-06-05):* the FD assembly is **vectorised** (batched
+     numpy, GIL released) — this gave the real-time live worker (§4.1) but is
+     still finite-difference. Analytic Jacobians remain TODO for the accuracy +
+     further speed gate.
 4. **Raw-stereo triangulation** instead of the depth-map blob, so scale and
    landmarks are self-consistent with the BA. Gate: fast-push scale → ~1.0.
 5. **Keyframe management** (Basalt-style selection + window of KFs, not every
@@ -181,10 +224,18 @@ Do these on the `vio` path (`vio_window.py`) so production `ours` stays safe.
 # Live (device): our loosely-coupled VIO with the guards on
 ./run.sh --source ours --fps 60
 
+# Live (device): tight-coupled window + fully VPU-free depth (our SGM)
+./run.sh --source ours-vio                 # watch the sgm=/vo=/loop= split + drop=0
+
 # Offline scoring vs Basalt
 .venv/bin/python tools/vio_run.py --all --backend f2f    # production frontend
 .venv/bin/python tools/vio_run.py --all --backend ba     # + windowed BA
 .venv/bin/python tools/vio_run.py --all --backend vio    # tight-coupled (experimental)
+.venv/bin/python tools/vio_run.py --all --backend vio --depth ours --depth-fast  # + our SGM depth
+
+# Our from-scratch depth vs the chip depth (oracle)
+.venv/bin/python tools/stereo_selftest.py               # match rate + rel err on gold
+.venv/bin/python tools/stereo_view.py --session sessions/gold/<name>  # eyeball replay
 
 # Live-path replay without a device (reproduces the display pipeline frame-for-frame)
 .venv/bin/python tools/live_replay.py --session sessions/gold/<name> \

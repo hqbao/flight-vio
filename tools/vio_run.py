@@ -38,6 +38,7 @@ from oakd.vio import (  # noqa: E402
 )
 from oakd.vio.slam import SlamConfig       # noqa: E402
 from oakd.vio.posegraph import se3_inv  # noqa: E402
+from oakd.vio.stereo import SGMConfig, SGMStereoMatcher  # noqa: E402
 
 
 def load_basalt_positions(session_dir: Path) -> dict[int, np.ndarray]:
@@ -123,6 +124,13 @@ def main() -> int:
                          "exceeded). 0 = unlimited [0]")
     ap.add_argument("--no-gyro", action="store_true",
                     help="disable the gyro complementary rotation fusion")
+    ap.add_argument("--depth", choices=("chip", "ours"), default="chip",
+                    help="depth source fed to the VIO: 'chip' = recorded "
+                         "StereoDepth (baseline); 'ours' = our from-scratch SGM "
+                         "computed live from rectified-left + raw-right [chip]")
+    ap.add_argument("--depth-fast", action="store_true",
+                    help="with --depth ours, use the faster SGMConfig.live() "
+                         "preset (half-res, 4-path) instead of the full one")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -134,7 +142,8 @@ def main() -> int:
                        slam_radius_m=args.slam_radius,
                        slam_kf_min_trans=args.slam_kf_min_trans,
                        slam_kf_min_rot=args.slam_kf_min_rot,
-                       slam_max_kf=args.slam_max_kf, use_gyro=use_gyro)
+                       slam_max_kf=args.slam_max_kf, use_gyro=use_gyro,
+                       depth_source=args.depth, depth_fast=args.depth_fast)
 
     score_session(Path(args.session), args.max_frames, args.verbose,
                   use_imu=use_imu, backend=args.backend,
@@ -142,7 +151,8 @@ def main() -> int:
                   slam_radius_m=args.slam_radius,
                   slam_kf_min_trans=args.slam_kf_min_trans,
                   slam_kf_min_rot=args.slam_kf_min_rot,
-                  slam_max_kf=args.slam_max_kf, use_gyro=use_gyro)
+                  slam_max_kf=args.slam_max_kf, use_gyro=use_gyro,
+                  depth_source=args.depth, depth_fast=args.depth_fast)
     return 0
 
 
@@ -164,7 +174,8 @@ def basalt_ref_is_broken(positions: dict[int, np.ndarray]) -> bool:
 def run_all(use_imu: bool = True, backend: str = "f2f",
             slam_kf_every: int = 5, slam_radius_m: float = 0.0,
             slam_kf_min_trans: float = 0.0, slam_kf_min_rot: float = 0.0,
-            slam_max_kf: int = 0, use_gyro: bool = True) -> int:
+            slam_max_kf: int = 0, use_gyro: bool = True,
+            depth_source: str = "chip", depth_fast: bool = False) -> int:
     gold = Path("sessions/gold")
     rows = []
     for d in sorted(gold.iterdir()):
@@ -179,7 +190,9 @@ def run_all(use_imu: bool = True, backend: str = "f2f",
                                                 slam_kf_min_trans=slam_kf_min_trans,
                                                 slam_kf_min_rot=slam_kf_min_rot,
                                                 slam_max_kf=slam_max_kf,
-                                                use_gyro=use_gyro)
+                                                use_gyro=use_gyro,
+                                                depth_source=depth_source,
+                                                depth_fast=depth_fast)
         rows.append((d.name, res, note))
         print(f"  {d.name:18s} done")
 
@@ -220,9 +233,20 @@ def score_session(session_dir: Path, max_frames: int, verbose: bool,
                   backend: str = "f2f", slam_kf_every: int = 5,
                   slam_radius_m: float = 0.0, slam_kf_min_trans: float = 0.0,
                   slam_kf_min_rot: float = 0.0, slam_max_kf: int = 0,
-                  use_gyro: bool = True):
+                  use_gyro: bool = True, depth_source: str = "chip",
+                  depth_fast: bool = False, sgm_cfg=None):
     reader = SessionReader(session_dir)
     n = len(reader) if max_frames <= 0 else min(max_frames, len(reader))
+
+    # Depth source: 'chip' uses the recorded StereoDepth map (baseline). 'ours'
+    # rebuilds depth from scratch every frame with our SGM matcher, fed the
+    # rectified-left + RAW right frames the session stored (the matcher
+    # rectifies the right internally). This is the apples-to-apples test of
+    # whether our portable depth can drive the VIO as well as the chip's.
+    matcher = None
+    if depth_source == "ours":
+        cfg = sgm_cfg or (SGMConfig.live() if depth_fast else SGMConfig())
+        matcher = SGMStereoMatcher.from_calib(reader.calib, cfg)
     # Gyro complementary fusion: the gyro owns the inter-frame rotation and
     # vision only corrects it (weighted by inlier confidence), so fast turns --
     # especially yaw, which gravity cannot recover -- keep the attitude right
@@ -291,6 +315,9 @@ def score_session(session_dir: Path, max_frames: int, verbose: bool,
         print(f"session : {reader.dir}")
         print(f"frames  : {n}/{len(reader)}")
         print(f"imu     : {'gyro rotation prior ON' if pre else 'OFF (vision only)'}")
+        depth_tag = ("ours SGM (" + ("live" if depth_fast else "full") + ")"
+                     if matcher is not None else "chip StereoDepth")
+        print(f"depth   : {depth_tag}")
         print("running VO ...")
 
     est: dict[int, np.ndarray] = {}
@@ -303,14 +330,17 @@ def score_session(session_dir: Path, max_frames: int, verbose: bool,
     last_kf_idx = -1
     anchors: dict[int, tuple[int, np.ndarray]] = {}
     for i in range(n):
-        f = reader.load_frame(i)
+        f = reader.load_frame(i, load_right=(matcher is not None))
+        depth = f.depth_m
+        if matcher is not None:
+            depth = matcher.dense_depth(f.gray_left, f.gray_right)
         R_prior = None
         if pre is not None and prev_ts is not None:
             R_prior = pre.delta_rotation(prev_ts, f.ts_ns)
         if backend == "vio":
-            pose = vo.process(f.gray_left, f.depth_m, f.ts_ns, R_prior=R_prior)
+            pose = vo.process(f.gray_left, depth, f.ts_ns, R_prior=R_prior)
         else:
-            pose = vo.process(f.gray_left, f.depth_m, R_prior=R_prior)
+            pose = vo.process(f.gray_left, depth, R_prior=R_prior)
         prev_ts = f.ts_ns
         est[f.seq] = pose[:3, 3].copy()
         if vo.last_info.get("ok"):
@@ -320,7 +350,7 @@ def score_session(session_dir: Path, max_frames: int, verbose: bool,
             is_kf = (last_kf_idx < 0) or (frames_since_kf >= slam_kf_every)
             if is_kf:
                 frames_since_kf = 0
-                slam.add_keyframe(pose, f.gray_left, f.depth_m, seq=f.seq)
+                slam.add_keyframe(pose, f.gray_left, depth, seq=f.seq)
                 last_kf_idx = len(slam.kf_orig) - 1
             else:
                 frames_since_kf += 1

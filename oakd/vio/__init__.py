@@ -17,6 +17,15 @@ from .odometry import OdometryConfig, RGBDVisualOdometry, level_attitude
 from .posegraph import PoseGraph, se3_adjoint, se3_inv, se3_log
 from .reader import CameraCalib, Frame, SessionReader, StereoCalib
 from .slam import SlamConfig, SlamMap
+from .stereo import (
+    LeftRectifier,
+    RightRectifier,
+    SGMConfig,
+    SGMStereoMatcher,
+    StereoConfig,
+    StereoMatcher,
+    rectify_rotations,
+)
 from .vio_window import (
     WindowedVIOConfig,
     WindowedVIOMap,
@@ -57,4 +66,11 @@ __all__ = [
     "se3_log",
     "SlamConfig",
     "SlamMap",
+    "StereoConfig",
+    "StereoMatcher",
+    "SGMConfig",
+    "SGMStereoMatcher",
+    "LeftRectifier",
+    "RightRectifier",
+    "rectify_rotations",
 ]

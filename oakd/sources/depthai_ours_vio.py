@@ -2,14 +2,21 @@
 
 Unlike :mod:`oakd.sources.depthai_vio` (which reads poses out of DepthAI's
 built-in ``BasaltVIO`` node), this source runs **our own** frame-to-frame
-RGB-D PnP odometry (:class:`oakd.vio.RGBDVisualOdometry`) on the live
-rectified-left + depth stream. It exists so we can watch our VIO drive the 3D
+RGB-D PnP odometry (:class:`oakd.vio.RGBDVisualOdometry`) with depth from our
+**own** SGM stereo matcher. It exists so we can watch our VIO drive the 3D
 viewer in real time and eyeball its quality against Basalt *before* we add
 sliding-window bundle adjustment.
 
-Pipeline (same front-end as the recorder):
-    Camera CAM_B/CAM_C -> StereoDepth (depthAlign=left)
-        -> rectifiedLeft (uint8 gray) + depth (uint16 mm)
+Fully portable pipeline (NO VPU / depth library): we tap the two RAW mono
+camera frames directly and do everything ourselves --
+
+    Camera CAM_B (raw left) + CAM_C (raw right)
+        -> our Left/RightRectifier (library-free rectification)
+        -> our SGM matcher -> metric depth (float32 m)
+
+There is no ``StereoDepth`` node: the chip's stereo/depth engine is never used,
+so this front-end ports unchanged to any platform with two cameras + a CPU.
+
 
 Our odometry produces poses in the standard OpenCV **camera optical** frame
 (x right, y down, z forward), world = first frame (assumed level at start, since
@@ -205,12 +212,24 @@ class OakOursVioSource(PoseSource):
                  slam_radius_m: float = 0.0, ba_window: int = 6,
                  ba_kf_every: int = 5, ba_iters: int = 5,
                  slam_kf_min_trans: float = 0.0,
-                 slam_kf_min_rot: float = 0.0, slam_max_kf: int = 0) -> None:
+                 slam_kf_min_rot: float = 0.0, slam_max_kf: int = 0,
+                 depth_fast: bool = True) -> None:
         super().__init__()
         self.width = int(width)
         self.height = int(height)
         self.cam_fps = int(fps)
         self.backend = backend
+        # Depth feeding the VIO is ALWAYS our own from-scratch SGM matcher
+        # (oakd.vio.stereo) run live on the rectified left + the RAW syncedRight
+        # frame. The chip StereoDepth map is deliberately NOT used here: this is
+        # the portable pipeline that must run on a target platform with no VPU /
+        # depth library. (The chip-depth path lives only in the Basalt sources
+        # ``depthai_vio`` / ``depthai_slam`` and in the offline oracle
+        # ``tools/vio_run.py --depth chip`` for A/B measurement.)
+        # ``depth_fast`` uses the half-res SGMConfig.live() preset that fits the
+        # live per-frame budget (full-res SGM is too slow for real time).
+        self.depth_fast = bool(depth_fast)
+
         # SLAM update cadence: insert a keyframe (and run loop detection) every
         # ``slam_kf_every`` frames. This is the main lever for the SLAM update
         # rate -- fewer keyframes = more responsive loop closure AND a smaller
@@ -301,16 +320,12 @@ class OakOursVioSource(PoseSource):
         with dai.Pipeline() as p:
             left = p.create(dai.node.Camera).build(left_socket, sensorFps=self.cam_fps)
             right = p.create(dai.node.Camera).build(right_socket, sensorFps=self.cam_fps)
-            stereo = p.create(dai.node.StereoDepth)
             imu = p.create(dai.node.IMU)
 
-            stereo.setExtendedDisparity(False)
-            stereo.setLeftRightCheck(True)
-            stereo.setSubpixel(False)
-            stereo.setRectifyEdgeFillColor(0)
-            stereo.enableDistortionCorrection(True)
-            stereo.initialConfig.setLeftRightCheckThreshold(10)
-            stereo.setDepthAlign(left_socket)
+            # NO StereoDepth node: this is the fully portable pipeline. We pull
+            # the RAW left + RAW right frames straight from the two cameras and
+            # rectify BOTH ourselves (oakd.vio.stereo Left/RightRectifier), then
+            # run our SGM. Nothing here touches the VPU's stereo/depth engine.
 
             # Accelerometer (gravity leveling) + gyroscope (the inter-frame
             # rotation prior for the complementary fusion). The gyro is what
@@ -322,24 +337,64 @@ class OakOursVioSource(PoseSource):
             imu.setBatchReportThreshold(1)
             imu.setMaxBatchReports(10)
 
-            left.requestOutput((self.width, self.height)).link(stereo.left)
-            right.requestOutput((self.width, self.height)).link(stereo.right)
+            # Raw camera outputs (CAM_B/CAM_C are hardware frame-synced on the
+            # OAK-D, so their sequence numbers increment together; we still pair
+            # strictly by sequence below). These are unrectified -- our matcher
+            # rectifies both internally.
+            left_out = left.requestOutput((self.width, self.height))
+            right_out = right.requestOutput((self.width, self.height))
 
             # Non-blocking queues so a slow consumer never stalls the device
             # (a stalled XLink read is what triggers X_LINK_ERROR). We keep a
             # small buffer and always consume the *latest* frame below.
-            q_left = stereo.rectifiedLeft.createOutputQueue(maxSize=4, blocking=False)
-            q_depth = stereo.depth.createOutputQueue(maxSize=4, blocking=False)
+            q_left = left_out.createOutputQueue(maxSize=4, blocking=False)
+            q_right = right_out.createOutputQueue(maxSize=4, blocking=False)
             q_imu = imu.out.createOutputQueue(maxSize=50, blocking=False)
 
             p.start()
 
             # Pull rectified-left intrinsics for the metric back-projection.
             ch = p.getDefaultDevice().readCalibration()
+
             K = np.array(
                 ch.getCameraIntrinsics(left_socket, self.width, self.height),
                 dtype=np.float64,
             )
+
+            # Build our SGM matcher from the live device calibration. We
+            # assemble the same JSON shape the recorder writes (so
+            # StereoCalib.from_json applies the identical cm->m extrinsic
+            # convention) and hand it to SGMStereoMatcher, which precomputes BOTH
+            # rectification maps (left + right) once here. ``rectify_left=True``
+            # makes the matcher rectify the raw left frame too, so the whole
+            # depth path is VPU-free: nothing reads the chip's rectifiedLeft or
+            # StereoDepth output.
+            from ..vio.reader import StereoCalib
+            from ..vio.stereo import SGMConfig, SGMStereoMatcher
+
+            def _intr(sock):
+                Ki = np.array(ch.getCameraIntrinsics(
+                    sock, self.width, self.height), dtype=np.float64)
+                dist = list(ch.getDistortionCoefficients(sock))
+                return {"fx": float(Ki[0, 0]), "fy": float(Ki[1, 1]),
+                        "cx": float(Ki[0, 2]), "cy": float(Ki[1, 2]),
+                        "dist": [float(x) for x in dist],
+                        "width": int(self.width), "height": int(self.height)}
+
+            T_lr = np.array(
+                ch.getCameraExtrinsics(left_socket, right_socket),
+                dtype=np.float64).reshape(4, 4)
+            calib = StereoCalib.from_json({
+                "intrinsics_left": _intr(left_socket),
+                "intrinsics_right": _intr(right_socket),
+                "T_left_right": T_lr.tolist(),
+            })
+            sgm_cfg = SGMConfig.live() if self.depth_fast else SGMConfig()
+            matcher = SGMStereoMatcher.from_calib(calib, sgm_cfg,
+                                                  rectify_left=True)
+            print(f"[ours-vio] depth source: OURS SGM "
+                  f"({'live/half-res' if self.depth_fast else 'full'})")
+
             # IMU->left-camera rotation (for bringing accel into the optical
             # frame). depthai returns the extrinsic with translation in cm; we
             # only need the 3x3 rotation here.
@@ -493,6 +548,7 @@ class OakOursVioSource(PoseSource):
             #   vo/emit/loop ms = where the per-iteration time goes
             diag_backlog_sum = 0
             diag_recv = 0
+            diag_sgm_ms = 0.0
             diag_vo_ms = 0.0
             diag_emit_ms = 0.0
             diag_loop_ms = 0.0
@@ -556,6 +612,22 @@ class OakOursVioSource(PoseSource):
                          else np.zeros(3))
             gyro_last_ts: float | None = None
 
+            # Sequence-number pairing buffers for our SGM depth: the raw left
+            # and raw right come from SEPARATE camera outputs, so draining each
+            # queue independently to "latest" can hand SGM a MISMATCHED pair
+            # (left frame N vs right frame N-1/2) -> the disparity is then
+            # garbage and PnP loses tracking. The cameras are hardware
+            # frame-synced (shared sequence numbers), so we pair strictly by
+            # sequence: stash by seq, only match a left+right that share one.
+            pend_l: dict[int, object] = {}
+            pend_r: dict[int, object] = {}
+
+            def _seq(msg) -> int:
+                try:
+                    return int(msg.getSequenceNum())
+                except Exception:
+                    return -1
+
             while not self._stop.is_set() and p.isRunning():
                 # Drain each queue to its most recent frame; drop the backlog so
                 # that if anything briefly stalls we skip stale frames instead of
@@ -568,13 +640,39 @@ class OakOursVioSource(PoseSource):
                         break
                     ld = nxt
                     _backlog += 1
-                dd = q_depth.tryGet()
+                # Pair left+right by sequence number (see pend_l/pend_r). We
+                # already drained q_left above; stash every drained left and
+                # every available right by seq, then take the NEWEST seq that
+                # exists in both. Older partials are dropped so the buffers
+                # never grow. This guarantees SGM always gets a true stereo
+                # pair from the same capture instant.
+                rd = None
+                if ld is not None:
+                    pend_l[_seq(ld)] = ld
                 while True:
-                    nxt = q_depth.tryGet()
+                    nxt = q_right.tryGet()
                     if nxt is None:
                         break
-                    dd = nxt
-                if ld is None or dd is None:
+                    pend_r[_seq(nxt)] = nxt
+                common = pend_l.keys() & pend_r.keys()
+                if common:
+                    seq = max(common)
+                    ld = pend_l.pop(seq)
+                    rd = pend_r.pop(seq)
+                    # Drop any partials older than the one we just consumed.
+                    for k in [k for k in pend_l if k < seq]:
+                        pend_l.pop(k, None)
+                    for k in [k for k in pend_r if k < seq]:
+                        pend_r.pop(k, None)
+                else:
+                    # Bound the buffers if one stream stalls (keep newest 8).
+                    for buf in (pend_l, pend_r):
+                        if len(buf) > 8:
+                            for k in sorted(buf)[:-8]:
+                                buf.pop(k, None)
+                    ld = None       # no matched pair yet this iteration
+                if ld is None or rd is None:
+                    # No matched stereo pair this iteration; wait for one.
                     time.sleep(0.002)
                     continue
                 _iter_t0 = time.monotonic()
@@ -586,8 +684,24 @@ class OakOursVioSource(PoseSource):
                     # BGR -> luminance (Rec.601), library-free; live display only
                     gray = (gray[..., 0] * 0.114 + gray[..., 1] * 0.587
                             + gray[..., 2] * 0.299).astype(np.uint8)
-                depth_mm = dd.getCvFrame()
-                depth_m = depth_mm.astype(np.float32) / 1000.0
+                # Our from-scratch depth: SGM on the RAW left + RAW right. The
+                # matcher rectifies BOTH frames internally and returns metric
+                # depth (float32 m, 0 = invalid). No chip StereoDepth involved.
+                # CRITICAL: the depth is on the RECTIFIED-left grid, so we must
+                # also TRACK on the rectified left (returned here) -- feeding the
+                # raw left to vo.process while depth is rectified reads every
+                # feature's depth at the wrong pixel (rectification warp, several
+                # px near the edges) and degrades PnP. dense_depth_rectified_left
+                # rectifies the left exactly once and reuses it, so it costs the
+                # same as dense_depth.
+                right = rd.getCvFrame()
+                if right.ndim == 3:
+                    right = (right[..., 0] * 0.114 + right[..., 1] * 0.587
+                             + right[..., 2] * 0.299).astype(np.uint8)
+                _sgm_t0 = time.monotonic()
+                gray, depth_m = matcher.dense_depth_rectified_left(gray, right)
+                diag_sgm_ms += (time.monotonic() - _sgm_t0) * 1e3
+
 
                 # Drain the IMU queue ONCE per frame, BEFORE odometry, so we have
                 # this frame's gyro rotation prior ready for PnP. We both (a)
@@ -655,9 +769,10 @@ class OakOursVioSource(PoseSource):
                         if prev_frame_ts is not None else 1.0 / 30.0)
                 prev_frame_ts = frame_ts
 
+                _vo_t0 = time.monotonic()
                 vo.process(gray, depth_m, R_prior=R_prior,  # camera-optical world
                            dt_s=dt_f)
-                diag_vo_ms += (time.monotonic() - _iter_t0) * 1e3
+                diag_vo_ms += (time.monotonic() - _vo_t0) * 1e3
 
 
                 # --- accelerometer leveling, gated on the camera being at rest --
@@ -1036,7 +1151,8 @@ class OakOursVioSource(PoseSource):
                     n = max(diag_iter, 1)
                     print(f"[ours-vio] thru recv={diag_recv/win:4.1f}fps "
                           f"proc={frames/win:4.1f}fps drop={diag_backlog_sum} "
-                          f"vo={diag_vo_ms/n:4.1f}ms emit={diag_emit_ms/n:4.1f}ms "
+                          f"sgm={diag_sgm_ms/n:4.1f}ms vo={diag_vo_ms/n:4.1f}ms "
+                          f"emit={diag_emit_ms/n:4.1f}ms "
                           f"loop={diag_loop_ms/n:4.1f}ms")
                     print(f"[ours-vio] path  vo={diag_vo_path*1000:6.0f}mm "
                           f"filt={diag_filt_path*1000:6.0f}mm "
@@ -1046,7 +1162,7 @@ class OakOursVioSource(PoseSource):
                     frames = 0
                     last_fps_t = now
                     diag_backlog_sum = diag_recv = 0
-                    diag_vo_ms = diag_emit_ms = diag_loop_ms = 0.0
+                    diag_sgm_ms = diag_vo_ms = diag_emit_ms = diag_loop_ms = 0.0
                     diag_iter = 0
                     diag_vo_path = diag_filt_path = diag_disp_path = 0.0
 
@@ -1210,9 +1326,22 @@ class OakOursVioSource(PoseSource):
         if getattr(self, "_gyro_bias", None) is not None:
             bg0 = R_imu_cam @ self._gyro_bias
 
-        cfg = WindowedVIOConfig(window=min(self.ba_window, 5),
+        # Real-time budget for the background solve. The dense finite-difference
+        # VIO solve cost scales ~linearly with both the window length and the LM
+        # iteration count. Measured on gold (tools/vio_run.py --backend vio,
+        # per-solve run_ba timing): window=5/iters=6 costs ~320 ms median, which
+        # at the kf_every=5 submit cadence (~350-420 ms between keyframes on this
+        # host) leaves the worker busy ~90% of the time -- it saturates the CPU
+        # almost continuously and starves the main-loop SGM+KLT (the live
+        # ours-vio lag: sgm/vo inflated 2-5x, loop 45-150 ms). Trimming to
+        # window=4/iters=3 drops the solve to ~125 ms (~30% duty) and breaks the
+        # starvation, with ATE essentially unchanged across the gold sessions
+        # (lab_loop 184->190 mm, straight 212->236, quick 112->117; all <0.1%
+        # of path). The numbers are documented in
+        # /memories/repo and the sweep in the lag investigation.
+        cfg = WindowedVIOConfig(window=min(self.ba_window, 4),
                                 kf_every=self.ba_kf_every,
-                                vio=VioConfig(max_iters=6, lock_tilt=True))
+                                vio=VioConfig(max_iters=3, lock_tilt=True))
         vio_map = WindowedVIOMap(K, bg0=bg0, cfg=cfg)
 
         snap_lock = threading.Lock()

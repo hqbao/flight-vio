@@ -10,11 +10,16 @@ A recorded session on disk looks like::
             imu.jsonl        # one line per IMU sample (gyro rad/s, accel m/s^2)
             img/
                 000000_L.png     # rectified left, uint8 grayscale (H, W)
-                000000_R.png     # rectified right, uint8 grayscale (H, W)
+                000000_R.png     # synced RIGHT (raw, NOT rectified), uint8 (H, W)
                 000000_D.raw16   # depth, uint16 millimetres, row-major (H, W)
 
 Everything the from-scratch VIO needs (image, depth, IMU, calibration) is here,
 so the whole pipeline can be developed and validated without an OAK-D attached.
+
+Note: the recorder saves ``stereo.syncedRight`` as ``*_R.png``, which is the
+right frame *synced* to the left but **not** rectified (only ``rectifiedLeft`` and
+``depth`` are rectified by the chip). To block-match it against the rectified
+left you must rectify it first -- see :class:`oakd.vio.stereo.RightRectifier`.
 
 Conventions
 -----------

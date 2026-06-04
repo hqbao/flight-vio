@@ -258,44 +258,85 @@ def optimize_vio(
         lm_col[m] = n; n += 3
     ndim = n
     eps = cfg.fd_eps
+    N = obs_cam.shape[0]
+    sigma_px = cfg.sigma_px
+    huber_px = cfg.huber_px
+    depth_huber = cfg.depth_huber
 
-    # --- residual evaluators (operate on a given state) --------------------
-    def proj_raw(stt, k):
-        """Raw residual rows for observation k (pixel/sigma, depth/sigma)."""
-        i = obs_cam[k]; m = obs_lm[k]
-        Xc, Z, u, v = _project(stt.R[i], stt.p[i], stt.landmarks[m],
-                               fx, fy, cx, cy, cfg.min_view_z)
-        rpx = np.array([(u - obs_uv[k, 0]) / cfg.sigma_px,
-                        (v - obs_uv[k, 1]) / cfg.sigma_px])
-        if use_depth and obs_depth[k] > 0:
-            sz = cfg.depth_sigma_coeff * obs_depth[k] ** 2
-            rz = np.array([(Z - obs_depth[k]) / sz])
-            return np.concatenate([rpx, rz])
-        return rpx
+    # --- precomputed constants for the vectorised factor assembly ----------
+    # The projection + depth factors used to be a scalar Python loop over every
+    # observation, each finite-differencing one column at a time. Run from the
+    # background VIO worker that loop held the GIL for the whole ~100ms solve and
+    # starved the realtime camera loop (frame drops -> feature loss on fast
+    # motion). Here the identical finite-difference math is computed with batched
+    # numpy ops (which release the GIL), and the per-observation J^T J / J^T r
+    # blocks are scattered with np.add.at. Mirrors the BA/PGO vectorisations.
+    depth_mask = ((obs_depth > 0) if use_depth
+                  else np.zeros(N, dtype=bool))
+    # safe per-observation depth sigma (1.0 where no depth; that row is masked)
+    sz_all = cfg.depth_sigma_coeff * np.where(depth_mask, obs_depth, 1.0) ** 2
+    lm_base = lm_col[obs_lm]                 # (N,) landmark column base
+    pose_base_all = pose_col[obs_cam]        # (N,) pose column base, -1 anchor
+    free_obs = pose_base_all >= 0
+    pose_base_free = pose_base_all[free_obs]
+    lm_base_free = lm_base[free_obs]
+    ar_pose = np.arange(pose_dof, dtype=np.int64)
+    ar3 = np.arange(3, dtype=np.int64)
+    # Constant finite-difference rotation increments: the same pose DoF
+    # perturbation is applied to every observation, so build the Exp(eps) 3x3
+    # rotation(s) once (identical to the scalar _pose_perturb step).
+    if lock_tilt:
+        dR_yaw = so3_exp(up_axis * eps)
+    else:
+        dR_rot = np.stack([so3_exp(np.eye(3)[a] * eps) for a in range(3)])
+    fd_tiny = 1e-300
+
+    # --- batched residual evaluators ---------------------------------------
+    def _proj_uvz(Rb, pb, lmb):
+        """Vectorised _project over a batch of (R, p, landmark)."""
+        d = lmb - pb
+        Xc = np.einsum('nki,nk->ni', Rb, d)          # R^T @ (Xw - p)
+        Z = Xc[:, 2]
+        Zc = np.where(Z > cfg.min_view_z, Z, cfg.min_view_z)
+        u = fx * Xc[:, 0] / Zc + cx
+        v = fy * Xc[:, 1] / Zc + cy
+        return u, v, Z
+
+    def _rows(Rb, pb, lmb):
+        """Raw (unweighted) residual rows (N,3); depth row 0 where absent."""
+        u, v, Z = _proj_uvz(Rb, pb, lmb)
+        r = np.empty((N, 3))
+        r[:, 0] = (u - obs_uv[:, 0]) / sigma_px
+        r[:, 1] = (v - obs_uv[:, 1]) / sigma_px
+        r[:, 2] = np.where(depth_mask, (Z - obs_depth) / sz_all, 0.0)
+        return r
+
+    def _gather(stt):
+        R_arr = np.array(stt.R) if nC else np.zeros((0, 3, 3))
+        p_arr = np.array(stt.p) if nC else np.zeros((0, 3))
+        return R_arr[obs_cam], p_arr[obs_cam], stt.landmarks[obs_lm]
 
     def total_cost(stt) -> tuple[float, float]:
         cost = 0.0
-        e_sum = 0.0
-        e_cnt = 0
-        for k in range(obs_cam.shape[0]):
-            r = proj_raw(stt, k)
-            e_px = float(np.hypot(r[0], r[1])) * cfg.sigma_px
-            w = 1.0 if e_px <= cfg.huber_px else cfg.huber_px / e_px
-            # robust cost on pixel rows + robust (Huber) on the depth row
-            cost += 0.5 * w * (r[0] ** 2 + r[1] ** 2)
-            if r.shape[0] == 3:
-                sz = cfg.depth_sigma_coeff * obs_depth[k] ** 2
-                thr = cfg.depth_huber / sz
-                az = abs(r[2])
-                cost += (0.5 * r[2] ** 2 if az <= thr
-                         else thr * (az - 0.5 * thr))
-            e_sum += e_px; e_cnt += 1
+        mean_e = 0.0
+        if N:
+            R_obs, p_obs, lm_obs = _gather(stt)
+            r = _rows(R_obs, p_obs, lm_obs)
+            e_px = np.hypot(r[:, 0], r[:, 1]) * sigma_px
+            w = np.where(e_px <= huber_px, 1.0,
+                         huber_px / np.maximum(e_px, fd_tiny))
+            cost += 0.5 * float(np.sum(w * (r[:, 0] ** 2 + r[:, 1] ** 2)))
+            az = np.abs(r[:, 2])
+            thr = depth_huber / sz_all
+            dcost = np.where(az <= thr, 0.5 * r[:, 2] ** 2,
+                             thr * (az - 0.5 * thr))
+            cost += float(np.sum(np.where(depth_mask, dcost, 0.0)))
+            mean_e = float(np.mean(e_px))
         for (i, j, pre) in imu_factors:
             ri = _imu_residual(stt.R[i], stt.p[i], stt.v[i], stt.bg[i], stt.ba[i],
                                stt.R[j], stt.p[j], stt.v[j], pre, g_world, cfg)
             rb = _bias_rw_residual(stt.bg[i], stt.ba[i], stt.bg[j], stt.ba[j], cfg)
             cost += 0.5 * float(ri @ ri + rb @ rb)
-        mean_e = e_sum / max(e_cnt, 1)
         return cost, mean_e
 
     # --- one Gauss-Newton/LM linear system ---------------------------------
@@ -303,78 +344,113 @@ def optimize_vio(
         H = np.zeros((ndim, ndim))
         b = np.zeros(ndim)
 
-        # projection + depth factors
-        for k in range(obs_cam.shape[0]):
-            i = obs_cam[k]; m = obs_lm[k]
-            r0 = proj_raw(stt, k)
-            rows = r0.shape[0]
-            # local free columns: pose i (if free) then landmark m
-            idx = []
-            if pose_col[i] >= 0:
-                idx.extend(range(pose_col[i], pose_col[i] + pose_dof))
-            idx.extend(range(lm_col[m], lm_col[m] + 3))
-            idx = np.asarray(idx, np.int64)
-            J = np.zeros((rows, idx.shape[0]))
+        # projection + depth factors (vectorised over all observations)
+        if N:
+            R_obs, p_obs, lm_obs = _gather(stt)
+            ncol = pose_dof + 3
+            r0 = _rows(R_obs, p_obs, lm_obs)
+            J = np.empty((N, 3, ncol))
             col = 0
-            if pose_col[i] >= 0:
-                for d in range(pose_dof):
-                    dd = np.zeros(pose_dof); dd[d] = eps
-                    Rp, pp = _pose_perturb(stt.R[i], stt.p[i], dd, up_axis)
-                    Xc, Z, u, v = _project(Rp, pp, stt.landmarks[m],
-                                           fx, fy, cx, cy, cfg.min_view_z)
-                    rp = np.array([(u - obs_uv[k, 0]) / cfg.sigma_px,
-                                   (v - obs_uv[k, 1]) / cfg.sigma_px])
-                    if rows == 3:
-                        sz = cfg.depth_sigma_coeff * obs_depth[k] ** 2
-                        rp = np.concatenate([rp, [(Z - obs_depth[k]) / sz]])
-                    J[:, col] = (rp - r0) / eps
+            # pose translation columns: p <- p + R @ (eps e_d) = p + eps R[:,d]
+            for dax in range(3):
+                pp = p_obs + eps * R_obs[:, :, dax]
+                J[:, :, col] = (_rows(R_obs, pp, lm_obs) - r0) / eps
+                col += 1
+            # pose rotation column(s): R <- R Exp(eps e_a) (or yaw-only locked)
+            if lock_tilt:
+                Rp = np.einsum('ij,njk->nik', dR_yaw, R_obs)
+                J[:, :, col] = (_rows(Rp, p_obs, lm_obs) - r0) / eps
+                col += 1
+            else:
+                for a in range(3):
+                    Rp = np.einsum('nij,jk->nik', R_obs, dR_rot[a])
+                    J[:, :, col] = (_rows(Rp, p_obs, lm_obs) - r0) / eps
                     col += 1
-            for d in range(3):
-                lm2 = stt.landmarks[m].copy(); lm2[d] += eps
-                Xc, Z, u, v = _project(stt.R[i], stt.p[i], lm2,
-                                       fx, fy, cx, cy, cfg.min_view_z)
-                rp = np.array([(u - obs_uv[k, 0]) / cfg.sigma_px,
-                               (v - obs_uv[k, 1]) / cfg.sigma_px])
-                if rows == 3:
-                    sz = cfg.depth_sigma_coeff * obs_depth[k] ** 2
-                    rp = np.concatenate([rp, [(Z - obs_depth[k]) / sz]])
-                J[:, col] = (rp - r0) / eps
+            # landmark columns
+            for dax in range(3):
+                lp = lm_obs.copy()
+                lp[:, dax] += eps
+                J[:, :, col] = (_rows(R_obs, p_obs, lp) - r0) / eps
                 col += 1
 
-            # robust (Huber) sqrt-weight on the pixel rows, IRLS-style: weight
-            # from the current residual, held fixed across this linearisation.
-            e_px = float(np.hypot(r0[0], r0[1])) * cfg.sigma_px
-            sw = 1.0 if e_px <= cfg.huber_px else np.sqrt(cfg.huber_px / e_px)
+            # IRLS robust sqrt-weights from the current residual (held fixed
+            # across this linearisation), identical to the scalar version.
             r = r0.copy()
-            r[0] *= sw; r[1] *= sw
-            J[0, :] *= sw; J[1, :] *= sw
-            # same IRLS sqrt-weight on the depth row (robustify depth outliers,
-            # matching bundle.optimize so noisy RGB-D points don't drag poses).
-            if rows == 3:
-                sz = cfg.depth_sigma_coeff * obs_depth[k] ** 2
-                thr = cfg.depth_huber / sz
-                az = abs(r0[2])
-                dw = 1.0 if az <= thr else np.sqrt(thr / max(az, 1e-12))
-                r[2] *= dw
-                J[2, :] *= dw
+            e_px = np.hypot(r0[:, 0], r0[:, 1]) * sigma_px
+            sw = np.where(e_px <= huber_px, 1.0,
+                          np.sqrt(huber_px / np.maximum(e_px, fd_tiny)))
+            r[:, 0] *= sw
+            r[:, 1] *= sw
+            J[:, 0, :] *= sw[:, None]
+            J[:, 1, :] *= sw[:, None]
+            az = np.abs(r0[:, 2])
+            thr = depth_huber / sz_all
+            dw = np.where(az <= thr, 1.0,
+                          np.sqrt(thr / np.maximum(az, 1e-12)))
+            dw = np.where(depth_mask, dw, 1.0)
+            r[:, 2] *= dw
+            J[:, 2, :] *= dw[:, None]
 
-            H[np.ix_(idx, idx)] += J.T @ J
-            b[idx] += J.T @ r
+            Jp = J[:, :, :pose_dof]
+            Jl = J[:, :, pose_dof:]
 
-        # IMU + bias-rw factors
+            # landmark-landmark block + landmark rhs (every observation)
+            Hll = np.einsum('nri,nrj->nij', Jl, Jl)
+            bl = np.einsum('nri,nr->ni', Jl, r)
+            lm_rows = (lm_base[:, None, None] + ar3[None, :, None]
+                       + np.zeros((1, 1, 3), np.int64))
+            lm_cols = (lm_base[:, None, None] + ar3[None, None, :]
+                       + np.zeros((1, 3, 1), np.int64))
+            np.add.at(H, (lm_rows.ravel(), lm_cols.ravel()), Hll.ravel())
+            np.add.at(b, (lm_base[:, None] + ar3[None, :]).ravel(), bl.ravel())
+
+            # pose blocks (only free, non-anchor poses)
+            if pose_base_free.size:
+                Jpf = Jp[free_obs]
+                Jlf = Jl[free_obs]
+                rf = r[free_obs]
+                Hpp = np.einsum('nri,nrj->nij', Jpf, Jpf)
+                Hpl = np.einsum('nri,nrj->nij', Jpf, Jlf)
+                bp = np.einsum('nri,nr->ni', Jpf, rf)
+                pp_rows = (pose_base_free[:, None, None]
+                           + ar_pose[None, :, None]
+                           + np.zeros((1, 1, pose_dof), np.int64))
+                pp_cols = (pose_base_free[:, None, None]
+                           + ar_pose[None, None, :]
+                           + np.zeros((1, pose_dof, 1), np.int64))
+                np.add.at(H, (pp_rows.ravel(), pp_cols.ravel()), Hpp.ravel())
+                np.add.at(b, (pose_base_free[:, None]
+                              + ar_pose[None, :]).ravel(), bp.ravel())
+                # pose-landmark cross blocks (+ symmetric transpose)
+                pl_rows = (pose_base_free[:, None, None]
+                           + ar_pose[None, :, None]
+                           + np.zeros((1, 1, 3), np.int64))
+                pl_cols = (lm_base_free[:, None, None]
+                           + ar3[None, None, :]
+                           + np.zeros((1, pose_dof, 1), np.int64))
+                # H[pose+a, lm+b] += Hpl[n,a,b]; the symmetric H[lm+b, pose+a]
+                # gets the SAME value (Jl^T Jp)[b,a] == Hpl[n,a,b], so reuse the
+                # ravel with the row/col index arrays swapped (do NOT transpose
+                # the value array -- its [n,a,b] order must match the indices).
+                np.add.at(H, (pl_rows.ravel(), pl_cols.ravel()), Hpl.ravel())
+                np.add.at(H, (pl_cols.ravel(), pl_rows.ravel()), Hpl.ravel())
+
+        # IMU + bias-rw factors (few factors -> scalar FD, but evaluated on the
+        # 10 nav vectors of the two adjacent keyframes directly: no VioState /
+        # landmark copies per perturbation column, so the per-column GIL-held
+        # Python work is minimal).
+        def _imu_eval(pre, Ri, pi, vi, bgi, bai, Rj, pj, vj, bgj, baj):
+            ri = _imu_residual(Ri, pi, vi, bgi, bai, Rj, pj, vj,
+                               pre, g_world, cfg)
+            rb = _bias_rw_residual(bgi, bai, bgj, baj, cfg)
+            return np.concatenate([ri, rb])
+
         for (i, j, pre) in imu_factors:
-            def res(stt2):
-                ri = _imu_residual(stt2.R[i], stt2.p[i], stt2.v[i],
-                                   stt2.bg[i], stt2.ba[i],
-                                   stt2.R[j], stt2.p[j], stt2.v[j],
-                                   pre, g_world, cfg)
-                rb = _bias_rw_residual(stt2.bg[i], stt2.ba[i],
-                                       stt2.bg[j], stt2.ba[j], cfg)
-                return np.concatenate([ri, rb])
-
-            r0 = res(stt)
-            rows = r0.shape[0]
-            # local variable blocks: (var arrays, col base, size)
+            base_vals = [stt.R[i], stt.p[i], stt.v[i], stt.bg[i], stt.ba[i],
+                         stt.R[j], stt.p[j], stt.v[j], stt.bg[j], stt.ba[j]]
+            r0i = _imu_eval(pre, *base_vals)
+            rows = r0i.shape[0]
+            # local variable blocks: (kind, keyframe, col base, size)
             blocks = []
             if pose_col[i] >= 0:
                 blocks.append(("pose", i, pose_col[i], pose_dof))
@@ -391,27 +467,29 @@ def optimize_vio(
             for _, _, base, size in blocks:
                 idx.extend(range(base, base + size))
             idx = np.asarray(idx, np.int64)
-            J = np.zeros((rows, idx.shape[0]))
+            Ji = np.zeros((rows, idx.shape[0]))
 
+            # slot of each variable in base_vals: i-side 0..4, j-side 5..9
+            # (pose occupies the R,p pair at slots 0/1 and 5/6).
+            base_slot = {i: 0, j: 5}
+            kind_off = {"pose": 0, "vel": 2, "bg": 3, "ba": 4}
             col = 0
             for kind, vi, base, size in blocks:
+                s0 = base_slot[vi]
                 for d in range(size):
-                    stt2 = stt.copy()
+                    vals = list(base_vals)
                     if kind == "pose":
                         dd = np.zeros(pose_dof); dd[d] = eps
-                        stt2.R[vi], stt2.p[vi] = _pose_perturb(
+                        vals[s0], vals[s0 + 1] = _pose_perturb(
                             stt.R[vi], stt.p[vi], dd, up_axis)
-                    elif kind == "vel":
-                        stt2.v[vi] = stt.v[vi].copy(); stt2.v[vi][d] += eps
-                    elif kind == "bg":
-                        stt2.bg[vi] = stt.bg[vi].copy(); stt2.bg[vi][d] += eps
-                    else:  # ba
-                        stt2.ba[vi] = stt.ba[vi].copy(); stt2.ba[vi][d] += eps
-                    J[:, col] = (res(stt2) - r0) / eps
+                    else:
+                        si = s0 + kind_off[kind]
+                        v = vals[si].copy(); v[d] += eps; vals[si] = v
+                    Ji[:, col] = (_imu_eval(pre, *vals) - r0i) / eps
                     col += 1
 
-            H[np.ix_(idx, idx)] += J.T @ J
-            b[idx] += J.T @ r0
+            H[np.ix_(idx, idx)] += Ji.T @ Ji
+            b[idx] += Ji.T @ r0i
 
         return H, b
 
