@@ -56,6 +56,11 @@ class KeyframeAppearance:
 
     def __init__(self, gray: np.ndarray, depth_m: np.ndarray, K: np.ndarray,
                  orb: cv2.ORB, cfg: LoopConfig):
+        # ORB requires CV_8UC1; the live path now feeds the float32 rectified
+        # left image (bilinear remap can land slightly outside [0,255]), so
+        # clip + cast defensively for every caller (live + offline).
+        if gray.dtype != np.uint8:
+            gray = np.clip(gray, 0, 255).astype(np.uint8)
         kps, desc = orb.detectAndCompute(gray, None)
         self.K = K
         if desc is None or len(kps) == 0:
