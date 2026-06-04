@@ -79,7 +79,35 @@ co-tested values here as we find them.
 | 640×400 | 1.00 | baseline (tuned) | 400 | 12 | 21 | 3 | 2.0 | 96 | 800 | reference; gold ATE corridor 0.61% |
 | 480×300 | 0.75 | auto (untested) | 300 | 9.0 | 15 | 3 | 1.5 | 72 | 600 | — |
 | 320×200 | 0.50 | auto (untested) | 200 | 6.0 | 11 | 2 | 1.0 | 48 | 400 | — |
-| 160×100 | 0.25 | auto (untested) | 100 | 4.0 | 7 | 1 | 1.0 | 32 | 200 | floors hit; likely too small for SLAM |
+| 160×100 | 0.25 | auto (untested) | 100 | 4.0 | 7 | 1 | 1.0 | 32 | 200 | floors hit; recommended low-res **floor** for VIO |
 
 Update the **Status** column to `co-tested` and fill the **Notes** with the
 measured ATE / observations once we run each on device.
+
+## How small can it go? (measured)
+
+Offline probe on the `corridor_60s` gold stereo (downscale the real frames,
+rescale the calib, run the live SGM preset + the scaled Shi-Tomasi corners) plus
+a device run of the live preview at 54×42:
+
+| Resolution | s | Depth coverage | Corners | Verdict |
+|---|---|---|---|---|
+| 640×400 | 1.00 | ~45% | 146 | reference |
+| 320×200 | 0.50 | ~54% | 104 | healthy |
+| 160×100 | 0.25 | ~58% | 75 | healthy — **recommended floor** |
+| 96×60 | 0.15 | ~50% | 38 | edge; usable, fewer tracks |
+| 54×42 | ~0.08 | ~30% | 14 | runs (device-confirmed, no crash) but **less accurate** than higher res — coverage and corner count drop sharply, so the pose jitters/drifts more |
+
+Notes:
+
+- The SGM `live()` preset uses `downscale=2`, which internally **halves**
+  `num_disparities`, so stereo stays geometrically valid (internal ndisp <
+  compute width) even at 54×42 — the tiny sizes get *less accurate*, not broken.
+- **54×42 runs but is marginal**: with ~14 corners and ~30% depth coverage the
+  VIO has little to bind to, so it drifts more than higher resolutions. Use it
+  only when CPU is the hard constraint and some jitter is acceptable.
+- **160×100 is the practical floor** for VIO (≈58% coverage, ≈75 corners): much
+  lighter than 640×400 while still tracking well. **96×60** is the edge if you
+  need maximum lightness.
+- Preview any size live first (matches the VIO depth path exactly):
+  `python tools/stereo_view.py --live --fast --width 160 --height 100`.
