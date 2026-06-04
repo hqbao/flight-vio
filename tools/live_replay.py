@@ -55,7 +55,8 @@ _REST_MOTION_THRESH = 0.35   # m/s^2, same as the live source
 
 def replay(session_dir: Path, max_frames: int = 0, verbose: bool = False,
            no_accel: bool = False, decimate: int = 1, lock_trans: bool = False,
-           vel_damp: float = 0.9):
+           vel_damp: float = 0.9, resolve_disagree: bool = False,
+           clamp_speed: float = 0.0, min_inliers: int = 0):
     reader = SessionReader(session_dir)
     K = reader.K
     imu = reader.load_imu()
@@ -80,7 +81,10 @@ def replay(session_dir: Path, max_frames: int = 0, verbose: bool = False,
         accel0_cam = None
 
     od_cfg = OdometryConfig(gyro_fuse=True,
-                            lock_translation_to_rotation=lock_trans)
+                            lock_translation_to_rotation=lock_trans,
+                            resolve_translation_on_disagree=resolve_disagree,
+                            max_translation_speed=clamp_speed,
+                            min_inliers_for_translation=min_inliers)
     vo = RGBDVisualOdometry(K, od_cfg)
     if accel0_cam is not None:
         vo.align_to_gravity(accel0_cam)
@@ -134,7 +138,11 @@ def replay(session_dir: Path, max_frames: int = 0, verbose: bool = False,
         R_prior = (R_imu_cam @ R_imu_accum @ R_imu_cam.T
                    if gyro_cnt > 0 else None)
 
-        vo.process(gray, depth, R_prior=R_prior)
+        dt_f = ((fr.ts_ns - prev_frame_ts) * 1e-9
+                if prev_frame_ts is not None else 1.0 / 20.0)
+        prev_frame_ts = fr.ts_ns
+
+        vo.process(gray, depth, R_prior=R_prior, dt_s=dt_f)
         n_proc += 1
         if not bool(vo.last_info.get("ok", False)):
             n_fail += 1
@@ -159,9 +167,6 @@ def replay(session_dir: Path, max_frames: int = 0, verbose: bool = False,
         R_wc = vo.pose[:3, :3]
         gyro_deg = (float(np.degrees(np.linalg.norm(
             cv2.Rodrigues(R_imu_accum)[0]))) if gyro_cnt > 0 else 0.0)
-        dt_f = ((fr.ts_ns - prev_frame_ts) * 1e-9
-                if prev_frame_ts is not None else 1.0 / 20.0)
-        prev_frame_ts = fr.ts_ns
         vo_t_now = vo.pose[:3, 3].copy()
         vis_ok = bool(vo.last_info.get("ok", False))
         dp_vis = (vo_t_now - prev_vo_t) if (prev_vo_t is not None and vis_ok) else None
@@ -244,6 +249,16 @@ def main():
                          " matching the live source)")
     ap.add_argument("--vel-damp", type=float, default=0.9, dest="vel_damp",
                     help="velocity decay on vision-failure coast (1.0 = hold)")
+    ap.add_argument("--resolve-disagree", action="store_true",
+                    dest="resolve_disagree",
+                    help="re-solve translation with the gyro rotation held fixed"
+                         " when vision disagrees (anti-freeze under shake)")
+    ap.add_argument("--clamp", type=float, default=0.0, dest="clamp_speed",
+                    help="physical per-frame translation speed clamp (m/s); 0"
+                         " = off. Caps non-physical phantom jumps (anti-wobble)")
+    ap.add_argument("--min-inliers", type=int, default=0, dest="min_inliers",
+                    help="freeze translation when PnP inliers < this (white-wall"
+                         " / textureless freeze); 0 = off")
     args = ap.parse_args()
 
     if args.all:
@@ -254,10 +269,14 @@ def main():
 
     for sd in sessions:
         print(f"=== {sd}  (no_accel={args.no_accel} decimate={args.decimate} "
-              f"lock={args.lock}) ===")
+              f"lock={args.lock} resolve_disagree={args.resolve_disagree} "
+              f"clamp={args.clamp_speed} min_inliers={args.min_inliers}) ===")
         positions = replay(sd, max_frames=args.max_frames, verbose=args.verbose,
                             no_accel=args.no_accel, decimate=args.decimate,
-                            lock_trans=args.lock, vel_damp=args.vel_damp)
+                            lock_trans=args.lock, vel_damp=args.vel_damp,
+                            resolve_disagree=args.resolve_disagree,
+                            clamp_speed=args.clamp_speed,
+                            min_inliers=args.min_inliers)
         score(sd, positions)
         print()
     return 0

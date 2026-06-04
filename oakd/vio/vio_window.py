@@ -100,6 +100,16 @@ class VioConfig:
     huber_px: float = 2.0           # robust threshold on pixel residual
     use_depth: bool = True
     min_view_z: float = 1e-3
+    # When True the camera ROLL/PITCH (tilt relative to gravity) is HELD FIXED
+    # during optimisation: each pose only has 4 free DoF -- 3 translation + 1 YAW
+    # about the world-vertical axis -- instead of the full 6. The accelerometer
+    # (via the IMU factor's gravity term, and the f2f gravity-levelling that
+    # seeds the input pose) already owns tilt absolutely; locking it stops the
+    # reprojection factors from drifting roll/pitch and stops gravity leaking
+    # into a horizontal translation. Vision/depth then refine only what the IMU
+    # cannot observe: yaw and position. Default False keeps the full 6-DoF
+    # solve (and the byte-identical self-test recovery of a perturbed tilt).
+    lock_tilt: bool = False
     # LM
     max_iters: int = 30
     init_lambda: float = 1e-3
@@ -166,12 +176,20 @@ def _bias_rw_residual(bg_i, ba_i, bg_j, ba_j, cfg) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------- #
-# Pose perturbation helper (R <- R Exp(dphi), p <- p + R dp)
+# Pose perturbation helper.
+#   Full 6-DoF (up_axis None):  d = [dp(3), dphi(3)], R <- R Exp(dphi).
+#   Tilt-locked 4-DoF (up_axis): d = [dp(3), dyaw(1)], R <- Exp(up_axis*dyaw) R.
+# In the tilt-locked case the yaw increment is a rotation about the WORLD
+# vertical axis applied on the LEFT, so the gravity direction expressed in the
+# body frame (R^T @ down_world) is unchanged -- i.e. roll/pitch stay fixed and
+# only the heading (yaw) moves. Translation stays a body-frame perturbation in
+# both cases.
 # --------------------------------------------------------------------------- #
-def _pose_perturb(R, p, d6):
-    dp = d6[:3]
-    dphi = d6[3:]
-    return R @ so3_exp(dphi), p + R @ dp
+def _pose_perturb(R, p, d, up_axis=None):
+    dp = d[:3]
+    if up_axis is None:
+        return R @ so3_exp(d[3:6]), p + R @ dp
+    return so3_exp(up_axis * d[3]) @ R, p + R @ dp
 
 
 # --------------------------------------------------------------------------- #
@@ -213,6 +231,15 @@ def optimize_vio(
                  else np.zeros(obs_cam.shape[0]))
 
     # --- column layout -----------------------------------------------------
+    # tilt-lock: pose has 4 free DoF (3 translation + 1 yaw) instead of 6, with
+    # the yaw perturbation about the world-vertical (gravity) axis.
+    lock_tilt = bool(cfg.lock_tilt)
+    pose_dof = 4 if lock_tilt else 6
+    up_axis = None
+    if lock_tilt:
+        gn = float(np.linalg.norm(g_world))
+        up_axis = (g_world / gn) if gn > 1e-9 else np.array([0.0, 1.0, 0.0])
+
     pose_col = np.full(nC, -1, np.int64)
     vel_col = np.zeros(nC, np.int64)
     bg_col = np.zeros(nC, np.int64)
@@ -221,7 +248,7 @@ def optimize_vio(
     for i in range(nC):
         if i != anchor:
             pose_col[i] = n
-            n += 6
+            n += pose_dof
     for i in range(nC):
         vel_col[i] = n; n += 3
         bg_col[i] = n; n += 3
@@ -284,15 +311,15 @@ def optimize_vio(
             # local free columns: pose i (if free) then landmark m
             idx = []
             if pose_col[i] >= 0:
-                idx.extend(range(pose_col[i], pose_col[i] + 6))
+                idx.extend(range(pose_col[i], pose_col[i] + pose_dof))
             idx.extend(range(lm_col[m], lm_col[m] + 3))
             idx = np.asarray(idx, np.int64)
             J = np.zeros((rows, idx.shape[0]))
             col = 0
             if pose_col[i] >= 0:
-                for d in range(6):
-                    d6 = np.zeros(6); d6[d] = eps
-                    Rp, pp = _pose_perturb(stt.R[i], stt.p[i], d6)
+                for d in range(pose_dof):
+                    dd = np.zeros(pose_dof); dd[d] = eps
+                    Rp, pp = _pose_perturb(stt.R[i], stt.p[i], dd, up_axis)
                     Xc, Z, u, v = _project(Rp, pp, stt.landmarks[m],
                                            fx, fy, cx, cy, cfg.min_view_z)
                     rp = np.array([(u - obs_uv[k, 0]) / cfg.sigma_px,
@@ -350,12 +377,12 @@ def optimize_vio(
             # local variable blocks: (var arrays, col base, size)
             blocks = []
             if pose_col[i] >= 0:
-                blocks.append(("pose", i, pose_col[i], 6))
+                blocks.append(("pose", i, pose_col[i], pose_dof))
             blocks.append(("vel", i, vel_col[i], 3))
             blocks.append(("bg", i, bg_col[i], 3))
             blocks.append(("ba", i, ba_col[i], 3))
             if pose_col[j] >= 0:
-                blocks.append(("pose", j, pose_col[j], 6))
+                blocks.append(("pose", j, pose_col[j], pose_dof))
             blocks.append(("vel", j, vel_col[j], 3))
             blocks.append(("bg", j, bg_col[j], 3))
             blocks.append(("ba", j, ba_col[j], 3))
@@ -371,9 +398,9 @@ def optimize_vio(
                 for d in range(size):
                     stt2 = stt.copy()
                     if kind == "pose":
-                        d6 = np.zeros(6); d6[d] = eps
+                        dd = np.zeros(pose_dof); dd[d] = eps
                         stt2.R[vi], stt2.p[vi] = _pose_perturb(
-                            stt.R[vi], stt.p[vi], d6)
+                            stt.R[vi], stt.p[vi], dd, up_axis)
                     elif kind == "vel":
                         stt2.v[vi] = stt.v[vi].copy(); stt2.v[vi][d] += eps
                     elif kind == "bg":
@@ -392,8 +419,9 @@ def optimize_vio(
         out = stt.copy()
         for i in range(nC):
             if pose_col[i] >= 0:
-                d6 = delta[pose_col[i]:pose_col[i] + 6]
-                out.R[i], out.p[i] = _pose_perturb(stt.R[i], stt.p[i], d6)
+                dd = delta[pose_col[i]:pose_col[i] + pose_dof]
+                out.R[i], out.p[i] = _pose_perturb(stt.R[i], stt.p[i], dd,
+                                                   up_axis)
             out.v[i] = stt.v[i] + delta[vel_col[i]:vel_col[i] + 3]
             out.bg[i] = stt.bg[i] + delta[bg_col[i]:bg_col[i] + 3]
             out.ba[i] = stt.ba[i] + delta[ba_col[i]:ba_col[i] + 3]
@@ -519,14 +547,16 @@ class WindowedVIOConfig:
     # at rest the accelerometer reads +g upward, so g_world points +y.
     g_world: tuple = (0.0, 9.81, 0.0)
     use_imu: bool = True         # set False to A/B the IMU factors (diagnostic)
-    # IMU factor sigmas are deliberately LOOSE: when vision is healthy (the gold
-    # sessions) the visual reprojection+depth residuals are mm-tight, so a loose
-    # IMU factor is a near-no-op and ATE matches pure BA. It only takes over when
-    # vision produces a gross phantom translation -- e.g. fast in-place yaw, where
-    # the true linear acceleration is ~0 so the IMU says "velocity unchanged =>
-    # no translation", killing the drift the vision-only path leaves behind.
+    # The windowed VIO solves each pose with roll/pitch LOCKED (lock_tilt): the
+    # accelerometer owns tilt absolutely (gravity is an absolute reference), so
+    # the joint solve only refines what the IMU cannot observe -- yaw + position
+    # + velocity + scale. Locking tilt removes the 2 DoF where gravity used to
+    # leak into a horizontal translation (corridor scale drift) and where the
+    # reprojection factors could fight the IMU. The IMU vel/pos sigmas are TIGHT
+    # so the accelerometer (not the blur-biased RGB-D depth) anchors metric scale.
     vio: VioConfig = field(default_factory=lambda: VioConfig(
-        max_iters=12, sigma_rot=0.02, sigma_vel=0.15, sigma_pos=0.15))
+        max_iters=12, sigma_rot=0.02, sigma_vel=0.03, sigma_pos=0.03,
+        lock_tilt=True))
 
 
 class WindowedVIOMap:

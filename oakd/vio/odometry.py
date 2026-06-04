@@ -197,6 +197,64 @@ class OdometryConfig:
     # offline score (f2f/ba/slam) and the regression suite stay byte-for-byte
     # unchanged; the live source turns it on for all backends.
     lock_translation_to_rotation: bool = False
+    # --- re-solve translation when vision disagrees with gyro (opt-in) -------
+    # The honest middle ground between full ``lock_translation_to_rotation``
+    # (re-solve EVERY frame -> injects lateral error on a straight push when the
+    # gyro carries a small bias/extrinsic error) and the legacy disagreement
+    # damping (multiply the translation by ``t_trust`` -> ZEROES real forward
+    # motion whenever vision under-rotates, the "move + shake and it freezes"
+    # symptom). When enabled, on a frame where the vision rotation disagrees with
+    # the gyro by more than ``gyro_disagree_deg`` (KLT slipped under shake), we
+    # RE-ESTIMATE the translation with the trusted gyro-fused rotation held fixed
+    # (``_translation_given_rotation``) and KEEP it -- this removes the
+    # rotational-flow phantom at the source (a pure yaw -> t~0) while preserving a
+    # real forward push (its translation survives the rotation-locked solve). The
+    # legacy ``t_trust`` multiply is then skipped (it would re-zero the recovered
+    # translation). HEALTHY frames (disagreement below the gate, i.e. all of
+    # gold) are untouched -> joint PnP ``tvec`` as before, so the regression suite
+    # stays byte-for-byte unchanged. This is the loosely-coupled analog of what
+    # Basalt does (drop slipped tracks via the forward-backward check, then let
+    # the IMU own rotation while translation is still estimated). Default OFF; the
+    # live source turns it on.
+    resolve_translation_on_disagree: bool = False
+    # --- physical per-frame translation speed clamp (opt-in, default OFF) ----
+    # Under a hard/fast hand shake or a very fast in-place yaw, the surviving KLT
+    # tracks are low-parallax and PnP turns the rotational image flow into a
+    # spurious translation -- a per-frame "jump" much larger than any real hand
+    # motion. Integrated, these jumps make the displayed path wobble like a
+    # roller-coaster even though the net stays put (the "đi tàu lượn" symptom).
+    # There is no vision-only signal that separates a phantom jump from a real
+    # one (their magnitudes overlap), but a PHYSICAL upper bound does exist: a
+    # hand cannot translate a camera faster than a few m/s. When this is > 0 and
+    # the per-frame interval ``dt_s`` is known, the solved translation is clamped
+    # so its implied speed never exceeds ``max_translation_speed`` (m/s) -- this
+    # caps only the non-physical spikes (the visible wobble) and leaves every
+    # real, in-budget motion untouched. fps-independent (scales with dt). Default
+    # 0.0 (off) so offline gold / the regression suite are byte-for-byte
+    # unchanged (gold per-frame motion is well under any sane bound); the live
+    # source sets a generous value.
+    max_translation_speed: float = 0.0
+    # --- freeze translation on untrustworthy vision (opt-in, default OFF) ----
+    # Pointing at a textureless surface (white wall / blank screen) the KLT
+    # tracker still fills its corner budget with garbage corners, so
+    # ``n_tracks`` stays high and is NOT a usable signal. But those garbage
+    # tracks have no consistent depth+geometry, so PnP's RANSAC keeps only a
+    # handful of inliers (measured: white-wall ``n_inliers`` median 0, p95 11;
+    # a real fast push has median ~140). solvePnP still "succeeds" on those few
+    # garbage inliers and returns a meaningless translation that walks the body
+    # off in an undefined direction (the "white wall + move -> drifts randomly"
+    # symptom). When this is > 0 and PnP returns fewer than this many inliers,
+    # the translation is FROZEN: the rotation is still advanced by the gyro (so
+    # the body tracks any turn) but the position is held put -- the honest
+    # behaviour when vision cannot be trusted, consistent with staying still on
+    # a covered camera. Unlike a fast-motion dropout this is NOT coasted: a
+    # white wall carries no real motion to coast. The gate is well below the
+    # inlier count of any real motion (fast-push p25 = 33, still ~36), so normal
+    # use is untouched; the ~8% of fast-push frames that do dip below it are
+    # frames that genuinely lost tracking, where freezing for one frame is
+    # correct anyway. Default 0 (off) -> offline gold byte-for-byte unchanged;
+    # the live source enables it.
+    min_inliers_for_translation: int = 0
 
 
 
@@ -292,12 +350,18 @@ class RGBDVisualOdometry:
         return np.array([(u - cx) * z / fx, (v - cy) * z / fy, z])
 
     def process(self, gray: np.ndarray, depth_m: np.ndarray,
-                R_prior: np.ndarray | None = None) -> np.ndarray:
+                R_prior: np.ndarray | None = None,
+                dt_s: float | None = None) -> np.ndarray:
         """Advance odometry by one frame; returns the current 4x4 world pose.
 
         ``R_prior`` (optional) is the predicted previous->current camera rotation
         (e.g. from gyro preintegration). When given it seeds the PnP solver, which
         helps a lot during fast rotation where KLT correspondences are sparse.
+
+        ``dt_s`` (optional) is the time since the previous processed frame in
+        seconds; when given together with ``max_translation_speed`` it bounds the
+        per-frame translation to a physically plausible hand speed (clamps the
+        non-physical phantom jumps that make the path wobble under shake/yaw).
         """
         state = self.frontend.process(gray)
         cur_obs = {int(i): p for i, p in zip(state.ids, state.points)}
@@ -353,6 +417,22 @@ class RGBDVisualOdometry:
                     R, _ = cv2.Rodrigues(rvec)
                     ninl = int(len(inliers))
                     t_use = tvec.reshape(3)
+                    # Freeze translation when vision is untrustworthy (too few
+                    # inliers -> textureless / white wall). Advance rotation by
+                    # the gyro but hold the position put; do NOT coast (no real
+                    # motion to coast on a blank wall). Off when the gate is 0.
+                    if (self.cfg.min_inliers_for_translation > 0
+                            and ninl < self.cfg.min_inliers_for_translation):
+                        info["n_inliers"] = ninl
+                        info["reason"] = "low_inliers_frozen"
+                        if self.cfg.gyro_fuse and R_prior is not None:
+                            T_pc = np.eye(4)
+                            T_pc[:3, :3] = np.asarray(R_prior, dtype=np.float64).T
+                            self.pose = self.pose @ np.linalg.inv(T_pc)
+                        self._prev_obs = cur_obs
+                        self._prev_depth = depth_m
+                        self.last_info = info
+                        return self.pose
                     if self.cfg.gyro_fuse and R_prior is not None:
                         # Gyro owns rotation; vision corrects it, weighted by
                         # confidence (inlier count). Then re-estimate translation
@@ -394,6 +474,14 @@ class RGBDVisualOdometry:
                         if self.cfg.lock_translation_to_rotation:
                             t_use = _translation_given_rotation(
                                 obj[idx], img[idx], R_fused, self.K)
+                        elif (self.cfg.resolve_translation_on_disagree
+                                and disagree_deg > self.cfg.gyro_disagree_deg):
+                            # Vision rotation is suspect (KLT slip under shake):
+                            # recover the REAL translation with the gyro rotation
+                            # held fixed instead of zeroing it. A pure yaw -> ~0;
+                            # a real forward push survives.
+                            t_use = _translation_given_rotation(
+                                obj[idx], img[idx], R_fused, self.K)
                         else:
                             dev = float(np.degrees(np.linalg.norm(
                                 cv2.Rodrigues(R_fused @ R.T)[0])))
@@ -418,6 +506,7 @@ class RGBDVisualOdometry:
                         # with the rotation locked -- the phantom is gone at the
                         # source, so no damping is needed.)
                         if (not self.cfg.lock_translation_to_rotation
+                                and not self.cfg.resolve_translation_on_disagree
                                 and disagree_deg > self.cfg.gyro_disagree_deg):
                             span = max(self.cfg.gyro_disagree_span_deg, 1e-6)
                             t_trust = max(0.0, 1.0 - (disagree_deg
@@ -450,6 +539,19 @@ class RGBDVisualOdometry:
                                    else np.zeros(3))
                             t_use = r_trust * t_use + (1.0 - r_trust) * vel
                             info["rot_t_trust"] = r_trust
+
+                    # Physical per-frame translation speed clamp (opt-in): cap
+                    # only the non-physical phantom jumps (a hand cannot move the
+                    # camera faster than a few m/s). Real, in-budget motion is
+                    # left untouched. Off when speed<=0 or dt unknown -> gold
+                    # byte-identical.
+                    if (self.cfg.max_translation_speed > 0.0
+                            and dt_s is not None and dt_s > 0.0):
+                        cap = self.cfg.max_translation_speed * dt_s
+                        tmag = float(np.linalg.norm(t_use))
+                        if tmag > cap:
+                            t_use = t_use * (cap / tmag)
+                            info["t_clamped"] = tmag
 
                     T_pc = np.eye(4)
                     T_pc[:3, :3] = R

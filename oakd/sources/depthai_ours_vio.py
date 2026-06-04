@@ -413,7 +413,44 @@ class OakOursVioSource(PoseSource):
             # drift (107 vs 71 mm), so the lock stays OFF. The
             # ``InertialTranslationFilter`` then owns the displayed position
             # (accel feed-forward off; see ``use_accel_prediction``).
-            od_cfg = OdometryConfig(gyro_fuse=True)
+            #
+            # ``resolve_translation_on_disagree``: when the camera is shaken
+            # while moving, KLT slips and the vision rotation under-rotates vs the
+            # gyro. The legacy disagreement handling multiplied the translation by
+            # ``t_trust`` -> 0, FREEZING real forward motion (the "move + shake
+            # and it doesn't move at all" symptom). MEASURED on the
+            # ``push_shake_20s`` gold session this re-solve was INEFFECTIVE (the
+            # disagreement gate fires on only ~8% of frames there and never
+            # zeroed the translation), so it is left OFF -- the freeze under hard
+            # shake is the missing tight-accel translation factor, not this gate.
+            #
+            # ``max_translation_speed``: a hard/fast shake or a very fast
+            # in-place yaw makes PnP read the rotational image flow as a spurious
+            # per-frame translation jump far bigger than any real hand motion;
+            # integrated, the path wobbles (the "đi tàu lượn" / "cong vẹo"
+            # symptom). No vision-only signal separates a phantom jump from a real
+            # one, but a physical bound does: a hand can't move the camera faster
+            # than a few m/s. 4.0 m/s caps only the non-physical spikes and leaves
+            # every real in-budget motion untouched (gold per-frame motion is far
+            # below this, so offline scoring is byte-identical). Needs the
+            # per-frame ``dt_s`` passed to ``vo.process`` (below).
+            #
+            # ``min_inliers_for_translation``: pointing at a textureless surface
+            # (white wall / blank screen) KLT still fills its corner budget with
+            # garbage corners (n_tracks stays high), but those have no consistent
+            # depth+geometry so PnP keeps only a handful of inliers (measured:
+            # white-wall median 0, p95 11; a real fast push median ~140). solvePnP
+            # still "succeeds" on the garbage and returns a meaningless
+            # translation that walks the body off randomly (the "white wall +
+            # move -> drifts in an undefined direction" symptom). 12 inliers
+            # freezes translation in exactly that regime (rotation still tracked
+            # by the gyro, position held put) while leaving all real motion
+            # untouched -- fast-push p25 is 33 inliers, and the ~8% of its frames
+            # that dip below 12 are genuine tracking losses where freezing for one
+            # frame is correct anyway (measured: ATE 2.14% -> 1.82%).
+            od_cfg = OdometryConfig(gyro_fuse=True,
+                                    max_translation_speed=4.0,
+                                    min_inliers_for_translation=12)
             vo = RGBDVisualOdometry(
                 K, od_cfg, frontend=KLTFrontend(fe_cfg))
 
@@ -639,7 +676,19 @@ class OakOursVioSource(PoseSource):
                 R_prior = (R_imu_cam @ R_imu_accum @ R_imu_cam.T
                            if gyro_cnt > 0 else None)
 
-                vo.process(gray, depth_m, R_prior=R_prior)  # camera-optical world
+                # Per-frame interval (device clock) — needed BEFORE odometry so
+                # the physical translation-speed clamp can bound this frame's
+                # solved translation. Falls back to ~1/30 s on the first frame.
+                try:
+                    frame_ts = ld.getTimestampDevice().total_seconds()
+                except Exception:
+                    frame_ts = time.monotonic()
+                dt_f = (frame_ts - prev_frame_ts
+                        if prev_frame_ts is not None else 1.0 / 30.0)
+                prev_frame_ts = frame_ts
+
+                vo.process(gray, depth_m, R_prior=R_prior,  # camera-optical world
+                           dt_s=dt_f)
                 diag_vo_ms += (time.monotonic() - _iter_t0) * 1e3
 
 
@@ -693,13 +742,6 @@ class OakOursVioSource(PoseSource):
                 R_wc = vo.pose[:3, :3]
                 gyro_deg = (float(np.degrees(np.linalg.norm(
                     cv2.Rodrigues(R_imu_accum)[0]))) if gyro_cnt > 0 else 0.0)
-                try:
-                    frame_ts = ld.getTimestampDevice().total_seconds()
-                except Exception:
-                    frame_ts = time.monotonic()
-                dt_f = (frame_ts - prev_frame_ts
-                        if prev_frame_ts is not None else 1.0 / 30.0)
-                prev_frame_ts = frame_ts
                 vo_t_now = vo.pose[:3, 3].copy()
                 vis_ok = bool(vo.last_info.get("ok", False))
                 if prev_vo_t is not None and vis_ok:
@@ -1202,7 +1244,7 @@ class OakOursVioSource(PoseSource):
 
         cfg = WindowedVIOConfig(window=min(self.ba_window, 5),
                                 kf_every=self.ba_kf_every,
-                                vio=VioConfig(max_iters=6))
+                                vio=VioConfig(max_iters=6, lock_tilt=True))
         vio_map = WindowedVIOMap(K, bg0=bg0, cfg=cfg)
 
         snap_lock = threading.Lock()

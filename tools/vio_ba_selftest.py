@@ -128,7 +128,7 @@ def build_factors(imu_raw, bg_lin, ba_lin):
     return factors
 
 
-def run_scenario(name, true_bg, true_ba, gate_bias):
+def run_scenario(name, true_bg, true_ba, gate_bias, lock_tilt=False):
     w = make_world(true_bg=true_bg, true_ba=true_ba)
     nKF = len(w["kf_R"])
     rng = np.random.default_rng(7)
@@ -141,10 +141,19 @@ def run_scenario(name, true_bg, true_ba, gate_bias):
                   ba=[true_ba.copy() for _ in range(nKF)],
                   landmarks=w["lms"].copy())
 
+    # world-up axis (gravity is z-down here -> up = +z); the tilt-locked solve
+    # only moves yaw about this axis, so the perturbation must keep roll/pitch at
+    # ground truth (a tilt error would be unrecoverable by design).
+    up = -G / np.linalg.norm(G)
+
     # perturbed initial guess (anchor KF0 left at truth -> gauge fixed)
     st = gt.copy()
     for i in range(1, nKF):
-        st.R[i] = st.R[i] @ so3_exp(rng.normal(0, np.radians(3.0), 3))
+        if lock_tilt:
+            dyaw = rng.normal(0, np.radians(3.0))
+            st.R[i] = so3_exp(up * dyaw) @ st.R[i]   # yaw-only, tilt preserved
+        else:
+            st.R[i] = st.R[i] @ so3_exp(rng.normal(0, np.radians(3.0), 3))
         st.p[i] = st.p[i] + rng.normal(0, 0.05, 3)
         st.v[i] = st.v[i] + rng.normal(0, 0.1, 3)
     st.v[0] = gt.v[0] + rng.normal(0, 0.1, 3)
@@ -156,7 +165,7 @@ def run_scenario(name, true_bg, true_ba, gate_bias):
     # factors preintegrated at the zero linearisation bias (matches guess)
     factors = build_factors(w["imu_raw"], np.zeros(3), np.zeros(3))
 
-    cfg = VioConfig(max_iters=40)
+    cfg = VioConfig(max_iters=40, lock_tilt=lock_tilt)
     res = optimize_vio(K, st, w["obs_cam"], w["obs_lm"], w["obs_uv"], w["obs_d"],
                        factors, G, cfg, anchor=0)
     out = res.state
@@ -193,7 +202,10 @@ def main() -> int:
                        np.array([0.004, -0.003, 0.005]),
                        np.array([0.03, -0.02, 0.04]),
                        gate_bias=(2e-3, 2e-2))
-    ok = okA and okB
+    okC = run_scenario("C: tilt-locked (yaw+pos only)",
+                       np.zeros(3), np.zeros(3),
+                       gate_bias=(1e-3, 1e-2), lock_tilt=True)
+    ok = okA and okB and okC
     print("\nPASS" if ok else "\nFAIL")
     return 0 if ok else 1
 

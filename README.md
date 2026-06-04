@@ -80,6 +80,37 @@ small disagreement) the fusion collapses to pure vision, so there is no accuracy
 cost on good data. Position is still vision-only — this is loosely-coupled VIO,
 not Basalt's tight-coupled optimisation.
 
+Because the position is vision-only, three **opt-in `OdometryConfig` guards**
+(all off by default → offline gold scoring stays byte-identical; the live
+`ours` source turns them on) stop the PnP solver from injecting *phantom*
+translation when vision cannot be trusted. Each was tuned by measurement on the
+gold sessions, not guessed:
+
+- **`max_translation_speed`** (live 4.0 m/s) — under a hard shake or very fast
+  yaw the surviving KLT tracks are low-parallax and PnP reads the rotational
+  image flow as a per-frame translation *jump* far larger than any real hand
+  motion; integrated, the path wobbles ("đi tàu lượn"). A hand cannot move the
+  camera faster than a few m/s, so the per-frame translation is clamped to that
+  physical bound (needs the per-frame `dt_s`) — caps only the non-physical
+  spikes, real in-budget motion is untouched.
+- **`min_inliers_for_translation`** (live 12) — pointing at a textureless
+  surface (white wall / blank screen) KLT still fills its corner budget with
+  *garbage* corners, so `n_tracks` stays high, but PnP keeps only a handful of
+  inliers (measured: white-wall median 0 inliers, p95 11; a real fast push
+  median ~140). solvePnP still "succeeds" on the garbage and walks the body off
+  in a random direction. Below the gate the translation is **frozen** (rotation
+  still tracked by the gyro, position held put — the honest behaviour when
+  vision is untrustworthy, same as a covered camera). The gate sits well below
+  any real motion (fast-push p25 = 33 inliers), so normal use is untouched; the
+  few fast-push frames that dip below it genuinely lost tracking, where freezing
+  one frame is correct anyway (measured white-wall path-jitter 4.3 → 2.0,
+  fast-push ATE 2.14% → 1.82%).
+- **`resolve_translation_on_disagree`** — kept available but **left off live**:
+  measured on `push_shake_20s` its disagreement gate fires on only ~8% of frames
+  and never zeroed the translation, so it was ineffective; the freeze under hard
+  shake is the missing tight-accel term, not this gate.
+
+
 Tuning knobs (all optional, shown with their defaults):
 
 ```bash
@@ -131,6 +162,10 @@ sessions show slow accel/gravity drift -- corridor scale ~1.15). It is opt-in
 and touches no production path; `tools/vio_diag.py` A/Bs the IMU factor on/off to
 attribute the gap. Closing it needs online gravity-direction estimation, which
 is the next step.
+
+**How our pipeline differs from BasaltVIO** (and the ordered roadmap to match
+it) is documented in [`docs/OURS_VS_BASALT.md`](docs/OURS_VS_BASALT.md) — read
+that first before any tight-coupling work.
 
 Self-tests (run before/after touching the from-scratch VIO):
 
