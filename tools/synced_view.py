@@ -161,12 +161,27 @@ def render_imu_panel(size: int, R_cum: np.ndarray, q_wxyz: np.ndarray,
     # --- bottom: averaged accel vector ---------------------------------------
     cv2.putText(panel, "ACCEL -> averaged vector (m/s^2)", (8, s // 2 + 8),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1, cv2.LINE_AA)
+    # Faint true-vertical reference (anti-gravity = optical -y) so "level" is
+    # visible: at rest the accel arrow should sit ON this line. Any lean is the
+    # device's real tilt + sensor noise, NOT snapped away.
+    ref_len = int(s * 0.18)
+    cv2.line(panel, (bot_c[0], bot_c[1]),
+             (bot_c[0], bot_c[1] - ref_len), (90, 90, 90), 1, cv2.LINE_AA)
+    cv2.putText(panel, "up", (bot_c[0] + 4, bot_c[1] - ref_len + 2),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (90, 90, 90), 1, cv2.LINE_AA)
     mag = float(np.linalg.norm(accel_vec))
     if np.isfinite(accel_vec).all() and mag > 1e-6:
         _arrow(panel, bot_c, accel_vec / _G, s * 0.18, (60, 220, 255),
                "a", 3)
+        # Tilt of the measured specific force from true vertical (-y). At rest
+        # this is the device's real tilt; it jitters with accel noise.
+        tilt = float(np.degrees(np.arccos(
+            np.clip(-accel_vec[1] / mag, -1.0, 1.0))))
         atxt = (f"a [{accel_vec[0]:+5.2f} {accel_vec[1]:+5.2f} "
                 f"{accel_vec[2]:+5.2f}]  |a| {mag:5.2f}")
+        cv2.putText(panel, f"tilt {tilt:4.1f} deg from vertical",
+                    (8, s - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                    (60, 220, 255), 1, cv2.LINE_AA)
     else:
         atxt = "a  (no IMU samples this frame)"
     cv2.putText(panel, atxt, (8, s - 26), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
