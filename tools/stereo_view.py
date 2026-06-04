@@ -47,6 +47,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from oakd.vio import SessionReader, SGMConfig, SGMStereoMatcher  # noqa: E402
 from oakd.vio.stereo import HAVE_NUMBA, RightRectifier  # noqa: E402
+from oakd.vio.resolution import ResolutionProfile  # noqa: E402
 
 # Fixed depth range (metres) for the colormap, so colours are stable across
 # frames (a per-frame autoscale makes the scene "breathe" and hides drift).
@@ -260,6 +261,10 @@ def run_live(cfg: SGMConfig, width: int, height: int, fps: int,
                                    rectifier=rect)
         print(f"live {width}x{height}@{fps}  engine "
               f"{'numba' if HAVE_NUMBA else 'pure-numpy'}")
+        print(f"[stereo_view] SGM cfg: ndisp={cfg.num_disparities} "
+              f"downscale={cfg.downscale} -> compute width "
+              f"{width // max(1, cfg.downscale)}px "
+              f"(internal ndisp {cfg.num_disparities // max(1, cfg.downscale)})")
         _warmup(matcher, height, width)
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
         cv2.startWindowThread()  # macOS/Linux: keep the HighGUI event loop alive
@@ -400,6 +405,12 @@ def main() -> int:
                     help="replay/live frame rate cap [15]")
     ap.add_argument("--width", type=int, default=640)
     ap.add_argument("--height", type=int, default=400)
+    ap.add_argument("--num-disparities", type=int, default=None,
+                    dest="num_disparities",
+                    help="(live) SGM disparity search range px; default None = "
+                         "auto-scale from the 640x400 baseline (96*width/640). "
+                         "Must stay below the internal compute width "
+                         "(width/downscale) or near depth is lost")
     ap.add_argument("--dump", default=None,
                     help="(live) save raw L/R + depth + stats to this dir for "
                          "offline analysis of the flicker")
@@ -424,12 +435,21 @@ def main() -> int:
     args = ap.parse_args()
 
     hold = 0 if args.no_stabilize else args.hold
-    cfg = SGMConfig.live() if args.fast else SGMConfig()
     if args.live:
+        # Match the EXACT SGM config the live VIO source would use at this
+        # resolution: ResolutionProfile scales num_disparities (and the live
+        # preset's census/paths) from the 640x400 baseline, so the depth you
+        # preview here is what the VIO actually consumes. (Replay keeps the flat
+        # preset since the recorded frames are always 640x400.)
+        prof = ResolutionProfile.for_resolution(args.width, args.height,
+                                                num_disparities=args.num_disparities)
+        cfg = prof.sgm(fast=args.fast)
+        print(f"[stereo_view] resolution profile: {prof.describe()}")
         dump_dir = Path(args.dump) if args.dump else None
         return run_live(cfg, args.width, args.height, int(args.fps),
                         dump_dir, args.dump_n, hold, args.mains_hz,
                         args.exposure, args.iso, args.exit_after_dump)
+    cfg = SGMConfig.live() if args.fast else SGMConfig()
     return run_replay(Path(args.session), cfg, args.fps, hold)
 
 
