@@ -67,6 +67,43 @@ def rpy_to_quat(roll: float, pitch: float, yaw: float) -> np.ndarray:
     ], dtype=np.float64)
 
 
+def rot_to_quat(R: np.ndarray) -> np.ndarray:
+    """Convert a 3x3 rotation matrix to a unit quaternion ``(w, x, y, z)``.
+
+    Inverse of :func:`quat_to_rot`. Uses the numerically stable branch that
+    picks the largest diagonal term so the divisor never collapses near a
+    180-degree rotation.
+    """
+    R = np.asarray(R, dtype=np.float64)
+    trace = R[0, 0] + R[1, 1] + R[2, 2]
+    if trace > 0.0:
+        s = np.sqrt(trace + 1.0) * 2.0
+        w = 0.25 * s
+        x = (R[2, 1] - R[1, 2]) / s
+        y = (R[0, 2] - R[2, 0]) / s
+        z = (R[1, 0] - R[0, 1]) / s
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
+        w = (R[2, 1] - R[1, 2]) / s
+        x = 0.25 * s
+        y = (R[0, 1] + R[1, 0]) / s
+        z = (R[0, 2] + R[2, 0]) / s
+    elif R[1, 1] > R[2, 2]:
+        s = np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
+        w = (R[0, 2] - R[2, 0]) / s
+        x = (R[0, 1] + R[1, 0]) / s
+        y = 0.25 * s
+        z = (R[1, 2] + R[2, 1]) / s
+    else:
+        s = np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
+        w = (R[1, 0] - R[0, 1]) / s
+        x = (R[0, 2] + R[2, 0]) / s
+        y = (R[1, 2] + R[2, 1]) / s
+        z = 0.25 * s
+    q = np.array([w, x, y, z], dtype=np.float64)
+    return q / np.linalg.norm(q)
+
+
 def rot_ned_to_enu(R_ned: np.ndarray) -> np.ndarray:
     """Rotate a body-attitude rotation matrix from NED-world to ENU-world.
 
