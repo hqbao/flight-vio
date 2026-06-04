@@ -547,16 +547,26 @@ class WindowedVIOMap:
     consecutive keyframe timestamps internally.
     """
 
-    def __init__(self, K: np.ndarray, ts_ns: np.ndarray,
-                 gyro_cam: np.ndarray, accel_cam: np.ndarray,
+    def __init__(self, K: np.ndarray, ts_ns: np.ndarray | None = None,
+                 gyro_cam: np.ndarray | None = None,
+                 accel_cam: np.ndarray | None = None,
                  bg0: np.ndarray | None = None, ba0: np.ndarray | None = None,
                  cfg: WindowedVIOConfig | None = None):
         self.K = np.asarray(K, dtype=np.float64)
         self.cfg = cfg or WindowedVIOConfig()
-        order = np.argsort(ts_ns)
-        self.imu_ts = np.asarray(ts_ns, np.int64)[order]
-        self.imu_gyro = np.asarray(gyro_cam, np.float64)[order]
-        self.imu_accel = np.asarray(accel_cam, np.float64)[order]
+        # Offline: the full IMU stream is supplied up front and sliced between
+        # keyframe timestamps. Live: no stream exists yet, so the caller hands
+        # each keyframe's raw IMU segment to ``add_keyframe(imu_seg=...)`` and we
+        # leave the stored stream empty.
+        if ts_ns is None or len(ts_ns) == 0:
+            self.imu_ts = np.zeros(0, np.int64)
+            self.imu_gyro = np.zeros((0, 3), np.float64)
+            self.imu_accel = np.zeros((0, 3), np.float64)
+        else:
+            order = np.argsort(ts_ns)
+            self.imu_ts = np.asarray(ts_ns, np.int64)[order]
+            self.imu_gyro = np.asarray(gyro_cam, np.float64)[order]
+            self.imu_accel = np.asarray(accel_cam, np.float64)[order]
         self.bg0 = (np.zeros(3) if bg0 is None
                     else np.asarray(bg0, np.float64).copy())
         self.ba0 = (np.zeros(3) if ba0 is None
@@ -575,8 +585,16 @@ class WindowedVIOMap:
         return R.T @ (Xc - t)
 
     def add_keyframe(self, T_cw: np.ndarray, ids: np.ndarray,
-                     pts: np.ndarray, depth_m: np.ndarray, ts_ns: int) -> None:
-        """Register a keyframe (pose + track snapshot + depth + timestamp)."""
+                     pts: np.ndarray, depth_m: np.ndarray, ts_ns: int,
+                     imu_seg: tuple[np.ndarray, np.ndarray, np.ndarray] | None
+                     = None) -> None:
+        """Register a keyframe (pose + track snapshot + depth + timestamp).
+
+        ``imu_seg`` (live path) is the raw ``(ts_ns, gyro_cam, accel_cam)`` block
+        of IMU samples spanning the interval since the previous keyframe, already
+        rotated into the camera frame. When ``None`` (offline path) the segment
+        is sliced from the stored full stream by timestamp.
+        """
         h, w = depth_m.shape
         obs: dict[int, np.ndarray] = {}
         for tid, px in zip(ids, pts):
@@ -601,8 +619,14 @@ class WindowedVIOMap:
         else:
             prev = self.keyframes[-1]
             bg_i, ba_i = prev["bg"], prev["ba"]
-            seg = _imu_segment(self.imu_ts, self.imu_gyro, self.imu_accel,
-                               prev["ts_ns"], ts_ns)
+            if imu_seg is not None:
+                ts_seg = np.asarray(imu_seg[0], np.int64)
+                seg = None if ts_seg.size < 2 else (
+                    ts_seg, np.asarray(imu_seg[1], np.float64),
+                    np.asarray(imu_seg[2], np.float64))
+            else:
+                seg = _imu_segment(self.imu_ts, self.imu_gyro, self.imu_accel,
+                                   prev["ts_ns"], ts_ns)
             pre = None
             v_j = prev["v"].copy()
             if seg is not None:

@@ -143,6 +143,61 @@ class OdometryConfig:
     # rescues (the inlier count alone called them healthy).
     gyro_disagree_deg: float = 1.5
     gyro_disagree_span_deg: float = 3.0
+    # --- rotation-gated translation damping (opt-in, default OFF) -----------
+    # The disagreement gate above only fires when the VISION rotation is wrong.
+    # But during a smooth in-place yaw the KLT tracker follows the rotational
+    # image flow well (vision AGREES with the gyro, disagreement < gate), yet
+    # solvePnP still explains that rotational flow + depth as a phantom
+    # TRANSLATION -- so the position walks off on every spin even though the
+    # rotation is tracked correctly. There is no vision signal that separates
+    # this phantom from a real translation; the only honest discriminator is
+    # the gyro: a large per-frame rotation means most of the apparent motion is
+    # rotational, so the co-occurring vision translation is suspect. When
+    # enabled, the translation is scaled down as the gyro's per-frame rotation
+    # grows past ``rot_damp_gate_deg`` (reaching 0 at +``rot_damp_span_deg``),
+    # INDEPENDENTLY of the disagreement gate. Default OFF so every offline score
+    # (f2f/ba/slam) and the regression suite stay byte-for-byte unchanged; the
+    # live tight-coupled ``vio`` backend turns it on. A pure translation (no
+    # rotation) is never damped; a pure fast yaw is fully suppressed.
+    rot_translation_damp: bool = False
+    rot_damp_gate_deg: float = 1.5
+    rot_damp_span_deg: float = 4.0
+    # --- constant-velocity translation prediction (opt-in, default OFF) -----
+    # On fast motion the KLT tracker loses correspondences (motion blur + large
+    # inter-frame flow at a low host frame rate), so PnP either fails or sees too
+    # few points; the fallback ``_gyro_propagate`` then advances rotation but
+    # leaves TRANSLATION at zero. During a fast straight-line move (gyro ~0) that
+    # freezes the pose entirely -- the camera flies forward but the trajectory
+    # sits still until vision re-locks (the "it lags then jumps" / "it just
+    # stalls" symptom; Basalt avoids it by predicting the pose from the IMU).
+    # When enabled we keep the last successful inter-frame translation as a
+    # velocity and, on a vision-failure frame, propagate the pose by that
+    # velocity (decayed each consecutive miss, capped at ``predict_max_frames``)
+    # instead of zero -- so a brief tracking dropout during fast motion coasts
+    # smoothly through instead of freezing. A genuine stop is unaffected: vision
+    # keeps succeeding with t~0 there, so prediction only ever fills failure
+    # frames. Default OFF so offline gold (f2f/ba/slam) stays byte-for-byte
+    # unchanged; the live source turns it on for every backend.
+    predict_translation: bool = False
+    predict_decay: float = 0.85
+    predict_max_frames: int = 8
+    # --- IMU-locked translation solve (opt-in, default OFF) -----------------
+    # The honest, Basalt-aligned separation of rotation and translation: the IMU
+    # (gyro) owns rotation, so we solve the per-frame translation with that fused
+    # rotation HELD FIXED (``_translation_given_rotation``) on EVERY frame,
+    # instead of trusting solvePnP's joint rotation+translation ``tvec``. In a
+    # joint solve a small rotation error is absorbed as a spurious translation,
+    # so a pure in-place yaw produces a phantom linear drift; with the rotation
+    # locked to the accurate gyro, the rotated 3D points already match the
+    # current viewing rays and the least-squares translation comes out ~0 -- the
+    # phantom is removed AT THE SOURCE, with no rotation-magnitude heuristic. A
+    # genuine translate-while-turning still recovers its true translation (depth
+    # gives metric scale). When this is on, the disagreement/rotation translation
+    # damping below is bypassed (it is no longer needed). Default OFF so every
+    # offline score (f2f/ba/slam) and the regression suite stay byte-for-byte
+    # unchanged; the live source turns it on for all backends.
+    lock_translation_to_rotation: bool = False
+
 
 
 def _scale_rotation(R: np.ndarray, s: float) -> np.ndarray:
@@ -193,6 +248,12 @@ class RGBDVisualOdometry:
         self._prev_depth: np.ndarray | None = None
         self.last_info: dict = {}
         self._g_ref: float | None = None      # |gravity| from startup accel
+        # Constant-velocity translation prediction state (see OdometryConfig):
+        # the last successful inter-frame translation (cur<-prev, PnP T_pc
+        # frame), reused to coast the pose through vision-failure frames during
+        # fast motion. ``_predict_count`` caps consecutive predicted frames.
+        self._vel_t: np.ndarray | None = None
+        self._predict_count = 0
 
     def align_to_gravity(self, accel_cam: np.ndarray) -> None:
         """Seed the initial attitude from gravity (call before the first frame).
@@ -270,7 +331,14 @@ class RGBDVisualOdometry:
                 tvec0 = None
                 if R_prior is not None:
                     rvec0, _ = cv2.Rodrigues(np.asarray(R_prior, dtype=np.float64))
-                    tvec0 = np.zeros((3, 1))
+                    # Warm-start the translation with the predicted velocity (if
+                    # enabled) so the iterative refinement converges on large
+                    # fast-motion steps instead of from a zero-motion guess.
+                    if (self.cfg.predict_translation
+                            and self._vel_t is not None):
+                        tvec0 = self._vel_t.reshape(3, 1).astype(np.float64)
+                    else:
+                        tvec0 = np.zeros((3, 1))
                     use_guess = True
 
                 ok, rvec, tvec, inliers = cv2.solvePnPRansac(
@@ -292,6 +360,9 @@ class RGBDVisualOdometry:
                         # The gyro prior comes in the prev<-cur convention, so
                         # transpose it into PnP's cur<-prev point-rotation frame.
                         R_gyro = np.asarray(R_prior, dtype=np.float64).T
+                        rot_deg = float(np.degrees(np.linalg.norm(
+                            cv2.Rodrigues(R_gyro)[0])))
+                        info["rot_deg"] = rot_deg
                         gain = self.cfg.gyro_corr_gain_max * min(
                             1.0, ninl / max(self.cfg.gyro_trust_inliers, 1))
                         R_corr = R @ R_gyro.T          # vision relative to gyro
@@ -310,18 +381,25 @@ class RGBDVisualOdometry:
                                           - self.cfg.gyro_disagree_deg) / span
                             gain *= max(0.0, damp)
                         R_fused = _scale_rotation(R_corr, gain) @ R_gyro
-                        # Only re-estimate translation when the fused rotation
-                        # actually departs from PnP's (i.e. the gyro overrode a
-                        # weak vision rotation). On healthy frames R_fused == the
-                        # vision rotation, so we keep PnP's robust RANSAC tvec and
-                        # the result is byte-for-byte the pure-vision pose -- no
-                        # accuracy regression where vision is already good.
-                        dev = float(np.degrees(np.linalg.norm(
-                            cv2.Rodrigues(R_fused @ R.T)[0])))
-                        if dev > 0.5:
-                            idx = inliers.reshape(-1)
+                        # Translation solve. With ``lock_translation_to_rotation``
+                        # we ALWAYS re-estimate the translation with the fused
+                        # (gyro-owned) rotation held fixed -- the honest
+                        # Basalt-style separation that keeps rotational image flow
+                        # out of the translation (a pure yaw -> t~0). Otherwise
+                        # (offline gold) we keep solvePnP's joint ``tvec`` on
+                        # healthy frames and only re-solve when the gyro overrode
+                        # a weak vision rotation (``dev > 0.5``), so those scores
+                        # stay byte-for-byte unchanged.
+                        idx = inliers.reshape(-1)
+                        if self.cfg.lock_translation_to_rotation:
                             t_use = _translation_given_rotation(
                                 obj[idx], img[idx], R_fused, self.K)
+                        else:
+                            dev = float(np.degrees(np.linalg.norm(
+                                cv2.Rodrigues(R_fused @ R.T)[0])))
+                            if dev > 0.5:
+                                t_use = _translation_given_rotation(
+                                    obj[idx], img[idx], R_fused, self.K)
                         R = R_fused
                         # Translation trust: the SAME slipped tracks that made
                         # the vision ROTATION untrustworthy also corrupt the
@@ -336,18 +414,62 @@ class RGBDVisualOdometry:
                         # by the same disagreement factor. Unchanged below the
                         # gate, so gold / well-tracked motion keeps full vision
                         # translation (gold disagreement stays < 0.75 deg).
-                        if disagree_deg > self.cfg.gyro_disagree_deg:
+                        # (Skipped entirely when the translation is already solved
+                        # with the rotation locked -- the phantom is gone at the
+                        # source, so no damping is needed.)
+                        if (not self.cfg.lock_translation_to_rotation
+                                and disagree_deg > self.cfg.gyro_disagree_deg):
                             span = max(self.cfg.gyro_disagree_span_deg, 1e-6)
                             t_trust = max(0.0, 1.0 - (disagree_deg
                                           - self.cfg.gyro_disagree_deg) / span)
                             t_use = t_use * t_trust
                             info["t_trust"] = t_trust
+                        # Rotation-gated translation handling (opt-in). Even
+                        # when vision AGREES with the gyro on the rotation, a
+                        # large per-frame yaw makes the co-occurring vision
+                        # translation a likely phantom (rotational image flow
+                        # read as a translation). But simply zeroing it also
+                        # kills a REAL forward push that happens to carry some
+                        # hand-rotation jitter (the "forward move doesn't track"
+                        # symptom). So instead of damping toward ZERO we blend
+                        # toward the constant-velocity motion model ``_vel_t``
+                        # (the trusted velocity, only ever refreshed on
+                        # low-rotation = clean frames below): a true forward push
+                        # keeps moving (prediction is forward), while an in-place
+                        # yaw from rest blends toward ~0 (no recent clean
+                        # velocity) -- killing the phantom without freezing real
+                        # motion. With prediction off (offline gold) ``_vel_t``
+                        # is None, so this falls back to the original damp-to-0.
+                        if (self.cfg.rot_translation_damp
+                                and not self.cfg.lock_translation_to_rotation
+                                and rot_deg > self.cfg.rot_damp_gate_deg):
+                            span = max(self.cfg.rot_damp_span_deg, 1e-6)
+                            r_trust = max(0.0, 1.0 - (rot_deg
+                                          - self.cfg.rot_damp_gate_deg) / span)
+                            vel = (self._vel_t if self._vel_t is not None
+                                   else np.zeros(3))
+                            t_use = r_trust * t_use + (1.0 - r_trust) * vel
+                            info["rot_t_trust"] = r_trust
+
                     T_pc = np.eye(4)
                     T_pc[:3, :3] = R
                     T_pc[:3, 3] = t_use
                     self.pose = self.pose @ np.linalg.inv(T_pc)
                     info["n_inliers"] = ninl
                     info["ok"] = True
+                    # Refresh the trusted velocity for coasting / rotation-gated
+                    # blending -- but ONLY from clean (low-rotation) frames, so a
+                    # phantom translation produced during a fast yaw never
+                    # pollutes it. On a high-rotation frame the velocity is left
+                    # holding the last clean value (which decays through the
+                    # coast path on vision failures). ``rot_deg`` is 0 here when
+                    # there is no gyro prior (pure-vision), so every frame counts
+                    # as clean in that case.
+                    if self.cfg.predict_translation:
+                        rot_deg = float(info.get("rot_deg", 0.0))
+                        if rot_deg < self.cfg.rot_damp_gate_deg:
+                            self._vel_t = np.asarray(t_use, float).copy()
+                            self._predict_count = 0
                 else:
                     info["reason"] = self._gyro_propagate(R_prior, "pnp_failed")
             else:
@@ -368,15 +490,47 @@ class RGBDVisualOdometry:
         (``pnp_failed``) and the harder one where a fast rotation left too few
         tracked points to even attempt PnP (``too_few_points``). The latter is
         exactly the fast-yaw spike the user sees: without this branch the pose
-        froze precisely when the camera was turning hardest. Translation is left
-        at zero (the gyro says nothing about it); rotation is propagated so the
-        body frame keeps tracking the turn through the blind frames. Returns the
-        reason string to record (annotated when the gyro took over).
+        froze precisely when the camera was turning hardest. Rotation is
+        propagated so the body frame keeps tracking the turn through the blind
+        frames. Translation is normally left at zero (the gyro says nothing about
+        it), but when ``predict_translation`` is on we coast it with the last
+        successful inter-frame velocity (decayed, capped) so a fast STRAIGHT
+        move -- where the freeze-at-zero is most visible -- keeps advancing
+        through the dropout instead of stalling. Returns the reason string to
+        record (annotated when the gyro / velocity took over).
         """
-        if self.cfg.gyro_fuse and R_prior is not None:
-            T_pc = np.eye(4)
-            # prev<-cur gyro prior -> PnP's cur<-prev point-rotation frame.
-            T_pc[:3, :3] = np.asarray(R_prior, dtype=np.float64).T
-            self.pose = self.pose @ np.linalg.inv(T_pc)
-            return fail_reason + "_gyro_propagated"
-        return fail_reason
+        if not (self.cfg.gyro_fuse and R_prior is not None):
+            # No rotation prior: optionally still coast translation so a pure
+            # fast forward move (no usable vision) does not freeze.
+            if (self.cfg.predict_translation and self._vel_t is not None
+                    and self._predict_count < self.cfg.predict_max_frames):
+                self._predict_count += 1
+                T_pc = np.eye(4)
+                T_pc[:3, 3] = self._vel_t           # coast the last velocity
+                self.pose = self.pose @ np.linalg.inv(T_pc)
+                self._vel_t = self._vel_t * self.cfg.predict_decay  # then decay
+                return fail_reason + "_vel_predicted"
+            return fail_reason
+
+        T_pc = np.eye(4)
+        # prev<-cur gyro prior -> PnP's cur<-prev point-rotation frame.
+        R_gyro_pc = np.asarray(R_prior, dtype=np.float64).T
+        T_pc[:3, :3] = R_gyro_pc
+        tag = "_gyro_propagated"
+        # Only coast translation when the gyro reports little rotation: during a
+        # fast yaw the true translation is ~0 (the same reason the rotation-gated
+        # damping zeroes it on success frames), so coasting a stale forward
+        # velocity through a yaw would re-introduce the phantom drift. Slow/no
+        # rotation is exactly the fast straight-line regime we want to bridge.
+        rot_deg = float(np.degrees(np.linalg.norm(cv2.Rodrigues(R_gyro_pc)[0])))
+        if (self.cfg.predict_translation and self._vel_t is not None
+                and rot_deg < self.cfg.rot_damp_gate_deg
+                and self._predict_count < self.cfg.predict_max_frames):
+            self._predict_count += 1
+            T_pc[:3, 3] = self._vel_t              # coast the last velocity
+            self._vel_t = self._vel_t * self.cfg.predict_decay  # then decay
+            tag = "_gyro_vel_propagated"
+        self.pose = self.pose @ np.linalg.inv(T_pc)
+        return fail_reason + tag
+
+

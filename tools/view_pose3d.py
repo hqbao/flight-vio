@@ -44,17 +44,24 @@ def _build_source(name: str, args):
             slam_kf_min_trans=args.slam_kf_min_trans,
             slam_kf_min_rot=args.slam_kf_min_rot,
             slam_max_kf=args.slam_max_kf)
+    if name == "ours-vio":
+        from oakd.sources.depthai_ours_vio import OakOursVioSource
+        return OakOursVioSource(
+            fps=args.fps, backend="vio", use_own_klt=args.own_klt,
+            ba_window=args.ba_window, ba_kf_every=args.ba_kf_every)
     raise SystemExit(f"unknown --source '{name}' "
-                     f"(expected: fake|oak|slam|ours|ours-ba|ours-slam)")
+                     f"(expected: fake|oak|slam|ours|ours-ba|ours-slam|"
+                     f"ours-vio)")
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="OAK-D 3D pose viewer")
     ap.add_argument("--source", default="fake",
                     choices=("fake", "oak", "slam", "ours", "ours-ba",
-                             "ours-slam"),
+                             "ours-slam", "ours-vio"),
                     help="pose provider (ours = our f2f VO; ours-ba = windowed "
-                         "BA; ours-slam = f2f + loop-closure SLAM)")
+                         "BA; ours-slam = f2f + loop-closure SLAM; "
+                         "ours-vio = tight-coupled visual+IMU VIO)")
     ap.add_argument("--fps", type=int, default=20,
                     help="camera frame rate (ours/ours-ba/ours-slam) [20]")
     ap.add_argument("--own-klt", action="store_true", dest="own_klt",

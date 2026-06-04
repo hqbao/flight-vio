@@ -11,6 +11,7 @@ through the geometry to prove the data path is correct.
 from .frontend import FrontendConfig, KLTFrontend, TrackState
 from .geometry import backproject, valid_mask
 from .imu import GyroPreintegrator, gravity_aligned_R0, so3_exp
+from .inertial_filter import InertialFilterConfig, InertialTranslationFilter
 from .loopclosure import KeyframeAppearance, LoopConfig, LoopDetector
 from .odometry import OdometryConfig, RGBDVisualOdometry, level_attitude
 from .posegraph import PoseGraph, se3_adjoint, se3_inv, se3_log
@@ -39,6 +40,8 @@ __all__ = [
     "GyroPreintegrator",
     "gravity_aligned_R0",
     "so3_exp",
+    "InertialFilterConfig",
+    "InertialTranslationFilter",
     "WindowedConfig",
     "WindowedRGBDOdometry",
     "WindowedBAMap",

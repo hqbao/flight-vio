@@ -50,8 +50,8 @@ import numpy as np
 from ..pose import Pose
 from ..frames import quat_to_rpy
 from ..vio import (
-    FrontendConfig, KLTFrontend, OdometryConfig, RGBDVisualOdometry,
-    gravity_aligned_R0, level_attitude,
+    FrontendConfig, InertialTranslationFilter, KLTFrontend, OdometryConfig,
+    RGBDVisualOdometry, gravity_aligned_R0, level_attitude,
 )
 from .base import PoseSource
 
@@ -88,6 +88,17 @@ _MOUNT_R0 = np.array(
 # and vision holds the attitude. ~0.35 m/s^2 sits above the sensor noise floor
 # (~0.02-0.15) and below the accel of deliberate handheld motion.
 _REST_MOTION_THRESH = 0.35
+
+# --- live tight-coupled VIO correction gating (backend='vio') -------------
+# The background VIO worker double-integrates the device accelerometer to tie
+# keyframe translations. On the OAK-D the accel is noisy, so a diverged optimiser
+# can publish a huge correction that would jerk the displayed trajectory. We
+# reject any single correction whose translation exceeds ``_VIO_CORR_MAX_T`` as
+# such a blow-up; whatever survives is eased onto the display so it never snaps.
+# (An earlier rotation-freeze was removed: it held the correction at identity
+# during all hand motion, so the accelerometer path never reached the screen --
+# the "linear acceleration has no effect" symptom.)
+_VIO_CORR_MAX_T = 0.25           # m; reject corrections larger than this
 
 # Column reorder optical (right, down, fwd) -> body FRD (fwd, right, down).
 # The viewer triad expects the attitude columns to be [forward, right, down],
@@ -367,9 +378,46 @@ class OakOursVioSource(PoseSource):
                 fe_cfg = (FrontendConfig(use_own_klt=True) if HAVE_NUMBA
                           else FrontendConfig.live_own())
             else:
-                fe_cfg = FrontendConfig(use_own_klt=False)
+                # Live cv2 frontend, tuned for FAST hand-held pushes. The camera
+                # delivers only ~14-20 fps (device measured, drop=0 -- not a host
+                # frame-drop), so during a fast push the inter-frame pixel motion
+                # is large and the default pyramid (win=21, level=3 -> ~168 px
+                # reach) loses KLT tracks: measured on gold ``push_fwdback_20s``,
+                # 25 % of the 30-60 mm/frame "fast push" frames failed KLT
+                # (ok-rate 0.75) and the translation collapsed to 0.70x -- the
+                # "đẩy nhanh thì ì lại / chỉ đi đoạn ngắn" symptom (vision drops
+                # out -> the inertial filter has nothing to correct with ->
+                # coasts then decays -> stalls). A larger window + one more
+                # pyramid level (win=31, level=4 -> ~496 px reach) plus a looser
+                # forward-backward gate (blur inflates the f-b residual on fast
+                # frames) recovers the fast bucket to ok-rate 0.81 / scale 0.80
+                # while leaving the slow/still buckets unchanged (ok 0.93->0.94,
+                # overall scale 0.90). This is a LIVE-ONLY config object; the
+                # offline gold path (``tools/vio_run.py``) builds its own
+                # frontend, so the byte-identical gold scores are untouched.
+                fe_cfg = FrontendConfig(use_own_klt=False, win_size=31,
+                                        max_level=4, fb_threshold=2.0)
+            # Translation is owned by vision (frame-to-frame RGB-D PnP) with the
+            # gyro FUSED softly: the gyro corrects a slipped vision rotation via
+            # the disagreement gate (``gyro_disagree_deg``) and damps the
+            # co-occurring phantom translation, WITHOUT hard-locking translation
+            # to the gyro rotation. Measured on the gold sessions
+            # (``tools/live_replay.py`` + ``tools/lateral_analysis.py``), the hard
+            # lock (``lock_translation_to_rotation``) made the FAST-MOTION case
+            # markedly worse -- it forced every small gyro error (bias / timing /
+            # extrinsic) into a SIDEWAYS translation, raising path jitter
+            # 20.3 -> 27.0 and the lateral/longitudinal ratio 0.19 -> 0.23 on the
+            # fwd/back push (the "veers sideways while pushing forward" symptom).
+            # Joint PnP + the disagreement gate beats it on motion (ATE 0.99% vs
+            # 1.28%, jitter below Basalt's own) at a small cost on pure-still
+            # drift (107 vs 71 mm), so the lock stays OFF. The
+            # ``InertialTranslationFilter`` then owns the displayed position
+            # (accel feed-forward off; see ``use_accel_prediction``).
+            od_cfg = OdometryConfig(gyro_fuse=True)
             vo = RGBDVisualOdometry(
-                K, OdometryConfig(gyro_fuse=True), frontend=KLTFrontend(fe_cfg))
+                K, od_cfg, frontend=KLTFrontend(fe_cfg))
+
+
 
             # Gravity-level the initial attitude: average the accelerometer over
             # a short static startup window, rotate it into the camera optical
@@ -414,7 +462,18 @@ class OakOursVioSource(PoseSource):
             if self.backend == "slam":
                 slam_state = self._start_slam_worker(K)
 
-
+            # In tight-coupled VIO mode, a background thread runs the joint
+            # visual+IMU sliding-window solve (WindowedVIOMap). Each keyframe
+            # carries its raw IMU segment (cam frame) since the previous one;
+            # the worker publishes a correction eased onto the f2f display the
+            # same way as BA. ``vio_imu_*`` accumulate the per-sample cam-frame
+            # IMU between keyframe submits.
+            vio_state = None
+            vio_imu_ts: list[int] = []
+            vio_imu_gyro: list[np.ndarray] = []
+            vio_imu_accel: list[np.ndarray] = []
+            if self.backend == "vio":
+                vio_state = self._start_vio_worker(K, R_imu_cam)
 
             t0 = time.monotonic()
             prev_pos_ned = np.zeros(3)
@@ -422,11 +481,66 @@ class OakOursVioSource(PoseSource):
             frames = 0
             kf_count = 0
             last_fps_t = t0
+            # --- live throughput diagnostics (test #10: fast-push undershoot) ---
+            # Answers the open question: is the loop dropping frames the camera
+            # delivered (recoverable backlog -> process it) or is the camera
+            # simply delivering few frames (raise sensorFps)? Per 0.5 s window:
+            #   recv  = frames the camera handed us (processed + discarded)
+            #   drop  = frames we DISCARDED by draining to latest
+            #   vo/emit/loop ms = where the per-iteration time goes
+            diag_backlog_sum = 0
+            diag_recv = 0
+            diag_vo_ms = 0.0
+            diag_emit_ms = 0.0
+            diag_loop_ms = 0.0
+            diag_iter = 0
+            # Translation accounting (test #10b: "đẩy nhanh chỉ ăn 1/2 đoạn").
+            # Per 0.5 s window, sum the per-frame step magnitude at three stages
+            # so the device tells us WHERE motion is lost: raw VO -> after the
+            # inertial filter -> after the BA/VIO/SLAM correction (displayed).
+            diag_vo_path = 0.0     # sum |raw vo step|  (camera-optical)
+            diag_filt_path = 0.0   # sum |filter step|  (pre-correction)
+            diag_disp_path = 0.0   # sum |displayed step| (post-correction+grav)
+            diag_prev_vo = None
+            diag_prev_filt = None
+            diag_prev_disp = None
             accel_n = 0
             accel_used = 0
             last_tilt_log = t0
             accel_ema: np.ndarray | None = None
             grav_corr = np.eye(3)   # stateful display-frame gravity correction
+
+            # Per-frame inertial translation filter (predict with the
+            # accelerometer, correct with the vision displacement). It owns the
+            # displayed translation for ALL live backends. ``prev_vo_t`` is the
+            # previous f2f world position used to form the vision displacement
+            # measurement; ``prev_frame_ts`` is the device-clock timestamp of the
+            # previous frame used for the integration dt.
+            tfilt = InertialTranslationFilter()
+            tfilt.reset(vo.pose[:3, 3].copy())
+            prev_vo_t: np.ndarray | None = None
+            prev_frame_ts: float | None = None
+
+            # --- yaw-in-place phantom-translation diagnostics (vio backend) ---
+            # Accumulate, over a ~1 s window: mean gyro angular speed, the f2f
+            # per-frame translation that occurs WHILE rotating fast (the phantom
+            # drift proxy), and the min t_trust / max vision-gyro disagreement so
+            # we can see on the device whether the translation damping is even
+            # firing during a spin.
+            last_vio_log = t0
+            vio_gyro_deg = 0.0      # sum of per-frame gyro rotation (deg)
+            vio_t_all = 0.0         # sum of f2f per-frame translation (m)
+            vio_t_rot = 0.0         # ditto, but only on fast-rotation frames
+            vio_disagree_max = 0.0
+            vio_ttrust_min = 1.0
+            vio_rtrust_min = 1.0
+            vio_n = 0
+            prev_vo_pos: np.ndarray | None = None
+            prev_disp_pos: np.ndarray | None = None
+            vio_disp_rot = 0.0      # displayed (post-correction) t during rot
+            vio_C_t = 0.0           # VIO worker correction translation magnitude
+            vio_fail_n = 0          # vision-failure frames per window
+            vio_coast_n = 0         # of those, velocity-coasted frames
 
             # Gyro complementary-fusion state. ``gyro_bias`` is the mean gyro over
             # the static startup window (rad/s, IMU frame); each frame we
@@ -444,11 +558,13 @@ class OakOursVioSource(PoseSource):
                 # that if anything briefly stalls we skip stale frames instead of
                 # falling progressively further behind (stays real time).
                 ld = q_left.tryGet()
+                _backlog = 0          # how many left frames we DISCARD this iter
                 while True:
                     nxt = q_left.tryGet()
                     if nxt is None:
                         break
                     ld = nxt
+                    _backlog += 1
                 dd = q_depth.tryGet()
                 while True:
                     nxt = q_depth.tryGet()
@@ -458,6 +574,9 @@ class OakOursVioSource(PoseSource):
                 if ld is None or dd is None:
                     time.sleep(0.002)
                     continue
+                _iter_t0 = time.monotonic()
+                diag_backlog_sum += _backlog
+                diag_recv += 1 + _backlog
 
                 gray = ld.getCvFrame()
                 if gray.ndim == 3:
@@ -501,6 +620,16 @@ class OakOursVioSource(PoseSource):
                                             (w - gyro_bias) * dt)
                                         gyro_cnt += 1
                                 gyro_last_ts = ts
+                                # Tight-coupled VIO keeps every raw sample
+                                # (cam frame, no bias subtraction — the bias is
+                                # handled inside preintegration) timestamped on
+                                # the same device clock as the keyframes.
+                                if (vio_state is not None
+                                        and np.all(np.isfinite(v))):
+                                    vio_imu_ts.append(int(ts * 1e9))
+                                    vio_imu_gyro.append(R_imu_cam @ w)
+                                    vio_imu_accel.append(
+                                        R_imu_cam @ np.asarray(v, float))
                     imsg = q_imu.tryGet()
                 accel_raw = None if acc_cnt == 0 else R_imu_cam @ (acc_sum / acc_cnt)
 
@@ -511,6 +640,7 @@ class OakOursVioSource(PoseSource):
                            if gyro_cnt > 0 else None)
 
                 vo.process(gray, depth_m, R_prior=R_prior)  # camera-optical world
+                diag_vo_ms += (time.monotonic() - _iter_t0) * 1e3
 
 
                 # --- accelerometer leveling, gated on the camera being at rest --
@@ -551,10 +681,47 @@ class OakOursVioSource(PoseSource):
 
                 pose = vo.pose.copy()  # camera-optical world
 
+                # --- per-frame inertial translation filter (predict+correct) ---
+                # Replace the f2f-accumulated translation with the inertial
+                # filter's: predict the world position with the accelerometer,
+                # correct it with the vision displacement (down-weighted while
+                # rotating fast). This owns translation for every live backend;
+                # the rotation below is still the gyro-fused VO attitude. The
+                # filter runs in the SAME camera-optical world as ``vo.pose``, so
+                # the BA/SLAM/VIO world-frame correction and ``grav_corr``
+                # leveling apply downstream exactly as before.
+                R_wc = vo.pose[:3, :3]
+                gyro_deg = (float(np.degrees(np.linalg.norm(
+                    cv2.Rodrigues(R_imu_accum)[0]))) if gyro_cnt > 0 else 0.0)
+                try:
+                    frame_ts = ld.getTimestampDevice().total_seconds()
+                except Exception:
+                    frame_ts = time.monotonic()
+                dt_f = (frame_ts - prev_frame_ts
+                        if prev_frame_ts is not None else 1.0 / 30.0)
+                prev_frame_ts = frame_ts
+                vo_t_now = vo.pose[:3, 3].copy()
+                vis_ok = bool(vo.last_info.get("ok", False))
+                if prev_vo_t is not None and vis_ok:
+                    dp_vis = vo_t_now - prev_vo_t
+                else:
+                    dp_vis = None
+                prev_vo_t = vo_t_now
+                filt_p = tfilt.step(dt_f, R_wc, accel_cam, dp_vis, gyro_deg)
+                # accounting: raw VO step + filter step (pre-correction)
+                if diag_prev_vo is not None:
+                    diag_vo_path += float(np.linalg.norm(vo_t_now - diag_prev_vo))
+                diag_prev_vo = vo_t_now.copy()
+                if diag_prev_filt is not None:
+                    diag_filt_path += float(np.linalg.norm(filt_p - diag_prev_filt))
+                diag_prev_filt = filt_p.copy()
+                pose[:3, 3] = filt_p
+
                 # Set True when a loop-closure correction slews the pose this
                 # frame (a teleport while the camera is ~still). Coloured
                 # distinctly in the path so the jump reads as a map correction.
                 teleport = False
+
 
                 if ba_state is not None:
                     # Submit a keyframe snapshot every kf_every frames. Drop if
@@ -580,6 +747,43 @@ class OakOursVioSource(PoseSource):
                     if newC is not None:
                         C_target = newC
                     # Ease toward the target so the correction never snaps.
+                    C_applied = _ease_se3(C_applied, C_target, 0.15)
+                    pose = C_applied @ pose
+
+                if vio_state is not None:
+                    # Same cadence as BA, but each keyframe also carries its raw
+                    # IMU segment (cam frame) since the previous submit. Snapshot
+                    # the accumulated buffers and clear them so the next segment
+                    # spans exactly this->next keyframe.
+                    kf_count += 1
+                    if kf_count >= vio_state["kf_every"]:
+                        kf_count = 0
+                        st = vo.frontend.tracks
+                        try:
+                            frame_ts_ns = int(
+                                ld.getTimestampDevice().total_seconds() * 1e9)
+                        except Exception:
+                            frame_ts_ns = vio_imu_ts[-1] if vio_imu_ts else 0
+                        seg = (np.asarray(vio_imu_ts, np.int64),
+                               np.asarray(vio_imu_gyro, np.float64),
+                               np.asarray(vio_imu_accel, np.float64))
+                        vio_state["submit"](
+                            np.linalg.inv(pose),          # T_cw (world->cam)
+                            st.ids.copy(), st.points.copy(),
+                            depth_m.copy(), frame_ts_ns, seg)
+                        vio_imu_ts.clear()
+                        vio_imu_gyro.clear()
+                        vio_imu_accel.clear()
+                    # Pull + clamp + ease the tight-coupled correction every
+                    # frame so the accelerometer-tied VIO refinement actually
+                    # reaches the display (it must move during MOTION -- that is
+                    # when it matters). A blown-up correction (optimiser diverged
+                    # on noisy accel) is rejected by the translation clamp; the
+                    # ease then smooths whatever survives so it never snaps.
+                    newC = vio_state["poll"]()
+                    if (newC is not None and
+                            np.linalg.norm(newC[:3, 3]) < _VIO_CORR_MAX_T):
+                        C_target = newC
                     C_applied = _ease_se3(C_applied, C_target, 0.15)
                     pose = C_applied @ pose
 
@@ -728,8 +932,62 @@ class OakOursVioSource(PoseSource):
                         accel_used = 0
                         last_tilt_log = time.monotonic()
 
+                # Inertial-filter diagnostics (vio backend only). Reports the
+                # honest separation: the RAW vision displacement during fast
+                # rotation (the phantom the front-end emits) versus the DISPLAYED
+                # (filter-driven) displacement during the same frames -- the
+                # filter should reject the phantom -- plus the filter speed and
+                # vision-failure count. All quantities trace to real outputs.
+                if self.backend == "vio":
+                    vo_pos = vo.pose[:3, 3]
+                    disp_pos = pose[:3, 3]            # filter-driven position
+                    if prev_vo_pos is not None:
+                        tstep = float(np.linalg.norm(vo_pos - prev_vo_pos))
+                        vio_t_all += tstep
+                        if gyro_deg > 0.3:      # fast-rotation frame
+                            vio_t_rot += tstep
+                    if prev_disp_pos is not None and gyro_deg > 0.3:
+                        vio_disp_rot += float(np.linalg.norm(
+                            disp_pos - prev_disp_pos))
+                    prev_vo_pos = vo_pos.copy()
+                    prev_disp_pos = disp_pos.copy()
+                    vio_C_t = max(vio_C_t,
+                                  float(np.linalg.norm(C_applied[:3, 3])))
+                    vio_gyro_deg += gyro_deg
+                    if not vis_ok:
+                        vio_fail_n += 1
+                    # filter speed (m/s) max over the window
+                    vio_rtrust_min = min(
+                        vio_rtrust_min, float(np.linalg.norm(tfilt.v)))
+                    vio_n += 1
+                    now_v = time.monotonic()
+                    win = now_v - last_vio_log
+                    if win >= 1.0:
+                        rate = vio_gyro_deg / max(win, 1e-6)   # deg/s
+                        print(f"[ours-vio] filt-diag gyro={rate:5.1f}deg/s "
+                              f"vis_t@rot={vio_t_rot*100:5.1f}cm "
+                              f"disp_t@rot={vio_disp_rot*100:5.1f}cm "
+                              f"C_t={vio_C_t*100:5.1f}cm "
+                              f"fail={vio_fail_n} "
+                              f"v={np.linalg.norm(tfilt.v):.2f}m/s")
+                        vio_gyro_deg = vio_t_all = vio_t_rot = 0.0
+                        vio_disp_rot = 0.0
+                        vio_C_t = 0.0
+                        vio_fail_n = 0
+                        vio_coast_n = 0
+                        vio_disagree_max = 0.0
+                        vio_ttrust_min = 1.0
+                        vio_rtrust_min = 1.0
+                        last_vio_log = now_v
+
+
+
+
                 pos_opt = pose[:3, 3]
                 R_opt = pose[:3, :3]
+                if diag_prev_disp is not None:
+                    diag_disp_path += float(np.linalg.norm(pos_opt - diag_prev_disp))
+                diag_prev_disp = pos_opt.copy()
 
                 pos_ned = _M_OPT_TO_NED @ pos_opt
                 # Body axes [forward, right, down] in NED for the viewer triad.
@@ -747,6 +1005,7 @@ class OakOursVioSource(PoseSource):
                 prev_t = now
 
                 ok = bool(vo.last_info.get("ok", False))
+                _emit_t0 = time.monotonic()
                 self._emit(Pose(
                     t=t,
                     pos_ned=pos_ned,
@@ -756,12 +1015,30 @@ class OakOursVioSource(PoseSource):
                     teleport=teleport,
                     accel_quat_wxyz=accel_q_ned,
                 ))
+                diag_emit_ms += (time.monotonic() - _emit_t0) * 1e3
+                diag_loop_ms += (time.monotonic() - _iter_t0) * 1e3
+                diag_iter += 1
 
                 frames += 1
                 if now - last_fps_t >= 0.5:
                     self.fps = frames / (now - last_fps_t)
+                    win = now - last_fps_t
+                    n = max(diag_iter, 1)
+                    print(f"[ours-vio] thru recv={diag_recv/win:4.1f}fps "
+                          f"proc={frames/win:4.1f}fps drop={diag_backlog_sum} "
+                          f"vo={diag_vo_ms/n:4.1f}ms emit={diag_emit_ms/n:4.1f}ms "
+                          f"loop={diag_loop_ms/n:4.1f}ms")
+                    print(f"[ours-vio] path  vo={diag_vo_path*1000:6.0f}mm "
+                          f"filt={diag_filt_path*1000:6.0f}mm "
+                          f"disp={diag_disp_path*1000:6.0f}mm "
+                          f"(filt/vo={diag_filt_path/max(diag_vo_path,1e-6):.2f} "
+                          f"disp/filt={diag_disp_path/max(diag_filt_path,1e-6):.2f})")
                     frames = 0
                     last_fps_t = now
+                    diag_backlog_sum = diag_recv = 0
+                    diag_vo_ms = diag_emit_ms = diag_loop_ms = 0.0
+                    diag_iter = 0
+                    diag_vo_path = diag_filt_path = diag_disp_path = 0.0
 
             if ba_state is not None:
                 ba_state["stop"].set()
@@ -886,6 +1163,91 @@ class OakOursVioSource(PoseSource):
                         state["_corr"] = np.linalg.inv(post) @ T_cw
 
         th = threading.Thread(target=worker, name="OursBAWorker", daemon=True)
+        th.start()
+        state["thread"] = th
+        state["submit"] = submit
+        state["poll"] = poll
+        return state
+
+    # ----------------------------------------------------------------------- #
+    def _start_vio_worker(self, K: np.ndarray, R_imu_cam: np.ndarray) -> dict:
+        """Spawn the background tight-coupled VIO thread.
+
+        Returns a state dict with ``submit(T_cw, ids, pts, depth, ts_ns, seg)``
+        and ``poll() -> C | None``. Mirrors :meth:`_start_ba_worker` but the map
+        is a :class:`WindowedVIOMap`, so every keyframe also carries its raw IMU
+        segment (``seg = (ts_ns, gyro_cam, accel_cam)``, already rotated into the
+        camera frame and spanning the interval since the previous keyframe). The
+        joint visual+IMU solve pins translation to real linear acceleration, so
+        an in-place yaw can no longer be explained away as drift by slipped
+        tracks. The published correction ``C = inv(T_vio) @ T_cw`` maps the raw
+        f2f frame onto the VIO-refined one, eased onto the display.
+
+        The dense finite-difference solver is ~100x heavier than the BA core, so
+        a small window + few iterations keep each background solve short enough
+        that corrections stay reasonably fresh; if a solve is still running when
+        the next keyframe arrives, the single-slot pending queue simply drops the
+        older request (corrections update less often, never blocking the loop).
+        """
+        import threading
+
+        from ..vio.vio_window import (VioConfig, WindowedVIOConfig,
+                                      WindowedVIOMap)
+
+        # startup gyro bias is collected in the IMU frame; rotate it into the
+        # camera frame to match the cam-frame gyro samples fed to the map.
+        bg0 = None
+        if getattr(self, "_gyro_bias", None) is not None:
+            bg0 = R_imu_cam @ self._gyro_bias
+
+        cfg = WindowedVIOConfig(window=min(self.ba_window, 5),
+                                kf_every=self.ba_kf_every,
+                                vio=VioConfig(max_iters=6))
+        vio_map = WindowedVIOMap(K, bg0=bg0, cfg=cfg)
+
+        snap_lock = threading.Lock()
+        out_lock = threading.Lock()
+        event = threading.Event()
+        stop = threading.Event()
+        state = {
+            "event": event,
+            "stop": stop,
+            "kf_every": cfg.kf_every,
+            "_pending": None,
+            "_corr": None,
+        }
+
+        def submit(T_cw, ids, pts, depth_m, ts_ns, seg):
+            with snap_lock:
+                state["_pending"] = (T_cw, ids, pts, depth_m, ts_ns, seg)
+            event.set()
+
+        def poll():
+            with out_lock:
+                C = state["_corr"]
+                state["_corr"] = None
+            return C
+
+        def worker():
+            while not stop.is_set():
+                event.wait()
+                event.clear()
+                if stop.is_set():
+                    break
+                with snap_lock:
+                    snap = state["_pending"]
+                    state["_pending"] = None
+                if snap is None:
+                    continue
+                T_cw, ids, pts, depth_m, ts_ns, seg = snap
+                vio_map.add_keyframe(T_cw, ids, pts, depth_m, ts_ns,
+                                     imu_seg=seg)
+                post = vio_map.run_ba()
+                if post is not None:
+                    with out_lock:
+                        state["_corr"] = np.linalg.inv(post) @ T_cw
+
+        th = threading.Thread(target=worker, name="OursVIOWorker", daemon=True)
         th.start()
         state["thread"] = th
         state["submit"] = submit
