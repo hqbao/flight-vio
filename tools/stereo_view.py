@@ -7,11 +7,12 @@ Two ways to see *how our depth map looks*:
     ``[ rectified-left | OUR SGM depth | chip depth ]`` so you can eyeball our
     depth against the OAK-D's reference frame by frame, in real time.
 
-  * **Live** (``--live``, needs an OAK-D plugged in): runs the same recorder
-    front-end on the device (chip ``rectifiedLeft`` + raw ``syncedRight`` +
-    calibration) and shows ``[ rectified-left | OUR SGM depth ]`` computed live by
-    our own matcher -- no chip depth in the loop (that is the whole point: our
-    depth is what a ported platform would compute).
+  * **Live** (``--live``, needs an OAK-D plugged in): taps the two RAW cameras
+    (``CAM_B``/``CAM_C``) and rectifies BOTH frames + runs our SGM ourselves --
+    exactly the VPU-free path the live VIO source uses, so the depth you preview
+    here is byte-identical to what the VIO consumes. NO chip ``StereoDepth`` node
+    is in the loop (so there is no "width multiple of 16" constraint, and nothing
+    reads the VPU depth). Shows ``[ rectified-left | OUR SGM depth ]``.
 
 Our depth is :class:`oakd.vio.SGMStereoMatcher` (own rectification + dense
 semi-global matching, library-free). The chip depth shown in replay is only the
@@ -45,8 +46,10 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from oakd.vio import SessionReader, SGMConfig, SGMStereoMatcher  # noqa: E402
-from oakd.vio.stereo import HAVE_NUMBA, RightRectifier  # noqa: E402
+from oakd.vio import (  # noqa: E402
+    SessionReader, SGMConfig, SGMStereoMatcher, StereoCalib,
+)
+from oakd.vio.stereo import HAVE_NUMBA  # noqa: E402
 from oakd.vio.resolution import ResolutionProfile  # noqa: E402
 
 # Fixed depth range (metres) for the colormap, so colours are stable across
@@ -227,40 +230,61 @@ def run_live(cfg: SGMConfig, width: int, height: int, fps: int,
             print(f"camera: manual exposure {exposure_us}us iso{iso}")
         else:
             print(f"camera: auto-exposure, anti-banding {mains_hz}Hz")
-        stereo = p.create(dai.node.StereoDepth)
-        stereo.setExtendedDisparity(False)
-        stereo.setLeftRightCheck(True)
-        stereo.setSubpixel(False)
-        stereo.setDepthAlign(left_socket)
-        left.requestOutput((width, height)).link(stereo.left)
-        right.requestOutput((width, height)).link(stereo.right)
 
-        # Same inputs the recorder/gold use: chip rectified-left + RAW synced
-        # right. We rectify the right ourselves and run our own SGM -- the chip
-        # depth is never read here.
-        q_left = stereo.rectifiedLeft.createOutputQueue(maxSize=4, blocking=False)
-        q_right = stereo.syncedRight.createOutputQueue(maxSize=4, blocking=False)
-        # Chip depth is read ONLY when dumping, purely as an offline oracle to
-        # score our SGM against -- it is never used to produce our map.
-        q_depth = (stereo.depth.createOutputQueue(maxSize=4, blocking=False)
-                   if dump_dir is not None else None)
+        # VPU-FREE preview (matches the live VIO source exactly): tap the two
+        # RAW cameras and rectify BOTH ourselves + run our SGM. No chip
+        # StereoDepth in the loop -> no "width must be multiple of 16" constraint
+        # and the depth shown here is byte-identical to what the VIO consumes.
+        left_out = left.requestOutput((width, height))
+        right_out = right.requestOutput((width, height))
+        q_left = left_out.createOutputQueue(maxSize=4, blocking=False)
+        q_right = right_out.createOutputQueue(maxSize=4, blocking=False)
+
+        # Chip depth is an OPTIONAL offline oracle, read ONLY when dumping. The
+        # chip StereoDepth node requires the input width to be a multiple of 16,
+        # so the dump path (and only it) inherits that constraint.
+        q_depth = None
+        if dump_dir is not None:
+            if width % 16 != 0:
+                print(f"ERROR: --dump needs the chip StereoDepth oracle, whose "
+                      f"input width must be a multiple of 16 (got {width}). "
+                      f"Re-run --dump with e.g. --width {((width + 15)//16)*16}.")
+                return 2
+            stereo = p.create(dai.node.StereoDepth)
+            stereo.setExtendedDisparity(False)
+            stereo.setLeftRightCheck(True)
+            stereo.setSubpixel(False)
+            stereo.setDepthAlign(left_socket)
+            left_out.link(stereo.left)
+            right_out.link(stereo.right)
+            q_depth = stereo.depth.createOutputQueue(maxSize=4, blocking=False)
         p.start()
 
         ch = p.getDefaultDevice().readCalibration()
-        K = np.array(ch.getCameraIntrinsics(left_socket, width, height),
-                     dtype=np.float64)
-        Kr = np.array(ch.getCameraIntrinsics(right_socket, width, height),
-                      dtype=np.float64)
-        Dr = np.array(ch.getDistortionCoefficients(right_socket),
-                      dtype=np.float64)
-        T = np.array(ch.getCameraExtrinsics(left_socket, right_socket),
-                     dtype=np.float64).reshape(4, 4)
-        T[:3, 3] *= 0.01  # cm -> m
-        rect = RightRectifier(K, Kr, Dr, T[:3, :3], T[:3, 3], width, height)
-        matcher = SGMStereoMatcher(K, float(np.linalg.norm(T[:3, 3])), cfg,
-                                   rectifier=rect)
+
+        # Build our matcher from the live calibration exactly like the VIO source
+        # (oakd.sources.depthai_ours_vio): assemble the same JSON shape so
+        # StereoCalib.from_json applies the identical cm->m extrinsic convention,
+        # then ``rectify_left=True`` makes the matcher rectify BOTH raw frames.
+        def _intr(sock):
+            Ki = np.array(ch.getCameraIntrinsics(sock, width, height),
+                          dtype=np.float64)
+            dist = list(ch.getDistortionCoefficients(sock))
+            return {"fx": float(Ki[0, 0]), "fy": float(Ki[1, 1]),
+                    "cx": float(Ki[0, 2]), "cy": float(Ki[1, 2]),
+                    "dist": [float(x) for x in dist],
+                    "width": int(width), "height": int(height)}
+
+        T_lr = np.array(ch.getCameraExtrinsics(left_socket, right_socket),
+                        dtype=np.float64).reshape(4, 4)
+        calib = StereoCalib.from_json({
+            "intrinsics_left": _intr(left_socket),
+            "intrinsics_right": _intr(right_socket),
+            "T_left_right": T_lr.tolist(),
+        })
+        matcher = SGMStereoMatcher.from_calib(calib, cfg, rectify_left=True)
         print(f"live {width}x{height}@{fps}  engine "
-              f"{'numba' if HAVE_NUMBA else 'pure-numpy'}")
+              f"{'numba' if HAVE_NUMBA else 'pure-numpy'}  (VPU-free, own rectify)")
         print(f"[stereo_view] SGM cfg: ndisp={cfg.num_disparities} "
               f"downscale={cfg.downscale} -> compute width "
               f"{width // max(1, cfg.downscale)}px "
@@ -283,12 +307,12 @@ def run_live(cfg: SGMConfig, width: int, height: int, fps: int,
                 g = cv2.cvtColor(g, cv2.COLOR_BGR2GRAY)
             return g
 
-        # rectifiedLeft and syncedRight arrive on independent queues, so they are
-        # rarely both ready on the same poll AND a left frame may be paired with a
+        # The two RAW cameras arrive on independent queues, so they are rarely
+        # both ready on the same poll AND a left frame may be paired with a
         # stale right (or vice-versa). Feeding such a temporally MISMATCHED pair
         # to the matcher makes the disparity jump every frame -> violent flicker.
         # Fix: buffer by sequence number and only compute on a MATCHED pair (same
-        # seq), which the chip guarantees come from the same capture.
+        # seq); CAM_B/CAM_C are hardware frame-synced so equal seq = same capture.
         # Separately: pump the HighGUI loop (cv2.waitKey) EVERY iteration so the
         # macOS window never goes "Not Responding" while waiting for frames.
         pend_l: dict[int, np.ndarray] = {}
@@ -334,15 +358,21 @@ def run_live(cfg: SGMConfig, width: int, height: int, fps: int,
                 pend_r = {k: v for k, v in pend_r.items() if k > seq}
                 pend_d = {k: v for k, v in pend_d.items() if k > seq}
                 t0 = time.perf_counter()
-                ours = matcher.dense_depth(gl, gr)
+                # Rectify BOTH raw frames ourselves and get depth on the
+                # rectified-left grid (exactly what the VIO frontend tracks on).
+                rect_left, ours = matcher.dense_depth_rectified_left(gl, gr)
                 ms = (time.perf_counter() - t0) * 1e3
                 shown = stab(ours) if stab is not None else ours
+                # Display the RECTIFIED left (uint8), so the image and the depth
+                # share the same grid the VIO uses. Bilinear remap can land just
+                # outside [0,255], so clip before the cast.
+                disp_left = np.clip(rect_left, 0, 255).astype(np.uint8)
                 # Diagnostics: exposure (mean/std of left) tells us if the camera
                 # is auto-exposure hunting (alternating bright/dark -> flicker);
                 # valid% tells us how much depth survived this frame.
-                lmean = float(gl.mean()); lstd = float(gl.std())
+                lmean = float(disp_left.mean()); lstd = float(disp_left.std())
                 vr = float((ours > 0).mean()) * 100.0
-                left_bgr = _label(_gray_bgr(gl), "left")
+                left_bgr = _label(_gray_bgr(disp_left), "left (rect)")
                 cv2.putText(left_bgr,
                             f"seq{seq} exp{lmean:.0f}/{lstd:.0f} val{vr:.0f}%",
                             (8, height - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
@@ -354,7 +384,8 @@ def run_live(cfg: SGMConfig, width: int, height: int, fps: int,
                 cv2.imshow(win, panel)
                 shown_a_frame = True
                 if dump_f is not None and dumped < dump_n:
-                    cv2.imwrite(str(dump_dir / f"{dumped:03d}_L.png"), gl)
+                    # L = rectified left (gold convention), R = raw right.
+                    cv2.imwrite(str(dump_dir / f"{dumped:03d}_L.png"), disp_left)
                     cv2.imwrite(str(dump_dir / f"{dumped:03d}_R.png"), gr)
                     np.save(dump_dir / f"{dumped:03d}_depth.npy",
                             ours.astype(np.float32))
