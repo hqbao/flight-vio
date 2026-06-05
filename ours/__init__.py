@@ -8,8 +8,12 @@ DepthAI BasaltVIO + RTABMap black boxes one module at a time:
                                    graph + loop closure, the synced-input bundle)
   * ``ours.depthai_ours_vio``    — the live OAK-D source driving ``ours.vio``
   * ``ours.tools``               — offline scoring, self-tests and inspectors
+  * ``ours.{pose,frames,pngio}`` — our own pose types, frames math, PNG codec
+  * ``ours.sources`` / ``ours.ui`` — our own pose-source base + Qt 3D viewer
 
-Shared infrastructure (pose types, frames math, the Qt viewer, the session
-recorder, the PNG codec) lives in the neutral ``oakd`` core package, which this
-package depends on. The library baseline we are replacing lives in ``baseline``.
+This package is fully self-contained: it imports nothing from ``oakd`` (the
+baseline's core) so the two pipelines share no code. We accept the small
+duplication (pose/frames/pngio/sources/ui) in exchange for a clean split. The
+library baseline we are replacing lives in ``baseline`` (with ``oakd`` as its
+core).
 """

@@ -38,7 +38,7 @@ from typing import Iterator
 
 import numpy as np
 
-from oakd.pngio import imread_gray
+from ours.pngio import imread_gray
 
 
 @dataclass

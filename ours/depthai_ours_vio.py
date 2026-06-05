@@ -54,13 +54,13 @@ import time
 
 import numpy as np
 
-from oakd.pose import Pose
-from oakd.frames import quat_to_rpy
+from ours.pose import Pose
+from ours.frames import quat_to_rpy
 from ours.vio import (
     InertialTranslationFilter, KLTFrontend,
     RGBDVisualOdometry, gravity_aligned_R0, level_attitude,
 )
-from oakd.sources.base import PoseSource
+from ours.sources.base import PoseSource
 
 
 # Standard OpenCV optical (x right, y down, z forward) -> world NED.

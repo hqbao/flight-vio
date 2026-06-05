@@ -37,7 +37,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from oakd.frames import quat_to_rpy  # noqa: E402
+from ours.frames import quat_to_rpy  # noqa: E402
 from ours.vio.imu import gravity_aligned_R0  # noqa: E402
 
 

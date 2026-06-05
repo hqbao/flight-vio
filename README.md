@@ -6,7 +6,7 @@ to a Raspberry Pi 5 later.
 
 ```
 oak-d/
-  oakd/                  neutral shared core (depends on nothing)
+  oakd/                  core for the BASELINE pipeline only (ours has its own copies)
     frames.py            camera <-> body (FRD) <-> world (NED) transforms
     pose.py              Pose dataclass + ring buffer
     recorder.py          live-run logger (C0..C9 streams to sessions/<name>/)
@@ -19,7 +19,12 @@ oak-d/
       viewer3d.py        pyqtgraph GLViewWidget — trajectory, drone triad, grid
       panels.py          telemetry side-panel
       mainwindow.py      top-level QMainWindow + toolbar (view presets)
-  ours/                  OUR from-scratch pipeline (library-free; replaces Basalt)
+  ours/                  OUR from-scratch pipeline (library-free; shares NO code with oakd/)
+    pose.py              own Pose dataclass + ring buffer (copy, kept independent)
+    frames.py            own camera/body/world transforms (copy)
+    pngio.py             own pure-Python PNG codec (copy)
+    sources/             own PoseSource base + fake source (copy)
+    ui/                  own Qt 3D viewer (theme/viewer3d/panels/mainwindow, copy)
     depthai_ours_vio.py  live OAK-D source driving ours.vio (ours/-ba/-slam/-vio)
     vio/                 the algorithm library
       frontend.py        own KLT + Shi-Tomasi feature frontend (cv2-free)
@@ -40,6 +45,7 @@ oak-d/
       reader.py          recorded-session reader for offline scoring
       synced.py          transparent time-synced (image, depth, IMU) bundles
     tools/
+      view_pose3d.py     live 3D viewer (run.sh entry; ours backends)
       vio_run.py         offline scoring of ours f2f/ba/slam/vio vs Basalt
       live_replay.py     replay a recorded session through the live ours pipeline
       synced_view.py     inspect the synced (image, depth, IMU) triplet
@@ -49,7 +55,7 @@ oak-d/
     depthai_vio.py       real stereo-inertial VIO (dai.node.BasaltVIO)
     depthai_slam.py      VIO + SLAM with loop closure (BasaltVIO + RTABMapSLAM)
     tools/
-      view_pose3d.py     live 3D viewer from OAK over USB (run.sh entry)
+      view_pose3d.py     live 3D viewer from OAK over USB (Basalt backends)
       record_session.py  dump C0..C9 + PCL from a live run to sessions/<name>/
       viz_session.py     offline multi-tab replay of a recorded session
       compare_sessions.py  ATE/RPE between two pose streams (VIO vs SLAM, etc.)
@@ -82,19 +88,21 @@ This gives camera-frame axes (right-handed, OpenCV convention):
 
 ## Quick start
 
-```bash
-./run.sh                       # launches viewer with fake pose source
-./run.sh --source fake         # explicit
-./run.sh --source oak          # real VIO (BasaltVIO, low latency, no loop closure)
-./run.sh --source slam         # VIO + SLAM with loop closure (BasaltVIO + RTABMapSLAM)
-```
-
-### From-scratch VIO/SLAM sources (our own pipeline, replacing Basalt)
+`run.sh` launches the viewer for **our** pipeline (the two roots share no code):
 
 ```bash
+./run.sh                       # our frame-to-frame RGB-D PnP VO (default)
+./run.sh --source fake         # device-free procedural trajectory
 ./run.sh --source ours         # our frame-to-frame RGB-D PnP VO
 ./run.sh --source ours-ba      # + sliding-window bundle adjustment (depth-anchored)
 ./run.sh --source ours-slam    # + ORB loop closure + SE(3) pose graph (full SLAM)
+```
+
+The **baseline** (DepthAI/Basalt) viewer is a separate entry point:
+
+```bash
+.venv/bin/python baseline/tools/view_pose3d.py --source oak    # BasaltVIO
+.venv/bin/python baseline/tools/view_pose3d.py --source slam   # BasaltVIO + RTABMapSLAM
 ```
 
 Both `ours-ba` and `ours-slam` run their heavy optimisation on a background
@@ -253,7 +261,7 @@ in the numbers instead of as lag on the device.
       and the offline f2f/ba scoring are now fully cv2-free; cv2 is lazily
       imported only for ORB loop closure (`ours-slam`) and the dev-only PnP A/B
       oracle (`OAKD_OWN_PNP=0`)
-- [x] Pure-Python PNG codec (`oakd/pngio.py`, 8-bit grayscale, all 5 PNG
+- [x] Pure-Python PNG codec (`ours/pngio.py`, 8-bit grayscale, all 5 PNG
       filters) for frame IO, replacing `cv2.imread`/`imwrite` (decode verified
       byte-for-byte vs cv2)
 - [x] Logging + offline replay (`baseline/tools/record_session.py` + `baseline/tools/viz_session.py`)
