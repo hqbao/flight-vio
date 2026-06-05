@@ -24,9 +24,9 @@ oak-d/
       io/                recorded-session reader + time-synced bundles
       config/            resolution-aware tuning profiles
     flows/               live-pipeline orchestration (one thread + tasks per flow)
-      capture/ depth/ odometry/ backend/ slam/ ui/
-    sources/             own PoseSource base + fake source (copy)
-    ui/                  own Qt 3D viewer (theme/viewer3d/panels/mainwindow, copy)
+      capture/ depth/ odometry/ backend/ slam/ ui/   (capture = replay + live)
+      live_source.py     bridge: run the live flow graph into the Qt viewer
+    ui/                  own Qt 3D viewer + PoseSource base + fake source (copy)
     tools/               offline scoring + self-tests (call ours.lib directly)
       view_pose3d.py     live 3D viewer (run.sh entry; ours backends)
       vio_run.py         offline scoring of ours f2f/ba/slam/vio vs Basalt
@@ -93,6 +93,14 @@ The **baseline** (DepthAI/Basalt) viewer is a separate entry point:
 ```bash
 .venv/bin/python baseline/tools/view_pose3d.py --source oak    # BasaltVIO
 .venv/bin/python baseline/tools/view_pose3d.py --source slam   # BasaltVIO + RTABMapSLAM
+```
+
+`--source ours` is the flow pipeline (capture → depth → odometry → backend →
+slam → ui flows over a pub/sub bus); the older single-file source is still
+available as `--source ours-legacy`. For a device run with no GUI:
+
+```bash
+.venv/bin/python -m ours.app --live          # headless: stream the OAK-D, print pose/loops
 ```
 
 Both `ours-ba` and `ours-slam` run their heavy optimisation on a background

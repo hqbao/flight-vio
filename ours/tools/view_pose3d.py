@@ -142,7 +142,11 @@ def main() -> int:
     source = _build_source(args.source, args)
 
     app = QApplication(sys.argv)
-    win = MainWindow(history, source, source_name=args.source)
+    # Live device sources show best top-down (drone seen from above); the
+    # synthetic figure-8 reads better in the default iso view.
+    default_view = "ISO" if args.source.lower() == "fake" else "TOP"
+    win = MainWindow(history, source, source_name=args.source,
+                     default_view=default_view)
     win.show()
     return app.exec()
 

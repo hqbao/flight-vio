@@ -25,6 +25,7 @@ offline test harness.
 """
 from __future__ import annotations
 
+import sys
 import time
 from dataclasses import dataclass
 
@@ -43,6 +44,14 @@ from ...lib.task import Task
 # of the raw accelerometer against its EMA (recent motion energy, m/s^2). Mirrors
 # the legacy live path so the at-rest gate behaves identically.
 _REST_MOTION_THRESH = 0.35
+
+# Startup calibration (gyro bias + gravity-align accel) is only valid while the
+# camera is genuinely still: the bias is the mean gyro, so ANY rotation during
+# the window is absorbed into the bias and then injected into every later motion
+# prior -> the VIO drifts. These gates reject a sample (and restart the still
+# window) when the device is moving, so a shake at START no longer poisons it.
+_STILL_GYRO = 0.15   # rad/s; max |gyro| still considered "at rest"
+_STILL_ACCEL = 0.6   # m/s^2; max accel deviation from the window mean
 
 
 @dataclass(frozen=True)
@@ -155,12 +164,24 @@ class LiveCaptureFlow(SourceFlow):
                          accel_align=self._accel_align)
 
     def _collect_startup(self, window_s: float = 0.4,
-                         timeout_s: float = 2.0) -> np.ndarray | None:
-        """Mean startup accel (cam frame) + gyro bias over a static window."""
+                         timeout_s: float = 6.0) -> np.ndarray | None:
+        """Mean startup accel (cam frame) + gyro bias over a STILL window.
+
+        The bias is the mean gyro and the gravity reference is the mean accel,
+        so the window must be motion-free: a sample is accepted only while the
+        device is at rest (``|gyro| < _STILL_GYRO`` and the accel stays within
+        ``_STILL_ACCEL`` of the window mean). Any motion clears the buffer and
+        restarts the window -- so shaking the camera right after START no longer
+        bakes the shake into the gyro bias / level. We wait up to ``timeout_s``
+        for a clean ``window_s`` still span; if the camera never settles we fall
+        back to whatever was seen and warn (bias left at zero rather than
+        poisoned), so the run still starts but the user knows to hold still.
+        """
         accel: list[np.ndarray] = []
         gyro: list[np.ndarray] = []
+        win_start: float | None = None
+        moved = False
         t_start = time.monotonic()
-        t_first: float | None = None
         while time.monotonic() - t_start < timeout_s:
             msg = self._q_imu.tryGet()
             if msg is None:
@@ -169,18 +190,39 @@ class LiveCaptureFlow(SourceFlow):
             for pkt in msg.packets:
                 a = pkt.acceleroMeter
                 v = np.array([a.x, a.y, a.z], dtype=np.float64)
-                if np.all(np.isfinite(v)):
-                    accel.append(v)
                 g = pkt.gyroscope
                 w = np.array([g.x, g.y, g.z], dtype=np.float64)
-                if np.all(np.isfinite(w)):
-                    gyro.append(w)
-            if t_first is None:
-                t_first = time.monotonic()
-            elif time.monotonic() - t_first >= window_s:
-                break
-        if gyro:
-            self._gyro_bias = np.mean(gyro, axis=0)
+                if not (np.all(np.isfinite(v)) and np.all(np.isfinite(w))):
+                    continue
+                moving = float(np.linalg.norm(w)) > _STILL_GYRO
+                if accel and float(np.linalg.norm(
+                        v - np.mean(accel, axis=0))) > _STILL_ACCEL:
+                    moving = True
+                if moving:
+                    # Shake detected -> drop the partial window and restart; a
+                    # motion-contaminated mean would poison bias + leveling.
+                    accel.clear()
+                    gyro.clear()
+                    win_start = None
+                    moved = True
+                    continue
+                accel.append(v)
+                gyro.append(w)
+                now = time.monotonic()
+                if win_start is None:
+                    win_start = now
+                elif now - win_start >= window_s and len(gyro) >= 10:
+                    self._gyro_bias = np.mean(gyro, axis=0)
+                    if moved:
+                        print("[live] startup: settled after initial motion "
+                              "-> calibrated at rest.", file=sys.stderr)
+                    return self._R_imu_cam @ np.mean(accel, axis=0)
+        # Timed out without a clean still window. Use the accel mean for a rough
+        # level but leave the gyro bias at zero -- a biased estimate from motion
+        # is worse than none. Warn so the user holds still and re-presses START.
+        print("[live] WARNING: camera kept moving during startup calibration; "
+              "gyro bias not estimated. Hold the camera still and restart for "
+              "a stable VIO.", file=sys.stderr)
         if not accel:
             return None
         return self._R_imu_cam @ np.mean(accel, axis=0)

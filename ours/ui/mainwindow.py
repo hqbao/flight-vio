@@ -39,6 +39,7 @@ class MainWindow(QMainWindow):
         history: PoseHistory,
         source: PoseSource,
         source_name: str = "fake",
+        default_view: str = "ISO",
     ) -> None:
         super().__init__()
         self.history = history
@@ -98,7 +99,7 @@ class MainWindow(QMainWindow):
         bh.setContentsMargins(6, 6, 6, 6)
         bh.setSpacing(6)
 
-        self.viewer = Viewer3D(history)
+        self.viewer = Viewer3D(history, default_view=default_view)
         # Live SLAM map overlay (keyframe dots + loop-closure links), only when
         # the source publishes one (backend='slam'); harmless no-op otherwise.
         if hasattr(source, "slam_overlay_snapshot"):

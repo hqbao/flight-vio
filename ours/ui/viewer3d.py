@@ -126,7 +126,8 @@ VIEW_PRESETS: dict[str, tuple[float, float, float]] = {
 class Viewer3D(gl.GLViewWidget):
     """OpenGL viewport with grid, axes, trajectory line and drone triad."""
 
-    def __init__(self, history: PoseHistory, parent=None) -> None:
+    def __init__(self, history: PoseHistory, parent=None,
+                 default_view: str = "ISO") -> None:
         super().__init__(parent)
         self.history = history
         self.setBackgroundColor(QColor(theme.BG))
@@ -187,7 +188,7 @@ class Viewer3D(gl.GLViewWidget):
 
         # ---- follow-cam state --------------------------------------------
         self._follow = False
-        self.set_view("ISO")
+        self.set_view(default_view if default_view in VIEW_PRESETS else "ISO")
 
         # ---- refresh timer (UI 60 Hz, decoupled from source rate) --------
         self._timer = QtCore.QTimer(self)
