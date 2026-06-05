@@ -8,13 +8,7 @@ edges of the unified acquisition front-end:
 * ``frame.depth`` -> [:class:`~ours.flows.odometry.track_features.TrackFeatures`,
   :class:`~ours.flows.odometry.estimate_motion.EstimateMotion`,
   :class:`~ours.flows.odometry.publish_pose.PublishPose`,
-  :class:`~ours.flows.odometry.emit_keyframe.EmitKeyframe`,
-  :class:`~ours.flows.odometry.signal_done.SignalDone`]
-
-``SignalDone`` is the tail: it publishes one ``frame.done`` per processed frame so
-the imu_cam flow's realtime admission gate frees the frame's in-flight credit (the
-backpressure loop). It runs after ``EmitKeyframe`` (which now returns the ``Step``
-so the chain continues).
+  :class:`~ours.flows.odometry.emit_keyframe.EmitKeyframe`]
 
 Both inputs come from the SAME flow: the imu_cam flow publishes ``imucam.sample``
 and, with its depth task, ``frame.depth``. This flow owns the IMU->prior fusion
@@ -47,7 +41,6 @@ from .track_features import TrackFeatures
 from .estimate_motion import EstimateMotion
 from .publish_pose import PublishPose
 from .emit_keyframe import EmitKeyframe
-from .signal_done import SignalDone
 
 
 class OdometryFlow(Flow):
@@ -69,5 +62,5 @@ class OdometryFlow(Flow):
         self.on(topics.IMUCAM_SAMPLE, [PreintegratePrior()])
         self.on(topics.FRAME_DEPTH,
                 [TrackFeatures(), EstimateMotion(), PublishPose(),
-                 EmitKeyframe(), SignalDone()])
+                 EmitKeyframe()])
         self.forwards_to(topics.POSE_ODOM, topics.KEYFRAME)

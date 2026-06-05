@@ -170,8 +170,8 @@ violate the §2 rule (which only forbids *cross-flow* calls).
 | Flow | Tasks (in order) | Subscribes | Publishes |
 |---|---|---|---|
 | **cam** | `produce` → `PublishCamSync` | — (source) | `cam.sync` |
-| **imu_cam** | `AdmitFrame` → `PackImuCam` → `PublishImuRaw` → `ApplyCalibration` → `PublishImuCam` → `ComputeDepth` → `PublishDepth` ; `CompleteAdmission` | `cam.sync`, `frame.done` | `imu.raw`, `imucam.sample`, `frame.depth` |
-| **odometry** | `PreintegratePrior` ⟂ `TrackFeatures` → `EstimateMotion` → `PublishPose` → `EmitKeyframe` → `SignalDone` | `imucam.sample`, `frame.depth` | `pose.odom`, `keyframe`, `frame.done` |
+| **imu_cam** | `PackImuCam` → `PublishImuRaw` → `ApplyCalibration` → `PublishImuCam` → `ComputeDepth` → `PublishDepth` | `cam.sync` | `imu.raw`, `imucam.sample`, `frame.depth` |
+| **odometry** | `PreintegratePrior` ⟂ `TrackFeatures` → `EstimateMotion` → `PublishPose` → `EmitKeyframe` | `imucam.sample`, `frame.depth` | `pose.odom`, `keyframe` |
 | **backend** | `RunBA` → `PublishRefined` | `keyframe` | `pose.refined` |
 | **slam** | `SlamStep` → `PublishCorrection` | `keyframe` | `loop.correction` |
 | **ui-collector** | `CollectOdom` / `CollectRefined` / `CollectCorrection` | `pose.odom`, `pose.refined`, `loop.correction` | — (sink) |
@@ -184,31 +184,28 @@ hardware. The replay path subtracts a startup gyro bias (mean of the first ~1 s)
 in `ApplyCalibration` and seeds the odometry gravity-align from the first ~0.3 s
 of accel, mirroring what the live front-end measures once at boot.
 
-**Realtime backpressure (live only).** The camera streams at a fixed fps but the
-VIO sustains less; with unbounded inboxes the surplus ~0.5 MB stereo packets pile
-up on the host until memory pressure starves the depthai link and the device
-firmware **watchdog crashes the camera**. The `imu_cam` flow therefore admits at most
-`N` frames in flight (`BudgetAdmission`, default 2): `AdmitFrame` (first in the
-chain, before the IMU is drained) skips a frame at the source when over budget —
-so the skipped interval's IMU folds into the next admitted frame and the diamond
-never desyncs — and `SignalDone` (odometry tail) publishes `frame.done` to free a
-credit. The gate sits BEFORE the pack/depth work, so the surviving subset is
-identical on both the `imucam.sample` and `frame.depth` outputs. Replay injects `AdmitAll` (admit everything,
-never count) so it stays byte-for-byte deterministic (60-for-60).
+**Live device safety (host-side).** The OAK-D is single-client: the `cam` and
+`imu_cam` live sources share ONE `SharedLiveDevice` pipeline (reference-counted).
+Every read of a depthai output queue goes through `SharedLiveDevice.poll`, which
+holds the same lock the teardown (`release` → `handle.stop`) holds. So the two
+reader threads never enter the depthai link concurrently, and a queue is never
+read while another thread is destroying the pipeline — the lifetime race that
+aborted the host with `mutex lock failed: Invalid argument` and (by starving the
+XLink) tripped the device firmware watchdog. Verified offline by
+`oak_live_selftest` (readers hammer `poll` while a concurrent `release` destroys a
+queue that raises if read post-stop).
 
 ### Per-flow files
 - `cam/`: `sources.py` (replay/live `CamSource`), `publish_cam_sync.py`,
   `cam_flow.py`.
 - `imu_cam/`: `sources.py` (replay/live `ImuSource`), `pack_imucam.py`,
   `apply_calibration.py`, `publish_imu_raw.py`, `publish_imucam.py`,
-  `admission.py` (realtime credit gate) + `admit_frame.py` / `complete_admission.py`,
   `compute_depth.py`, `publish_depth.py` (depth as a task in this flow),
   `imu_stream.py` (IMU-only reader for the calib wizards), `imu_cam_flow.py`.
 - `odometry/`: `preintegrate_prior.py`, `track_features.py` (KLT, holds the numba
   parallel lock), `estimate_motion.py` (pure-NumPy PnP + gyro fusion, lock-free),
   `tracked.py` (TrackFeatures→EstimateMotion carrier), `publish_pose.py`,
-  `emit_keyframe.py`, `signal_done.py` (backpressure credit), `step.py` (carrier),
-  `odometry_flow.py`.
+  `emit_keyframe.py`, `step.py` (carrier), `odometry_flow.py`.
 - `backend/`: `run_ba.py`, `publish_refined.py`, `backend_flow.py`.
 - `slam/`: `slam_step.py`, `publish_correction.py`, `slam_flow.py`.
 - `ui/`: `collect_odom.py`, `collect_refined.py`, `collect_correction.py`,
@@ -272,7 +269,7 @@ The stable public API is the flat re-export from `ours/lib/__init__.py`
    ```
    for t in orb klt stereo vio_ba ba posegraph imu_preint motion_predict \
             inertial_filter accel_calib calib_store calib_collect \
-            imucam_sync flow_replay admission; do
+            imucam_sync flow_replay; do
      python -m ours.tools.${t}_selftest; done
    QT_QPA_PLATFORM=offscreen python -m ours.tools.ui_calib_selftest
    python -m ours.app --session sessions/gold/lab_loop_30s --max-frames 60 --depth-fast

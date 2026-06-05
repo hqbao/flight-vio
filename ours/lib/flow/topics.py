@@ -25,17 +25,6 @@ sensor reported), the frames bundled with the *calibrated* IMU on
 own depth task. The odometry flow owns the IMU->prior fusion itself (no separate
 capture flow).
 
-A backpressure CONTROL edge closes the loop on the live path only::
-
-    odometry  --frame.done----> imu_cam   (one credit per admitted frame)
-
-The ``imu_cam`` flow admits at most ``N`` frames in flight; ``frame.done``
-(published once per processed frame by the odometry tail) frees a credit. Over
-budget, the ``imu_cam`` flow skips a camera frame at the source -- before the
-heavy packet is built -- so the host backlog stays bounded and the device link
-never stalls. Replay admits everything (deterministic). See
-``flows/imu_cam/admission.py``.
-
 Note: the back-end and SLAM flows both trigger off ``keyframe`` (NOT
 ``pose.odom``); the SLAM ``loop.correction`` is currently consumed only by the
 UI collector -- it is not yet fed back into odometry (no closed loop on the live
@@ -56,8 +45,3 @@ IMUCAM_SAMPLE = "imucam.sample"
 # Raw IMU for each frame interval, published BEFORE calibration (honest, what
 # the sensor reported). ``imucam.sample`` carries the CALIBRATED IMU.
 IMU_RAW = "imu.raw"
-# Backpressure CONTROL topic (not data): the odometry tail publishes a one-per-
-# admitted-frame FrameDone here; the imu_cam flow's admission gate consumes it to
-# free an in-flight credit. Live-only effect (replay admits everything); never
-# END-forwarded, so it does not enter the graph's drain accounting.
-FRAME_DONE = "frame.done"

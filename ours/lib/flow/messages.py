@@ -158,17 +158,3 @@ class ImuRaw:
     imu_ts: np.ndarray
     gyro: np.ndarray
     accel: np.ndarray
-
-
-@dataclass(frozen=True)
-class FrameDone:
-    """Backpressure CONTROL signal: one frame finished the depth+odometry diamond.
-
-    Published on ``topics.FRAME_DONE`` by the odometry tail once per processed
-    frame (always -- even when tracking failed), and consumed by the imu_cam
-    flow's admission gate to free an in-flight credit. It is control, not data: it
-    carries only the frame ``seq`` and never an estimate. On the replay path the
-    gate admits everything, so this is a no-op there.
-    """
-
-    seq: int

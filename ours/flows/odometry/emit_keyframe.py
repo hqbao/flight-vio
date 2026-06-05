@@ -3,9 +3,6 @@
 The keyframe carries the pose, image, depth, the current track snapshot and --
 only when the camera was at rest -- the gravity accel for the back-end (a moving
 keyframe's lateral acceleration would bias the gravity direction).
-
-Returns the :class:`Step` unchanged so a tail task (``SignalDone``) can run after
-it; it is no longer the last task in the chain.
 """
 from __future__ import annotations
 

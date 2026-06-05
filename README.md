@@ -110,12 +110,11 @@ on how the camera is held); the **gyro bias** is a sensor constant, so it is
 calibrated once, saved per device under `.cache/imu_calib.json`, and reused on
 later runs. Force a fresh bias measurement with `--recalibrate-bias`.
 
-The live path applies **realtime backpressure**: the camera streams at `--fps`
-but the VIO sustains less, so the imu_cam flow admits at most a few frames in flight
-(default 2) and skips the rest at the source. This keeps the host backlog bounded
-— without it the surplus stereo packets pile up until memory pressure stalls the
-depthai link and the OAK-D firmware watchdog crashes the device. Replay admits
-every frame (deterministic).
+All access to the shared OAK-D output queues goes through one lock
+(`SharedLiveDevice.poll`), so the camera and IMU reader threads never enter the
+depthai link concurrently and a queue is never read while another thread is
+tearing the pipeline down — the lifetime race that aborted the host with
+`mutex lock failed` and tripped the device watchdog.
 
 The 3D viewer groups its features in a **menu bar** (the toolbar keeps only the
 primary START/STOP):
@@ -313,8 +312,7 @@ Self-tests (run before/after touching the from-scratch VIO):
 .venv/bin/python ours/tools/vio_ba_selftest.py     # tight-coupled VIO joint solve
 .venv/bin/python -m ours.tools.imucam_sync_selftest  # split cam/IMU sync contract (1 pkt/frame, samples in (prev,ts])
 .venv/bin/python -m ours.tools.flow_replay_selftest  # full ours.app VIO graph over a gold session (60 pose.odom + refined)
-.venv/bin/python -m ours.tools.admission_selftest    # realtime backpressure gate (caps frames in flight; folds IMU on skip)
-.venv/bin/python -m ours.tools.oak_live_selftest     # single-client shared OAK-D (cam+IMU open the device once)
+.venv/bin/python -m ours.tools.oak_live_selftest     # single-client shared OAK-D (cam+IMU open once; teardown race-safe)
 QT_QPA_PLATFORM=offscreen .venv/bin/python -m ours.tools.imucam_window_selftest  # in-app synced view renders (offscreen Qt)
 QT_QPA_PLATFORM=offscreen .venv/bin/python -m ours.tools.synced_window_selftest  # image|depth|IMU triplet window renders (offscreen Qt)
 QT_QPA_PLATFORM=offscreen .venv/bin/python -m ours.tools.keypoints_window_selftest # keypoints coloured by depth + per-id trails (offscreen Qt)
