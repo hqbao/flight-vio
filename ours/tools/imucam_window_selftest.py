@@ -45,27 +45,48 @@ def _replay_factory(reader: SessionReader):
     return _make
 
 
-def main() -> int:
-    print("imucam_window_selftest")
-    reader = SessionReader(Path(_SESSION))
-    app = QApplication.instance() or QApplication([])
+class _DeadCamSource(ReplayCamSource):
+    """A camera source that fails to open -- mimics a missing/busy OAK-D.
 
+    Reproduces the live failure where ``LiveCamSource.open()`` raises
+    ``X_LINK_DEVICE_NOT_FOUND``; the window must surface it, not hang.
+    """
+
+    def open(self) -> None:
+        raise RuntimeError(
+            "Failed to find device (3.1.2), error message: X_LINK_DEVICE_NOT_FOUND")
+
+
+def _dead_factory(reader: SessionReader):
+    def _make():
+        return (_DeadCamSource(reader, max_frames=_MAX_FRAMES),
+                ReplayImuSource(reader, realtime=False))
+    return _make
+
+
+def _run_until(app, predicate, timeout_s: float) -> None:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline and not predicate():
+        app.processEvents()
+        time.sleep(0.005)
+
+
+def test_happy_path(app, reader: SessionReader) -> None:
+    print(" replay (happy path)")
     win = ImuCamWindow(_replay_factory(reader), fps=120)
     win.show()                                       # showEvent -> start()
     _check(win._running, "window started the split flows on show")
 
-    # Pump the Qt loop until the widget has rendered frames (or timeout).
     seqs: list[int] = []
-    deadline = time.time() + 15.0
-    while time.time() < deadline:
-        app.processEvents()
+
+    def _got_frames() -> bool:
         pix = win._view.pixmap()
         txt = win._status.text()
         if pix is not None and not pix.isNull() and txt.startswith("seq="):
             seqs.append(int(txt.split("seq=")[1].split()[0]))
-            if len(seqs) >= 5 or win._ended:
-                break
-        time.sleep(0.005)
+        return len(seqs) >= 5 or win._ended
+
+    _run_until(app, _got_frames, 15.0)
 
     pix = win._view.pixmap()
     _check(pix is not None and not pix.isNull(), "widget shows a rendered pixmap")
@@ -78,6 +99,33 @@ def main() -> int:
 
     win.close()                                      # closeEvent -> stop()
     _check(not win._running, "window stopped the flows on close")
+
+
+def test_device_not_found(app, reader: SessionReader) -> None:
+    print(" device-not-found (must fail clean, not hang)")
+    win = ImuCamWindow(_dead_factory(reader), fps=120)
+    win._startup_timeout_s = 3.0
+    win.show()
+
+    _run_until(app, lambda: win._failed, 8.0)
+
+    _check(win._failed, "window flagged failure instead of hanging")
+    _check(not win._first_seen, "no frame was rendered on the dead device")
+    _check("X_LINK_DEVICE_NOT_FOUND" in win._view.text(),
+           f"widget shows the device error (got: {win._view.text()!r})")
+    _check(not win._timer.isActive(), "render timer stopped after failure")
+
+    win.close()
+    _check(not win._running, "window stopped the flows on close")
+
+
+def main() -> int:
+    print("imucam_window_selftest")
+    reader = SessionReader(Path(_SESSION))
+    app = QApplication.instance() or QApplication([])
+
+    test_happy_path(app, reader)
+    test_device_not_found(app, reader)
 
     print("ALL PASS")
     return 0

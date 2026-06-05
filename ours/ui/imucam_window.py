@@ -22,6 +22,7 @@ only by that renderer (when this window is opened), so the base UI stays cv2-fre
 from __future__ import annotations
 
 import queue
+import time
 from collections.abc import Callable
 
 import numpy as np
@@ -115,7 +116,14 @@ class ImuCamWindow(QWidget):
         self._sink: _QueueSink | None = None
         self._running = False
         self._ended = False
+        self._first_seen = False
+        self._failed = False
+        self._t_start = 0.0
         self._buf: np.ndarray | None = None   # keep QImage backing alive
+
+        # If no frame arrives within this window (and nothing reports an error),
+        # assume the device is unreachable/stalled rather than hanging forever.
+        self._startup_timeout_s = 12.0
 
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(15)
@@ -140,6 +148,10 @@ class ImuCamWindow(QWidget):
         self._cam.start()
         self._running = True
         self._ended = False
+        self._first_seen = False
+        self._failed = False
+        self._t_start = time.monotonic()
+        self._view.setText("starting…  (opening the OAK-D)")
         self._timer.start()
 
     def stop(self) -> None:
@@ -157,15 +169,48 @@ class ImuCamWindow(QWidget):
     def _on_tick(self) -> None:
         packet = self._drain_latest()
         if packet is None:
-            if self._ended:
-                self._status.setText("stream ended")
-                self._timer.stop()
+            self._maybe_report_no_frame()
             return
+        self._first_seen = True
         row = compose(packet, self._chart)               # BGR uint8 (H, W, 3)
         self._show(row)
         self._status.setText(
             f"seq={packet.seq}   imu samples={packet.imu_ts.size}   "
             f"left {packet.gray_left.shape[1]}×{packet.gray_left.shape[0]}")
+
+    def _maybe_report_no_frame(self) -> None:
+        """Surface a clean error/end state instead of hanging on 'starting…'."""
+        if self._first_seen:
+            if self._ended:
+                self._status.setText("stream ended")
+                self._timer.stop()
+            return
+        # No frame yet: decide whether the stream failed or simply finished.
+        reason = self._failure_reason()
+        threads_dead = (self._cam is not None and not self._cam.is_alive()
+                        and self._imu is not None and not self._imu.is_alive())
+        timed_out = (time.monotonic() - self._t_start) > self._startup_timeout_s
+        if reason or self._ended or threads_dead or timed_out:
+            self._fail(reason or
+                       ("no frames — is the OAK-D connected and free? "
+                        "(nothing else may hold the device)"))
+
+    def _fail(self, message: str) -> None:
+        if self._failed:
+            return
+        self._failed = True
+        self._timer.stop()
+        self._view.setText(f"⚠  {message}")
+        self._status.setText("not streaming")
+
+    def _failure_reason(self) -> str | None:
+        """The first concrete error reported by the camera or IMU source."""
+        if self._cam is not None and getattr(self._cam, "error", None):
+            return self._cam.error
+        imu_src = getattr(self._imu, "source", None)
+        if imu_src is not None and getattr(imu_src, "error", None):
+            return f"IMU open failed: {imu_src.error}"
+        return None
 
     def _drain_latest(self):
         """Return the most recent packet, dropping stale ones to stay realtime."""

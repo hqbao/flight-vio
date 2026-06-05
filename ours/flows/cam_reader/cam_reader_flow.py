@@ -23,10 +23,18 @@ class CamReaderFlow(SourceFlow):
         self.source = source
         self.fps = max(1, int(fps))
         self.realtime = bool(realtime)
+        self.error: str | None = None
         self.forwards_to(topics.CAM_SYNC)
 
     def produce(self):
-        self.source.open()
+        try:
+            self.source.open()
+        except Exception as e:                                    # noqa: BLE001
+            # e.g. the OAK-D is absent (X_LINK_DEVICE_NOT_FOUND). Record the
+            # reason and return cleanly so the flow still emits END -- the graph
+            # drains and the UI can surface the failure instead of hanging.
+            self.error = f"camera open failed: {e}"
+            return
         period = 1.0 / self.fps
         try:
             next_tick = time.monotonic()
@@ -36,7 +44,11 @@ class CamReaderFlow(SourceFlow):
                     if now < next_tick:
                         time.sleep(next_tick - now)
                     next_tick += period
-                item = self.source.read()
+                try:
+                    item = self.source.read()
+                except Exception as e:                            # noqa: BLE001
+                    self.error = f"camera read failed: {e}"
+                    break
                 if item is None:
                     break
                 seq, ts_ns, gray_left, gray_right = item
