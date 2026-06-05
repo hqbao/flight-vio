@@ -596,6 +596,12 @@ class SyncedViewWindow(QWidget):
                                        QImage.Format.Format_RGB888))
 
     def _show_gray(self, label: QLabel, gray: np.ndarray) -> None:
+        # The live matcher rectifies the left with a bilinear remap that returns
+        # float32 (sub-pixel grid the KLT tracker wants); replay passes uint8
+        # through. Grayscale8 reads one byte per pixel, so a float buffer must be
+        # coerced or QImage renders raw float bytes as noise.
+        if gray.dtype != np.uint8:
+            gray = np.clip(gray, 0, 255).astype(np.uint8)
         g = np.ascontiguousarray(gray)
         self._buf_img = g
         self._blit(label, QImage(g.data, g.shape[1], g.shape[0], g.shape[1],
