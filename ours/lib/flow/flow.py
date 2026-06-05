@@ -105,7 +105,12 @@ class Flow(_BaseFlow):
                 break
             if msg is END:
                 self._ends_seen += 1
-                if not self._emitted_end:
+                # Emit our own END only once EVERY END-bearing input has drained
+                # (expected_ends). A single-input flow keeps the old behaviour
+                # (expected_ends defaults to 1 -> emits on the first END); a
+                # multi-input join (e.g. odometry on imucam.sample + frame.depth)
+                # waits for all of them so it never signals "done" early.
+                if self._ends_seen >= self.expected_ends and not self._emitted_end:
                     self._emitted_end = True
                     self._emit_end()
                 self.on_end()
