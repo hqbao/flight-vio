@@ -89,22 +89,81 @@ not installable on this host (macOS arm64, py3.13).
 
 One thread per flow; **one Task per file**; a `*_flow.py` only wires the tasks.
 
+### Topic-level data flow (which flow publishes/subscribes which topic)
+
 ```
-capture ──frame.raw──┬─► depth ──frame.depth──► odometry ──pose.odom──┬─► backend ──pose.refined──┐
-         ──imu.sample─┘                         ├──keyframe──────────────┘                          │
-                                                └──pose.odom──► slam ──loop.correction──────────────┤
-                                                                                                    ▼
-                                                                                      ui (collect / display / score)
+capture ──frame.raw────► depth ──frame.depth──► odometry ──pose.odom────► ui-collector, ui-render
+        ──imu.sample──────────────────────────►          ──keyframe─────► backend, slam
+                                                 backend ──pose.refined─► ui-collector
+                                                 slam    ──loop.correction─► ui-collector
 ```
 
-| Flow | Does | Publishes |
-|---|---|---|
-| **capture** | stereo frames + IMU (replay from disk or live OAK-D) | `frame.raw`, `imu.sample` |
-| **depth** | rectify + SGM dense depth | `frame.depth` |
-| **odometry** | KLT + RGB-D PnP, optional gyro prior | `pose.odom`, `keyframe` |
-| **backend** | sliding-window bundle adjustment | `pose.refined` |
-| **slam** | ORB loop closure + pose-graph optimization | `loop.correction` |
-| **ui** | collects poses for display / scoring | — (sink) |
+Edges above are exactly the `self.on(...)` subscriptions in each `*_flow.py`.
+Two things worth noting because the obvious guess is wrong:
+
+- **backend and slam both trigger off `keyframe`**, not `pose.odom`. odometry
+  emits a keyframe every `kf_every` frames; backend refines it, slam loop-closes.
+- **`loop.correction` is consumed only by the UI collector** today — it is *not*
+  fed back into odometry, so the live pose path has no closed loop yet. (When
+  that feedback is added, give odometry a `self.on(LOOP_CORRECTION, ...)`.)
+
+### Task-level wiring (who receives from whom)
+
+```mermaid
+flowchart TD
+    subgraph CAP["capture flow (SourceFlow)"]
+        PROD["produce()"] --> PCAP["PublishCapture"]
+    end
+    subgraph DEP["depth flow"]
+        CD["ComputeDepth"] --> PD["PublishDepth"]
+    end
+    subgraph ODO["odometry flow"]
+        RI["RouteImu"]
+        PV["ProcessVO"] --> PP["PublishPose"] --> EK["EmitKeyframe"]
+    end
+    subgraph BCK["backend flow"]
+        RB["RunBA"] --> PR["PublishRefined"]
+    end
+    subgraph SLM["slam flow"]
+        SS["SlamStep"] --> PC2["PublishCorrection"]
+    end
+    subgraph UIC["ui-collector flow"]
+        COd["CollectOdom"]
+        CRf["CollectRefined"]
+        CCo["CollectCorrection"]
+    end
+    subgraph UIR["ui-render flow"]
+        RP["RenderPose"]
+    end
+
+    PCAP -- "frame.raw" --> CD
+    PCAP -- "imu.sample" --> RI
+    PD -- "frame.depth" --> PV
+    PP -- "pose.odom" --> COd
+    PP -- "pose.odom" --> RP
+    EK -- "keyframe" --> RB
+    EK -- "keyframe" --> SS
+    PR -- "pose.refined" --> CRf
+    PC2 -- "loop.correction" --> CCo
+
+    RI -. "ctx.state['priors'][seq]\n(same thread, not via Bus)" .-> PV
+```
+
+The dotted edge is the one **intra-flow** hand-off: `RouteImu` stashes the gyro
+prior for sequence `seq` in the flow's own `ctx.state`, and `ProcessVO` pops it
+when the matching depth frame arrives. This is shared state inside a single
+thread/flow — it does **not** cross the Bus and does **not** violate the §2 rule
+(which only forbids *cross-flow* calls).
+
+| Flow | Tasks (in order) | Subscribes | Publishes |
+|---|---|---|---|
+| **capture** | `produce` → `PublishCapture` | — (source) | `frame.raw`, `imu.sample` |
+| **depth** | `ComputeDepth` → `PublishDepth` | `frame.raw` | `frame.depth` |
+| **odometry** | `RouteImu` ⟂ `ProcessVO` → `PublishPose` → `EmitKeyframe` | `imu.sample`, `frame.depth` | `pose.odom`, `keyframe` |
+| **backend** | `RunBA` → `PublishRefined` | `keyframe` | `pose.refined` |
+| **slam** | `SlamStep` → `PublishCorrection` | `keyframe` | `loop.correction` |
+| **ui-collector** | `CollectOdom` / `CollectRefined` / `CollectCorrection` | `pose.odom`, `pose.refined`, `loop.correction` | — (sink) |
+| **ui-render** | `RenderPose` | `pose.odom` | — (sink) |
 
 `capture` is the only device-specific flow. `ReplayCaptureFlow` and the live
 `LiveCaptureFlow` publish the **identical** topics, so depth→ui are unchanged on
