@@ -28,7 +28,7 @@ from collections.abc import Callable
 import numpy as np
 from PyQt6 import QtCore
 from PyQt6.QtGui import QImage, QPixmap
-from PyQt6.QtWidgets import QLabel, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QLabel, QSizePolicy, QVBoxLayout, QWidget
 
 from ..flows.cam_reader import CamReaderFlow
 from ..flows.cam_reader.sources import CamSource
@@ -100,6 +100,10 @@ class ImuCamWindow(QWidget):
         self.setWindowTitle("Camera + IMU — synced (live)")
         self.setObjectName("ImuCamWindow")
         self.resize(1280, 420)
+        # Keep the 4-panel row legible: never let the window collapse to a
+        # sliver (the view is horizontally Ignored, so width is otherwise
+        # unconstrained). A tactical viewer must not shrink telemetry away.
+        self.setMinimumSize(720, 360)
         self.setStyleSheet(theme.QSS)
 
         root = QVBoxLayout(self)
@@ -109,6 +113,14 @@ class ImuCamWindow(QWidget):
         self._view.setObjectName("ImuCamView")
         self._view.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self._view.setMinimumHeight(360)
+        # The frame is drawn by scaling the rendered pixmap to the LABEL's own
+        # size. The label must NOT report that pixmap as its size hint, or the
+        # window grows to fit it, which enlarges the label, which scales the
+        # pixmap bigger… a feedback loop that stretches the window wider every
+        # frame. Ignored size policy breaks the loop: the layout fixes the
+        # label size, the pixmap just fits inside it.
+        self._view.setSizePolicy(QSizePolicy.Policy.Ignored,
+                                 QSizePolicy.Policy.Ignored)
         self._status = QLabel("—")
         self._status.setObjectName("ImuCamStatus")
         root.addWidget(self._view, stretch=1)
@@ -171,7 +183,9 @@ class ImuCamWindow(QWidget):
         self._first_seen = False
         self._failed = False
         self._t_start = time.monotonic()
+        self._view.setStyleSheet("")          # clear any prior fault styling
         self._view.setText("starting…  (opening the OAK-D)")
+        self._set_status("connecting…", theme.TEXT_DIM)
         self._timer.start()
 
     def stop(self) -> None:
@@ -204,15 +218,20 @@ class ImuCamWindow(QWidget):
         self._first_seen = True
         row = compose(packet, self._chart)               # BGR uint8 (H, W, 3)
         self._show(row)
-        self._status.setText(
+        self._set_status(
             f"seq={packet.seq}   imu samples={packet.imu_ts.size}   "
-            f"left {packet.gray_left.shape[1]}×{packet.gray_left.shape[0]}")
+            f"left {packet.gray_left.shape[1]}×{packet.gray_left.shape[0]}",
+            theme.TEXT_DIM)
+
+    def _set_status(self, text: str, color: str) -> None:
+        self._status.setText(text)
+        self._status.setStyleSheet(f"color: {color};")
 
     def _maybe_report_no_frame(self) -> None:
         """Surface a clean error/end state instead of hanging on 'starting…'."""
         if self._first_seen:
             if self._ended:
-                self._status.setText("stream ended")
+                self._set_status("stream ended", theme.WARN)
                 self._timer.stop()
             return
         # No frame yet: decide whether the stream failed or simply finished.
@@ -229,8 +248,12 @@ class ImuCamWindow(QWidget):
         if self._failed:
             return
         self._failed = True
+        # A fault must read as an ALERT, not routine chrome: amber, larger.
+        self._view.setStyleSheet(
+            f"color: {theme.WARN}; font-size: 15px; font-weight: bold;")
         self._view.setText(f"⚠  {message}")
-        self._status.setText("not streaming — reopen from the Visualize menu to retry")
+        self._set_status("not streaming — reopen from the Visualize menu to retry",
+                         theme.BAD)
         self._teardown()          # release the dead graph so a reopen retries
 
     def _failure_reason(self) -> str | None:

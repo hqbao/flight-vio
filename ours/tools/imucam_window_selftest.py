@@ -74,17 +74,20 @@ def _run_until(app, predicate, timeout_s: float) -> None:
 def test_happy_path(app, reader: SessionReader) -> None:
     print(" replay (happy path)")
     win = ImuCamWindow(_replay_factory(reader), fps=120)
+    win.resize(1280, 420)
     win.show()                                       # showEvent -> start()
     _check(win._running, "window started the split flows on show")
 
     seqs: list[int] = []
+    widths: list[int] = []
 
     def _got_frames() -> bool:
         pix = win._view.pixmap()
         txt = win._status.text()
         if pix is not None and not pix.isNull() and txt.startswith("seq="):
             seqs.append(int(txt.split("seq=")[1].split()[0]))
-        return len(seqs) >= 5 or win._ended
+            widths.append(win.width())
+        return len(seqs) >= 12 or win._ended
 
     _run_until(app, _got_frames, 15.0)
 
@@ -94,6 +97,11 @@ def test_happy_path(app, reader: SessionReader) -> None:
            "pixmap spans the cameras + gyro + accel row")
     _check(len(seqs) >= 1, f"status reported rendered packets (saw seq {seqs[:5]})")
     _check(seqs == sorted(seqs), "rendered packets arrive in frame order")
+    # Regression: the window must NOT keep widening frame after frame (the
+    # earlier size-feedback loop stretched it horizontally without bound).
+    if len(widths) >= 5:
+        _check(max(widths) - min(widths) <= 2,
+               f"window width stays stable across frames (saw {min(widths)}..{max(widths)})")
     _check("depthai" not in sys.modules,
            "offline replay path never imported depthai (stays lazy)")
 
