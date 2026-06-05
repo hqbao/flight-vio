@@ -25,6 +25,7 @@ import queue
 import threading
 from typing import Any, Iterable, Sequence
 
+from .messages import END
 from .pubsub import Bus
 from .task import Task
 
@@ -50,6 +51,16 @@ class _BaseFlow(threading.Thread):
         self.bus = bus
         self.ctx = FlowContext(bus, name)
         self._stop = threading.Event()
+        self._downstream: list[str] = []
+
+    def forwards_to(self, *topics: str) -> "_BaseFlow":
+        """Declare the topics this flow publishes, so END is forwarded to them."""
+        self._downstream.extend(topics)
+        return self
+
+    def _emit_end(self) -> None:
+        for topic in self._downstream:
+            self.bus.publish(topic, END)
 
     def stop(self) -> None:
         self._stop.set()
@@ -69,12 +80,19 @@ class Flow(_BaseFlow):
         super().__init__(name, bus)
         self._inbox: "queue.Queue[tuple[str, Any]]" = queue.Queue()
         self._routes: dict[str, list[Task]] = {}
+        self.done = threading.Event()  #: set after all expected ENDs are handled
+        self.expected_ends = 1  #: a sink subscribing N END-bearing topics sets this to N
+        self._ends_seen = 0
+        self._emitted_end = False
 
     def on(self, topic: str, tasks: Sequence[Task]) -> "Flow":
         """Run ``tasks`` (in order) whenever a message arrives on ``topic``."""
         self._routes[topic] = list(tasks)
         self.bus.subscribe(topic, lambda m, t=topic: self._inbox.put((t, m)))
         return self
+
+    def on_end(self) -> None:
+        """Hook called once END has been received. Override for custom drain."""
 
     def stop(self) -> None:
         super().stop()
@@ -85,6 +103,15 @@ class Flow(_BaseFlow):
             topic, msg = self._inbox.get()
             if msg is _SENTINEL:
                 break
+            if msg is END:
+                self._ends_seen += 1
+                if not self._emitted_end:
+                    self._emitted_end = True
+                    self._emit_end()
+                self.on_end()
+                if self._ends_seen >= self.expected_ends:
+                    self.done.set()
+                continue
             self._run_chain(self.ctx, self._routes.get(topic, ()), msg)
 
 
@@ -94,6 +121,7 @@ class SourceFlow(_BaseFlow):
     def __init__(self, name: str, bus: Bus, tasks: Sequence[Task]) -> None:
         super().__init__(name, bus)
         self.tasks = list(tasks)
+        self.done = threading.Event()
 
     def produce(self) -> Iterable[Any]:
         """Yield raw items to feed into the task chain. Override in subclass."""
@@ -104,3 +132,5 @@ class SourceFlow(_BaseFlow):
             if self._stop.is_set():
                 break
             self._run_chain(self.ctx, self.tasks, item)
+        self._emit_end()
+        self.done.set()
