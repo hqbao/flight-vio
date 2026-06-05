@@ -6,7 +6,7 @@ to close the gap (or to deliberately keep a difference) has a concrete basis and
 does not have to re-derive it.
 
 **Last updated**: 2026-06-05
-**Our code**: `ours/depthai_ours_vio.py` (live) + `ours/vio/*`
+**Our code**: `ours/legacy/depthai_ours_vio.py` (live)
 **Basalt (reference)**: `dai.node.BasaltVIO` consumed in `baseline/depthai_vio.py`
 **Scoring**: `ours/tools/vio_run.py` (offline, vs recorded Basalt poses) + `ours/tools/live_replay.py`
 
@@ -147,7 +147,7 @@ and touches no production path.**
 
 ### 4.1 Live `--source ours-vio`: VPU-free depth + a real-time background solve
 
-`ours/depthai_ours_vio.py` runs the tight-coupled window **live** with
+`ours/legacy/depthai_ours_vio.py` runs the tight-coupled window **live** with
 two deliberate properties, both **measured** (no device-only guesses):
 
 1. **Fully portable depth (no VPU / no `StereoDepth`).** The source taps the two

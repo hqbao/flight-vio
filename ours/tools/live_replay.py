@@ -3,7 +3,7 @@
 
 This is the honest self-test that lets us iterate on the live translation
 pipeline WITHOUT a device. It reproduces, frame-for-frame, exactly what
-``ours/depthai_ours_vio.py`` does on the OAK-D:
+``ours/legacy/depthai_ours_vio.py`` does on the OAK-D:
 
   1. gyro preintegration between frames -> per-frame rotation prior ``R_prior``
   2. accelerometer averaged into the camera frame + gravity leveling

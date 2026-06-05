@@ -13,7 +13,8 @@ DepthAI BasaltVIO + RTABMap black boxes one module at a time:
                                    flow (capture, depth, odometry, backend, slam,
                                    ui), each a thread of sequential tasks that
                                    talk over the pub/sub bus.
-  * ``ours.depthai_ours_vio``    — legacy monolithic live OAK-D source (kept
+  * ``ours.legacy``             — transitional pre-flow code: the monolithic
+                                   live OAK-D source ``depthai_ours_vio`` (kept
                                    until the flow live path is verified on-device)
   * ``ours.tools``               — offline scoring, self-tests and inspectors
                                    (these call ``ours.lib`` directly, not the flows)

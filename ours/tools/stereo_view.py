@@ -279,7 +279,7 @@ def run_live(cfg: SGMConfig, width: int, height: int, fps: int,
         ch = p.getDefaultDevice().readCalibration()
 
         # Build our matcher from the live calibration exactly like the VIO source
-        # (ours.depthai_ours_vio): assemble the same JSON shape so
+        # (ours.legacy.depthai_ours_vio): assemble the same JSON shape so
         # StereoCalib.from_json applies the identical cm->m extrinsic convention,
         # then ``rectify_left=True`` makes the matcher rectify BOTH raw frames.
         def _intr(sock):

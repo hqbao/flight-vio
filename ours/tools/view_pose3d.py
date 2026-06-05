@@ -2,7 +2,7 @@
 """Entry point — launch the 3D pose viewer for *our* from-scratch VIO.
 
 Standalone to the ``ours/`` pipeline: it wires our live RGB-D VIO source
-(:class:`ours.depthai_ours_vio.OakOursVioSource`) into our own copy of the Qt
+(:class:`ours.legacy.depthai_ours_vio.OakOursVioSource`) into our own copy of the Qt
 3D viewer (:mod:`ours.ui`). It shares nothing with ``baseline/`` — the Basalt
 backends live in ``baseline/tools/view_pose3d.py``.
 """
@@ -45,16 +45,16 @@ def _build_source(name: str, args):
                               fps=args.fps,
                               recalibrate_bias=args.recalibrate_bias)
     if name == "ours-legacy":
-        from ours.depthai_ours_vio import OakOursVioSource
+        from ours.legacy.depthai_ours_vio import OakOursVioSource
         return OakOursVioSource(fps=args.fps, backend="f2f", **res_kw)
     if name == "ours-ba":
-        from ours.depthai_ours_vio import OakOursVioSource
+        from ours.legacy.depthai_ours_vio import OakOursVioSource
         return OakOursVioSource(
             fps=args.fps, backend="ba",
             ba_window=args.ba_window, ba_kf_every=args.ba_kf_every,
             ba_iters=args.ba_iters, **res_kw)
     if name == "ours-slam":
-        from ours.depthai_ours_vio import OakOursVioSource
+        from ours.legacy.depthai_ours_vio import OakOursVioSource
         return OakOursVioSource(
             fps=args.fps, backend="slam",
             slam_kf_every=args.slam_kf_every, slam_radius_m=args.slam_radius,
@@ -62,7 +62,7 @@ def _build_source(name: str, args):
             slam_kf_min_rot=args.slam_kf_min_rot,
             slam_max_kf=args.slam_max_kf, **res_kw)
     if name == "ours-vio":
-        from ours.depthai_ours_vio import OakOursVioSource
+        from ours.legacy.depthai_ours_vio import OakOursVioSource
         return OakOursVioSource(
             fps=args.fps, backend="vio",
             ba_window=args.ba_window, ba_kf_every=args.ba_kf_every, **res_kw)
