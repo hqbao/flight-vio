@@ -99,13 +99,17 @@ def _replay_imu_startup(reader: SessionReader, use_gyro: bool):
 
 def build_replay(bus: Bus, reader: SessionReader, *, kf_every: int = 5,
                  use_gyro: bool = True, depth_fast: bool = False,
-                 max_frames: int = 0,
+                 max_frames: int = 0, ui=None,
                  slam_cfg: SlamConfig | None = None):
     """Construct the full flow graph driven by a recorded session.
 
     Returns ``((cam_flow, imu_flow), reactive_flows, ui)``. The reactive flows
     subscribe to their topics during construction, so they capture every message
     even if the front-end starts publishing before their threads are running.
+
+    ``ui`` lets a caller inject its own sink (e.g. the keypoint-depth tracker's
+    :class:`~ours.flows.ui.tracks.UiTracksFlow`); it defaults to the offline
+    :class:`~ours.flows.ui.UiCollectorFlow`.
     """
     sgm = SGMConfig.live() if depth_fast else SGMConfig()
     matcher = SGMStereoMatcher.from_calib(reader.calib, sgm)
@@ -119,7 +123,7 @@ def build_replay(bus: Bus, reader: SessionReader, *, kf_every: int = 5,
     cam_flow = CamFlow(
         bus, ReplayCamSource(reader, max_frames=max_frames), fps=20)
 
-    ui = UiCollectorFlow(bus)
+    ui = ui if ui is not None else UiCollectorFlow(bus)
     flows = build_graph(bus, reader.K, ui=ui, R_imu_cam=R_imu_cam,
                         accel_align=accel_align, kf_every=kf_every,
                         use_gyro=use_gyro, slam_cfg=slam_cfg)

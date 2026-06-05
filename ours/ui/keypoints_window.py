@@ -1,8 +1,8 @@
 """In-app Qt window: camera frame + detected keypoints, coloured by depth.
 
 The headline view for inspecting OUR visual frontend. Each frame shows the
-rectified-left image with every live :class:`~ours.lib.frontend.frontend.KLTFrontend`
-track drawn on it:
+rectified-left image with every live
+:class:`~ours.lib.frontend.frontend.KLTFrontend` track drawn on it:
 
 * the dot **colour** = that keypoint's metric depth (the SAME fixed khaki
   0.3-8.0 m map + scale-bar legend as the depth panel), so colour means the same
@@ -11,18 +11,24 @@ track drawn on it:
 * a faint **trail** per track id shows where the *same* keypoint moved over the
   last ``TRAIL_LEN`` (20) frames -- the persistent id is what links the dots.
 
-Honest-data: the keypoints + ids are the real frontend output (the same code the
-odometry runs); the trail is the UI buffering each id's recent positions. Nothing
-is invented. See :mod:`ours.lib.viz.keypoint_overlay`.
+Honest-data: the keypoints + ids are the REAL frontend output **subscribed from
+the running pipeline** -- the odometry flow's
+:class:`~ours.flows.odometry.publish_tracks.PublishTracks` publishes the very
+``{id: pixel}`` its motion estimate consumes on ``frame.tracks``, and this window
+is just a sink for it (no parallel detector, no second frontend). The trail is the
+UI buffering each id's recent positions. Nothing is invented. See
+:mod:`ours.lib.viz.keypoint_overlay`.
 
-Two data sources drive the identical window through an injected worker factory:
+The window runs the same flow graph the VIO runs (``ours.app.build_live`` /
+``build_replay``) with a :class:`~ours.flows.ui.tracks.UiTracksFlow` sink, exactly
+as :class:`~ours.ui.live_source.FlowPoseSource` drives the 3D viewer off
+``pose.odom``. Two data sources drive the identical window through an injected
+worker factory:
 
-* **Live** (:class:`LiveKeypointWorker`, default): taps the two RAW OAK-D cameras,
-  rectifies the left frame, runs our SGM for depth and our KLT frontend for the
-  tracks -- bench-only (no device in CI).
-* **Replay** (:class:`ReplayKeypointWorker`): runs the frontend over a recorded
-  session's stored frames + depth, fully offline -- this is what the self-test
-  drives.
+* **Live** (:class:`LiveKeypointWorker`, default): wires the live OAK-D graph and
+  taps ``frame.tracks`` -- bench-only (no device in CI).
+* **Replay** (:class:`ReplayKeypointWorker`): wires the recorded-session graph and
+  taps ``frame.tracks``, fully offline -- this is what the self-test drives.
 
 cv2 / depthai are imported lazily (only when this window opens).
 """
@@ -33,6 +39,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 from PyQt6 import QtCore
@@ -72,12 +79,15 @@ class KeypointSample:
 
 
 class KeypointWorker(threading.Thread):
-    """Base producer: pushes :class:`KeypointSample` (then ``None``) onto a queue.
+    """Base producer: subscribe ``frame.tracks``, render, queue samples.
 
-    Owns the persistent :class:`KLTFrontend` + :class:`TrackTrails`, advances both
-    once per produced frame (so tracking + trails stay continuous), renders the
-    overlay and ships the finished sample. Subclasses implement :meth:`_frames`,
-    yielding ``(seq, t_s, gray_left, depth_m)``.
+    Runs the flow graph (built by the subclass' :meth:`_drive`) with a
+    :class:`~ours.flows.ui.tracks.UiTracksFlow` sink. For each subscribed
+    :class:`~ours.lib.flow.messages.FrameTracks` it advances the per-id
+    :class:`~ours.lib.viz.keypoint_overlay.TrackTrails`, renders the overlay and
+    ships a finished :class:`KeypointSample` (then ``None``). It runs NO frontend
+    itself -- the tracks come straight off the pipeline -- so it needs no numba
+    parallel lock.
     """
 
     mode = "—"
@@ -92,40 +102,38 @@ class KeypointWorker(threading.Thread):
         self._stop.set()
 
     def run(self) -> None:                                          # noqa: D401
-        from ..lib.flow.runtime import NUMBA_PARALLEL_LOCK
-        from ..lib.frontend.frontend import FrontendConfig, KLTFrontend
+        from ..flows.ui.tracks import UiTracksFlow
+        from ..lib.flow.pubsub import Bus
         from ..lib.viz.keypoint_overlay import (
             TrackTrails, draw_overlay, sample_depths,
         )
 
-        frontend = KLTFrontend(FrontendConfig())
         trails = TrackTrails()
+        t0_ns: list[int | None] = [None]
+
+        def on_tracks(msg) -> None:
+            ids = np.asarray(msg.ids, dtype=np.int64).reshape(-1)
+            pts = np.asarray(msg.points, dtype=np.float32).reshape(-1, 2)
+            trails.update(ids, pts)
+            depths = sample_depths(msg.depth_m, pts)
+            rgb = draw_overlay(msg.gray_left, msg.depth_m, ids, pts, trails)
+            if t0_ns[0] is None:
+                t0_ns[0] = msg.ts_ns
+            sample = KeypointSample(
+                rgb=rgb, ids=ids, points=pts, depths=depths,
+                seq=int(msg.seq), t_s=(msg.ts_ns - t0_ns[0]) * 1e-9,
+                n_tracks=int(ids.shape[0]),
+                n_valid=int(np.count_nonzero(depths > 1e-6)),
+                mean_age=trails.mean_age(), new_count=trails.new_count)
+            try:
+                self.queue.put_nowait(sample)
+            except queue.Full:
+                pass                       # drop to stay realtime
+
+        bus = Bus()
         try:
-            for seq, t_s, gray, depth_m in self._frames():
-                if self._stop.is_set():
-                    break
-                # KLT uses numba parallel=True, which is not threadsafe across
-                # Python threads -- serialize it like the odometry flow's
-                # TrackFeatures does so concurrent frontends (e.g. two windows, or
-                # a window + the VIO source) can't abort the numba runtime.
-                with NUMBA_PARALLEL_LOCK:
-                    state = frontend.process(gray)
-                ids = np.asarray(state.ids, dtype=np.int64).reshape(-1)
-                pts = np.asarray(state.points, dtype=np.float32).reshape(-1, 2)
-                trails.update(ids, pts)
-                depths = sample_depths(depth_m, pts)
-                rgb = draw_overlay(gray, depth_m, ids, pts, trails)
-                sample = KeypointSample(
-                    rgb=rgb, ids=ids, points=pts, depths=depths,
-                    seq=int(seq), t_s=float(t_s),
-                    n_tracks=int(ids.shape[0]),
-                    n_valid=int(np.count_nonzero(depths > 1e-6)),
-                    mean_age=trails.mean_age(), new_count=trails.new_count)
-                try:
-                    self.queue.put_nowait(sample)
-                except queue.Full:
-                    pass                       # drop to stay realtime
-        except Exception as exc:               # surface, don't crash the UI
+            self._drive(bus, UiTracksFlow(bus, on_tracks))
+        except Exception as exc:           # surface, don't crash the UI
             self.error = str(exc)
         finally:
             try:
@@ -133,12 +141,13 @@ class KeypointWorker(threading.Thread):
             except queue.Full:
                 pass
 
-    def _frames(self):
+    def _drive(self, bus, sink) -> None:
+        """Build + run the flow graph feeding ``sink`` until stopped/drained."""
         raise NotImplementedError
 
 
 class ReplayKeypointWorker(KeypointWorker):
-    """Run the frontend over a recorded session's stored frames (fully offline)."""
+    """Drive the recorded-session graph and tap ``frame.tracks`` (fully offline)."""
 
     mode = "REPLAY"
 
@@ -146,37 +155,47 @@ class ReplayKeypointWorker(KeypointWorker):
                  max_frames: int | None = None) -> None:
         super().__init__()
         self._session_dir = session_dir
-        self._fps = max(float(fps), 1e-3)
         self._max_frames = max_frames
+        # ``fps`` is accepted for call-site compatibility; the replay graph drives
+        # the cam flow itself (full speed), so there is no UI-side throttle here.
 
-    def _frames(self):
-        from ..lib import SessionReader
+    def _drive(self, bus, sink) -> None:
+        from ..app import build_replay
+        from ..lib.io.reader import SessionReader
 
-        reader = SessionReader(self._session_dir)
+        reader = SessionReader(Path(self._session_dir))
         if len(reader) == 0:
             self.error = f"no frames in {self._session_dir}"
             return
-        period = 1.0 / self._fps
-        n = len(reader) if self._max_frames is None \
-            else min(len(reader), self._max_frames)
-        for i in range(n):
-            if self._stop.is_set():
-                return
-            t0 = time.perf_counter()
-            fr = reader.load_frame(i)
-            yield fr.seq, fr.ts_s, fr.gray_left, fr.depth_m
-            dt = period - (time.perf_counter() - t0)
-            if dt > 0:
-                self._stop.wait(dt)
+        (cam_flow, imu_flow), flows, _ = build_replay(
+            bus, reader, depth_fast=True,
+            max_frames=int(self._max_frames or 0), ui=sink)
+        for f in flows:
+            f.start()
+        imu_flow.start()
+        cam_flow.start()
+        try:
+            # Let the camera produce every frame (or stop early on request).
+            while not self._stop.is_set() and cam_flow.is_alive():
+                self._stop.wait(0.02)
+            # Drain the whole graph BEFORE tearing flows down, so every frame's
+            # tracks reach the sink (mirrors ours.app.run_replay's ordering).
+            if not self._stop.is_set():
+                sink.done.wait(timeout=10.0)
+        finally:
+            cam_flow.stop()
+            imu_flow.stop()
+            for f in flows:
+                f.stop()
 
 
 class LiveKeypointWorker(KeypointWorker):
-    """Live frontend over a connected OAK-D -- bench-only.
+    """Drive the live OAK-D graph and tap ``frame.tracks`` -- bench-only.
 
-    Taps the two RAW cameras, rectifies the left frame and runs our SGM on the
-    host for depth (mirrors :class:`ours.ui.synced_window.LiveTripletWorker`'s
-    camera + SGM setup, minus the IMU -- this view needs only image + depth). Not
-    exercised in CI (needs hardware); confirm on the bench.
+    Wires the SAME live pipeline the VIO runs (:func:`ours.app.build_live`) off the
+    one shared device and subscribes ``frame.tracks``, so the keypoints shown are
+    exactly what the running odometry frontend tracked. Not exercised in CI (needs
+    hardware); confirm on the bench.
     """
 
     mode = "LIVE"
@@ -186,86 +205,27 @@ class LiveKeypointWorker(KeypointWorker):
         super().__init__()
         self._w, self._h, self._fps, self._fast = width, height, int(fps), fast
 
-    def _frames(self):
-        import cv2
-        import depthai as dai
+    def _drive(self, bus, sink) -> None:
+        from ..app import build_live
 
-        from ..lib import SGMStereoMatcher, StereoCalib
-        from ..lib.config.resolution import ResolutionProfile
+        device, (cam_flow, imu_flow), flows, _ = build_live(
+            bus, width=self._w, height=self._h, fps=self._fps,
+            depth_fast=self._fast, ui=sink)
+        for f in flows:
+            f.start()
+        imu_flow.start()
+        cam_flow.start()
+        try:
+            while not self._stop.is_set() and cam_flow.is_alive():
+                self._stop.wait(0.05)
+        finally:
+            cam_flow.stop()
+            imu_flow.stop()
+            sink.done.wait(timeout=5.0)
+            for f in flows:
+                f.stop()
+            device.release()
 
-        left_socket = dai.CameraBoardSocket.CAM_B
-        right_socket = dai.CameraBoardSocket.CAM_C
-        res = ResolutionProfile.for_resolution(self._w, self._h)
-        cfg = res.sgm(fast=self._fast)
-
-        with dai.Pipeline() as p:
-            left = p.create(dai.node.Camera).build(left_socket,
-                                                   sensorFps=self._fps)
-            right = p.create(dai.node.Camera).build(right_socket,
-                                                    sensorFps=self._fps)
-            left_out = left.requestOutput((self._w, self._h))
-            right_out = right.requestOutput((self._w, self._h))
-            q_left = left_out.createOutputQueue(maxSize=4, blocking=False)
-            q_right = right_out.createOutputQueue(maxSize=4, blocking=False)
-            p.start()
-
-            ch = p.getDefaultDevice().readCalibration()
-
-            def _intr(sock):
-                Ki = np.array(ch.getCameraIntrinsics(sock, self._w, self._h),
-                              dtype=np.float64)
-                dist = list(ch.getDistortionCoefficients(sock))
-                return {"fx": float(Ki[0, 0]), "fy": float(Ki[1, 1]),
-                        "cx": float(Ki[0, 2]), "cy": float(Ki[1, 2]),
-                        "dist": [float(x) for x in dist],
-                        "width": int(self._w), "height": int(self._h)}
-
-            T_lr = np.array(ch.getCameraExtrinsics(left_socket, right_socket),
-                            dtype=np.float64).reshape(4, 4)
-            calib = StereoCalib.from_json({
-                "intrinsics_left": _intr(left_socket),
-                "intrinsics_right": _intr(right_socket),
-                "T_left_right": T_lr.tolist(),
-            })
-            matcher = SGMStereoMatcher.from_calib(calib, cfg, rectify_left=True)
-            dummy = np.zeros((self._h, self._w), np.uint8)
-            matcher.dense_depth(dummy, dummy)          # one-time JIT warmup
-
-            def _as_gray(msg):
-                g = msg.getCvFrame()
-                if g.ndim == 3:
-                    g = cv2.cvtColor(g, cv2.COLOR_BGR2GRAY)
-                return g
-
-            pend_l: dict[int, np.ndarray] = {}
-            pend_r: dict[int, np.ndarray] = {}
-            t0 = time.monotonic()
-            while p.isRunning() and not self._stop.is_set():
-                got = False
-                while True:
-                    m = q_left.tryGet()
-                    if m is None:
-                        break
-                    pend_l[m.getSequenceNum()] = _as_gray(m)
-                    got = True
-                while True:
-                    m = q_right.tryGet()
-                    if m is None:
-                        break
-                    pend_r[m.getSequenceNum()] = _as_gray(m)
-                    got = True
-
-                common = pend_l.keys() & pend_r.keys()
-                if common:
-                    seq = max(common)
-                    gl, gr = pend_l[seq], pend_r[seq]
-                    pend_l = {k: v for k, v in pend_l.items() if k > seq}
-                    pend_r = {k: v for k, v in pend_r.items() if k > seq}
-                    rect_left, depth = matcher.dense_depth_rectified_left(gl, gr)
-                    yield (int(seq), time.monotonic() - t0,
-                           np.clip(rect_left, 0, 255).astype(np.uint8), depth)
-                if not got:
-                    self._stop.wait(0.002)
 
 
 WorkerFactory = Callable[[], KeypointWorker]

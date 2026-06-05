@@ -55,6 +55,29 @@ class DepthFrame:
 
 
 @dataclass(frozen=True)
+class FrameTracks:
+    """One frame's KLT tracks for the keypoint-depth visualiser.
+
+    Published on ``topics.FRAME_TRACKS`` by the odometry flow's
+    :class:`~ours.flows.odometry.publish_tracks.PublishTracks` task. The ``ids`` /
+    ``points`` are the REAL frontend tracks the motion estimate consumes (the same
+    ``{id: pixel}`` :class:`~ours.flows.odometry.tracked.Tracked` carries) -- not a
+    parallel detector. The frame's rectified-left image + depth ride along so the
+    UI can colour every keypoint by its metric depth without re-running anything.
+
+    * ``ids`` -- ``(N,)`` int64 persistent track ids.
+    * ``points`` -- ``(N, 2)`` float32 pixel coordinates (same order as ``ids``).
+    """
+
+    seq: int
+    ts_ns: int
+    gray_left: np.ndarray
+    depth_m: np.ndarray
+    ids: np.ndarray
+    points: np.ndarray
+
+
+@dataclass(frozen=True)
 class PoseMsg:
     """An estimated camera pose (4x4 ``T_world_cam``) for one frame."""
 

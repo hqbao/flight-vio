@@ -11,5 +11,6 @@ guarantees every upstream flow has fully drained.
 """
 from .collector import UiCollectorFlow
 from .render import UiRenderFlow
+from .tracks import UiTracksFlow
 
-__all__ = ["UiCollectorFlow", "UiRenderFlow"]
+__all__ = ["UiCollectorFlow", "UiRenderFlow", "UiTracksFlow"]

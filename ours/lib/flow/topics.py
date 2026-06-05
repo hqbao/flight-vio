@@ -13,6 +13,7 @@ emits::
     imu_cam  --imucam.sample-> odometry       (frames + CALIBRATED IMU)
     imu_cam  --frame.depth---> odometry       (depth task output)
     odometry --pose.odom-----> ui-collector, ui-render
+    odometry --frame.tracks--> ui-tracks       (KLT tracks + depth, visualiser)
     odometry --keyframe------> backend, slam
     backend  --pose.refined--> ui-collector
     slam     --loop.correction-> ui-collector
@@ -38,6 +39,11 @@ POSE_ODOM = "pose.odom"
 KEYFRAME = "keyframe"
 POSE_REFINED = "pose.refined"
 LOOP_CORRECTION = "loop.correction"
+
+# Per-frame KLT tracks the odometry frontend produced (ids + pixels) bundled with
+# the frame + its depth, for the keypoint-depth visualiser. The SAME tracks the
+# motion estimate consumes -- no parallel detector. Consumed only by the UI.
+FRAME_TRACKS = "frame.tracks"
 
 # Acquisition front-end (``cam`` <-> ``imu_cam``).
 CAM_SYNC = "cam.sync"

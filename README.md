@@ -151,14 +151,17 @@ primary START/STOP):
     OAK-D (host SGM) or a recorded session.
   - **Keypoint Depth Tracker** opens an in-app Qt window
     (`ours/ui/keypoints_window.py`): the rectified-left frame with every live
-    **KLT-frontend track** drawn on it (the SAME frontend the odometry runs, not
-    a parallel detector). Each dot's **colour = that keypoint's metric depth**
-    (the same fixed khaki 0.3–8 m ramp + scale bar as the depth panel), so colour
-    means the same distance everywhere; keypoints with no stereo return are
-    **hollow grey rings** (never a faked colour), fresh tracks get an amber ring.
-    A faint per-id **trail** shows where the *same* keypoint moved over the last
-    20 frames. The footer prints honest stats (`trk`, `valid-z %`, `mean-age`,
-    `new`). Live off the OAK-D (host SGM) or a recorded session.
+    **KLT-frontend track** drawn on it. The tracks are **subscribed from the
+    running pipeline** — the odometry flow publishes the very `{id: pixel}` its
+    motion estimate consumes on `frame.tracks`, and this window is just a sink for
+    it (no parallel detector, no second frontend). Each dot's **colour = that
+    keypoint's metric depth** (the same fixed khaki 0.3–8 m ramp + scale bar as
+    the depth panel), so colour means the same distance everywhere; keypoints with
+    no stereo return are **hollow grey rings** (never a faked colour), fresh
+    tracks get an amber ring. A faint per-id **trail** shows where the *same*
+    keypoint moved over the last 20 frames. The footer prints honest stats
+    (`trk`, `valid-z %`, `mean-age`, `new`). Live off the OAK-D or a recorded
+    session — both run the same flow graph the VIO runs.
 
 The same synced split front-end can be inspected **without the GUI** — a cv2
 window over a recorded session or the live device:

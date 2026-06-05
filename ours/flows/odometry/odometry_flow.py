@@ -6,6 +6,7 @@ edges of the unified acquisition front-end:
 * ``imucam.sample`` ->
   [:class:`~ours.flows.odometry.preintegrate_prior.PreintegratePrior`]
 * ``frame.depth`` -> [:class:`~ours.flows.odometry.track_features.TrackFeatures`,
+  :class:`~ours.flows.odometry.publish_tracks.PublishTracks`,
   :class:`~ours.flows.odometry.estimate_motion.EstimateMotion`,
   :class:`~ours.flows.odometry.publish_pose.PublishPose`,
   :class:`~ours.flows.odometry.emit_keyframe.EmitKeyframe`]
@@ -16,10 +17,11 @@ itself (``PreintegratePrior``). The frame-chain splits the visual odometry into
 two tasks -- ``TrackFeatures`` (KLT, the only numba-parallel section, holds the
 parallel lock) then ``EstimateMotion`` (pure-NumPy PnP + fusion, lock-free) -- so
 the heavy motion solve overlaps the next frame's depth matcher instead of
-serialising against it. The :class:`~ours.flows.odometry.tracked.Tracked` carrier
-threads the tracks between them; the
-:class:`~ours.flows.odometry.step.Step` carrier threads the result through the
-rest of the chain.
+serialising against it. ``PublishTracks`` (between them) emits the same KLT tracks
+on ``frame.tracks`` for the keypoint-depth visualiser. The
+:class:`~ours.flows.odometry.tracked.Tracked` carrier threads the tracks between
+them; the :class:`~ours.flows.odometry.step.Step` carrier threads the result
+through the rest of the chain.
 
 Joining two END-bearing inputs (``imucam.sample`` + ``frame.depth``, both from the
 imu_cam flow) means the flow must see BOTH ENDs before draining:
@@ -38,6 +40,7 @@ from ...lib.flow import Flow, Bus, topics
 from ...lib.odometry.odometry import OdometryConfig, RGBDVisualOdometry
 from .preintegrate_prior import PreintegratePrior
 from .track_features import TrackFeatures
+from .publish_tracks import PublishTracks
 from .estimate_motion import EstimateMotion
 from .publish_pose import PublishPose
 from .emit_keyframe import EmitKeyframe
@@ -61,6 +64,6 @@ class OdometryFlow(Flow):
         self.expected_ends = 2          # imucam.sample + frame.depth both end
         self.on(topics.IMUCAM_SAMPLE, [PreintegratePrior()])
         self.on(topics.FRAME_DEPTH,
-                [TrackFeatures(), EstimateMotion(), PublishPose(),
-                 EmitKeyframe()])
-        self.forwards_to(topics.POSE_ODOM, topics.KEYFRAME)
+                [TrackFeatures(), PublishTracks(), EstimateMotion(),
+                 PublishPose(), EmitKeyframe()])
+        self.forwards_to(topics.POSE_ODOM, topics.KEYFRAME, topics.FRAME_TRACKS)

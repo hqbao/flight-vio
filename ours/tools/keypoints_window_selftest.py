@@ -8,9 +8,10 @@ Two layers, both offline (no device):
    panel's :func:`colorize_depth`), and the overlay drawing.
 2. **Window** (:class:`ours.ui.keypoints_window.KeypointTrackWindow`): driven off
    a recorded session through :class:`ReplayKeypointWorker` under the offscreen Qt
-   platform -- asserts it runs our REAL KLT frontend, renders the overlay pixmap,
-   keeps track ids alive across frames, and prints the honest footer stats. The
-   live OAK-D path is the only part left to the bench.
+   platform -- it runs the recorded-session flow graph and SUBSCRIBES the
+   odometry frontend's real ``frame.tracks``, renders the overlay pixmap, keeps
+   track ids alive across frames, and prints the honest footer stats. The live
+   OAK-D path is the only part left to the bench.
 
 Run::
 
@@ -159,9 +160,8 @@ class _DeadWorker(KeypointWorker):
 
     mode = "LIVE"
 
-    def _frames(self):
+    def _drive(self, bus, sink):
         raise RuntimeError("X_LINK_DEVICE_NOT_FOUND")
-        yield  # pragma: no cover  (makes this a generator)
 
 
 def test_window_happy_path(app) -> None:

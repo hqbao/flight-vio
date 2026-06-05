@@ -93,8 +93,8 @@ One thread per flow; **one Task per file**; a `*_flow.py` only wires the tasks.
 
 ```
 cam ──cam.sync──► imu_cam ──imucam.sample──► odometry ──pose.odom──► ui-collector, ui-render
-                          ──frame.depth─────►          ──keyframe──► backend, slam
-                          ──imu.raw───────► (visualiser)
+                          ──frame.depth─────►          ──frame.tracks─► ui-tracks (keypoints view)
+                          ──imu.raw───────► (visualiser) ──keyframe──► backend, slam
                                                        backend ──pose.refined──► ui-collector
                                                        slam    ──loop.correction──► ui-collector
 ```
@@ -110,7 +110,10 @@ noting because the obvious guess is wrong:
   The visualiser builds `imu_cam` with `matcher=None`, so it skips depth.
 - **odometry consumes both `imucam.sample` and `frame.depth`** (both published by
   `imu_cam`); it integrates the packet's gyro into the per-frame rotation prior
-  (`PreintegratePrior`) and runs RGB-D PnP against the depth (`ProcessVO`).
+  (`PreintegratePrior`) and runs RGB-D PnP against the depth (`EstimateMotion`).
+- **the keypoint-depth view subscribes `frame.tracks`** (the odometry frontend's
+  real `{id: pixel}` tracks, published by `PublishTracks`); it does NOT run its
+  own frontend — it is a UI sink like ui-render, honest about its data source.
 - **odometry is a two-input join** (`imucam.sample` + `frame.depth`); it sees an
   END on each before it drains (`expected_ends = 2`).
 - **backend and slam both trigger off `keyframe`**, not `pose.odom`. odometry
@@ -131,7 +134,7 @@ flowchart TD
     end
     subgraph ODO["odometry flow"]
         PIP["PreintegratePrior"]
-        TF["TrackFeatures"] --> PV["EstimateMotion"] --> PP["PublishPose"] --> EK["EmitKeyframe"]
+        TF["TrackFeatures"] --> PT["PublishTracks"] --> PV["EstimateMotion"] --> PP["PublishPose"] --> EK["EmitKeyframe"]
     end
     subgraph BCK["backend flow"]
         RB["RunBA"] --> PR["PublishRefined"]
@@ -147,12 +150,16 @@ flowchart TD
     subgraph UIR["ui-render flow"]
         RP["RenderPose"]
     end
+    subgraph UITR["ui-tracks flow (keypoints view)"]
+        RT["RenderTracks"]
+    end
 
     PCS -- "cam.sync" --> PIC
     PICAM -- "imucam.sample" --> PIP
     PD -- "frame.depth" --> TF
     PP -- "pose.odom" --> COd
     PP -- "pose.odom" --> RP
+    PT -- "frame.tracks" --> RT
     EK -- "keyframe" --> RB
     EK -- "keyframe" --> SS
     PR -- "pose.refined" --> CRf
@@ -171,11 +178,12 @@ violate the §2 rule (which only forbids *cross-flow* calls).
 |---|---|---|---|
 | **cam** | `produce` → `PublishCamSync` | — (source) | `cam.sync` |
 | **imu_cam** | `PackImuCam` → `PublishImuRaw` → `ApplyCalibration` → `PublishImuCam` → `ComputeDepth` → `PublishDepth` | `cam.sync` | `imu.raw`, `imucam.sample`, `frame.depth` |
-| **odometry** | `PreintegratePrior` ⟂ `TrackFeatures` → `EstimateMotion` → `PublishPose` → `EmitKeyframe` | `imucam.sample`, `frame.depth` | `pose.odom`, `keyframe` |
+| **odometry** | `PreintegratePrior` ⟂ `TrackFeatures` → `PublishTracks` → `EstimateMotion` → `PublishPose` → `EmitKeyframe` | `imucam.sample`, `frame.depth` | `pose.odom`, `keyframe`, `frame.tracks` |
 | **backend** | `RunBA` → `PublishRefined` | `keyframe` | `pose.refined` |
 | **slam** | `SlamStep` → `PublishCorrection` | `keyframe` | `loop.correction` |
 | **ui-collector** | `CollectOdom` / `CollectRefined` / `CollectCorrection` | `pose.odom`, `pose.refined`, `loop.correction` | — (sink) |
 | **ui-render** | `RenderPose` | `pose.odom` | — (sink) |
+| **ui-tracks** | `RenderTracks` | `frame.tracks` | — (sink) |
 
 `cam` + `imu_cam` are the only device-specific flows; their sources are
 injected (`ReplayCamSource`/`ReplayImuSource` offline, `LiveCamSource`/
@@ -203,13 +211,15 @@ queue that raises if read post-stop).
   `compute_depth.py`, `publish_depth.py` (depth as a task in this flow),
   `imu_stream.py` (IMU-only reader for the calib wizards), `imu_cam_flow.py`.
 - `odometry/`: `preintegrate_prior.py`, `track_features.py` (KLT, holds the numba
-  parallel lock), `estimate_motion.py` (pure-NumPy PnP + gyro fusion, lock-free),
-  `tracked.py` (TrackFeatures→EstimateMotion carrier), `publish_pose.py`,
-  `emit_keyframe.py`, `step.py` (carrier), `odometry_flow.py`.
+  parallel lock), `publish_tracks.py` (emits the KLT tracks on `frame.tracks` for
+  the keypoints view), `estimate_motion.py` (pure-NumPy PnP + gyro fusion,
+  lock-free), `tracked.py` (TrackFeatures→EstimateMotion carrier),
+  `publish_pose.py`, `emit_keyframe.py`, `step.py` (carrier), `odometry_flow.py`.
 - `backend/`: `run_ba.py`, `publish_refined.py`, `backend_flow.py`.
 - `slam/`: `slam_step.py`, `publish_correction.py`, `slam_flow.py`.
 - `ui/`: `collect_odom.py`, `collect_refined.py`, `collect_correction.py`,
-  `collector.py`, `render_pose.py`, `render.py`.
+  `collector.py`, `render_pose.py`, `render.py`, `render_tracks.py`, `tracks.py`
+  (the keypoint-depth sink).
 
 ---
 
