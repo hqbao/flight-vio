@@ -43,6 +43,9 @@ from . import theme
 from .imu_panels import Accel3DView, GyroPlot
 
 _G = 9.80665
+# 0.7x the ImuCamWindow accel zoom (its _VIEW_DIST is 4.6): a larger camera
+# distance renders the vector smaller so it fits this wider triplet panel.
+_ACCEL_VIEW_DIST = 4.6 / 0.7
 
 
 # --------------------------------------------------------------------------- #
@@ -520,13 +523,19 @@ class SyncedViewWindow(QWidget):
         av = QVBoxLayout(accel_box)
         av.setContentsMargins(0, 0, 0, 0)
         av.setSpacing(2)
-        self._accel = Accel3DView()
+        # 0.7x the ImuCamWindow zoom so the whole vector fits in this wider
+        # panel; passed per-instance so the ImuCamWindow accel is unchanged.
+        self._accel = Accel3DView(view_dist=_ACCEL_VIEW_DIST)
         av.addWidget(self._accel, stretch=1)
         self._imu_readout = QLabel("tilt — · |a| —")
         self._imu_readout.setObjectName("ImuCamStatus")
         av.addWidget(self._imu_readout, stretch=0)
         row.addWidget(accel_box)
-        row.setSizes([1, 1])
+        # Equal halves: large equal sizes force a stable 50/50 split regardless
+        # of the two children's differing size hints (the GL view hints larger).
+        row.setSizes([10_000, 10_000])
+        row.setStretchFactor(0, 1)
+        row.setStretchFactor(1, 1)
         lay.addWidget(row, stretch=1)
         return panel
 

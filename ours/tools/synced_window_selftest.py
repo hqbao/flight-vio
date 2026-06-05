@@ -106,6 +106,13 @@ def test_happy_path(app) -> None:
     _check(len(seqs) >= 1, f"reported rendered frames (saw seq {seqs[:5]})")
     _check(min(widths) == max(widths),
            f"window width stayed stable (no pixmap feedback growth) {set(widths)}")
+    _check(abs(win._accel._view_dist - 4.6 / 0.7) < 1e-6,
+           f"accel zoomed 0.7x (view_dist={win._accel._view_dist:.2f})")
+    sizes = win._gyro.parent().sizes() if hasattr(win._gyro.parent(), "sizes") \
+        else None
+    if sizes and len(sizes) == 2 and min(sizes) > 0:
+        _check(abs(sizes[0] - sizes[1]) <= max(sizes) * 0.1,
+               f"gyro|accel split is symmetric ({sizes})")
     win.close()
     _check(not win._running, "window stopped the worker on close")
 

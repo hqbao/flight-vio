@@ -230,9 +230,10 @@ class _OrbitGL(gl.GLViewWidget):
 class Accel3DView(QtWidgets.QWidget):
     """Interactive 3D accel vector (orbit with mouse, BACK/LEFT/TOP presets)."""
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, parent=None, *, view_dist: float = _VIEW_DIST) -> None:
         super().__init__(parent)
         self.setObjectName("Accel3DView")
+        self._view_dist = float(view_dist)
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(4)
@@ -245,7 +246,7 @@ class Accel3DView(QtWidgets.QWidget):
         self._gl = _OrbitGL(self._on_user_orbit)
         self._gl.setObjectName("Accel3DGL")
         self._gl.setBackgroundColor(QColor(theme.BG))
-        self._gl.setCameraPosition(distance=_VIEW_DIST)
+        self._gl.setCameraPosition(distance=self._view_dist)
         lay.addWidget(self._gl, stretch=1)
 
         # Checkerboard ground placed below the origin: the gravity arrow points
@@ -310,7 +311,8 @@ class Accel3DView(QtWidgets.QWidget):
         if name not in _ACCEL_PRESETS:
             return
         az, el = _ACCEL_PRESETS[name]
-        self._gl.setCameraPosition(azimuth=az, elevation=el, distance=_VIEW_DIST)
+        self._gl.setCameraPosition(azimuth=az, elevation=el,
+                                   distance=self._view_dist)
         for key, btn in self._buttons.items():
             btn.setChecked(key == name)
 
