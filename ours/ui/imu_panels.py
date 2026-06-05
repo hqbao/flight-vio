@@ -39,6 +39,11 @@ def _rgba(hexstr: str, alpha: float = 1.0):
     return (c.redF(), c.greenF(), c.blueF(), alpha)
 
 
+def _rgba_u8(hexstr: str, alpha: int = 255):
+    c = QColor(hexstr)
+    return (c.red(), c.green(), c.blue(), alpha)
+
+
 # ---------------------------------------------------------------------------
 # Gyro -- auto-scaling scrolling line chart
 # ---------------------------------------------------------------------------
@@ -161,6 +166,47 @@ def _ring(radius: float, plane: str, n: int = 72):
     return np.stack([c, z, s], axis=1) * radius          # xz
 
 
+# Checkerboard floor placed UNDER the vector so "down" reads at a glance and the
+# 3D depth is easy to judge against a patterned ground (vs. empty black).
+_FLOOR_PX = 256
+_FLOOR_SIZE = 3.0
+_FLOOR_Z = -1.2
+
+
+def _checker_texture(squares: int = 8, px: int = _FLOOR_PX) -> np.ndarray:
+    """An ``(px, px, 4)`` uint8 checkerboard in two subtle panel tones."""
+    c0 = np.array(_rgba_u8(theme.PANEL), dtype=np.uint8)
+    c1 = np.array(_rgba_u8(theme.GRID), dtype=np.uint8)
+    tile = px // squares
+    img = np.empty((px, px, 4), dtype=np.uint8)
+    for i in range(squares):
+        for j in range(squares):
+            img[i * tile:(i + 1) * tile, j * tile:(j + 1) * tile] = (
+                c0 if (i + j) % 2 == 0 else c1)
+    return img
+
+
+def _arrow_mesh(length: float, shaft_r: float = 0.03, head_r: float = 0.085,
+                head_frac: float = 0.26, cols: int = 20):
+    """A solid +Z arrow (cylinder shaft + cone head) of total ``length``.
+
+    Rendered as a mesh instead of a GL line so the vector is unmistakably
+    visible regardless of the platform's line-width support (macOS clamps it).
+    """
+    head_len = max(length * head_frac, 1e-4)
+    shaft_len = max(length - head_len, 1e-4)
+    shaft = gl.MeshData.cylinder(rows=1, cols=cols,
+                                 radius=[shaft_r, shaft_r], length=shaft_len)
+    head = gl.MeshData.cylinder(rows=1, cols=cols,
+                                radius=[head_r, 0.0], length=head_len)
+    v1, f1 = shaft.vertexes(), shaft.faces()
+    v2 = head.vertexes().copy()
+    v2[:, 2] += shaft_len
+    verts = np.vstack([v1, v2]).astype(np.float32)
+    faces = np.vstack([f1, head.faces() + len(v1)])
+    return gl.MeshData(vertexes=verts, faces=faces)
+
+
 class _OrbitGL(gl.GLViewWidget):
     """GLViewWidget that reports when the user manually orbits the camera."""
 
@@ -184,7 +230,8 @@ class Accel3DView(QtWidgets.QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(4)
 
-        caption = QtWidgets.QLabel("ACCEL — BODY FRAME · rings = 1 G")
+        caption = QtWidgets.QLabel(
+            "ACCEL — BODY FRAME · arrow = specific force · rings = 1 G · floor = down")
         caption.setObjectName("PanelTitle")
         lay.addWidget(caption)
 
@@ -194,11 +241,12 @@ class Accel3DView(QtWidgets.QWidget):
         self._gl.setCameraPosition(distance=_VIEW_DIST)
         lay.addWidget(self._gl, stretch=1)
 
-        grid = gl.GLGridItem()
-        grid.setSize(2.0, 2.0, 0.0)
-        grid.setSpacing(0.5, 0.5, 0.0)
-        grid.setColor(QColor(theme.GRID))
-        self._gl.addItem(grid)
+        # Checkerboard ground placed below the origin: the gravity arrow points
+        # down onto it, so "which way is down" and the 3D depth are obvious.
+        self._floor = gl.GLImageItem(_checker_texture())
+        self._floor.scale(_FLOOR_SIZE / _FLOOR_PX, _FLOOR_SIZE / _FLOOR_PX, 1.0)
+        self._floor.translate(-_FLOOR_SIZE / 2, -_FLOOR_SIZE / 2, _FLOOR_Z)
+        self._gl.addItem(self._floor)
 
         # 1 G reference rings (XY + XZ) so vector magnitude is readable from any
         # orbit -- gravity at rest is a unit vector that lands on these rings.
@@ -221,16 +269,13 @@ class Accel3DView(QtWidgets.QWidget):
             except Exception:
                 pass                       # GLTextItem missing on old pyqtgraph
 
-        # The live accel vector (specific force), 1 G == unit length.
-        accel_rgba = _rgba(theme.IMU_ACCEL)
-        self._vec = gl.GLLinePlotItem(
-            pos=np.zeros((2, 3), dtype=np.float32), color=accel_rgba,
-            width=3.0, antialias=True)
-        self._tip = gl.GLScatterPlotItem(
-            pos=np.zeros((1, 3), dtype=np.float32), color=accel_rgba,
-            size=11.0, pxMode=True)
-        self._gl.addItem(self._vec)
-        self._gl.addItem(self._tip)
+        # The live accel vector (specific force), drawn as a solid arrow mesh so
+        # it is clearly visible; 1 G == unit length. Rebuilt each frame.
+        self._accel_rgba = _rgba(theme.IMU_ACCEL)
+        self._arrow = gl.GLMeshItem(
+            meshdata=_arrow_mesh(1.0), color=self._accel_rgba, smooth=True,
+            shader="shaded", glOptions="opaque")
+        self._gl.addItem(self._arrow)
 
         controls = QtWidgets.QHBoxLayout()
         controls.setSpacing(4)
@@ -266,9 +311,19 @@ class Accel3DView(QtWidgets.QWidget):
             return
         a = np.atleast_2d(np.asarray(accel_rows, dtype=np.float64)).mean(axis=0)
         self.accel = a
-        v = (a / _G).astype(np.float32)
-        self._vec.setData(pos=np.stack([np.zeros(3, dtype=np.float32), v]))
-        self._tip.setData(pos=v.reshape(1, 3))
+        v = a / _G
+        length = float(np.linalg.norm(v))
+        if length > 1e-4:
+            # Rebuild the arrow at the true length, then rotate +Z -> direction.
+            d = v / length
+            axis = np.cross((0.0, 0.0, 1.0), d)
+            s = float(np.linalg.norm(axis))
+            c = float(np.clip(d[2], -1.0, 1.0))
+            angle = float(np.degrees(np.arctan2(s, c)))
+            axis = (1.0, 0.0, 0.0) if s < 1e-8 else tuple(axis / s)
+            self._arrow.setMeshData(meshdata=_arrow_mesh(length))
+            self._arrow.resetTransform()
+            self._arrow.rotate(angle, axis[0], axis[1], axis[2])
         self._mag.setText(
             f"|a| = {float(np.linalg.norm(a)):5.2f} m/s² (mean)   "
             f"({a[0]:+.1f}, {a[1]:+.1f}, {a[2]:+.1f})")

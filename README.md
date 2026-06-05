@@ -129,9 +129,10 @@ primary START/STOP):
     - **gyro** — an **auto-scaling** scrolling line chart (deg/s); the Y axis
       tracks the signal with a minimum span + expand-fast/shrink-slow
       hysteresis, so a still IMU doesn't strobe;
-    - **accel** — a **real interactive 3D** vector view (OpenGL): orbit it with
-      the mouse and snap to **BACK / LEFT / TOP**; 1 G reference rings and an
-      X/Y/Z body-axis triad make the magnitude and direction readable.
+    - **accel** — a **real interactive 3D** vector view (OpenGL): the specific
+      force is drawn as a solid arrow you can orbit with the mouse and snap to
+      **BACK / LEFT / TOP**. A checkerboard floor below + 1 G reference rings +
+      an X/Y/Z body-axis triad make the magnitude and direction readable.
 
     This is the view for verifying the camera↔IMU time-sync.
   - **Camera + Depth + IMU** triplet (`synced_view --live`) and **Stereo Depth**
