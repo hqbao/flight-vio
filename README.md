@@ -141,6 +141,16 @@ primary START/STOP):
     **calibrated** (`gyro − bias`, accel affine) when a per-device calibration is
     cached — the panel title reads `IMU · CALIBRATED` vs `IMU · RAW`. Live off the
     OAK-D (host SGM) or a recorded session.
+  - **Keypoint Depth Tracker** opens an in-app Qt window
+    (`ours/ui/keypoints_window.py`): the rectified-left frame with every live
+    **KLT-frontend track** drawn on it (the SAME frontend the odometry runs, not
+    a parallel detector). Each dot's **colour = that keypoint's metric depth**
+    (the same fixed TURBO 0.3–8 m map + scale bar as the depth panel), so colour
+    means the same distance everywhere; keypoints with no stereo return are
+    **hollow grey rings** (never a faked colour), fresh tracks get an amber ring.
+    A faint per-id **trail** shows where the *same* keypoint moved over the last
+    20 frames. The footer prints honest stats (`trk`, `valid-z %`, `mean-age`,
+    `new`). Live off the OAK-D (host SGM) or a recorded session.
 
 The same synced split front-end can be inspected **without the GUI** — a cv2
 window over a recorded session or the live device:
@@ -157,6 +167,7 @@ To self-verify the front-end with numbers instead of eyeballs (no device):
 .venv/bin/python -m ours.tools.imu_calib_selftest    # raw IMU on imu.raw, calibrated IMU in imucam.sample
 QT_QPA_PLATFORM=offscreen .venv/bin/python -m ours.tools.imucam_window_selftest
 QT_QPA_PLATFORM=offscreen .venv/bin/python -m ours.tools.synced_window_selftest   # image|depth|IMU triplet window
+QT_QPA_PLATFORM=offscreen .venv/bin/python -m ours.tools.keypoints_window_selftest # keypoints coloured by depth + per-id trails
 ```
 
 The imu-reader publishes the **raw** IMU for every frame interval on `imu.raw`
@@ -295,6 +306,7 @@ Self-tests (run before/after touching the from-scratch VIO):
 .venv/bin/python -m ours.tools.oak_live_selftest     # single-client shared OAK-D (cam+IMU open the device once)
 QT_QPA_PLATFORM=offscreen .venv/bin/python -m ours.tools.imucam_window_selftest  # in-app synced view renders (offscreen Qt)
 QT_QPA_PLATFORM=offscreen .venv/bin/python -m ours.tools.synced_window_selftest  # image|depth|IMU triplet window renders (offscreen Qt)
+QT_QPA_PLATFORM=offscreen .venv/bin/python -m ours.tools.keypoints_window_selftest # keypoints coloured by depth + per-id trails (offscreen Qt)
 ```
 
 `klt_selftest.py` is the regression guard for the library-free frontend: it

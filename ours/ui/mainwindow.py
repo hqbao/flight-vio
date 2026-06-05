@@ -152,6 +152,9 @@ class MainWindow(QMainWindow):
         triplet_act = QAction("Camera + Depth + IMU (triplet)…", self)
         triplet_act.triggered.connect(self._launch_triplet)
         vis_menu.addAction(triplet_act)
+        keypoints_act = QAction("Keypoint Depth Tracker…", self)
+        keypoints_act.triggered.connect(self._launch_keypoints)
+        vis_menu.addAction(keypoints_act)
 
     def _release_device(self, reason: str) -> bool:
         """Stop the live source so a calibration/visualize tool can open the device.
@@ -230,6 +233,26 @@ class MainWindow(QMainWindow):
         win.activateWindow()
         win.ensure_started()
         self.statusBar().showMessage("Camera + Depth + IMU triplet opened.", 2500)
+
+    def _launch_keypoints(self) -> None:
+        """Open the frame + depth-coloured keypoints + trails view (our own UI)."""
+        if not self._release_device("Keypoint depth tracker view"):
+            return
+        from .keypoints_window import KeypointTrackWindow, live_worker_factory
+        # Reuse one instance so repeated opens don't stack streams on the
+        # single-client device (mirrors _launch_triplet).
+        win = getattr(self, "_keypoints_win", None)
+        if win is None:
+            factory = live_worker_factory(width=self._cap_width,
+                                          height=self._cap_height,
+                                          fps=self._cap_fps)
+            win = KeypointTrackWindow(factory, fps=self._cap_fps, parent=self)
+            self._keypoints_win = win
+        win.show()
+        win.raise_()
+        win.activateWindow()
+        win.ensure_started()
+        self.statusBar().showMessage("Keypoint depth tracker opened.", 2500)
 
     # ----------------------------------------------------------------------
 
