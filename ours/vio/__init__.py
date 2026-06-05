@@ -14,6 +14,13 @@ from .imu import GyroPreintegrator, gravity_aligned_R0, so3_exp
 from .inertial_filter import InertialFilterConfig, InertialTranslationFilter
 from .loopclosure import KeyframeAppearance, LoopConfig, LoopDetector
 from .odometry import OdometryConfig, RGBDVisualOdometry, level_attitude
+from .orb import (
+    ORB,
+    OrbConfig,
+    find_fundamental_ransac,
+    hamming_knn,
+    match_ratio_mutual,
+)
 from .posegraph import PoseGraph, se3_adjoint, se3_inv, se3_log
 from .reader import CameraCalib, Frame, SessionReader, StereoCalib
 from .resolution import ResolutionProfile
@@ -62,6 +69,11 @@ __all__ = [
     "KeyframeAppearance",
     "LoopConfig",
     "LoopDetector",
+    "ORB",
+    "OrbConfig",
+    "find_fundamental_ransac",
+    "hamming_knn",
+    "match_ratio_mutual",
     "PoseGraph",
     "se3_adjoint",
     "se3_inv",

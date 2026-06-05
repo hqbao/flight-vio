@@ -25,7 +25,8 @@ oak-d/
       bundle.py          sliding-window bundle adjustment (analytic Schur)
       windowed.py        windowed BA driver (ours-ba)
       vio_window.py      tight-coupled joint VIO solve (experimental --backend vio)
-      loopclosure.py     ORB loop detector + PnP/F-matrix verify (cv2, ours-slam)
+      loopclosure.py     loop detector: own ORB + F-matrix + PnP verify (ours-slam)
+      orb.py             own oriented-FAST + steered-BRIEF + Hamming + F-RANSAC
       posegraph.py       SE(3) pose graph
       slam.py            full SLAM driver (ours-slam)
       geometry.py        SO(3)/SE(3) Lie-algebra helpers

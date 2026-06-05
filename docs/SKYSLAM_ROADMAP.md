@@ -258,9 +258,13 @@ path and offline f2f/ba scoring carry no cv2 (Numba JITs the KLT inner loop to
 ~15 ms/frame live; without Numba a lighter `live_own` preset keeps it real time).
 These are the reference to port to NEON-optimised `fast_detector.c` /
 `klt_tracker.c`. PnP is also our own (`ours/vio/pnp.py`) and frame IO uses a
-pure-Python PNG codec (`ours/pngio.py`), so no cv2 call remains in the
-`ours`/`ours-ba` path; cv2 is only used by ORB loop closure (`ours-slam`) and the
-dev-only PnP A/B oracle.
+pure-Python PNG codec (`ours/pngio.py`). ORB loop closure is now library-free
+too (`ours/vio/orb.py`: oriented FAST + steered BRIEF + Hamming kNN matcher +
+normalised 8-point fundamental-matrix RANSAC, with the metric verify reusing
+`ours/vio/pnp.py`), so **no cv2 call remains in any `ours` runtime path**
+(`ours`/`ours-ba`/`ours-slam`). cv2 survives only as a dev-time oracle in the
+self-tests + the env-gated PnP A/B (`OAKD_OWN_PNP=0`) and the HighGUI inspector
+windows.
 
 --- (3–5 days code | 2–3 weeks debug)
 
