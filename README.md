@@ -150,13 +150,22 @@ To self-verify the front-end with numbers instead of eyeballs (no device):
 
 ```bash
 .venv/bin/python -m ours.tools.imucam_sync_selftest --session sessions/gold/lab_loop_30s
+.venv/bin/python -m ours.tools.imu_calib_selftest    # raw IMU on imu.raw, calibrated IMU in imucam.sample
 QT_QPA_PLATFORM=offscreen .venv/bin/python -m ours.tools.imucam_window_selftest
 ```
 
+The imu-reader publishes the **raw** IMU for every frame interval on `imu.raw`
+(exactly what the sensor reported) and bundles the **calibrated** IMU
+(`gyro − bias`, `a = T·(a_raw − b)`) into the synced `imucam.sample` packet when a
+per-device calibration is cached; with none, the packet carries the raw samples.
+The live path loads the calibration lazily by device id once the shared OAK-D
+opens (`ours/lib/imu/imu_calib.py`).
+
 The calibration math and capture state machines live in `ours/lib/imu/`
-(`accel_calib.py`, `calib_collect.py`, `calib_store.py`) and are covered by
-offline self-tests (`accel_calib_selftest`, `calib_collect_selftest`,
-`calib_store_selftest`, `ui_calib_selftest`) that run without an OAK-D.
+(`accel_calib.py`, `calib_collect.py`, `calib_store.py`, `imu_calib.py`) and are
+covered by offline self-tests (`accel_calib_selftest`, `calib_collect_selftest`,
+`calib_store_selftest`, `imu_calib_selftest`, `ui_calib_selftest`) that run
+without an OAK-D.
 
 
 Both `ours-ba` and `ours-slam` run their heavy optimisation on a background

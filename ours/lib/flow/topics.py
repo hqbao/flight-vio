@@ -22,11 +22,14 @@ Split-acquisition front-end (camera + IMU as two flows) adds two edges, parallel
 to the monolithic capture above and not wired into it::
 
     cam-reader --cam.sync------> imu-reader      (trigger: stereo pair + ts)
-    imu-reader --imucam.sample-> downstream      (frames + IMU up to that ts)
+    imu-reader --imu.raw-------> downstream      (raw IMU for the interval)
+    imu-reader --imucam.sample-> downstream      (frames + CALIBRATED IMU)
 
 ``cam.sync`` carries the frames so the IMU flow packs them with the inertial
-samples it drains up to the frame timestamp; ``imucam.sample`` is the combined,
-time-synced unit consumers (state estimation, visualiser) subscribe to.
+samples it drains up to the frame timestamp. For each trigger the IMU flow emits
+the uncalibrated samples on ``imu.raw`` (honest, what the sensor reported) and
+the frames bundled with the *calibrated* IMU on ``imucam.sample`` -- the
+combined, time-synced unit consumers (state estimation, visualiser) subscribe to.
 """
 from __future__ import annotations
 
@@ -41,3 +44,6 @@ LOOP_CORRECTION = "loop.correction"
 # Split-acquisition front-end (camera-reader <-> imu-reader).
 CAM_SYNC = "cam.sync"
 IMUCAM_SAMPLE = "imucam.sample"
+# Raw IMU for each frame interval, published BEFORE calibration (honest, what
+# the sensor reported). ``imucam.sample`` carries the CALIBRATED IMU.
+IMU_RAW = "imu.raw"

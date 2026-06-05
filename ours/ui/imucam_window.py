@@ -193,7 +193,19 @@ class ImuCamWindow(QWidget):
         self._bus = Bus()
         self._sink = _QueueSink(self._bus, self._queue)
         self._sink.expected_ends = 1
-        self._imu = ImuReaderFlow(self._bus, imu_src)
+        # On the live path the IMU source carries the shared device; load that
+        # device's cached calibration lazily (its id is known only once the
+        # device opens) so the synced packet carries CALIBRATED IMU. Replay
+        # sources have no device -> no provider -> raw passes through.
+        device = getattr(imu_src, "device", None)
+        provider = None
+        if device is not None:
+            def provider():
+                from ..lib.imu.imu_calib import ImuCalibration
+                return ImuCalibration.load(
+                    getattr(device, "device_id", "default"))
+        self._imu = ImuReaderFlow(self._bus, imu_src,
+                                  calibration_provider=provider)
         self._cam = CamReaderFlow(self._bus, cam_src, fps=self._fps,
                                   realtime=True)
         # Start consumers before producers; the IMU source must be filling the

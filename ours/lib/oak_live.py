@@ -43,6 +43,7 @@ class SharedLiveDevice:
         self._lock = threading.Lock()
         self._refs = 0
         self._handle = None
+        self.device_id = "default"      # set once the pipeline opens (cal key)
         self.q_left = None
         self.q_right = None
         self.q_imu = None
@@ -61,6 +62,7 @@ class SharedLiveDevice:
                 self.q_left = q_left
                 self.q_right = q_right
                 self.q_imu = q_imu
+                self.device_id = _read_device_id(handle)
             self._refs += 1
 
     def release(self) -> None:
@@ -84,6 +86,29 @@ class SharedLiveDevice:
             return bool(handle.isRunning())
         except Exception:
             return False
+
+
+def _read_device_id(handle) -> str:
+    """Best-effort unique id of the open device (the per-device cache key).
+
+    ``handle`` is the depthai pipeline; mirrors the id lookup the monolithic
+    capture flow uses so both paths key the IMU calibration cache the same way.
+    A fake handle (offline tests) without these methods just yields "default".
+    """
+    try:
+        dev = handle.getDefaultDevice()
+    except Exception:
+        return "default"
+    for attr in ("getDeviceId", "getMxId", "getDeviceName"):
+        fn = getattr(dev, attr, None)
+        if callable(fn):
+            try:
+                val = fn()
+                if val:
+                    return str(val)
+            except Exception:
+                pass
+    return "default"
 
 
 def _open_oak_pipeline(dev: SharedLiveDevice) -> tuple:

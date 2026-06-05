@@ -154,3 +154,26 @@ class ImuCamPacket:
     imu_ts: np.ndarray
     gyro: np.ndarray
     accel: np.ndarray
+
+
+@dataclass(frozen=True)
+class ImuRaw:
+    """The RAW IMU samples for one frame interval, before any calibration.
+
+    Published on ``topics.IMU_RAW`` by
+    :class:`~ours.flows.imu_reader.ImuReaderFlow` for every :class:`CamSync`,
+    carrying exactly what the sensor reported (no bias/scale correction) so a
+    consumer can see the uncalibrated signal. The matching
+    :class:`ImuCamPacket` on ``topics.IMUCAM_SAMPLE`` carries the SAME interval's
+    samples after calibration. ``M`` may be 0 for an empty interval.
+
+    * ``imu_ts`` -- ``(M,)`` device timestamps (ns), time-ordered.
+    * ``gyro`` / ``accel`` -- ``(M, 3)`` raw angular rate (rad/s) and specific
+      force (m/s^2).
+    """
+
+    seq: int
+    ts_ns: int
+    imu_ts: np.ndarray
+    gyro: np.ndarray
+    accel: np.ndarray
