@@ -363,7 +363,7 @@ sessions/
 
 ## 5. How to record from the current pipeline
 
-Need an additional module `oakd/recorder.py`:
+Need an additional module `baseline/oakd/recorder.py`:
 
 ```python
 class SessionRecorder:
@@ -465,7 +465,7 @@ When skyslam reaches each phase, replay these 5 sessions → compute metrics
 
 Pre-skyslam infra ✅ DONE:
 
-- [x] `oakd/recorder.py` — fan-out tap on every queue
+- [x] `baseline/oakd/recorder.py` — fan-out tap on every queue
 - [x] `baseline/tools/record_session.py` — CLI with `--duration`, `--no-pcl`, `-f`
 - [x] `baseline/tools/compare_sessions.py` — ATE/RPE between two pose streams
 - [x] Recorded 6 gold sessions (see `docs/GOLD_SESSIONS.md`)
@@ -485,7 +485,7 @@ Skyslam work — see **`docs/SKYSLAM_RESEARCH.md`** Part 3 for plan v3
 - Long-term hardware/FC vision: `docs/SKYSLAM_ROADMAP.md`
 - Current SLAM source: `baseline/depthai_slam.py`
 - Current VIO source: `baseline/depthai_vio.py`
-- Pose data structure: `oakd/pose.py`
+- Pose data structure: `baseline/oakd/pose.py`
 
 ---
 

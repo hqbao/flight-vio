@@ -20,9 +20,9 @@ import time
 
 import numpy as np
 
-from oakd.frames import quat_to_rot
-from oakd.pose import Pose
-from oakd.sources.base import PoseSource
+from baseline.oakd.frames import quat_to_rot
+from baseline.oakd.pose import Pose
+from baseline.oakd.sources.base import PoseSource
 from .depthai_vio import _M_FLU_TO_NED, _rot_to_quat_wxyz
 
 

@@ -43,7 +43,7 @@ from PyQt6.QtWidgets import (                                # noqa: E402
 import pyqtgraph as pg                                       # noqa: E402
 import pyqtgraph.opengl as gl                                # noqa: E402
 
-from oakd.ui import theme                                    # noqa: E402
+from baseline.oakd.ui import theme                                    # noqa: E402
 
 
 # ============================================================================

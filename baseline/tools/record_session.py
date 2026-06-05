@@ -21,7 +21,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from oakd.recorder import SessionRecorder  # noqa: E402
+from baseline.oakd.recorder import SessionRecorder  # noqa: E402
 
 
 def _read_calib(device, width: int, height: int, left_socket, right_socket) -> dict:

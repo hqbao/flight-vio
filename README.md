@@ -6,20 +6,7 @@ to a Raspberry Pi 5 later.
 
 ```
 oak-d/
-  oakd/                  core for the BASELINE pipeline only (ours has its own copies)
-    frames.py            camera <-> body (FRD) <-> world (NED) transforms
-    pose.py              Pose dataclass + ring buffer
-    recorder.py          live-run logger (C0..C9 streams to sessions/<name>/)
-    pngio.py             pure-Python 8-bit PNG codec (replaces cv2.imread/imwrite)
-    sources/             pose-source base + the device-free fake source
-      base.py            PoseSource ABC
-      fake.py            procedural figure-8 trajectory (UI bring-up)
-    ui/
-      theme.py           military dark palette (mirrors flight-controller/_ui.py)
-      viewer3d.py        pyqtgraph GLViewWidget — trajectory, drone triad, grid
-      panels.py          telemetry side-panel
-      mainwindow.py      top-level QMainWindow + toolbar (view presets)
-  ours/                  OUR from-scratch pipeline (library-free; shares NO code with oakd/)
+  ours/                  OUR from-scratch pipeline (library-free; self-contained)
     pose.py              own Pose dataclass + ring buffer (copy, kept independent)
     frames.py            own camera/body/world transforms (copy)
     pngio.py             own pure-Python PNG codec (copy)
@@ -52,6 +39,13 @@ oak-d/
       stereo_view.py     inspect our SGM depth (replay + --live)
       *_selftest.py      regression guards (klt, ba, posegraph, imu_preint, vio_ba)
   baseline/              DepthAI library pipeline (BasaltVIO + RTABMapSLAM)
+    oakd/                baseline-only core (its Pose/frames/pngio/sources/ui)
+      frames.py          camera <-> body (FRD) <-> world (NED) transforms
+      pose.py            Pose dataclass + ring buffer
+      recorder.py        live-run logger (C0..C9 streams to sessions/<name>/)
+      pngio.py           pure-Python 8-bit PNG codec (replaces cv2.imread/imwrite)
+      sources/           PoseSource base + the device-free fake source
+      ui/                Qt 3D viewer (theme/viewer3d/panels/mainwindow)
     depthai_vio.py       real stereo-inertial VIO (dai.node.BasaltVIO)
     depthai_slam.py      VIO + SLAM with loop closure (BasaltVIO + RTABMapSLAM)
     tools/

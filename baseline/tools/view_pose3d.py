@@ -4,7 +4,7 @@
 Standalone to the ``baseline/`` pipeline: it wires DepthAI's built-in Basalt
 backends (:class:`baseline.depthai_vio.OakBasaltVioSource`,
 :class:`baseline.depthai_slam.OakBasaltSlamSource`) into the baseline copy of
-the Qt 3D viewer (:mod:`oakd.ui`). It shares nothing with ``ours/`` — our
+the Qt 3D viewer (:mod:`baseline.oakd.ui`). It shares nothing with ``ours/`` — our
 from-scratch VIO backends live in ``ours/tools/view_pose3d.py``.
 """
 from __future__ import annotations
@@ -18,9 +18,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from PyQt6.QtWidgets import QApplication       # noqa: E402
 
-from oakd.pose import PoseHistory              # noqa: E402
-from oakd.sources import FakePoseSource        # noqa: E402
-from oakd.ui.mainwindow import MainWindow      # noqa: E402
+from baseline.oakd.pose import PoseHistory              # noqa: E402
+from baseline.oakd.sources import FakePoseSource        # noqa: E402
+from baseline.oakd.ui.mainwindow import MainWindow      # noqa: E402
 
 
 def _build_source(name: str, args):
