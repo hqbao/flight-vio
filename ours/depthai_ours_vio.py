@@ -60,7 +60,7 @@ from ours.lib import (
     InertialTranslationFilter, KLTFrontend,
     RGBDVisualOdometry, gravity_aligned_R0, level_attitude,
 )
-from ours.sources.base import PoseSource
+from ours.ui.source import PoseSource
 
 
 # Standard OpenCV optical (x right, y down, z forward) -> world NED.

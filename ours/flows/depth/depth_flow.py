@@ -22,8 +22,13 @@ class _ComputeDepth(Task):
     def run(self, ctx, msg: RawFrame):
         matcher: SGMStereoMatcher = ctx.state["matcher"]
         with NUMBA_PARALLEL_LOCK:        # SGM uses numba parallel=True
-            depth = matcher.dense_depth(msg.gray_left, msg.gray_right)
-        return DepthFrame(msg.seq, msg.ts_ns, msg.gray_left, depth)
+            # Returns the tracking-grid left + metric depth on the SAME grid.
+            # For a replay matcher (rectify_left off) the left passes through
+            # unchanged; for the live matcher (rectify_left on, raw cameras) the
+            # left is rectified here so depth + tracking share one grid.
+            gray_track, depth = matcher.dense_depth_rectified_left(
+                msg.gray_left, msg.gray_right)
+        return DepthFrame(msg.seq, msg.ts_ns, gray_track, depth)
 
 
 class _PublishDepth(Task):

@@ -13,10 +13,12 @@ DepthAI BasaltVIO + RTABMap black boxes one module at a time:
                                    flow (capture, depth, odometry, backend, slam,
                                    ui), each a thread of sequential tasks that
                                    talk over the pub/sub bus.
-  * ``ours.depthai_ours_vio``    — the live OAK-D source driving ``ours.lib``
+  * ``ours.depthai_ours_vio``    — legacy monolithic live OAK-D source (kept
+                                   until the flow live path is verified on-device)
   * ``ours.tools``               — offline scoring, self-tests and inspectors
                                    (these call ``ours.lib`` directly, not the flows)
-  * ``ours.sources`` / ``ours.ui`` — our own pose-source base + Qt 3D viewer
+  * ``ours.ui``                  — our own Qt 3D viewer + its ``PoseSource``
+                                   input contract (base + fake source)
 
 This package is fully self-contained: it imports nothing from ``oakd`` (the
 baseline's core) so the two pipelines share no code. We accept the small

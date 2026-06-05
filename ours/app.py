@@ -34,6 +34,22 @@ from .lib.pubsub import Bus
 from .lib.stereo.stereo import SGMConfig, SGMStereoMatcher
 
 
+def build_graph(bus: Bus, K, matcher, *, ui, kf_every: int = 5,
+                use_gyro: bool = True, slam_cfg: SlamConfig | None = None):
+    """Build the shared depth/odometry/backend/slam flows around a ``ui`` sink.
+
+    The capture flow is built by the caller (replay vs live); everything
+    downstream of ``frame.raw`` is identical, so it is constructed here once.
+    Returns the list of reactive flows ``[depth, odom, backend, slam, ui]``.
+    """
+    depth = DepthFlow(bus, matcher)
+    odom = OdometryFlow(bus, K, OdometryConfig(gyro_fuse=use_gyro),
+                        kf_every=kf_every, use_gyro=use_gyro)
+    backend = BackendFlow(bus, K, kf_every=1)
+    slam = SlamFlow(bus, K, slam_cfg or SlamConfig(loop_max_odom_rot_deg=30.0))
+    return [depth, odom, backend, slam, ui]
+
+
 def build_replay(bus: Bus, reader: SessionReader, *, kf_every: int = 5,
                  use_gyro: bool = True, depth_fast: bool = False,
                  max_frames: int = 0,
@@ -47,15 +63,34 @@ def build_replay(bus: Bus, reader: SessionReader, *, kf_every: int = 5,
     sgm = SGMConfig.live() if depth_fast else SGMConfig()
     matcher = SGMStereoMatcher.from_calib(reader.calib, sgm)
 
-    capture = ReplayCaptureFlow(bus, reader, max_frames=max_frames)
-    depth = DepthFlow(bus, matcher)
-    odom = OdometryFlow(bus, reader.K, OdometryConfig(gyro_fuse=use_gyro),
-                        kf_every=kf_every, use_gyro=use_gyro)
-    backend = BackendFlow(bus, reader.K, kf_every=1)
-    slam = SlamFlow(bus, reader.K, slam_cfg or SlamConfig(
-        loop_max_odom_rot_deg=30.0))
+    capture = ReplayCaptureFlow(bus, reader, max_frames=max_frames,
+                                use_gyro=use_gyro)
     ui = UiCollectorFlow(bus)
-    return capture, [depth, odom, backend, slam, ui], ui
+    flows = build_graph(bus, reader.K, matcher, ui=ui, kf_every=kf_every,
+                        use_gyro=use_gyro, slam_cfg=slam_cfg)
+    return capture, flows, ui
+
+
+def build_live(bus: Bus, *, width: int = 640, height: int = 400, fps: int = 20,
+               kf_every: int = 5, use_gyro: bool = True, depth_fast: bool = True,
+               ui=None, slam_cfg: SlamConfig | None = None):
+    """Construct the live OAK-D graph. Opens the device to read calibration.
+
+    The live capture flow taps both raw cameras + IMU; its depth matcher
+    rectifies BOTH (``rectify_left=True``) since the raw left is unrectified.
+    Returns ``(capture, reactive_flows, ui)``. Caller starts the threads.
+    """
+    from .flows.capture import LiveCaptureFlow
+
+    capture = LiveCaptureFlow(bus, width=width, height=height, fps=fps,
+                              depth_fast=depth_fast, use_gyro=use_gyro)
+    calib = capture.open()                         # opens device, reads calib
+    matcher = SGMStereoMatcher.from_calib(calib.calib, calib.sgm_cfg,
+                                          rectify_left=True)
+    ui = ui if ui is not None else UiCollectorFlow(bus)
+    flows = build_graph(bus, calib.K, matcher, ui=ui, kf_every=kf_every,
+                        use_gyro=use_gyro, slam_cfg=slam_cfg)
+    return capture, flows, ui
 
 
 def run_replay(session: str, *, kf_every: int = 5, use_gyro: bool = True,
@@ -81,15 +116,53 @@ def run_replay(session: str, *, kf_every: int = 5, use_gyro: bool = True,
     return ui, reader, time.time() - t0
 
 
+def run_live(*, width: int = 640, height: int = 400, fps: int = 20,
+             kf_every: int = 5, use_gyro: bool = True,
+             depth_fast: bool = True) -> int:
+    """Headless live run: stream the OAK-D through the graph until Ctrl-C."""
+    bus = Bus()
+    capture, flows, ui = build_live(
+        bus, width=width, height=height, fps=fps, kf_every=kf_every,
+        use_gyro=use_gyro, depth_fast=depth_fast)
+    for f in flows:
+        f.start()
+    capture.start()
+    print("[ours-flow] live running — Ctrl-C to stop")
+    try:
+        while capture.is_alive():
+            time.sleep(2.0)
+            n_loops = ui.corrections[-1].n_loops if ui.corrections else 0
+            print(f"[ours-flow] poses={len(ui.odom)} refined={len(ui.refined)} "
+                  f"loops={n_loops}")
+    except KeyboardInterrupt:
+        print("\n[ours-flow] stopping…")
+    finally:
+        capture.stop()
+        ui.done.wait(timeout=10.0)
+        for f in flows:
+            f.stop()
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--live", action="store_true",
+                    help="run the live OAK-D device instead of a recorded session")
     ap.add_argument("--session", default="sessions/gold/lab_straight_20s")
     ap.add_argument("--max-frames", type=int, default=0, help="0 = all frames")
     ap.add_argument("--kf-every", type=int, default=5)
     ap.add_argument("--no-gyro", action="store_true")
     ap.add_argument("--depth-fast", action="store_true",
                     help="half-res SGM live preset (faster)")
+    ap.add_argument("--fps", type=int, default=20, help="live camera fps")
+    ap.add_argument("--width", type=int, default=640)
+    ap.add_argument("--height", type=int, default=400)
     args = ap.parse_args()
+
+    if args.live:
+        return run_live(width=args.width, height=args.height, fps=args.fps,
+                        kf_every=args.kf_every, use_gyro=not args.no_gyro,
+                        depth_fast=True)  # full-res SGM is too slow live
 
     ui, reader, elapsed = run_replay(
         args.session, kf_every=args.kf_every, use_gyro=not args.no_gyro,

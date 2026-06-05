@@ -8,4 +8,13 @@ is identical live or offline:
 """
 from .replay import ReplayCaptureFlow
 
-__all__ = ["ReplayCaptureFlow"]
+__all__ = ["ReplayCaptureFlow", "LiveCaptureFlow", "LiveCalib"]
+
+
+def __getattr__(name):
+    # Lazy: importing depthai (a heavy optional dep) only when the live capture
+    # flow is actually requested, so replay/offline never pays for it.
+    if name in ("LiveCaptureFlow", "LiveCalib"):
+        from .live import LiveCalib, LiveCaptureFlow
+        return {"LiveCaptureFlow": LiveCaptureFlow, "LiveCalib": LiveCalib}[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

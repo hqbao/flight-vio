@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..lib.pose import PoseHistory
-from ..sources.base import PoseSource
+from .source import PoseSource
 from . import theme
 from .panels import TelemetryPanel
 from .viewer3d import VIEW_PRESETS, Viewer3D

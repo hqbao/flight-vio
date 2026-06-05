@@ -21,18 +21,36 @@ END = object()
 
 
 @dataclass(frozen=True)
-class ImuChunk:
-    """The session's IMU stream, published once by capture before the frames.
+class ImuInit:
+    """One-shot IMU startup info, published by capture before any frame.
 
-    Lets the odometry flow build its gyro preintegrator and gravity-align the
-    initial attitude, exactly like the offline ``vio_run`` driver.
+    ``accel_align`` is the near-static startup accelerometer mean in the camera
+    optical frame (m/s^2), used once by the odometry flow to gravity-align the
+    initial attitude. ``None`` when the device has no usable IMU.
     """
 
-    ts_ns: np.ndarray
-    gyro: np.ndarray
-    accel: np.ndarray
-    T_imu_cam: np.ndarray | None
-    has_extrinsics: bool
+    accel_align: np.ndarray | None
+
+
+@dataclass(frozen=True)
+class ImuPrior:
+    """Per-frame IMU prior, published by capture alongside each raw frame.
+
+    The capture flow owns the IMU->prior fusion so the same odometry flow drives
+    both replay and live:
+
+    * ``R_prior`` -- inter-frame camera-frame rotation ``R_cam(prev->cur)`` from
+      the gyro (the rotation prior handed to PnP), or ``None`` on the first frame.
+    * ``accel_cam`` / ``at_rest`` -- the camera-frame accelerometer this frame and
+      whether the camera was still; supplied so a keyframe can carry a gravity
+      prior into the back-end. ``at_rest`` is ``False`` (accel ``None``) when no
+      usable gravity measurement is available (e.g. replay scoring).
+    """
+
+    seq: int
+    R_prior: np.ndarray | None
+    accel_cam: np.ndarray | None = None
+    at_rest: bool = False
 
 
 @dataclass(frozen=True)

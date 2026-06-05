@@ -1,16 +1,22 @@
 """odometry flow implementation.
 
-IMU chain (one message, ``imu.sample``):
+IMU chain (topic ``imu.sample``), routed by message type:
 
-* ``_BuildPrior`` -- build the gyro preintegrator + the gravity-align accel.
+* :class:`~ours.lib.messages.ImuInit`  -- stash the startup gravity-align accel.
+* :class:`~ours.lib.messages.ImuPrior` -- stash this frame's gyro rotation prior
+  (keyed by ``seq``) so the matching depth frame can pick it up.
 
 Frame chain (per ``frame.depth``):
 
-1. ``_ProcessVO``     -- gravity-align on the first frame, compute the gyro
-   rotation prior for ``[prev_ts, ts]``, run RGB-D PnP odometry.
+1. ``_ProcessVO``     -- gravity-align on the first frame, pull the stashed gyro
+   rotation prior for this ``seq``, run RGB-D PnP odometry.
 2. ``_PublishPose``   -- publish the resulting pose on ``pose.odom``.
 3. ``_EmitKeyframe``  -- every ``kf_every`` frames, publish a ``keyframe``
-   carrying the pose, image, depth and the current track snapshot.
+   carrying the pose, image, depth, the current track snapshot and (when the
+   camera was at rest) the gravity accel for the back-end.
+
+The capture flow owns the IMU->prior fusion, so this flow is identical for replay
+and live and stays bit-for-bit aligned with the offline ``vio_run`` f2f driver.
 """
 from __future__ import annotations
 
@@ -20,8 +26,7 @@ import numpy as np
 
 from ...lib import topics
 from ...lib.flow import Flow
-from ...lib.imu.imu import GyroPreintegrator
-from ...lib.messages import DepthFrame, ImuChunk, Keyframe, PoseMsg
+from ...lib.messages import DepthFrame, ImuInit, ImuPrior, Keyframe, PoseMsg
 from ...lib.odometry.odometry import OdometryConfig, RGBDVisualOdometry
 from ...lib.pubsub import Bus
 from ...lib.runtime import NUMBA_PARALLEL_LOCK
@@ -35,21 +40,19 @@ class _Step:
     frame: DepthFrame
     pose: np.ndarray
     info: dict
+    accel_cam: np.ndarray | None
+    at_rest: bool
 
 
-class _BuildPrior(Task):
-    name = "build_prior"
+class _RouteImu(Task):
+    name = "route_imu"
 
-    def run(self, ctx, msg: ImuChunk):
-        if not (msg.has_extrinsics and ctx.state.get("use_gyro", True)):
-            return None
-        ctx.state["pre"] = GyroPreintegrator(msg.ts_ns, msg.gyro, msg.T_imu_cam)
-        R_imu_cam = np.asarray(msg.T_imu_cam, float)[:3, :3]
-        t0 = int(msg.ts_ns[0])
-        win = msg.ts_ns <= t0 + int(0.3 * 1e9)        # first ~0.3 s (near static)
-        if win.any():
-            accel_imu = msg.accel[win].mean(axis=0)
-            ctx.state["accel_align"] = R_imu_cam @ accel_imu
+    def run(self, ctx, msg):
+        if isinstance(msg, ImuInit):
+            if msg.accel_align is not None:
+                ctx.state["accel_align"] = msg.accel_align
+        elif isinstance(msg, ImuPrior):
+            ctx.state["priors"][msg.seq] = msg
         return None
 
 
@@ -61,14 +64,13 @@ class _ProcessVO(Task):
         if not ctx.state.get("aligned") and "accel_align" in ctx.state:
             vo.align_to_gravity(ctx.state["accel_align"])
             ctx.state["aligned"] = True
-        pre = ctx.state.get("pre")
-        prev_ts = ctx.state.get("prev_ts")
-        R_prior = (pre.delta_rotation(prev_ts, msg.ts_ns)
-                   if (pre is not None and prev_ts is not None) else None)
+        prior: ImuPrior | None = ctx.state["priors"].pop(msg.seq, None)
+        R_prior = prior.R_prior if prior is not None else None
         with NUMBA_PARALLEL_LOCK:        # KLT tracker uses numba parallel=True
             pose = vo.process(msg.gray_left, msg.depth_m, R_prior=R_prior)
-        ctx.state["prev_ts"] = msg.ts_ns
-        return _Step(msg, pose.copy(), dict(vo.last_info))
+        accel_cam = prior.accel_cam if prior is not None else None
+        at_rest = prior.at_rest if prior is not None else False
+        return _Step(msg, pose.copy(), dict(vo.last_info), accel_cam, at_rest)
 
 
 class _PublishPose(Task):
@@ -94,10 +96,13 @@ class _EmitKeyframe(Task):
         tr = vo.frontend.tracks
         ids = tr.ids.copy() if tr is not None and tr.ids is not None else None
         px = tr.points.copy() if tr is not None and tr.points is not None else None
+        # Only hand the back-end a gravity measurement when the camera is at rest
+        # (a moving keyframe's lateral acceleration would bias the gravity dir).
+        accel = step.accel_cam if step.at_rest else None
         ctx.bus.publish(topics.KEYFRAME,
                         Keyframe(step.frame.seq, step.pose,
                                  step.frame.gray_left, step.frame.depth_m,
-                                 track_ids=ids, track_px=px))
+                                 track_ids=ids, track_px=px, accel=accel))
         return None
 
 
@@ -109,7 +114,8 @@ class OdometryFlow(Flow):
         self.ctx.state["vo"] = RGBDVisualOdometry(K, odom_cfg or OdometryConfig())
         self.ctx.state["kf_every"] = int(kf_every)
         self.ctx.state["use_gyro"] = bool(use_gyro)
-        self.on(topics.IMU_SAMPLE, [_BuildPrior()])
+        self.ctx.state["priors"] = {}
+        self.on(topics.IMU_SAMPLE, [_RouteImu()])
         self.on(topics.FRAME_DEPTH,
                 [_ProcessVO(), _PublishPose(), _EmitKeyframe()])
         self.forwards_to(topics.POSE_ODOM, topics.KEYFRAME)

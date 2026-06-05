@@ -10,5 +10,6 @@ subscribed topics (``expected_ends = 3``) before declaring itself done -- which
 guarantees every upstream flow has fully drained.
 """
 from .collector import UiCollectorFlow
+from .render import UiRenderFlow
 
-__all__ = ["UiCollectorFlow"]
+__all__ = ["UiCollectorFlow", "UiRenderFlow"]

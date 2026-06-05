@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from PyQt6.QtWidgets import QApplication       # noqa: E402
 
 from ours.lib.pose import PoseHistory              # noqa: E402
-from ours.sources import FakePoseSource        # noqa: E402
+from ours.ui.source import FakePoseSource          # noqa: E402
 from ours.ui.mainwindow import MainWindow      # noqa: E402
 
 
@@ -37,6 +37,13 @@ def _build_source(name: str, args):
         orb_features=args.orb_features,
     )
     if name == "ours":
+        # Default live source = the new flow pipeline (capture/depth/odometry/
+        # backend/slam/ui flows over a pub/sub bus). Displays the real-time f2f
+        # trajectory; backend + SLAM flows run alongside.
+        from ours.flows.live_source import FlowPoseSource
+        return FlowPoseSource(width=args.width, height=args.height,
+                              fps=args.fps)
+    if name == "ours-legacy":
         from ours.depthai_ours_vio import OakOursVioSource
         return OakOursVioSource(fps=args.fps, backend="f2f", **res_kw)
     if name == "ours-ba":
@@ -59,16 +66,17 @@ def _build_source(name: str, args):
             fps=args.fps, backend="vio",
             ba_window=args.ba_window, ba_kf_every=args.ba_kf_every, **res_kw)
     raise SystemExit(f"unknown --source '{name}' "
-                     f"(expected: fake|ours|ours-ba|ours-slam|ours-vio)")
+                     f"(expected: fake|ours|ours-legacy|ours-ba|ours-slam|ours-vio)")
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="3D pose viewer (our VIO)")
     ap.add_argument("--source", default="ours",
-                    choices=("fake", "ours", "ours-ba", "ours-slam",
-                             "ours-vio"),
-                    help="pose provider (ours = our f2f VO; ours-ba = windowed "
-                         "BA; ours-slam = f2f + loop-closure SLAM; "
+                    choices=("fake", "ours", "ours-legacy", "ours-ba",
+                             "ours-slam", "ours-vio"),
+                    help="pose provider (ours = flow pipeline, f2f live; "
+                         "ours-legacy = monolithic f2f source; ours-ba = "
+                         "windowed BA; ours-slam = f2f + loop-closure SLAM; "
                          "ours-vio = tight-coupled visual+IMU VIO)")
     ap.add_argument("--fps", type=int, default=20,
                     help="camera frame rate (ours/ours-ba/ours-slam) [20]")
