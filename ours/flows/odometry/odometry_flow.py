@@ -7,6 +7,8 @@ edges of the unified acquisition front-end:
   [:class:`~ours.flows.odometry.preintegrate_prior.PreintegratePrior`]
 * ``frame.depth`` -> [:class:`~ours.flows.odometry.track_features.TrackFeatures`,
   :class:`~ours.flows.odometry.publish_tracks.PublishTracks`,
+  :class:`~ours.flows.odometry.align_gravity.AlignGravity`,
+  :class:`~ours.flows.odometry.pull_prior.PullPrior`,
   :class:`~ours.flows.odometry.estimate_motion.EstimateMotion`,
   :class:`~ours.flows.odometry.publish_pose.PublishPose`,
   :class:`~ours.flows.odometry.emit_keyframe.EmitKeyframe`]
@@ -14,14 +16,19 @@ edges of the unified acquisition front-end:
 Both inputs come from the SAME flow: the imu_cam flow publishes ``imucam.sample``
 and, with its depth task, ``frame.depth``. This flow owns the IMU->prior fusion
 itself (``PreintegratePrior``). The frame-chain splits the visual odometry into
-two tasks -- ``TrackFeatures`` (KLT, the only numba-parallel section, holds the
-parallel lock) then ``EstimateMotion`` (pure-NumPy PnP + fusion, lock-free) -- so
-the heavy motion solve overlaps the next frame's depth matcher instead of
-serialising against it. ``PublishTracks`` (between them) emits the same KLT tracks
-on ``frame.tracks`` for the keypoint-depth visualiser. The
-:class:`~ours.flows.odometry.tracked.Tracked` carrier threads the tracks between
-them; the :class:`~ours.flows.odometry.step.Step` carrier threads the result
-through the rest of the chain.
+small single-purpose tasks. ``TrackFeatures`` (KLT) is the only numba-parallel
+section and holds the parallel lock; everything after it is pure NumPy and runs
+lock-free, so the heavy motion solve overlaps the next frame's depth matcher
+instead of serialising against it. ``PublishTracks`` emits the same KLT tracks on
+``frame.tracks`` for the keypoint-depth visualiser. ``AlignGravity`` does the
+one-shot startup attitude bootstrap; ``PullPrior`` is the IMU<->vision join that
+pops the preintegrated prior for the frame's ``seq``; ``EstimateMotion`` is then
+just the RGB-D PnP (+ gyro fusion) solve. The
+:class:`~ours.flows.odometry.tracked.Tracked` carrier threads the frame + tracks
+down to ``PullPrior``, which swaps it for the
+:class:`~ours.flows.odometry.primed.Primed` carrier (tracks + joined prior); the
+:class:`~ours.flows.odometry.step.Step` carrier then threads the result through
+the rest of the chain.
 
 Joining two END-bearing inputs (``imucam.sample`` + ``frame.depth``, both from the
 imu_cam flow) means the flow must see BOTH ENDs before draining:
@@ -41,6 +48,8 @@ from ...lib.odometry.odometry import OdometryConfig, RGBDVisualOdometry
 from .preintegrate_prior import PreintegratePrior
 from .track_features import TrackFeatures
 from .publish_tracks import PublishTracks
+from .align_gravity import AlignGravity
+from .pull_prior import PullPrior
 from .estimate_motion import EstimateMotion
 from .publish_pose import PublishPose
 from .emit_keyframe import EmitKeyframe
@@ -65,6 +74,6 @@ class OdometryFlow(Flow):
         self.expected_ends = 2          # imucam.sample + frame.depth both end
         self.on(topics.IMUCAM_SAMPLE, [PreintegratePrior()])
         self.on(topics.FRAME_DEPTH,
-                [TrackFeatures(), PublishTracks(), EstimateMotion(),
-                 PublishPose(), EmitKeyframe()])
+                [TrackFeatures(), PublishTracks(), AlignGravity(), PullPrior(),
+                 EstimateMotion(), PublishPose(), EmitKeyframe()])
         self.forwards_to(topics.POSE_ODOM, topics.KEYFRAME, topics.FRAME_TRACKS)

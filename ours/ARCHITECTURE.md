@@ -239,8 +239,11 @@ queue that raises if read post-stop).
   `imu_stream.py` (IMU-only reader for the calib wizards), `imu_cam_flow.py`.
 - `odometry/`: `preintegrate_prior.py`, `track_features.py` (KLT, holds the numba
   parallel lock), `publish_tracks.py` (emits the KLT tracks on `frame.tracks` for
-  the keypoints view), `estimate_motion.py` (pure-NumPy PnP + gyro fusion,
-  lock-free), `tracked.py` (TrackFeatures→EstimateMotion carrier),
+  the keypoints view), `align_gravity.py` (one-shot startup attitude bootstrap),
+  `pull_prior.py` (IMU↔vision join: pops the preintegrated prior by seq),
+  `estimate_motion.py` (pure-NumPy PnP + gyro fusion, lock-free),
+  `tracked.py` (TrackFeatures→PullPrior carrier), `primed.py`
+  (PullPrior→EstimateMotion carrier: tracks + joined prior),
   `publish_pose.py`, `emit_keyframe.py`, `step.py` (carrier), `odometry_flow.py`.
 - `backend/`: `run_ba.py`, `publish_refined.py`, `backend_flow.py`.
 - `slam/`: `slam_step.py`, `publish_correction.py`, `slam_flow.py`.
