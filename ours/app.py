@@ -47,6 +47,7 @@ from .lib.stereo.stereo import SGMConfig, SGMStereoMatcher
 
 def build_graph(bus: Bus, K, *, ui, R_imu_cam=None, accel_align=None,
                 kf_every: int = 5, use_gyro: bool = True,
+                with_backend_slam: bool = True,
                 slam_cfg: SlamConfig | None = None):
     """Build the shared odometry/backend/slam flows around a ``ui`` sink.
 
@@ -54,12 +55,20 @@ def build_graph(bus: Bus, K, *, ui, R_imu_cam=None, accel_align=None,
     task) is built by the caller (replay vs live); everything downstream of
     ``imucam.sample`` / ``frame.depth`` is identical, so it is constructed here
     once. ``R_imu_cam`` / ``accel_align`` seed the odometry flow's gyro prior and
-    startup gravity-leveling. Returns the list of reactive flows
-    ``[odom, backend, slam, ui]``.
+    startup gravity-leveling.
+
+    ``with_backend_slam`` (default ``True``) builds the windowed-BA back-end and
+    the loop-closing SLAM flow. A pure visualiser that only needs the odometry
+    front-end's output (e.g. the keypoint-depth view subscribing ``frame.tracks``)
+    passes ``False`` to skip those two heavy flows -- they would otherwise compete
+    for CPU and make the live stream fall seconds behind realtime. Returns the
+    list of reactive flows: ``[odom, backend, slam, ui]`` or ``[odom, ui]``.
     """
     odom = OdometryFlow(bus, K, R_imu_cam=R_imu_cam, accel_align=accel_align,
                         odom_cfg=OdometryConfig(gyro_fuse=use_gyro),
                         kf_every=kf_every, use_gyro=use_gyro)
+    if not with_backend_slam:
+        return [odom, ui]
     backend = BackendFlow(bus, K, kf_every=1)
     slam = SlamFlow(bus, K, slam_cfg or SlamConfig(loop_max_odom_rot_deg=30.0))
     return [odom, backend, slam, ui]
@@ -99,7 +108,7 @@ def _replay_imu_startup(reader: SessionReader, use_gyro: bool):
 
 def build_replay(bus: Bus, reader: SessionReader, *, kf_every: int = 5,
                  use_gyro: bool = True, depth_fast: bool = False,
-                 max_frames: int = 0, ui=None,
+                 max_frames: int = 0, ui=None, with_backend_slam: bool = True,
                  slam_cfg: SlamConfig | None = None):
     """Construct the full flow graph driven by a recorded session.
 
@@ -109,7 +118,8 @@ def build_replay(bus: Bus, reader: SessionReader, *, kf_every: int = 5,
 
     ``ui`` lets a caller inject its own sink (e.g. the keypoint-depth tracker's
     :class:`~ours.flows.ui.tracks.UiTracksFlow`); it defaults to the offline
-    :class:`~ours.flows.ui.UiCollectorFlow`.
+    :class:`~ours.flows.ui.UiCollectorFlow`. ``with_backend_slam=False`` skips the
+    heavy back-end + SLAM flows for a pure odometry-output visualiser.
     """
     sgm = SGMConfig.live() if depth_fast else SGMConfig()
     matcher = SGMStereoMatcher.from_calib(reader.calib, sgm)
@@ -126,13 +136,14 @@ def build_replay(bus: Bus, reader: SessionReader, *, kf_every: int = 5,
     ui = ui if ui is not None else UiCollectorFlow(bus)
     flows = build_graph(bus, reader.K, ui=ui, R_imu_cam=R_imu_cam,
                         accel_align=accel_align, kf_every=kf_every,
-                        use_gyro=use_gyro, slam_cfg=slam_cfg)
+                        use_gyro=use_gyro, with_backend_slam=with_backend_slam,
+                        slam_cfg=slam_cfg)
     return (cam_flow, imu_flow), flows, ui
 
 
 def build_live(bus: Bus, *, width: int = 640, height: int = 400, fps: int = 20,
                kf_every: int = 5, use_gyro: bool = True, depth_fast: bool = True,
-               recalibrate_bias: bool = False,
+               recalibrate_bias: bool = False, with_backend_slam: bool = True,
                ui=None, slam_cfg: SlamConfig | None = None):
     """Construct the live OAK-D graph off ONE shared device.
 
@@ -164,7 +175,8 @@ def build_live(bus: Bus, *, width: int = 640, height: int = 400, fps: int = 20,
     ui = ui if ui is not None else UiCollectorFlow(bus)
     flows = build_graph(bus, cal.K, ui=ui, R_imu_cam=cal.R_imu_cam,
                         accel_align=cal.accel_align, kf_every=kf_every,
-                        use_gyro=use_gyro, slam_cfg=slam_cfg)
+                        use_gyro=use_gyro, with_backend_slam=with_backend_slam,
+                        slam_cfg=slam_cfg)
     return device, (cam_flow, imu_flow), flows, ui
 
 

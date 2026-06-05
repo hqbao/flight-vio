@@ -114,11 +114,18 @@ class KeypointWorker(threading.Thread):
         def on_tracks(msg) -> None:
             ids = np.asarray(msg.ids, dtype=np.int64).reshape(-1)
             pts = np.asarray(msg.points, dtype=np.float32).reshape(-1, 2)
+            # Always advance the trails (cheap dict ops) so per-id history stays
+            # continuous even on frames we don't render.
             trails.update(ids, pts)
-            depths = sample_depths(msg.depth_m, pts)
-            rgb = draw_overlay(msg.gray_left, msg.depth_m, ids, pts, trails)
             if t0_ns[0] is None:
                 t0_ns[0] = msg.ts_ns
+            # If the UI hasn't drained the last overlays, skip the expensive
+            # draw_overlay for this frame: rendering a frame the UI will only drop
+            # would back the bus inbox up and grow latency without showing more.
+            if self.queue.full():
+                return
+            depths = sample_depths(msg.depth_m, pts)
+            rgb = draw_overlay(msg.gray_left, msg.depth_m, ids, pts, trails)
             sample = KeypointSample(
                 rgb=rgb, ids=ids, points=pts, depths=depths,
                 seq=int(msg.seq), t_s=(msg.ts_ns - t0_ns[0]) * 1e-9,
@@ -169,7 +176,8 @@ class ReplayKeypointWorker(KeypointWorker):
             return
         (cam_flow, imu_flow), flows, _ = build_replay(
             bus, reader, depth_fast=True,
-            max_frames=int(self._max_frames or 0), ui=sink)
+            max_frames=int(self._max_frames or 0), ui=sink,
+            with_backend_slam=False)
         for f in flows:
             f.start()
         imu_flow.start()
@@ -192,10 +200,13 @@ class ReplayKeypointWorker(KeypointWorker):
 class LiveKeypointWorker(KeypointWorker):
     """Drive the live OAK-D graph and tap ``frame.tracks`` -- bench-only.
 
-    Wires the SAME live pipeline the VIO runs (:func:`ours.app.build_live`) off the
-    one shared device and subscribes ``frame.tracks``, so the keypoints shown are
-    exactly what the running odometry frontend tracked. Not exercised in CI (needs
-    hardware); confirm on the bench.
+    Wires the SAME live acquisition + odometry front-end the VIO runs
+    (:func:`ours.app.build_live`) off the one shared device and subscribes
+    ``frame.tracks``, so the keypoints shown are exactly what the running odometry
+    frontend tracked. It builds the graph WITHOUT the back-end/SLAM flows
+    (``with_backend_slam=False``) -- those don't affect the tracks and would
+    otherwise compete for CPU and make the live view fall seconds behind. Not
+    exercised in CI (needs hardware); confirm on the bench.
     """
 
     mode = "LIVE"
@@ -210,7 +221,7 @@ class LiveKeypointWorker(KeypointWorker):
 
         device, (cam_flow, imu_flow), flows, _ = build_live(
             bus, width=self._w, height=self._h, fps=self._fps,
-            depth_fast=self._fast, ui=sink)
+            depth_fast=self._fast, ui=sink, with_backend_slam=False)
         for f in flows:
             f.start()
         imu_flow.start()
