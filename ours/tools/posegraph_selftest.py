@@ -18,7 +18,7 @@ Huber never engages -- the primary defence against false loops is the front-end
 
 Run::
 
-    .venv/bin/python tools/posegraph_selftest.py
+    .venv/bin/python ours/tools/posegraph_selftest.py
 """
 from __future__ import annotations
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Validate our sparse stereo depth against the OAK-D chip depth (the oracle).
 
-This is the regression guard for ``oakd/vio/stereo.py``, mirroring exactly what
+This is the regression guard for ``ours/vio/stereo.py``, mirroring exactly what
 ``klt_selftest.py`` does for optical flow: it proves our from-scratch block
 matcher agrees with the trusted reference (here the chip's SGBM depth stored as
 ``*_D.raw16``) before we let the VIO trust it. We do NOT use the chip depth in
@@ -16,8 +16,8 @@ For each gold session it:
 
 Usage::
 
-    python tools/stereo_selftest.py
-    python tools/stereo_selftest.py --session sessions/gold/corridor_60s
+    python ours/tools/stereo_selftest.py
+    python ours/tools/stereo_selftest.py --session sessions/gold/corridor_60s
 """
 from __future__ import annotations
 

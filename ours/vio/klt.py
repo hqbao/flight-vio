@@ -24,7 +24,7 @@ Everything is vectorised over *all* tracked points at once (the per-point window
 patches are sampled with a single bilinear gather), so it stays reasonably fast
 in pure NumPy. It is not as fast as OpenCV's hand-tuned C++/SIMD, but it tracks
 the same corners to sub-pixel accuracy (validated against ``cv2`` in
-``tools/klt_selftest.py``).
+``ours/tools/klt_selftest.py``).
 """
 from __future__ import annotations
 

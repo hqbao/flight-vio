@@ -23,8 +23,8 @@ mount. Run it with the camera held in the exact mount orientation.
 
 Usage::
 
-    python tools/measure_mount_attitude.py            # ~4 s capture
-    python tools/measure_mount_attitude.py --secs 8
+    python ours/tools/measure_mount_attitude.py            # ~4 s capture
+    python ours/tools/measure_mount_attitude.py --secs 8
 """
 from __future__ import annotations
 

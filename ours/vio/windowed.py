@@ -1,7 +1,7 @@
 """Windowed RGB-D visual odometry: frame-to-frame tracking + keyframe BA.
 
 This is the second odometry backend, kept deliberately separate from the plain
-:class:`oakd.vio.odometry.RGBDVisualOdometry` so we can compare the two
+:class:`ours.vio.odometry.RGBDVisualOdometry` so we can compare the two
 stage-by-stage on identical input.
 
 Pipeline
@@ -14,7 +14,7 @@ Pipeline
    - initialise a 3D landmark (in the world frame) for every live track that
      does not have one yet, back-projected from that keyframe's metric depth;
    - record the pixel observation of every landmark visible in the keyframe.
-3. **Sliding-window BA** (:func:`oakd.vio.bundle.optimize`) then jointly
+3. **Sliding-window BA** (:func:`ours.vio.bundle.optimize`) then jointly
    refines the last ``window`` keyframe poses + their landmarks by minimising
    reprojection error, holding the oldest keyframe fixed as the gauge anchor.
 4. The BA correction to the *latest* keyframe (which is the current frame) is

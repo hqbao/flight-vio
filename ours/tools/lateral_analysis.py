@@ -10,7 +10,7 @@ much sideways drift the vision translation injects, and where.
 
 Usage::
 
-    python tools/lateral_analysis.py --session sessions/gold/push_fwdback_20s
+    python ours/tools/lateral_analysis.py --session sessions/gold/push_fwdback_20s
 """
 from __future__ import annotations
 

@@ -3,9 +3,9 @@
 This is the optimisation *engine* only: given a set of keyframe poses, 3D
 landmarks and 2D observations, it refines them by minimising the robust
 reprojection error. It knows nothing about cameras, KLT or sessions — that
-glue lives in :mod:`oakd.vio.windowed`. Keeping the solver standalone means we
+glue lives in :mod:`ours.vio.windowed`. Keeping the solver standalone means we
 can unit-test it on a synthetic scene with a known answer (see
-``tools/ba_selftest.py``) before trusting it on real data.
+``ours/tools/ba_selftest.py``) before trusting it on real data.
 
 Conventions
 -----------

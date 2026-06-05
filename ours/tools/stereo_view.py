@@ -14,7 +14,7 @@ Two ways to see *how our depth map looks*:
     is in the loop (so there is no "width multiple of 16" constraint, and nothing
     reads the VPU depth). Shows ``[ rectified-left | OUR SGM depth ]``.
 
-Our depth is :class:`oakd.vio.SGMStereoMatcher` (own rectification + dense
+Our depth is :class:`ours.vio.SGMStereoMatcher` (own rectification + dense
 semi-global matching, library-free). The chip depth shown in replay is only the
 reference oracle, exactly like ``stereo_selftest.py`` -- it is NOT used to
 produce our map. cv2 here is a dev-tool display dependency (windowing +
@@ -24,13 +24,13 @@ path.
 Usage::
 
     # replay the default gold session, full-accuracy 8-path SGM
-    python tools/stereo_view.py
+    python ours/tools/stereo_view.py
 
     # a specific session, fast (live) preset
-    python tools/stereo_view.py --session sessions/gold/corridor_60s --fast
+    python ours/tools/stereo_view.py --session sessions/gold/corridor_60s --fast
 
     # live from the camera (fast preset recommended)
-    python tools/stereo_view.py --live --fast
+    python ours/tools/stereo_view.py --live --fast
 
 Keys: SPACE pause/resume, ``n`` step one frame (when paused), ``q`` / ESC quit.
 """
@@ -136,7 +136,7 @@ def _check_engine() -> None:
         print("=" * 70)
         print("WARNING: numba NOT available -> pure-NumPy SGM (~seconds/frame).")
         print("The UI will look frozen. Run with the project venv instead:")
-        print("    .venv/bin/python tools/stereo_view.py ...")
+        print("    .venv/bin/python ours/tools/stereo_view.py ...")
         print("=" * 70)
 
 
@@ -279,7 +279,7 @@ def run_live(cfg: SGMConfig, width: int, height: int, fps: int,
         ch = p.getDefaultDevice().readCalibration()
 
         # Build our matcher from the live calibration exactly like the VIO source
-        # (oakd.sources.depthai_ours_vio): assemble the same JSON shape so
+        # (ours.depthai_ours_vio): assemble the same JSON shape so
         # StereoCalib.from_json applies the identical cm->m extrinsic convention,
         # then ``rectify_left=True`` makes the matcher rectify BOTH raw frames.
         def _intr(sock):

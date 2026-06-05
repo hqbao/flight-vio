@@ -9,9 +9,9 @@ Everything runs offline on recorded gold data -- no OAK-D required.
 
 Usage::
 
-    python tools/vio_feed_test.py                       # default session, frame 0
-    python tools/vio_feed_test.py --frame 200           # pick a denser frame
-    python tools/vio_feed_test.py --session sessions/gold/lab_loop_30s
+    python ours/tools/vio_feed_test.py                       # default session, frame 0
+    python ours/tools/vio_feed_test.py --frame 200           # pick a denser frame
+    python ours/tools/vio_feed_test.py --session sessions/gold/lab_loop_30s
 """
 from __future__ import annotations
 

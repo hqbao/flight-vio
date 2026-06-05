@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Visualise the time-synced (image, depth, IMU) triplet from a recorded session.
 
-This is the eyeball companion to :mod:`oakd.vio.synced`: it replays a gold
-session as a sequence of :class:`oakd.vio.SyncedSample` bundles and shows, for
+This is the eyeball companion to :mod:`ours.vio.synced`: it replays a gold
+session as a sequence of :class:`ours.vio.SyncedSample` bundles and shows, for
 every frame, the three inputs the from-scratch VIO consumes -- all aligned on the
 same device clock::
 
@@ -32,12 +32,12 @@ like the other ``tools/*`` viewers -- nothing here is in a production path.
 
 Usage::
 
-    python tools/synced_view.py                                   # default gold
-    python tools/synced_view.py --session sessions/gold/lab_loop_30s
-    python tools/synced_view.py --scale 1.5 --no-bias             # raw gyro bias
+    python ours/tools/synced_view.py                                   # default gold
+    python ours/tools/synced_view.py --session sessions/gold/lab_loop_30s
+    python ours/tools/synced_view.py --scale 1.5 --no-bias             # raw gyro bias
 
-    python tools/synced_view.py --live                            # live OAK-D
-    python tools/synced_view.py --live --width 320 --height 200   # lighter live
+    python ours/tools/synced_view.py --live                            # live OAK-D
+    python ours/tools/synced_view.py --live --width 320 --height 200   # lighter live
 
 Keys: SPACE pause/resume, ``n`` step one frame (paused), ``r`` clear the gyro
 chart, ``q`` / ESC quit. (Live has no pause/step; ``r`` clear + ``q`` quit only.)
@@ -356,7 +356,7 @@ def run_live(width: int, height: int, fps: int, scale: float,
              use_bias: bool, fast: bool, bias_window_s: float = 1.0) -> int:
     """Live (image, depth, IMU) triplet from a connected OAK-D.
 
-    Mirrors the VPU-free live VIO input exactly (oakd.sources.depthai_ours_vio):
+    Mirrors the VPU-free live VIO input exactly (ours.depthai_ours_vio):
     taps the two RAW cameras + the IMU, rectifies BOTH frames and runs our SGM
     ourselves (no chip StereoDepth), and integrates/averages the IMU the same way
     the VIO does -- so the triplet shown here is the real pipeline input.

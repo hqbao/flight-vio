@@ -1,7 +1,7 @@
 """Numba-JIT core for the per-point Lucas-Kanade inner loop.
 
-The pure-NumPy :func:`oakd.vio.klt.calc_optical_flow_pyr_lk` is *correct* (proved
-by ``tools/klt_selftest.py``) but ~10x too slow for live use, because the
+The pure-NumPy :func:`ours.vio.klt.calc_optical_flow_pyr_lk` is *correct* (proved
+by ``ours/tools/klt_selftest.py``) but ~10x too slow for live use, because the
 coarse-to-fine Gauss-Newton iteration is inherently sequential: each step depends
 on the previous displacement, so NumPy's whole-array vectorisation cannot hide
 the per-iteration Python overhead or the temporary-array churn.

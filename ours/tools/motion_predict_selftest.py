@@ -1,4 +1,4 @@
-"""Self-test for constant-velocity translation prediction (oakd.vio.odometry).
+"""Self-test for constant-velocity translation prediction (ours.vio.odometry).
 
 Guards the live real-time responsiveness fix: during fast motion the KLT
 frontend briefly loses correspondences, PnP fails, and the fallback

@@ -45,7 +45,7 @@ starting heading (no magnetometer). If the device reports no IMU, we fall back t
 an identity start.
 
 Note: the gyro rotation prior is a measured no-op on well-synced data (see
-``oakd/vio/imu.py``), so this live source runs pure vision for simplicity.
+``ours/vio/imu.py``), so this live source runs pure vision for simplicity.
 """
 from __future__ import annotations
 
@@ -75,7 +75,7 @@ _M_OPT_TO_NED = np.array(
 
 # Measured mounted-pose attitude (camera->world), used only as a FALLBACK when
 # the device reports no accelerometer. Captured 2026-06-02 with the camera in
-# its drone-mount pose via ``tools/measure_mount_attitude.py`` (avg of 760 raw
+# its drone-mount pose via ``ours/tools/measure_mount_attitude.py`` (avg of 760 raw
 # accel samples, per-axis std ~0.02 m/s^2 -> tilt good to <0.05 deg): the mount
 # is essentially level (roll +0.1, pitch -0.5, lens looking horizontally
 # forward). The live path still prefers a fresh accel measurement at startup, so
@@ -188,7 +188,7 @@ class OakOursVioSource(PoseSource):
     frontend and depth, so switching backends isolates exactly what BA adds.
 
     ``backend='slam'`` runs the f2f VO for display and a **background loop-closure
-    SLAM** thread (:class:`oakd.vio.SlamMap`): every few frames a keyframe (the
+    SLAM** thread (:class:`ours.vio.SlamMap`): every few frames a keyframe (the
     raw f2f pose + its image + depth) is handed to the SLAM map, which recognises
     revisited places (ORB + fundamental-matrix + PnP geometric verification) and
     runs SE(3) pose-graph optimisation. The resulting world-frame correction is
@@ -238,12 +238,12 @@ class OakOursVioSource(PoseSource):
             klt_win=klt_win, klt_levels=klt_levels, reproj_px=reproj_px,
             num_disparities=num_disparities, orb_features=orb_features)
         # Depth feeding the VIO is ALWAYS our own from-scratch SGM matcher
-        # (oakd.vio.stereo) run live on the rectified left + the RAW syncedRight
+        # (ours.vio.stereo) run live on the rectified left + the RAW syncedRight
         # frame. The chip StereoDepth map is deliberately NOT used here: this is
         # the portable pipeline that must run on a target platform with no VPU /
         # depth library. (The chip-depth path lives only in the Basalt sources
         # ``depthai_vio`` / ``depthai_slam`` and in the offline oracle
-        # ``tools/vio_run.py --depth chip`` for A/B measurement.)
+        # ``ours/tools/vio_run.py --depth chip`` for A/B measurement.)
         # ``depth_fast`` uses the half-res SGMConfig.live() preset that fits the
         # live per-frame budget (full-res SGM is too slow for real time).
         self.depth_fast = bool(depth_fast)
@@ -342,7 +342,7 @@ class OakOursVioSource(PoseSource):
 
             # NO StereoDepth node: this is the fully portable pipeline. We pull
             # the RAW left + RAW right frames straight from the two cameras and
-            # rectify BOTH ourselves (oakd.vio.stereo Left/RightRectifier), then
+            # rectify BOTH ourselves (ours.vio.stereo Left/RightRectifier), then
             # run our SGM. Nothing here touches the VPU's stereo/depth engine.
 
             # Accelerometer (gravity leveling) + gyroscope (the inter-frame
@@ -441,7 +441,7 @@ class OakOursVioSource(PoseSource):
             # the disagreement gate (``gyro_disagree_deg``) and damps the
             # co-occurring phantom translation, WITHOUT hard-locking translation
             # to the gyro rotation. Measured on the gold sessions
-            # (``tools/live_replay.py`` + ``tools/lateral_analysis.py``), the hard
+            # (``ours/tools/live_replay.py`` + ``ours/tools/lateral_analysis.py``), the hard
             # lock (``lock_translation_to_rotation``) made the FAST-MOTION case
             # markedly worse -- it forced every small gyro error (bias / timing /
             # extrinsic) into a SIDEWAYS translation, raising path jitter
@@ -1346,7 +1346,7 @@ class OakOursVioSource(PoseSource):
 
         # Real-time budget for the background solve. The dense finite-difference
         # VIO solve cost scales ~linearly with both the window length and the LM
-        # iteration count. Measured on gold (tools/vio_run.py --backend vio,
+        # iteration count. Measured on gold (ours/tools/vio_run.py --backend vio,
         # per-solve run_ba timing): window=5/iters=6 costs ~320 ms median, which
         # at the kf_every=5 submit cadence (~350-420 ms between keyframes on this
         # host) leaves the worker busy ~90% of the time -- it saturates the CPU
@@ -1417,7 +1417,7 @@ class OakOursVioSource(PoseSource):
 
         Returns a state dict with ``submit(T_wc, gray, depth_m)`` and
         ``poll() -> C | None``. The worker keeps a persistent
-        :class:`oakd.vio.SlamMap` of every keyframe (in the *raw f2f* world
+        :class:`ours.vio.SlamMap` of every keyframe (in the *raw f2f* world
         frame, so its odometry edges stay self-consistent), recognises revisited
         places and runs pose-graph optimisation when a loop is confirmed. After
         each keyframe it publishes the world-frame correction for the **latest**

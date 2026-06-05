@@ -14,7 +14,7 @@ vision-only / loosely-coupled paths leave behind.
 Design choices (deliberate, to be correct and verifiable before fast):
   * **Body frame == camera frame** in this core. The IMU<->camera extrinsic is
     handled by the caller, which rotates the raw IMU samples into the camera
-    optical frame before preintegrating (see :mod:`oakd.vio.imu`). The small
+    optical frame before preintegrating (see :mod:`ours.vio.imu`). The small
     IMU/camera lever arm is treated as modelling noise (the OAK-D IMU sits ~cm
     from the left camera); a future refinement can add it explicitly.
   * Poses are parametrised as **body->world** ``(R, p)`` with the perturbation
@@ -25,7 +25,7 @@ Design choices (deliberate, to be correct and verifiable before fast):
     factor sees the 2 adjacent nav states), so FD is cheap AND immune to the
     hand-derivation sign errors that plague analytic VIO Jacobians. The IMU
     residual formulas themselves are the ones validated in
-    ``tools/imu_preint_selftest.py``.
+    ``ours/tools/imu_preint_selftest.py``.
   * **Dense Levenberg-Marquardt** over the whole window (no Schur complement).
     Correctness first; the window is small, so a dense solve is fine. Schur is a
     speed optimisation left for later if the live path needs it.
@@ -34,7 +34,7 @@ One keyframe (``anchor``, default 0) has its pose held fixed to pin the global
 position+yaw gauge (gravity already fixes roll/pitch through the IMU factors).
 Its velocity and biases stay free.
 
-Validated end-to-end by ``tools/vio_ba_selftest.py``: a synthetic multi-segment
+Validated end-to-end by ``ours/tools/vio_ba_selftest.py``: a synthetic multi-segment
 trajectory (fast yaw + translation under gravity) with consistent IMU + image
 measurements is perturbed and recovered to sub-mm / sub-mdeg.
 """
@@ -640,7 +640,7 @@ class WindowedVIOConfig:
 class WindowedVIOMap:
     """Sliding-window tight-coupled VIO map (visual + IMU), tracker-agnostic.
 
-    Mirrors :class:`oakd.vio.windowed.WindowedBAMap` but feeds the raw visual
+    Mirrors :class:`ours.vio.windowed.WindowedBAMap` but feeds the raw visual
     measurements **and** IMU preintegration factors into the joint optimiser
     :func:`optimize_vio`, solving for each keyframe's pose, velocity and
     gyro/accel bias together with the landmarks. The accelerometer ties the
@@ -836,7 +836,7 @@ class WindowedVIOMap:
 class WindowedVIORGBDOdometry:
     """Frame-to-frame tracking with a tight-coupled sliding-window VIO backend.
 
-    Drop-in sibling of :class:`oakd.vio.windowed.WindowedRGBDOdometry`: the same
+    Drop-in sibling of :class:`ours.vio.windowed.WindowedRGBDOdometry`: the same
     KLT/PnP frontend produces a smooth per-frame pose, but every keyframe is
     refined by :class:`WindowedVIOMap` (visual + IMU joint optimisation) instead
     of vision-only bundle adjustment. The caller passes the full IMU stream in

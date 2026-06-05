@@ -3,7 +3,7 @@
 
 This is the honest self-test that lets us iterate on the live translation
 pipeline WITHOUT a device. It reproduces, frame-for-frame, exactly what
-``oakd/sources/depthai_ours_vio.py`` does on the OAK-D:
+``ours/depthai_ours_vio.py`` does on the OAK-D:
 
   1. gyro preintegration between frames -> per-frame rotation prior ``R_prior``
   2. accelerometer averaged into the camera frame + gravity leveling
@@ -14,7 +14,7 @@ pipeline WITHOUT a device. It reproduces, frame-for-frame, exactly what
 
 It then aligns the resulting trajectory to the recorded Basalt poses with a
 rigid SE3 (and Sim3) Umeyama fit and reports the ATE -- the same scoring as
-``tools/vio_run.py``. Two regime-specific numbers are also printed:
+``ours/tools/vio_run.py``. Two regime-specific numbers are also printed:
 
   * STILL sessions  -> our displayed path length + max drift (should be small;
     the device is stationary so any motion is phantom drift).
@@ -23,9 +23,9 @@ rigid SE3 (and Sim3) Umeyama fit and reports the ATE -- the same scoring as
 
 Usage::
 
-    python tools/live_replay.py --session sessions/gold/still_15s
-    python tools/live_replay.py --session sessions/gold/push_fwdback_20s
-    python tools/live_replay.py --all
+    python ours/tools/live_replay.py --session sessions/gold/still_15s
+    python ours/tools/live_replay.py --session sessions/gold/push_fwdback_20s
+    python ours/tools/live_replay.py --all
 """
 from __future__ import annotations
 

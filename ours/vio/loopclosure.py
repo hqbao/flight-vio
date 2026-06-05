@@ -4,7 +4,7 @@ This is the *frontend* of the SLAM layer. Visual odometry tells us where the
 camera is up to accumulated drift; loop closure recognises when the camera has
 physically returned to a previously-seen place and produces a precise relative
 pose constraint between the two keyframes, which the pose graph
-(:mod:`oakd.vio.posegraph`) then uses to cancel the drift.
+(:mod:`ours.vio.posegraph`) then uses to cancel the drift.
 
 Honest pipeline note
 --------------------

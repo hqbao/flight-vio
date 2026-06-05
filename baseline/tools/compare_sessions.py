@@ -5,7 +5,7 @@ Two modes:
 
 1. Single-session VIO vs SLAM (default)::
 
-       ./tools/compare_sessions.py sessions/loop1
+       ./baseline/tools/compare_sessions.py sessions/loop1
 
    Compares ``basalt/vio_pose.jsonl`` against ``basalt/slam_pose.jsonl`` of
    the same session — useful to quantify how much drift the SLAM loop
@@ -13,7 +13,7 @@ Two modes:
 
 2. Two-session comparison (skyslam vs basalt baseline)::
 
-       ./tools/compare_sessions.py basalt_session skyslam_session \\
+       ./baseline/tools/compare_sessions.py basalt_session skyslam_session \\
            --ref-stream slam --test-stream slam
 
 Metrics

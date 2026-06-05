@@ -9,7 +9,7 @@ Validates the predict+correct behaviour on synthetic data (no device):
   E. forward + yaw          -- velocity prior coasts forward through the turn
   F. vision dropout         -- IMU coasts then the velocity bleeds to rest
 
-Run:  python tools/inertial_filter_selftest.py
+Run:  python ours/tools/inertial_filter_selftest.py
 """
 from __future__ import annotations
 

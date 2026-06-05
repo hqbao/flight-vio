@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Record a baseline session: dump C0/C1/C2/C3 streams from the OAK-D.
 
-Same pipeline as ``oakd/sources/depthai_slam.py`` (BasaltVIO + RTABMapSLAM),
+Same pipeline as ``baseline/depthai_slam.py`` (BasaltVIO + RTABMapSLAM),
 but every relevant queue is also fanned out to a :class:`SessionRecorder`.
 
 Usage::
 
-    ./tools/record_session.py sessions/2026-05-29_loop1 --duration 60
-    ./tools/record_session.py sessions/lab_static_30s --duration 30 --fps 20
+    ./baseline/tools/record_session.py sessions/2026-05-29_loop1 --duration 60
+    ./baseline/tools/record_session.py sessions/lab_static_30s --duration 30 --fps 20
 """
 from __future__ import annotations
 

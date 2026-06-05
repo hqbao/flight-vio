@@ -68,7 +68,7 @@ class InertialFilterConfig:
     # estimated accel bias + scale and a gravity vector tracked in a tightly-
     # coupled optimiser (what Basalt actually does). Our naive
     # ``R_wc @ accel + g`` with an EMA-levelled, drifting ``g_ref`` is NOT that --
-    # measured on device + offline (``tools/live_replay.py``) it roughly DOUBLES
+    # measured on device + offline (``ours/tools/live_replay.py``) it roughly DOUBLES
     # the trajectory jitter (path/net 44.6 vs 27.0 vision-only, Basalt 21.9) and
     # worsens ATE, because the residual gravity/bias error integrates into a
     # spurious velocity that vision then has to fight every frame. So we keep the

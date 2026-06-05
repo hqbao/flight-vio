@@ -1,4 +1,4 @@
-"""Self-test for IMU preintegration (oakd.vio.imu.preintegrate_imu).
+"""Self-test for IMU preintegration (ours.vio.imu.preintegrate_imu).
 
 Phase 1 guard for the tight-coupled VIO build. It checks the preintegrated
 increments ``dR, dv, dp`` against a CLOSED-FORM ground-truth trajectory, so a

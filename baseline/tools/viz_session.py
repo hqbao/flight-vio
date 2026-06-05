@@ -3,8 +3,8 @@
 
 Usage::
 
-    ./tools/viz_session.py sessions/2026-05-29_loop1
-    ./tools/viz_session.py /tmp/oakd_rec_smoke
+    ./baseline/tools/viz_session.py sessions/2026-05-29_loop1
+    ./baseline/tools/viz_session.py /tmp/oakd_rec_smoke
 
 Tabs
 ----

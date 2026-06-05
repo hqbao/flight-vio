@@ -7,7 +7,7 @@ only, IMU off -> should match windowed BA) or from the *IMU factor* (gravity
 leak / bias). Reports rigid ATE %path and Sim3 scale.
 
 Usage::
-    python tools/vio_diag.py --session sessions/gold/lab_loop_30s --max-frames 200
+    python ours/tools/vio_diag.py --session sessions/gold/lab_loop_30s --max-frames 200
 """
 from __future__ import annotations
 

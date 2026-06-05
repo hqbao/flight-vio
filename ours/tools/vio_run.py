@@ -11,9 +11,9 @@ how close our metric scale is to Basalt's.
 
 Usage::
 
-    python tools/vio_run.py
-    python tools/vio_run.py --session sessions/gold/lab_straight_20s
-    python tools/vio_run.py --max-frames 200
+    python ours/tools/vio_run.py
+    python ours/tools/vio_run.py --session sessions/gold/lab_straight_20s
+    python ours/tools/vio_run.py --max-frames 200
 """
 from __future__ import annotations
 

@@ -3,7 +3,7 @@
 
 This is the regression test that was missing while we kept "fixing" live lag
 blind. It pins down three independent things with hard pass/fail thresholds, so
-any future change to ``oakd/vio/klt.py`` or ``oakd/vio/corners.py`` is caught:
+any future change to ``ours/vio/klt.py`` or ``ours/vio/corners.py`` is caught:
 
 1. CORRECTNESS (synthetic, does NOT trust OpenCV) -- warp a deterministic
    textured image by a KNOWN sub-pixel translation, detect corners with our own
@@ -23,7 +23,7 @@ any future change to ``oakd/vio/klt.py`` or ``oakd/vio/corners.py`` is caught:
    (or a config that blows the budget) is visible at a glance, instead of being
    discovered only by feeling lag on the device.
 
-Run:  .venv/bin/python tools/klt_selftest.py
+Run:  .venv/bin/python ours/tools/klt_selftest.py
 """
 from __future__ import annotations
 

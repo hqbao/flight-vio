@@ -21,7 +21,7 @@ ATE/RPE compare **SLAM (ref) vs VIO (test)** — they measure how much loop clos
 ## How to regenerate
 
 ```bash
-.venv/bin/python tools/baseline_report.py sessions/gold \
+.venv/bin/python baseline/tools/baseline_report.py sessions/gold \
     > docs/GOLD_BASELINE.md
 ```
 

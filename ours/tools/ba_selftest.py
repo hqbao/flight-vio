@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Synthetic self-test for the sliding-window BA core (oakd.vio.bundle).
+"""Synthetic self-test for the sliding-window BA core (ours.vio.bundle).
 
 We build a known scene (random 3D landmarks + a smooth camera trajectory),
 project the landmarks into every camera to get *exact* pixel observations, then

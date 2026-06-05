@@ -7,7 +7,7 @@ events, tracking events, durations). Output is Markdown to stdout.
 
 Usage::
 
-    .venv/bin/python tools/baseline_report.py sessions/gold/ > docs/GOLD_BASELINE.md
+    .venv/bin/python baseline/tools/baseline_report.py sessions/gold/ > docs/GOLD_BASELINE.md
 """
 from __future__ import annotations
 
@@ -107,7 +107,7 @@ def main() -> int:
     print("## How to regenerate")
     print()
     print("```bash")
-    print(f".venv/bin/python tools/baseline_report.py {gold.relative_to(gold.parent.parent)} \\")
+    print(f".venv/bin/python baseline/tools/baseline_report.py {gold.relative_to(gold.parent.parent)} \\")
     print("    > docs/GOLD_BASELINE.md")
     print("```")
     print()

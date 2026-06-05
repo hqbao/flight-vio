@@ -1,4 +1,4 @@
-"""Self-test for the tight-coupled VIO window optimizer (oakd.vio.vio_window).
+"""Self-test for the tight-coupled VIO window optimizer (ours.vio.vio_window).
 
 Phase 2 gate for the Basalt-style build. It manufactures a synthetic world with
 a KNOWN answer, so a convention/sign error in the joint visual+inertial solve
