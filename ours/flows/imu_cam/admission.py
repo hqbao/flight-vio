@@ -6,12 +6,12 @@ unbounded per-flow inboxes the surplus frames -- each a ~0.5 MB stereo packet --
 pile up on the host until memory pressure starves the depthai XLink thread and
 the device firmware watchdog crashes the camera.
 
-The fix is a closed-loop *credit* budget enforced at the imu-reader, the single
+The fix is a closed-loop *credit* budget enforced at the imu_cam flow, the single
 funnel BEFORE the depth/odometry fan-out (so both branches always see the exact
 same surviving subset -- the diamond never desyncs). At most ``budget`` frames
 are admitted "in flight"; each admitted frame frees its credit when the odometry
 tail publishes a :class:`~ours.lib.flow.messages.FrameDone`. Over budget, the
-imu-reader skips the camera frame at the source -- before the heavy packet is
+imu_cam flow skips the camera frame at the source -- before the heavy packet is
 built and before the IMU is drained -- so the skipped interval's inertial samples
 simply fold into the next admitted frame (gyro preintegration stays gap-free).
 
@@ -21,7 +21,7 @@ Two strategies, selected by run mode:
   graph stays byte-for-byte deterministic (one packet per input frame).
 * :class:`BudgetAdmission` -- live: the ``N``-credit gate above.
 
-Both are touched only on the imu-reader's own thread (``try_admit`` from the
+Both are touched only on the imu_cam flow's own thread (``try_admit`` from the
 ``cam.sync`` handler, ``complete`` from the ``frame.done`` handler -- same inbox,
 same thread), so no locking is required for correctness; a lock is kept anyway as
 cheap insurance against future re-wiring.

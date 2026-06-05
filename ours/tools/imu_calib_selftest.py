@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline test: imu-reader publishes RAW IMU and CALIBRATED IMU per frame.
+"""Offline test: imu_cam flow publishes RAW IMU and CALIBRATED IMU per frame.
 
 The split front-end must, for every camera trigger, emit two messages from the
 same drained interval:
@@ -10,7 +10,7 @@ same drained interval:
   whose ``gyro`` / ``accel`` are the CALIBRATED samples when a per-device
   calibration exists.
 
-This drives the REAL :class:`~ours.flows.imu_reader.ImuReaderFlow` over a real
+This drives the REAL :class:`~ours.flows.imu_cam.ImuCamFlow` over a real
 bus with a recorded session (no device) and a planted
 :class:`~ours.lib.imu.imu_calib.ImuCalibration`, and checks both directly. It
 also unit-checks the calibration maths and the no-calibration pass-through.
@@ -28,10 +28,10 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from ours.flows.cam_reader import CamReaderFlow                   # noqa: E402
-from ours.flows.cam_reader.sources import ReplayCamSource         # noqa: E402
-from ours.flows.imu_reader import ImuReaderFlow                   # noqa: E402
-from ours.flows.imu_reader.sources import ReplayImuSource         # noqa: E402
+from ours.flows.cam import CamFlow                                # noqa: E402
+from ours.flows.cam.sources import ReplayCamSource               # noqa: E402
+from ours.flows.imu_cam import ImuCamFlow                         # noqa: E402
+from ours.flows.imu_cam.sources import ReplayImuSource           # noqa: E402
 from ours.lib.flow import Bus, Flow, topics                       # noqa: E402
 from ours.lib.imu.accel_calib import AccelCalibration             # noqa: E402
 from ours.lib.imu.imu_calib import ImuCalibration                 # noqa: E402
@@ -81,9 +81,9 @@ def _planted_calibration() -> ImuCalibration:
 def _run(session: str, calibration: ImuCalibration | None):
     reader = SessionReader(Path(session))
     bus = Bus()
-    imu_flow = ImuReaderFlow(bus, ReplayImuSource(reader),
+    imu_flow = ImuCamFlow(bus, ReplayImuSource(reader),
                              calibration=calibration)
-    cam_flow = CamReaderFlow(
+    cam_flow = CamFlow(
         bus, ReplayCamSource(reader, max_frames=_MAX_FRAMES), fps=20)
     sink = _Collector(bus)
     sink.start()

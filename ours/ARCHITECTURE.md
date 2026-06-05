@@ -78,8 +78,8 @@ the concrete flows or the algorithm libraries.
 ### Numba concurrency guard
 `numba parallel=True` is used only in `lib/stereo` (SGM) and
 `lib/frontend/klt_numba` (KLT). The default `workqueue` numba layer is **not**
-threadsafe across Python threads, so running the depth flow (SGM) and odometry
-flow (KLT) concurrently crashes. `runtime.NUMBA_PARALLEL_LOCK` serializes the two
+threadsafe across Python threads, so running the depth task (SGM, on the `imu_cam`
+thread) and the odometry flow (KLT) concurrently crashes. `runtime.NUMBA_PARALLEL_LOCK` serializes the two
 parallel regions; all other flows (pure numpy) run free. `tbb`/`omp` layers are
 not installable on this host (macOS arm64, py3.13).
 
@@ -92,21 +92,25 @@ One thread per flow; **one Task per file**; a `*_flow.py` only wires the tasks.
 ### Topic-level data flow (which flow publishes/subscribes which topic)
 
 ```
-cam-reader ──cam.sync──► imu-reader ──imucam.sample──► depth ──frame.depth──► odometry ──pose.odom──► ui-collector, ui-render
-                                    ──imucam.sample──────────────────────────►          ──keyframe──► backend, slam
-                                    ──imu.raw───────► (visualiser)
-                                                                       backend ──pose.refined──► ui-collector
-                                                                       slam    ──loop.correction──► ui-collector
+cam ──cam.sync──► imu_cam ──imucam.sample──► odometry ──pose.odom──► ui-collector, ui-render
+                          ──frame.depth─────►          ──keyframe──► backend, slam
+                          ──imu.raw───────► (visualiser)
+                                                       backend ──pose.refined──► ui-collector
+                                                       slam    ──loop.correction──► ui-collector
 ```
 
 Edges above are exactly the `self.on(...)` subscriptions in each `*_flow.py`.
-There is ONE acquisition front-end (cam-reader + imu-reader) shared by the VIO
+There is ONE acquisition front-end (`cam` + `imu_cam`) shared by the VIO
 and the camera/IMU visualiser — no separate capture monolith. Things worth
 noting because the obvious guess is wrong:
 
-- **depth and odometry both consume `imucam.sample`** (the synced frame+IMU
-  packet); depth uses only the stereo pair, odometry also integrates the packet's
-  gyro into the per-frame rotation prior (`PreintegratePrior`).
+- **depth is a task INSIDE the `imu_cam` flow**, not a separate flow: it is just a
+  transform of the stereo pair `imu_cam` already produces, so when a matcher is
+  wired in (the VIO path) `imu_cam` runs SGM inline and publishes `frame.depth`.
+  The visualiser builds `imu_cam` with `matcher=None`, so it skips depth.
+- **odometry consumes both `imucam.sample` and `frame.depth`** (both published by
+  `imu_cam`); it integrates the packet's gyro into the per-frame rotation prior
+  (`PreintegratePrior`) and runs RGB-D PnP against the depth (`ProcessVO`).
 - **odometry is a two-input join** (`imucam.sample` + `frame.depth`); it sees an
   END on each before it drains (`expected_ends = 2`).
 - **backend and slam both trigger off `keyframe`**, not `pose.odom`. odometry
@@ -119,14 +123,11 @@ noting because the obvious guess is wrong:
 
 ```mermaid
 flowchart TD
-    subgraph CAM["cam-reader flow (SourceFlow)"]
+    subgraph CAM["cam flow (SourceFlow)"]
         PRODC["produce()"] --> PCS["PublishCamSync"]
     end
-    subgraph IMU["imu-reader flow"]
-        PIC["PackImuCam"] --> PIR["PublishImuRaw"] --> AC["ApplyCalibration"] --> PICAM["PublishImuCam"]
-    end
-    subgraph DEP["depth flow"]
-        CD["ComputeDepth"] --> PD["PublishDepth"]
+    subgraph IMU["imu_cam flow (pack + depth)"]
+        PIC["PackImuCam"] --> PIR["PublishImuRaw"] --> AC["ApplyCalibration"] --> PICAM["PublishImuCam"] --> CD["ComputeDepth"] --> PD["PublishDepth"]
     end
     subgraph ODO["odometry flow"]
         PIP["PreintegratePrior"]
@@ -148,7 +149,6 @@ flowchart TD
     end
 
     PCS -- "cam.sync" --> PIC
-    PICAM -- "imucam.sample" --> CD
     PICAM -- "imucam.sample" --> PIP
     PD -- "frame.depth" --> PV
     PP -- "pose.odom" --> COd
@@ -169,18 +169,17 @@ violate the §2 rule (which only forbids *cross-flow* calls).
 
 | Flow | Tasks (in order) | Subscribes | Publishes |
 |---|---|---|---|
-| **cam-reader** | `produce` → `PublishCamSync` | — (source) | `cam.sync` |
-| **imu-reader** | `AdmitFrame` → `PackImuCam` → `PublishImuRaw` → `ApplyCalibration` → `PublishImuCam` ; `CompleteAdmission` | `cam.sync`, `frame.done` | `imu.raw`, `imucam.sample` |
-| **depth** | `ComputeDepth` → `PublishDepth` | `imucam.sample` | `frame.depth` |
+| **cam** | `produce` → `PublishCamSync` | — (source) | `cam.sync` |
+| **imu_cam** | `AdmitFrame` → `PackImuCam` → `PublishImuRaw` → `ApplyCalibration` → `PublishImuCam` → `ComputeDepth` → `PublishDepth` ; `CompleteAdmission` | `cam.sync`, `frame.done` | `imu.raw`, `imucam.sample`, `frame.depth` |
 | **odometry** | `PreintegratePrior` ⟂ `ProcessVO` → `PublishPose` → `EmitKeyframe` → `SignalDone` | `imucam.sample`, `frame.depth` | `pose.odom`, `keyframe`, `frame.done` |
 | **backend** | `RunBA` → `PublishRefined` | `keyframe` | `pose.refined` |
 | **slam** | `SlamStep` → `PublishCorrection` | `keyframe` | `loop.correction` |
 | **ui-collector** | `CollectOdom` / `CollectRefined` / `CollectCorrection` | `pose.odom`, `pose.refined`, `loop.correction` | — (sink) |
 | **ui-render** | `RenderPose` | `pose.odom` | — (sink) |
 
-`cam-reader` + `imu-reader` are the only device-specific flows; their sources are
+`cam` + `imu_cam` are the only device-specific flows; their sources are
 injected (`ReplayCamSource`/`ReplayImuSource` offline, `LiveCamSource`/
-`LiveImuSource` off one shared OAK-D on the bench), so depth→ui are unchanged on
+`LiveImuSource` off one shared OAK-D on the bench), so odometry→ui are unchanged on
 hardware. The replay path subtracts a startup gyro bias (mean of the first ~1 s)
 in `ApplyCalibration` and seeds the odometry gravity-align from the first ~0.3 s
 of accel, mirroring what the live front-end measures once at boot.
@@ -188,23 +187,23 @@ of accel, mirroring what the live front-end measures once at boot.
 **Realtime backpressure (live only).** The camera streams at a fixed fps but the
 VIO sustains less; with unbounded inboxes the surplus ~0.5 MB stereo packets pile
 up on the host until memory pressure starves the depthai link and the device
-firmware **watchdog crashes the camera**. The imu-reader therefore admits at most
+firmware **watchdog crashes the camera**. The `imu_cam` flow therefore admits at most
 `N` frames in flight (`BudgetAdmission`, default 2): `AdmitFrame` (first in the
 chain, before the IMU is drained) skips a frame at the source when over budget —
 so the skipped interval's IMU folds into the next admitted frame and the diamond
 never desyncs — and `SignalDone` (odometry tail) publishes `frame.done` to free a
-credit. The gate sits BEFORE the depth/odometry fan-out, so both branches always
-see the identical surviving subset. Replay injects `AdmitAll` (admit everything,
+credit. The gate sits BEFORE the pack/depth work, so the surviving subset is
+identical on both the `imucam.sample` and `frame.depth` outputs. Replay injects `AdmitAll` (admit everything,
 never count) so it stays byte-for-byte deterministic (60-for-60).
 
 ### Per-flow files
-- `cam_reader/`: `sources.py` (replay/live `CamSource`), `publish_cam_sync.py`,
-  `cam_reader_flow.py`.
-- `imu_reader/`: `sources.py` (replay/live `ImuSource`), `pack_imucam.py`,
+- `cam/`: `sources.py` (replay/live `CamSource`), `publish_cam_sync.py`,
+  `cam_flow.py`.
+- `imu_cam/`: `sources.py` (replay/live `ImuSource`), `pack_imucam.py`,
   `apply_calibration.py`, `publish_imu_raw.py`, `publish_imucam.py`,
   `admission.py` (realtime credit gate) + `admit_frame.py` / `complete_admission.py`,
-  `imu_stream.py` (IMU-only reader for the calib wizards), `imu_reader_flow.py`.
-- `depth/`: `compute_depth.py`, `publish_depth.py`, `depth_flow.py`.
+  `compute_depth.py`, `publish_depth.py` (depth as a task in this flow),
+  `imu_stream.py` (IMU-only reader for the calib wizards), `imu_cam_flow.py`.
 - `odometry/`: `preintegrate_prior.py`, `process_vo.py`, `publish_pose.py`,
   `emit_keyframe.py`, `signal_done.py` (backpressure credit), `step.py` (carrier),
   `odometry_flow.py`.

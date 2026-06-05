@@ -24,8 +24,9 @@ oak-d/
       io/                recorded-session reader + time-synced bundles
       config/            resolution-aware tuning profiles
     flows/               live-pipeline orchestration (one thread + tasks per flow)
-      cam_reader/ imu_reader/ depth/ odometry/ backend/ slam/ ui/
-                         (cam_reader + imu_reader = ONE acquisition front-end)
+      cam/ imu_cam/ odometry/ backend/ slam/ ui/
+                         (cam + imu_cam = ONE acquisition front-end;
+                          depth is a task inside imu_cam, not a separate flow)
       live_source.py     bridge: run the live flow graph into the Qt viewer
     ui/                  own Qt 3D viewer + PoseSource base + fake source (copy)
     tools/               offline scoring + self-tests (call ours.lib directly)
@@ -96,7 +97,7 @@ The **baseline** (DepthAI/Basalt) viewer is a separate entry point:
 .venv/bin/python baseline/tools/view_pose3d.py --source slam   # BasaltVIO + RTABMapSLAM
 ```
 
-`--source ours` is the flow pipeline (cam_reader + imu_reader → depth → odometry → backend →
+`--source ours` is the flow pipeline (cam + imu_cam → odometry → backend →
 slam → ui flows over a pub/sub bus); the older single-file source is still
 available as `--source ours-legacy`. For a device run with no GUI:
 
@@ -110,7 +111,7 @@ calibrated once, saved per device under `.cache/imu_calib.json`, and reused on
 later runs. Force a fresh bias measurement with `--recalibrate-bias`.
 
 The live path applies **realtime backpressure**: the camera streams at `--fps`
-but the VIO sustains less, so the imu-reader admits at most a few frames in flight
+but the VIO sustains less, so the imu_cam flow admits at most a few frames in flight
 (default 2) and skips the rest at the source. This keeps the host backlog bounded
 — without it the surplus stereo packets pile up until memory pressure stalls the
 depthai link and the OAK-D firmware watchdog crashes the device. Replay admits
@@ -129,7 +130,7 @@ primary START/STOP):
 - **Visualize** — inspect the raw sensor streams. These need exclusive device
   access, so the live VIO pipeline is released first.
   - **Camera + IMU (synced, live)** — opens an *in-app* window (no subprocess)
-    that runs the split `cam_reader` + `imu_reader` flows live and draws every
+    that runs the split `cam` + `imu_cam` flows live and draws every
     synchronised `ImuCamPacket` in three honest panels (each is exactly what the
     packet carries, no parallel pipeline):
     - **cameras** — `left | right` stereo pair;
@@ -178,7 +179,7 @@ QT_QPA_PLATFORM=offscreen .venv/bin/python -m ours.tools.synced_window_selftest 
 QT_QPA_PLATFORM=offscreen .venv/bin/python -m ours.tools.keypoints_window_selftest # keypoints coloured by depth + per-id trails
 ```
 
-The imu-reader publishes the **raw** IMU for every frame interval on `imu.raw`
+The imu_cam flow publishes the **raw** IMU for every frame interval on `imu.raw`
 (exactly what the sensor reported) and bundles the **calibrated** IMU
 (`gyro − bias`, `a = T·(a_raw − b)`) into the synced `imucam.sample` packet when a
 per-device calibration is cached; with none, the packet carries the raw samples.

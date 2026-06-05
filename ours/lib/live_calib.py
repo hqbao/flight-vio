@@ -1,6 +1,6 @@
 """Read the live OAK-D calibration + startup IMU references for the VIO graph.
 
-The unified front-end (camera-reader + imu-reader off ONE
+The unified front-end (``cam`` + ``imu_cam`` off ONE
 :class:`~ours.lib.oak_live.SharedLiveDevice`) needs the same boot-time facts the
 old monolithic capture flow read in ``LiveCaptureFlow.open()``:
 

@@ -25,8 +25,8 @@ import numpy as np                                              # noqa: E402
 
 from PyQt6.QtWidgets import QApplication                            # noqa: E402
 
-from ours.flows.cam_reader.sources import ReplayCamSource           # noqa: E402
-from ours.flows.imu_reader.sources import ReplayImuSource           # noqa: E402
+from ours.flows.cam.sources import ReplayCamSource                 # noqa: E402
+from ours.flows.imu_cam.sources import ReplayImuSource              # noqa: E402
 from ours.lib.io.reader import SessionReader                        # noqa: E402
 from ours.ui.imucam_window import ImuCamWindow                      # noqa: E402
 

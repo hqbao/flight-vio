@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Offline test for the realtime backpressure admission gate (imu-reader).
+"""Offline test for the realtime backpressure admission gate (imu_cam flow).
 
 The live camera streams faster than the VIO sustains; without a bound the host
 backlog of ~0.5 MB stereo packets grows until memory pressure starves the depthai
 link and the device firmware watchdog crashes the camera (observed on the bench).
-The :mod:`~ours.flows.imu_reader.admission` gate caps frames in flight. This test
+The :mod:`~ours.flows.imu_cam.admission` gate caps frames in flight. This test
 proves the gate offline (no device):
 
 1. **Strategy logic** -- :class:`AdmitAll` admits everything; :class:`BudgetAdmission`
@@ -13,7 +13,7 @@ proves the gate offline (no device):
 2. **IMU folding across a skip** -- when a frame is skipped the buffer is NOT
    drained, so the skipped interval's inertial samples fold into the next admitted
    frame (gyro preintegration stays gap-free, nothing lost or double-counted).
-3. **Cap end-to-end** -- the real :class:`CamReaderFlow` + :class:`ImuReaderFlow`
+3. **Cap end-to-end** -- the real :class:`CamFlow` + :class:`ImuCamFlow`
    over a gold session with a budget of ``N`` and NO completions deliver exactly
    ``N`` packets (the first ``N`` frames, in order): the host backlog is bounded.
 
@@ -32,13 +32,13 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from ours.flows.cam_reader import CamReaderFlow                   # noqa: E402
-from ours.flows.cam_reader.sources import ReplayCamSource         # noqa: E402
-from ours.flows.imu_reader import ImuReaderFlow                   # noqa: E402
-from ours.flows.imu_reader.sources import ReplayImuSource         # noqa: E402
-from ours.flows.imu_reader.admission import AdmitAll, BudgetAdmission  # noqa: E402
-from ours.flows.imu_reader.admit_frame import AdmitFrame          # noqa: E402
-from ours.flows.imu_reader.pack_imucam import PackImuCam          # noqa: E402
+from ours.flows.cam import CamFlow                                # noqa: E402
+from ours.flows.cam.sources import ReplayCamSource               # noqa: E402
+from ours.flows.imu_cam import ImuCamFlow                         # noqa: E402
+from ours.flows.imu_cam.sources import ReplayImuSource           # noqa: E402
+from ours.flows.imu_cam.admission import AdmitAll, BudgetAdmission  # noqa: E402
+from ours.flows.imu_cam.admit_frame import AdmitFrame            # noqa: E402
+from ours.flows.imu_cam.pack_imucam import PackImuCam            # noqa: E402
 from ours.lib.flow import Bus, Flow, topics                       # noqa: E402
 from ours.lib.flow.messages import CamSync                        # noqa: E402
 from ours.lib.imu.timed_buffer import TimedImuBuffer             # noqa: E402
@@ -135,9 +135,9 @@ def test_cap(session: str, budget: int, n: int) -> None:
     reader = SessionReader(Path(session))
     bus = Bus()
 
-    imu_flow = ImuReaderFlow(bus, ReplayImuSource(reader),
+    imu_flow = ImuCamFlow(bus, ReplayImuSource(reader),
                              admission=BudgetAdmission(budget))
-    cam_flow = CamReaderFlow(bus, ReplayCamSource(reader, max_frames=n), fps=20)
+    cam_flow = CamFlow(bus, ReplayCamSource(reader, max_frames=n), fps=20)
     sink = _Collector(bus)
     sink.expected_ends = 1
 

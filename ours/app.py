@@ -5,11 +5,11 @@ constructs the flows and starts their threads. The flows talk only over the bus
 (see ``ours.lib.flow.topics``).
 
 There is ONE acquisition front-end, shared by the real-time VIO and the
-camera/IMU visualiser: the camera-reader emits a ``cam.sync`` per scheduled
-stereo pair and the imu-reader drains its inertial buffer up to that timestamp,
-publishing the synced ``imucam.sample`` (frames + calibrated IMU). Both the depth
-flow and the odometry flow consume that single stream -- there is no separate
-capture monolith.
+camera/IMU visualiser: the ``cam`` flow emits a ``cam.sync`` per scheduled
+stereo pair and the ``imu_cam`` flow drains its inertial buffer up to that
+timestamp, publishing the synced ``imucam.sample`` (frames + calibrated IMU) and
+-- in the VIO path -- the ``frame.depth`` from its own depth task. The odometry
+flow consumes that single stream -- there is no separate capture monolith.
 
 Run it in **replay mode** over a recorded session -- the offline harness that
 drives the whole graph without a camera::
@@ -18,7 +18,7 @@ drives the whole graph without a camera::
 
 ``ReplayCamSource`` / ``ReplayImuSource`` feed the front-end from disk; the live
 OAK-D sources (``LiveCamSource`` / ``LiveImuSource`` off one shared device)
-publish the identical topics, so depth/odometry/backend/slam/ui are unchanged on
+publish the identical topics, so odometry/backend/slam/ui are unchanged on
 hardware (live device validation is done on the bench, not here).
 """
 from __future__ import annotations
@@ -30,11 +30,10 @@ from pathlib import Path
 import numpy as np
 
 from .flows.backend import BackendFlow
-from .flows.cam_reader import CamReaderFlow
-from .flows.cam_reader.sources import ReplayCamSource
-from .flows.depth import DepthFlow
-from .flows.imu_reader import ImuReaderFlow
-from .flows.imu_reader.sources import ReplayImuSource
+from .flows.cam import CamFlow
+from .flows.cam.sources import ReplayCamSource
+from .flows.imu_cam import ImuCamFlow
+from .flows.imu_cam.sources import ReplayImuSource
 from .flows.odometry import OdometryFlow
 from .flows.slam import SlamFlow
 from .flows.ui import UiCollectorFlow
@@ -46,24 +45,24 @@ from .lib.flow.pubsub import Bus
 from .lib.stereo.stereo import SGMConfig, SGMStereoMatcher
 
 
-def build_graph(bus: Bus, K, matcher, *, ui, R_imu_cam=None, accel_align=None,
+def build_graph(bus: Bus, K, *, ui, R_imu_cam=None, accel_align=None,
                 kf_every: int = 5, use_gyro: bool = True,
                 slam_cfg: SlamConfig | None = None):
-    """Build the shared depth/odometry/backend/slam flows around a ``ui`` sink.
+    """Build the shared odometry/backend/slam flows around a ``ui`` sink.
 
-    The acquisition front-end (cam-reader + imu-reader) is built by the caller
-    (replay vs live); everything downstream of ``imucam.sample`` is identical, so
-    it is constructed here once. ``R_imu_cam`` / ``accel_align`` seed the odometry
-    flow's gyro prior and startup gravity-leveling. Returns the list of reactive
-    flows ``[depth, odom, backend, slam, ui]``.
+    The acquisition front-end (``cam`` + ``imu_cam``, the latter owning the depth
+    task) is built by the caller (replay vs live); everything downstream of
+    ``imucam.sample`` / ``frame.depth`` is identical, so it is constructed here
+    once. ``R_imu_cam`` / ``accel_align`` seed the odometry flow's gyro prior and
+    startup gravity-leveling. Returns the list of reactive flows
+    ``[odom, backend, slam, ui]``.
     """
-    depth = DepthFlow(bus, matcher)
     odom = OdometryFlow(bus, K, R_imu_cam=R_imu_cam, accel_align=accel_align,
                         odom_cfg=OdometryConfig(gyro_fuse=use_gyro),
                         kf_every=kf_every, use_gyro=use_gyro)
     backend = BackendFlow(bus, K, kf_every=1)
     slam = SlamFlow(bus, K, slam_cfg or SlamConfig(loop_max_odom_rot_deg=30.0))
-    return [depth, odom, backend, slam, ui]
+    return [odom, backend, slam, ui]
 
 
 def _replay_imu_startup(reader: SessionReader, use_gyro: bool):
@@ -77,7 +76,7 @@ def _replay_imu_startup(reader: SessionReader, use_gyro: bool):
     * ``accel_align`` -- mean startup accelerometer (camera frame) over the first
       ~0.3 s, the gravity-leveling reference.
     * ``gyro_bias`` -- mean gyro over the first ~1 s (near-static start), removed
-      from every sample by the imu-reader so the rotation prior is unbiased.
+      from every sample by the imu_cam flow so the rotation prior is unbiased.
     """
     if not (use_gyro and reader.calib.has_imu_extrinsics):
         return None, None, None
@@ -115,12 +114,13 @@ def build_replay(bus: Bus, reader: SessionReader, *, kf_every: int = 5,
     calibration = (ImuCalibration(gyro_bias=gyro_bias)
                    if gyro_bias is not None else None)
 
-    imu_flow = ImuReaderFlow(bus, ReplayImuSource(reader), calibration=calibration)
-    cam_flow = CamReaderFlow(
+    imu_flow = ImuCamFlow(bus, ReplayImuSource(reader), matcher=matcher,
+                          calibration=calibration)
+    cam_flow = CamFlow(
         bus, ReplayCamSource(reader, max_frames=max_frames), fps=20)
 
     ui = UiCollectorFlow(bus)
-    flows = build_graph(bus, reader.K, matcher, ui=ui, R_imu_cam=R_imu_cam,
+    flows = build_graph(bus, reader.K, ui=ui, R_imu_cam=R_imu_cam,
                         accel_align=accel_align, kf_every=kf_every,
                         use_gyro=use_gyro, slam_cfg=slam_cfg)
     return (cam_flow, imu_flow), flows, ui
@@ -133,7 +133,7 @@ def build_live(bus: Bus, *, width: int = 640, height: int = 400, fps: int = 20,
     """Construct the live OAK-D graph off ONE shared device.
 
     Opens the device to read calibration + startup IMU references, then wires the
-    SAME front-end the replay path uses (camera-reader + imu-reader) onto the live
+    SAME front-end the replay path uses (``cam`` + ``imu_cam``) onto the live
     sources. The depth matcher rectifies BOTH cameras (``rectify_left=True``)
     since the raw left is unrectified. ``live_budget`` caps the realtime frames in
     flight (backpressure). Returns
@@ -144,9 +144,9 @@ def build_live(bus: Bus, *, width: int = 640, height: int = 400, fps: int = 20,
     """
     from .lib.oak_live import SharedLiveDevice
     from .lib.live_calib import read_live_calibration
-    from .flows.cam_reader.sources import LiveCamSource
-    from .flows.imu_reader.sources import LiveImuSource
-    from .flows.imu_reader.admission import BudgetAdmission
+    from .flows.cam.sources import LiveCamSource
+    from .flows.imu_cam.sources import LiveImuSource
+    from .flows.imu_cam.admission import BudgetAdmission
 
     device = SharedLiveDevice(width=width, height=height, fps=fps)
     cal = read_live_calibration(device, width=width, height=height,
@@ -158,13 +158,13 @@ def build_live(bus: Bus, *, width: int = 640, height: int = 400, fps: int = 20,
     # Realtime backpressure: the camera streams at ``fps`` but the VIO sustains
     # less; cap frames in flight so the host backlog stays bounded (else memory
     # pressure starves the depthai link and the device firmware watchdog fires).
-    imu_flow = ImuReaderFlow(bus, LiveImuSource(device),
-                             calibration=cal.imu_calibration,
-                             admission=BudgetAdmission(live_budget))
-    cam_flow = CamReaderFlow(bus, LiveCamSource(device), fps=fps, realtime=True)
+    imu_flow = ImuCamFlow(bus, LiveImuSource(device), matcher=matcher,
+                          calibration=cal.imu_calibration,
+                          admission=BudgetAdmission(live_budget))
+    cam_flow = CamFlow(bus, LiveCamSource(device), fps=fps, realtime=True)
 
     ui = ui if ui is not None else UiCollectorFlow(bus)
-    flows = build_graph(bus, cal.K, matcher, ui=ui, R_imu_cam=cal.R_imu_cam,
+    flows = build_graph(bus, cal.K, ui=ui, R_imu_cam=cal.R_imu_cam,
                         accel_align=cal.accel_align, kf_every=kf_every,
                         use_gyro=use_gyro, slam_cfg=slam_cfg)
     return device, (cam_flow, imu_flow), flows, ui

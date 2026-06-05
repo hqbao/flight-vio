@@ -11,18 +11,19 @@ edges of the unified acquisition front-end:
   :class:`~ours.flows.odometry.signal_done.SignalDone`]
 
 ``SignalDone`` is the tail: it publishes one ``frame.done`` per processed frame so
-the imu-reader's realtime admission gate frees the frame's in-flight credit (the
+the imu_cam flow's realtime admission gate frees the frame's in-flight credit (the
 backpressure loop). It runs after ``EmitKeyframe`` (which now returns the ``Step``
 so the chain continues).
 
-Both come from the SAME stream (the imu-reader publishes ``imucam.sample`` and the
-depth flow turns it into ``frame.depth``), so this flow owns the IMU->prior fusion
-itself (``PreintegratePrior``) instead of a separate capture flow. The
+Both inputs come from the SAME flow: the imu_cam flow publishes ``imucam.sample``
+and, with its depth task, ``frame.depth``. This flow owns the IMU->prior fusion
+itself (``PreintegratePrior``). The
 :class:`~ours.flows.odometry.step.Step` carrier threads one frame's result between
 the frame-chain tasks.
 
-Joining two END-bearing inputs (``imucam.sample`` direct + ``frame.depth`` via
-depth) means the flow must see BOTH ENDs before draining: ``expected_ends = 2``.
+Joining two END-bearing inputs (``imucam.sample`` + ``frame.depth``, both from the
+imu_cam flow) means the flow must see BOTH ENDs before draining:
+``expected_ends = 2``.
 
 ``R_imu_cam`` (IMU->camera rotation) drives the gyro prior; ``accel_align`` is the
 one-shot startup gravity reference (camera frame) the front-end measured, seeded

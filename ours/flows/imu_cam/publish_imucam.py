@@ -11,4 +11,4 @@ class PublishImuCam(Task):
 
     def run(self, ctx, msg: ImuCamPacket):
         ctx.bus.publish(topics.IMUCAM_SAMPLE, msg)
-        return None
+        return msg                         # pass on to depth (when matcher wired)

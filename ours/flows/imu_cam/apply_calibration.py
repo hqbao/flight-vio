@@ -1,6 +1,6 @@
 """``apply_calibration`` task: correct the packet's IMU before it is published.
 
-The imu-reader publishes the raw IMU separately (``topics.IMU_RAW``); the synced
+The imu_cam flow publishes the raw IMU separately (``topics.IMU_RAW``); the synced
 :class:`~ours.lib.flow.messages.ImuCamPacket` that downstream state-estimation
 consumes must carry the CALIBRATED inertial data when a per-device calibration
 exists. This task applies the gyro-bias + six-position accel correction

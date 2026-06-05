@@ -6,22 +6,19 @@ both the algorithm libraries (stereo, odometry, ...) and the flow-framework
 library ``ours.lib.flow`` (``Flow`` / ``SourceFlow`` / ``Task`` / ``Bus`` /
 ``topics`` / ``messages``). The flows hold no maths of their own.
 
-    capture   grabs stereo frames + IMU            -> frame.raw, imu.sample
-    depth     rectify + SGM dense depth            -> frame.depth
+    cam       pull stereo on a schedule           -> cam.sync
+    imu_cam   buffer IMU, pack per cam.sync,       -> imucam.sample, imu.raw,
+              + dense SGM depth (VIO path)            frame.depth
     odometry  KLT + RGB-D PnP (+ gyro prior)       -> pose.odom, keyframe
     backend   sliding-window bundle adjustment     -> pose.refined
     slam      ORB loop closure + pose graph        -> loop.correction
     ui        collects poses for display / scoring
 
-A second, parallel front-end splits acquisition into two independent flows (each
-its own subpackage, not wired into the monolithic ``capture`` above):
-
-    cam-reader  pull stereo on a schedule           -> cam.sync
-    imu-reader  buffer IMU, pack per cam.sync        -> imucam.sample
-
-``cam-reader`` publishes a frame + timestamp trigger; ``imu-reader`` drains its
-timestamped IMU buffer up to that timestamp and emits the combined
-``ImuCamPacket``. They share no state -- only the two bus messages.
+The acquisition front-end is two independent flows: ``cam`` publishes a frame +
+timestamp trigger; ``imu_cam`` drains its timestamped IMU buffer up to that
+timestamp and emits the combined ``ImuCamPacket`` (plus, when a depth matcher is
+wired in for the VIO path, the dense ``frame.depth`` from its own depth task).
+They share no state -- only the bus messages.
 
 ================================ HARD RULE ================================
 Flows NEVER call each other directly. The ONLY way one flow influences another

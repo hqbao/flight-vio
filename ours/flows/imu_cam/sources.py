@@ -1,6 +1,6 @@
-"""IMU sample sources for :class:`~ours.flows.imu_reader.ImuReaderFlow`.
+"""IMU sample sources for :class:`~ours.flows.imu_cam.ImuCamFlow`.
 
-The imu-reader flow owns a :class:`~ours.lib.imu.timed_buffer.TimedImuBuffer` but
+The imu_cam flow owns a :class:`~ours.lib.imu.timed_buffer.TimedImuBuffer` but
 not the *origin* of the samples -- that is injected as an ``ImuSource`` so the
 exact same flow runs offline (deterministic replay of a recorded session) and on
 the bench (the OAK-D IMU). A source is a tiny lifecycle object:

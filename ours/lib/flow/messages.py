@@ -94,11 +94,11 @@ class LoopCorrection:
 
 @dataclass(frozen=True)
 class CamSync:
-    """A stereo pair the camera-reader flow publishes as a sync trigger.
+    """A stereo pair the ``cam`` flow publishes as a sync trigger.
 
-    Published on ``topics.CAM_SYNC`` by :class:`~ours.flows.cam_reader.CamReaderFlow`
+    Published on ``topics.CAM_SYNC`` by :class:`~ours.flows.cam.CamFlow`
     once per scheduled frame. It carries the frames *and* their device timestamp
-    so the IMU-reader flow can both (a) drain its buffer up to ``ts_ns`` and
+    so the ``imu_cam`` flow can both (a) drain its buffer up to ``ts_ns`` and
     (b) pack the very same frames into the combined packet -- no second lookup,
     no shared state between the two flows beyond this message.
 
@@ -117,7 +117,7 @@ class ImuCamPacket:
     """A camera frame bundled with all IMU samples up to its timestamp.
 
     Published on ``topics.IMUCAM_SAMPLE`` by
-    :class:`~ours.flows.imu_reader.ImuReaderFlow` in response to each
+    :class:`~ours.flows.imu_cam.ImuCamFlow` in response to each
     :class:`CamSync`. This is the synchronised unit downstream consumers (state
     estimation, visualiser) work on: a stereo pair plus exactly the inertial
     measurements that fall in this frame's interval ``(prev_frame_ts, ts_ns]``,
@@ -142,7 +142,7 @@ class ImuRaw:
     """The RAW IMU samples for one frame interval, before any calibration.
 
     Published on ``topics.IMU_RAW`` by
-    :class:`~ours.flows.imu_reader.ImuReaderFlow` for every :class:`CamSync`,
+    :class:`~ours.flows.imu_cam.ImuCamFlow` for every :class:`CamSync`,
     carrying exactly what the sensor reported (no bias/scale correction) so a
     consumer can see the uncalibrated signal. The matching
     :class:`ImuCamPacket` on ``topics.IMUCAM_SAMPLE`` carries the SAME interval's
@@ -165,8 +165,8 @@ class FrameDone:
     """Backpressure CONTROL signal: one frame finished the depth+odometry diamond.
 
     Published on ``topics.FRAME_DONE`` by the odometry tail once per processed
-    frame (always -- even when tracking failed), and consumed by the imu-reader's
-    admission gate to free an in-flight credit. It is control, not data: it
+    frame (always -- even when tracking failed), and consumed by the imu_cam
+    flow's admission gate to free an in-flight credit. It is control, not data: it
     carries only the frame ``seq`` and never an estimate. On the replay path the
     gate admits everything, so this is a no-op there.
     """

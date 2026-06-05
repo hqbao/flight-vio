@@ -2,7 +2,7 @@
 """Offline integration test for the unified VIO graph driven by ``ours.app``.
 
 After the front-end unification there is no ``*_selftest`` that exercises the FULL
-``ours.app`` replay graph -- the camera-reader + imu-reader front-end feeding
+``ours.app`` replay graph -- the ``cam`` + ``imu_cam`` front-end feeding
 depth + odometry + backend + slam + ui. The app-graph parity used to be checked
 only by a manual ``python -m ours.app`` run; this test makes it part of the
 offline sweep so a topology regression is caught automatically.

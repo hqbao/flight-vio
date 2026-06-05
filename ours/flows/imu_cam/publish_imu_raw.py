@@ -1,6 +1,6 @@
 """``publish_imu_raw`` task: emit the uncalibrated IMU for a frame interval.
 
-This runs BEFORE calibration in the imu-reader chain: it takes the freshly
+This runs BEFORE calibration in the imu_cam chain: it takes the freshly
 packed (raw) :class:`~ours.lib.flow.messages.ImuCamPacket`, publishes its
 inertial samples on ``topics.IMU_RAW`` as an :class:`~ours.lib.flow.messages.ImuRaw`,
 and passes the same packet through unchanged so the next task can calibrate it.

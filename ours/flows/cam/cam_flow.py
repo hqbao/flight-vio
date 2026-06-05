@@ -1,4 +1,4 @@
-"""The :class:`CamReaderFlow` -- emit one ``CamSync`` per scheduled stereo pair."""
+"""The :class:`CamFlow` -- emit one ``CamSync`` per scheduled stereo pair."""
 from __future__ import annotations
 
 import time
@@ -9,7 +9,7 @@ from .publish_cam_sync import PublishCamSync
 from .sources import CamSource
 
 
-class CamReaderFlow(SourceFlow):
+class CamFlow(SourceFlow):
     """Source flow: emit one :class:`~ours.lib.flow.messages.CamSync` per frame.
 
     ``fps`` sets the schedule; ``realtime`` paces ticks to it (live-like) versus
@@ -19,7 +19,7 @@ class CamReaderFlow(SourceFlow):
 
     def __init__(self, bus: Bus, source: CamSource, *, fps: int = 20,
                  realtime: bool = False) -> None:
-        super().__init__("cam-reader", bus, [PublishCamSync()])
+        super().__init__("cam", bus, [PublishCamSync()])
         self.source = source
         self.fps = max(1, int(fps))
         self.realtime = bool(realtime)

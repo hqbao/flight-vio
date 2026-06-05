@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Offline integration test for the split camera/IMU acquisition front-end.
 
-Wires the real flows -- :class:`~ours.flows.cam_reader.CamReaderFlow` and
-:class:`~ours.flows.imu_reader.ImuReaderFlow` -- over a real
+Wires the real flows -- :class:`~ours.flows.cam.CamFlow` and
+:class:`~ours.flows.imu_cam.ImuCamFlow` -- over a real
 :class:`~ours.lib.flow.pubsub.Bus`, fed by a recorded gold session (no device),
 and verifies the synchronisation contract end to end:
 
@@ -27,10 +27,10 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from ours.flows.cam_reader import CamReaderFlow                   # noqa: E402
-from ours.flows.cam_reader.sources import ReplayCamSource         # noqa: E402
-from ours.flows.imu_reader import ImuReaderFlow                  # noqa: E402
-from ours.flows.imu_reader.sources import ReplayImuSource        # noqa: E402
+from ours.flows.cam import CamFlow                                # noqa: E402
+from ours.flows.cam.sources import ReplayCamSource               # noqa: E402
+from ours.flows.imu_cam import ImuCamFlow                         # noqa: E402
+from ours.flows.imu_cam.sources import ReplayImuSource           # noqa: E402
 from ours.lib.flow import Bus, Flow, topics                       # noqa: E402
 from ours.lib.io.reader import SessionReader                        # noqa: E402
 
@@ -66,8 +66,8 @@ def run(session: str, max_frames: int) -> list:
     reader = SessionReader(Path(session))
     bus = Bus()
 
-    imu_flow = ImuReaderFlow(bus, ReplayImuSource(reader))
-    cam_flow = CamReaderFlow(
+    imu_flow = ImuCamFlow(bus, ReplayImuSource(reader))
+    cam_flow = CamFlow(
         bus, ReplayCamSource(reader, max_frames=max_frames), fps=20)
     sink = _Collector(bus)
     sink.expected_ends = 1

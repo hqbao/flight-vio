@@ -23,8 +23,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from ours.flows.cam_reader.sources import LiveCamSource             # noqa: E402
-from ours.flows.imu_reader.sources import LiveImuSource             # noqa: E402
+from ours.flows.cam.sources import LiveCamSource                    # noqa: E402
+from ours.flows.imu_cam.sources import LiveImuSource                # noqa: E402
 from ours.lib.oak_live import SharedLiveDevice                      # noqa: E402
 
 

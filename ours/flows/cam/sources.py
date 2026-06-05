@@ -1,9 +1,8 @@
-"""Stereo-frame sources for :class:`~ours.flows.cam_reader.CamReaderFlow`.
+"""Stereo-frame sources for :class:`~ours.flows.cam.CamFlow`.
 
-The cam-reader flow drives the *schedule* (it pulls one stereo pair per scheduler
-tick) but the *origin* of the frames is injected as a ``CamSource`` so the same
-flow runs offline (replay of a recorded session) and on the bench (the OAK-D
-cameras).
+The cam flow drives the *schedule* (it pulls one stereo pair per scheduler tick)
+but the *origin* of the frames is injected as a ``CamSource`` so the same flow
+runs offline (replay of a recorded session) and on the bench (the OAK-D cameras).
 
 A source is pull-based -- :meth:`CamSource.read` returns the next
 ``(seq, ts_ns, gray_left, gray_right)`` or ``None`` when exhausted -- because the

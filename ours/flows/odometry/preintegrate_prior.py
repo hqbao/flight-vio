@@ -6,7 +6,7 @@ flow does (one acquisition stream, no separate capture monolith). The IMU->prior
 fusion that used to live in the capture flow now lives HERE, per packet:
 
 * ``R_prior`` -- the inter-frame camera-frame rotation integrated from the
-  packet's gyro (already bias-corrected by the imu-reader's ApplyCalibration),
+  packet's gyro (already bias-corrected by the imu_cam flow's ApplyCalibration),
   conjugated into the camera frame by ``R_imu_cam``. ``None`` when gyro fusion is
   off or the packet carries fewer than two samples (e.g. the first frame).
 * ``accel_cam`` / ``at_rest`` -- the camera-frame accelerometer this frame and a

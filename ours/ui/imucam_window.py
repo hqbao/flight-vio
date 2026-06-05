@@ -1,8 +1,9 @@
 """In-app Qt window for the split camera/IMU front-end's synchronised output.
 
 This is the "visualise live, on our own UI" view: it runs the REAL split
-acquisition flows -- :class:`~ours.flows.cam_reader.CamReaderFlow` and
-:class:`~ours.flows.imu_reader.ImuReaderFlow` -- over a private
+acquisition flows -- :class:`~ours.flows.cam.CamFlow` and
+:class:`~ours.flows.imu_cam.ImuCamFlow` (built WITHOUT a depth matcher, so it
+only packs the synced frame+IMU) -- over a private
 :class:`~ours.lib.flow.pubsub.Bus` and renders every
 :class:`~ours.lib.flow.messages.ImuCamPacket` they publish straight into a Qt
 widget. No cv2 window, no subprocess: the synced view lives inside the pose
@@ -35,10 +36,10 @@ from PyQt6 import QtCore
 from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import QLabel, QSizePolicy, QSplitter, QVBoxLayout, QWidget
 
-from ..flows.cam_reader import CamReaderFlow
-from ..flows.cam_reader.sources import CamSource
-from ..flows.imu_reader import ImuReaderFlow
-from ..flows.imu_reader.sources import ImuSource
+from ..flows.cam import CamFlow
+from ..flows.cam.sources import CamSource
+from ..flows.imu_cam import ImuCamFlow
+from ..flows.imu_cam.sources import ImuSource
 from ..lib.flow import Bus, Flow, topics
 from ..lib.viz.imucam_render import render_cameras
 from . import theme
@@ -58,8 +59,8 @@ def live_source_factory(width: int = 640, height: int = 400,
     ``X_LINK_DEVICE_NOT_FOUND``. depthai is pulled lazily by the shared device.
     """
     def _make() -> tuple[CamSource, ImuSource]:
-        from ..flows.cam_reader.sources import LiveCamSource
-        from ..flows.imu_reader.sources import LiveImuSource
+        from ..flows.cam.sources import LiveCamSource
+        from ..flows.imu_cam.sources import LiveImuSource
         from ..lib.oak_live import SharedLiveDevice
         device = SharedLiveDevice(width=width, height=height, fps=fps)
         return LiveCamSource(device), LiveImuSource(device)
@@ -151,8 +152,8 @@ class ImuCamWindow(QWidget):
 
         self._queue: "queue.Queue" = queue.Queue(maxsize=8)
         self._bus: Bus | None = None
-        self._cam: CamReaderFlow | None = None
-        self._imu: ImuReaderFlow | None = None
+        self._cam: CamFlow | None = None
+        self._imu: ImuCamFlow | None = None
         self._sink: _QueueSink | None = None
         self._running = False
         self._ended = False
@@ -204,9 +205,9 @@ class ImuCamWindow(QWidget):
                 from ..lib.imu.imu_calib import ImuCalibration
                 return ImuCalibration.load(
                     getattr(device, "device_id", "default"))
-        self._imu = ImuReaderFlow(self._bus, imu_src,
+        self._imu = ImuCamFlow(self._bus, imu_src,
                                   calibration_provider=provider)
-        self._cam = CamReaderFlow(self._bus, cam_src, fps=self._fps,
+        self._cam = CamFlow(self._bus, cam_src, fps=self._fps,
                                   realtime=True)
         # Start consumers before producers; the IMU source must be filling the
         # buffer before the first camera trigger drains it.

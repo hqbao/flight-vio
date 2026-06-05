@@ -2,8 +2,8 @@
 """Visualise the split camera/IMU front-end's synchronised output.
 
 This is the eyeball companion to the split-acquisition flows: it runs the REAL
-:class:`~ours.flows.cam_reader.CamReaderFlow` and
-:class:`~ours.flows.imu_reader.ImuReaderFlow` over a recorded session and
+:class:`~ours.flows.cam.CamFlow` and
+:class:`~ours.flows.imu_cam.ImuCamFlow` over a recorded session and
 draws, for every :class:`~ours.lib.flow.messages.ImuCamPacket` they publish, the
 four things that packet actually contains -- nothing computed in a parallel
 pipeline (honest visualisation):
@@ -40,10 +40,10 @@ import cv2
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from ours.flows.cam_reader import CamReaderFlow                   # noqa: E402
-from ours.flows.cam_reader.sources import ReplayCamSource         # noqa: E402
-from ours.flows.imu_reader import ImuReaderFlow                  # noqa: E402
-from ours.flows.imu_reader.sources import ReplayImuSource        # noqa: E402
+from ours.flows.cam import CamFlow                                # noqa: E402
+from ours.flows.cam.sources import ReplayCamSource               # noqa: E402
+from ours.flows.imu_cam import ImuCamFlow                         # noqa: E402
+from ours.flows.imu_cam.sources import ReplayImuSource           # noqa: E402
 from ours.lib.flow import Bus, Flow, topics                       # noqa: E402
 from ours.lib.io.reader import SessionReader                        # noqa: E402
 # Honest renderers shared with the in-app Qt window (ours.ui.imucam_window) so
@@ -92,8 +92,8 @@ def main() -> int:
     bus = Bus()
     pkt_q: "queue.Queue" = queue.Queue(maxsize=8)
 
-    imu_flow = ImuReaderFlow(bus, ReplayImuSource(reader, realtime=True))
-    cam_flow = CamReaderFlow(
+    imu_flow = ImuCamFlow(bus, ReplayImuSource(reader, realtime=True))
+    cam_flow = CamFlow(
         bus, ReplayCamSource(reader, max_frames=args.max_frames),
         fps=args.fps, realtime=True)
     sink = _SinkFlow(bus, pkt_q)
