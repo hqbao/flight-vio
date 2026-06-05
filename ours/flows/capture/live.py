@@ -39,6 +39,7 @@ from ...lib.imu.calib_store import (
     load_gyro_bias,
     save_gyro_bias,
 )
+from ...lib.imu.decode import decode_imu_packets
 from ...lib.imu.imu import so3_exp
 from ...lib.io.reader import StereoCalib
 from ...lib.flow.messages import ImuInit, ImuPrior, RawFrame
@@ -242,11 +243,7 @@ class LiveCaptureFlow(SourceFlow):
             if msg is None:
                 time.sleep(0.005)
                 continue
-            for pkt in msg.packets:
-                a = pkt.acceleroMeter
-                v = np.array([a.x, a.y, a.z], dtype=np.float64)
-                g = pkt.gyroscope
-                w = np.array([g.x, g.y, g.z], dtype=np.float64)
+            for w, v, _ in decode_imu_packets(msg):
                 if not (np.all(np.isfinite(v)) and np.all(np.isfinite(w))):
                     continue
                 moving = float(np.linalg.norm(w)) > _STILL_GYRO
@@ -364,27 +361,18 @@ class LiveCaptureFlow(SourceFlow):
                 acc_cnt = 0
                 imsg = qi.tryGet()
                 while imsg is not None:
-                    for pkt in imsg.packets:
-                        a = pkt.acceleroMeter
-                        v = (a.x, a.y, a.z)
+                    for w, v, ts in decode_imu_packets(imsg):
                         if np.all(np.isfinite(v)):
                             acc_sum += v
                             acc_cnt += 1
-                        g = pkt.gyroscope
-                        w = np.array([g.x, g.y, g.z], dtype=np.float64)
-                        if np.all(np.isfinite(w)):
-                            try:
-                                ts = g.getTimestampDevice().total_seconds()
-                            except Exception:
-                                ts = None
-                            if ts is not None:
-                                if gyro_last_ts is not None:
-                                    dt = ts - gyro_last_ts
-                                    if 0.0 < dt < 0.1:
-                                        R_imu_accum = R_imu_accum @ so3_exp(
-                                            (w - gyro_bias) * dt)
-                                        gyro_cnt += 1
-                                gyro_last_ts = ts
+                        if np.all(np.isfinite(w)) and ts is not None:
+                            if gyro_last_ts is not None:
+                                dt = ts - gyro_last_ts
+                                if 0.0 < dt < 0.1:
+                                    R_imu_accum = R_imu_accum @ so3_exp(
+                                        (w - gyro_bias) * dt)
+                                    gyro_cnt += 1
+                            gyro_last_ts = ts
                     imsg = qi.tryGet()
 
                 R_prior = (R_imu_cam @ R_imu_accum @ R_imu_cam.T

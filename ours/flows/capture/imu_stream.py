@@ -22,6 +22,8 @@ from typing import Callable
 
 import numpy as np
 
+from ...lib.imu.decode import decode_imu_packets
+
 # (gyro rad/s, accel m/s^2, t_seconds) -> None
 ImuCallback = Callable[[np.ndarray, np.ndarray, float], None]
 
@@ -83,14 +85,8 @@ class ImuStream:
                 if msg is None:
                     time.sleep(0.002)
                     continue
-                for pkt in msg.packets:
-                    a = pkt.acceleroMeter
-                    g = pkt.gyroscope
-                    accel = np.array([a.x, a.y, a.z], dtype=np.float64)
-                    gyro = np.array([g.x, g.y, g.z], dtype=np.float64)
-                    try:
-                        t_s = g.getTimestampDevice().total_seconds()
-                    except Exception:
+                for gyro, accel, t_s in decode_imu_packets(msg):
+                    if t_s is None:
                         t_s = time.monotonic()
                     if self._cb is not None:
                         self._cb(gyro, accel, t_s)
