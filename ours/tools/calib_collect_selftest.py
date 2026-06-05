@@ -24,9 +24,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from ours.lib.imu.accel_calib import G_STANDARD, SIX_FACES  # noqa: E402
 from ours.lib.imu.calib_collect import (  # noqa: E402
+    GYRO_MAX_STD,
     SixFaceCollector,
+    SixFaceConfig,
     StaticCollector,
     StaticCollectorConfig,
+    gyro_bias_verdict,
 )
 
 _M = np.array([[1.018, 0.012, -0.009],
@@ -135,6 +138,38 @@ def main() -> int:
     ok_amb = len(six2.captured_faces) == 0
     print(f"ambiguous tilt rejected: {'OK' if ok_amb else 'FAIL'}")
     ok &= ok_amb
+
+    # --- quality gate: gyro window steadiness -----------------------------
+    # A clean still window's worst-axis std is well under the bound and passes;
+    # a noisy window or a too-short one is refused.
+    sc2 = StaticCollector(StaticCollectorConfig(window_s=1.0, min_samples=80))
+    t = 0.0
+    _feed_still(sc2, SIX_FACES[4] * G_STANDARD, 1.2, t, rng, gyro_noise=0.004)
+    clean_std = sc2.gyro_std_max
+    v_clean = gyro_bias_verdict(clean_std, sc2.n)
+    v_noisy = gyro_bias_verdict(0.05, 200)          # 0.05 > 0.02 bound
+    v_short = gyro_bias_verdict(0.004, 30)          # 30 < 80 samples
+    ok_gyro_gate = (clean_std < GYRO_MAX_STD and v_clean.ok
+                    and not v_noisy.ok and not v_short.ok)
+    print(f"gyro gate (clean std={clean_std:.4f}): "
+          f"{'OK' if ok_gyro_gate else 'FAIL'}")
+    ok &= ok_gyro_gate
+
+    # --- quality gate: accel residual -------------------------------------
+    # The good six-face solve clears the default bound; an impossibly tight
+    # bound rejects the very same fit (gate wiring, not the maths).
+    v_accel_ok = six.verdict()
+    six_tight = SixFaceCollector(SixFaceConfig(max_residual_g=1e-9))
+    t = 0.0
+    for fi in [4, 5, 0, 1, 2, 3]:
+        t = _feed_motion(six_tight, 0.3, t, rng)
+        t, _, _ = _feed_still(six_tight, SIX_FACES[fi] * G_STANDARD, 1.0, t, rng)
+    v_accel_reject = six_tight.verdict()
+    ok_accel_gate = (v_accel_ok.ok and six_tight.complete
+                     and not v_accel_reject.ok)
+    print(f"accel gate (residual={v_accel_ok.metric:.4f}): "
+          f"{'OK' if ok_accel_gate else 'FAIL'}")
+    ok &= ok_accel_gate
 
     print("\nPASS" if ok else "\nFAIL")
     return 0 if ok else 1

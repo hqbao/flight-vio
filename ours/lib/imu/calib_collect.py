@@ -45,6 +45,51 @@ def face_name(index: int) -> str:
     return _FACE_NAMES[index]
 
 
+# -- quality gates --------------------------------------------------------- #
+# A military product must REFUSE a bad calibration, not silently store it. These
+# are the acceptance bounds for a hand-held bench calibration; the wizard keeps
+# SAVE disabled until the captured data clears them.
+GYRO_MAX_STD = 0.02          # rad/s; max per-axis gyro noise in the still window
+GYRO_MIN_SAMPLES = 80        # need a long enough window for a trustworthy mean
+ACCEL_MAX_RESIDUAL_G = 0.5   # m/s^2; max RMS |a_cal|-g over the six faces
+
+
+@dataclass(frozen=True)
+class CalibVerdict:
+    """Accept/reject decision for a finished calibration.
+
+    ``ok`` gates the wizard's SAVE button; ``message`` is shown to the operator;
+    ``metric`` is the figure that was tested (gyro noise std or accel residual).
+    """
+
+    ok: bool
+    message: str
+    metric: float = 0.0
+
+
+def gyro_bias_verdict(std_max: float, n: int, *,
+                      max_std: float = GYRO_MAX_STD,
+                      min_samples: int = GYRO_MIN_SAMPLES) -> CalibVerdict:
+    """Accept a gyro-bias window only if it is long AND genuinely steady.
+
+    The stillness gate already rejects per-sample motion, but a creeping or
+    vibrating rest can still pass it while leaving the window noisy -- which
+    poisons the mean. We additionally require the per-axis gyro std over the
+    window to stay under ``max_std``.
+    """
+    if n < min_samples:
+        return CalibVerdict(
+            False, f"Too few still samples ({n} < {min_samples}). "
+            "Hold still longer.", float(std_max))
+    if not np.isfinite(std_max) or std_max > max_std:
+        return CalibVerdict(
+            False, f"Surface not steady enough (gyro noise {std_max:.4f} > "
+            f"{max_std:.4f} rad/s). Use a firmer rest and retry.",
+            float(std_max))
+    return CalibVerdict(
+        True, f"Accepted (gyro noise {std_max:.4f} rad/s).", float(std_max))
+
+
 @dataclass
 class StaticCollectorConfig:
     """Stillness gate thresholds (tighter than live startup for cal quality)."""
@@ -65,6 +110,7 @@ class StaticCollector:
     def reset(self) -> None:
         self._n = 0
         self._gsum = np.zeros(3)
+        self._gsq = np.zeros(3)
         self._asum = np.zeros(3)
         self._t_start: float | None = None
         self._t_last: float | None = None
@@ -85,6 +131,7 @@ class StaticCollector:
             return True
         self._n += 1
         self._gsum += g
+        self._gsq += g * g
         self._asum += a
         if self._t_start is None:
             self._t_start = t_s
@@ -114,6 +161,20 @@ class StaticCollector:
         return self._gsum / max(self._n, 1)
 
     @property
+    def gyro_std(self) -> np.ndarray:
+        """Per-axis std of gyro over the still streak (window steadiness)."""
+        if self._n < 2:
+            return np.zeros(3)
+        mean = self._gsum / self._n
+        var = self._gsq / self._n - mean * mean
+        return np.sqrt(np.clip(var, 0.0, None))
+
+    @property
+    def gyro_std_max(self) -> float:
+        """Worst-axis gyro std over the streak (the figure the gate tests)."""
+        return float(np.max(self.gyro_std))
+
+    @property
     def accel_mean(self) -> np.ndarray:
         return self._asum / max(self._n, 1)
 
@@ -137,6 +198,9 @@ class SixFaceConfig:
     # A still mean only counts as a face if its dominant axis carries at least
     # this fraction of g (i.e. the device is held close enough to a true face).
     axis_min_frac: float = 0.92
+    # Reject the solved calibration if its sphere residual exceeds this (the
+    # faces were held too crooked / unsteady to trust the fit).
+    max_residual_g: float = ACCEL_MAX_RESIDUAL_G
     g: float = G_STANDARD
 
 
@@ -166,6 +230,25 @@ class SixFaceCollector:
     def calibration(self) -> AccelCalibration | None:
         """The solved calibration once all six faces are captured, else None."""
         return self._cal
+
+    def verdict(self) -> CalibVerdict:
+        """Accept the solved calibration only if all six faces fit the sphere.
+
+        The capture loop already enforces six distinct, square faces; this gates
+        the FIT quality: a high RMS residual means the poses were too crooked or
+        unsteady to trust, so SAVE stays disabled until the operator re-runs.
+        """
+        if not self.complete or self._cal is None:
+            return CalibVerdict(
+                False, f"Incomplete ({len(self._caps)}/6 faces captured).", 0.0)
+        r = self._cal.residual_g
+        if not np.isfinite(r) or r > self.cfg.max_residual_g:
+            return CalibVerdict(
+                False, f"Residual too high ({r:.4f} > "
+                f"{self.cfg.max_residual_g:.4f} m/s²). Re-run holding each face "
+                "squarer and stiller.", float(r))
+        return CalibVerdict(
+            True, f"Accepted (residual {r:.4f} m/s²).", float(r))
 
     def reset(self) -> None:
         self._coll.reset()

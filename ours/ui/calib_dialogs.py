@@ -29,6 +29,7 @@ from ..lib.imu.calib_collect import (
     StaticCollector,
     StaticCollectorConfig,
     face_name,
+    gyro_bias_verdict,
 )
 from ..lib.imu.calib_store import save_accel_calib, save_gyro_bias
 from . import theme
@@ -106,6 +107,7 @@ class GyroCalibDialog(_CalibDialogBase):
             gyro_thresh=0.05, accel_dev_thresh=0.4, window_s=1.0,
             min_samples=80))
         self._bias: np.ndarray | None = None
+        self._verdict = None
 
         root = QVBoxLayout(self)
         title = QLabel("GYROSCOPE BIAS CALIBRATION")
@@ -144,6 +146,7 @@ class GyroCalibDialog(_CalibDialogBase):
     def _on_start(self) -> None:
         self._coll.reset()
         self._bias = None
+        self._verdict = None
         self._save_btn.setEnabled(False)
         self._result.setText("bias = —")
         self._status.setText("Hold still…")
@@ -155,6 +158,8 @@ class GyroCalibDialog(_CalibDialogBase):
         self._coll.feed(gyro, accel, t_s)
         if self._coll.ready:
             self._bias = self._coll.gyro_mean.copy()
+            self._verdict = gyro_bias_verdict(
+                self._coll.gyro_std_max, self._coll.n)
             if self._device_id is None:
                 self._device_id = self._stream.device_id
             self._stop_stream()
@@ -162,13 +167,20 @@ class GyroCalibDialog(_CalibDialogBase):
     def _refresh(self) -> None:
         if self._bias is not None:
             b = self._bias
+            v = self._verdict
             self._bar.setValue(100)
-            self._status.setText(f"Done ({self._coll.n} samples). "
-                                 "Review and SAVE.")
             self._result.setText(
-                f"bias = [{b[0]:+.5f}, {b[1]:+.5f}, {b[2]:+.5f}] rad/s")
-            self._save_btn.setEnabled(True)
+                f"bias = [{b[0]:+.5f}, {b[1]:+.5f}, {b[2]:+.5f}] rad/s"
+                + (f"   (noise {v.metric:.4f})" if v is not None else ""))
             self._start_btn.setText("REDO")
+            if v is not None and v.ok:
+                self._status.setText(f"Done ({self._coll.n} samples). "
+                                     "Review and SAVE.")
+                self._save_btn.setEnabled(True)
+            else:
+                self._status.setText(
+                    "⚠ " + (v.message if v is not None else "Rejected."))
+                self._save_btn.setEnabled(False)
         else:
             self._bar.setValue(int(self._coll.progress * 100))
             if self._running:
@@ -178,6 +190,8 @@ class GyroCalibDialog(_CalibDialogBase):
 
     def _on_save(self) -> None:
         if self._bias is None:
+            return
+        if self._verdict is not None and not self._verdict.ok:
             return
         dev = self._device_id or "default"
         save_gyro_bias(dev, self._bias, self._coll.n)
@@ -283,16 +297,23 @@ class AccelCalibDialog(_CalibDialogBase):
             self._status.setText(st.message)
         if self._coll.complete and self._coll.calibration is not None:
             cal = self._coll.calibration
+            v = self._coll.verdict()
             self._result.setText(
                 f"residual = {cal.residual_g:.4f} m/s²   "
                 f"(6/6 faces, lower is better)")
-            self._save_btn.setEnabled(True)
             self._start_btn.setText("REDO")
             self._bar.setValue(100)
+            if v.ok:
+                self._save_btn.setEnabled(True)
+            else:
+                self._save_btn.setEnabled(False)
+                self._status.setText("⚠ " + v.message)
 
     def _on_save(self) -> None:
         cal = self._coll.calibration
         if cal is None:
+            return
+        if not self._coll.verdict().ok:
             return
         dev = self._device_id or "default"
         save_accel_calib(dev, cal, len(self._coll.captured_faces))
