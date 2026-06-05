@@ -262,6 +262,41 @@ class GyroPreintegrator:
         return self.R_imu_cam @ R_imu @ self.R_imu_cam.T
 
 
+def integrate_gyro_camera(imu_ts: np.ndarray, gyro: np.ndarray,
+                          R_imu_cam: np.ndarray) -> np.ndarray | None:
+    """Camera-frame rotation from a short, self-contained gyro block.
+
+    Unlike :class:`GyroPreintegrator` (which indexes a whole-session stream by
+    absolute timestamps), this integrates the samples carried inside a single
+    ``ImuCamPacket`` -- the gyro covering exactly one inter-frame interval. The
+    samples are assumed already bias-corrected (ApplyCalibration removes the
+    cached bias), so nothing is subtracted here.
+
+    Parameters
+    ----------
+    imu_ts : (M,) int64 device-clock nanoseconds for the packet, increasing.
+    gyro   : (M,3) rad/s in the IMU frame (calibrated).
+    R_imu_cam : 3x3 rotation mapping IMU-frame vectors into the camera frame.
+
+    Returns the trapezoidal camera-frame rotation ``R_imu_cam @ R_imu @
+    R_imu_cam^T`` for the interval, or ``None`` when fewer than two samples are
+    available (no rotation can be formed).
+    """
+    ts = np.asarray(imu_ts, dtype=np.int64)
+    if ts.size < 2:
+        return None
+    w = np.asarray(gyro, dtype=np.float64)
+    R = np.asarray(R_imu_cam, dtype=np.float64)
+    R_imu = np.eye(3)
+    for j in range(ts.size - 1):
+        dt = (int(ts[j + 1]) - int(ts[j])) * 1e-9
+        if dt <= 0:
+            continue
+        w_mid = 0.5 * (w[j] + w[j + 1])  # trapezoidal angular velocity
+        R_imu = R_imu @ so3_exp(w_mid * dt)
+    return R @ R_imu @ R.T
+
+
 def gravity_aligned_R0(accel_cam: np.ndarray) -> np.ndarray:
     """Initial camera->world rotation that levels the optical world to gravity.
 

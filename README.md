@@ -24,7 +24,8 @@ oak-d/
       io/                recorded-session reader + time-synced bundles
       config/            resolution-aware tuning profiles
     flows/               live-pipeline orchestration (one thread + tasks per flow)
-      capture/ depth/ odometry/ backend/ slam/ ui/   (capture = replay + live)
+      cam_reader/ imu_reader/ depth/ odometry/ backend/ slam/ ui/
+                         (cam_reader + imu_reader = ONE acquisition front-end)
       live_source.py     bridge: run the live flow graph into the Qt viewer
     ui/                  own Qt 3D viewer + PoseSource base + fake source (copy)
     tools/               offline scoring + self-tests (call ours.lib directly)
@@ -33,7 +34,7 @@ oak-d/
       live_replay.py     replay a recorded session through the live ours pipeline
       synced_view.py     inspect the synced (image, depth, IMU) triplet
       imucam_view.py     cv2 view of the split cam/IMU front-end (left|right|gyro|accel)
-      *_selftest.py      regression guards (klt, ba, posegraph, imu_preint, vio_ba, imucam_*)
+      *_selftest.py      regression guards (klt, ba, posegraph, imu_preint, vio_ba, imucam_*, flow_replay)
   baseline/              DepthAI library pipeline (BasaltVIO + RTABMapSLAM)
     oakd/                baseline-only core (its Pose/frames/pngio/sources/ui)
       frames.py          camera <-> body (FRD) <-> world (NED) transforms
@@ -95,7 +96,7 @@ The **baseline** (DepthAI/Basalt) viewer is a separate entry point:
 .venv/bin/python baseline/tools/view_pose3d.py --source slam   # BasaltVIO + RTABMapSLAM
 ```
 
-`--source ours` is the flow pipeline (capture → depth → odometry → backend →
+`--source ours` is the flow pipeline (cam_reader + imu_reader → depth → odometry → backend →
 slam → ui flows over a pub/sub bus); the older single-file source is still
 available as `--source ours-legacy`. For a device run with no GUI:
 
@@ -303,6 +304,7 @@ Self-tests (run before/after touching the from-scratch VIO):
 .venv/bin/python ours/tools/imu_preint_selftest.py # IMU preintegration vs closed form
 .venv/bin/python ours/tools/vio_ba_selftest.py     # tight-coupled VIO joint solve
 .venv/bin/python -m ours.tools.imucam_sync_selftest  # split cam/IMU sync contract (1 pkt/frame, samples in (prev,ts])
+.venv/bin/python -m ours.tools.flow_replay_selftest  # full ours.app VIO graph over a gold session (60 pose.odom + refined)
 .venv/bin/python -m ours.tools.oak_live_selftest     # single-client shared OAK-D (cam+IMU open the device once)
 QT_QPA_PLATFORM=offscreen .venv/bin/python -m ours.tools.imucam_window_selftest  # in-app synced view renders (offscreen Qt)
 QT_QPA_PLATFORM=offscreen .venv/bin/python -m ours.tools.synced_window_selftest  # image|depth|IMU triplet window renders (offscreen Qt)

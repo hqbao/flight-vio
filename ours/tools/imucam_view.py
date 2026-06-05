@@ -2,8 +2,8 @@
 """Visualise the split camera/IMU front-end's synchronised output.
 
 This is the eyeball companion to the split-acquisition flows: it runs the REAL
-:class:`~ours.flows.capture.cam_reader.CamReaderFlow` and
-:class:`~ours.flows.capture.imu_reader.ImuReaderFlow` over a recorded session and
+:class:`~ours.flows.cam_reader.CamReaderFlow` and
+:class:`~ours.flows.imu_reader.ImuReaderFlow` over a recorded session and
 draws, for every :class:`~ours.lib.flow.messages.ImuCamPacket` they publish, the
 four things that packet actually contains -- nothing computed in a parallel
 pipeline (honest visualisation):

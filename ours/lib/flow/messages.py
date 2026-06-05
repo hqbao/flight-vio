@@ -21,46 +21,27 @@ END = object()
 
 
 @dataclass(frozen=True)
-class ImuInit:
-    """One-shot IMU startup info, published by capture before any frame.
-
-    ``accel_align`` is the near-static startup accelerometer mean in the camera
-    optical frame (m/s^2), used once by the odometry flow to gravity-align the
-    initial attitude. ``None`` when the device has no usable IMU.
-    """
-
-    accel_align: np.ndarray | None
-
-
-@dataclass(frozen=True)
 class ImuPrior:
-    """Per-frame IMU prior, published by capture alongside each raw frame.
+    """Per-frame IMU prior, built inside the odometry flow from each packet.
 
-    The capture flow owns the IMU->prior fusion so the same odometry flow drives
-    both replay and live:
+    The odometry flow owns the IMU->prior fusion (``PreintegratePrior``), turning
+    the synced :class:`ImuCamPacket` into:
 
     * ``R_prior`` -- inter-frame camera-frame rotation ``R_cam(prev->cur)`` from
       the gyro (the rotation prior handed to PnP), or ``None`` on the first frame.
     * ``accel_cam`` / ``at_rest`` -- the camera-frame accelerometer this frame and
       whether the camera was still; supplied so a keyframe can carry a gravity
       prior into the back-end. ``at_rest`` is ``False`` (accel ``None``) when no
-      usable gravity measurement is available (e.g. replay scoring).
+      usable gravity measurement is available.
+
+    It is stashed in the flow's ``priors[seq]`` (never put on the bus) so the
+    matching depth frame can pick it up by ``seq``.
     """
 
     seq: int
     R_prior: np.ndarray | None
     accel_cam: np.ndarray | None = None
     at_rest: bool = False
-
-
-@dataclass(frozen=True)
-class RawFrame:
-    """A captured stereo pair (rectified left + raw right) with its timestamp."""
-
-    seq: int
-    ts_ns: int
-    gray_left: np.ndarray
-    gray_right: np.ndarray | None
 
 
 @dataclass(frozen=True)
@@ -115,7 +96,7 @@ class LoopCorrection:
 class CamSync:
     """A stereo pair the camera-reader flow publishes as a sync trigger.
 
-    Published on ``topics.CAM_SYNC`` by :class:`~ours.flows.capture.cam_reader.CamReaderFlow`
+    Published on ``topics.CAM_SYNC`` by :class:`~ours.flows.cam_reader.CamReaderFlow`
     once per scheduled frame. It carries the frames *and* their device timestamp
     so the IMU-reader flow can both (a) drain its buffer up to ``ts_ns`` and
     (b) pack the very same frames into the combined packet -- no second lookup,
@@ -136,7 +117,7 @@ class ImuCamPacket:
     """A camera frame bundled with all IMU samples up to its timestamp.
 
     Published on ``topics.IMUCAM_SAMPLE`` by
-    :class:`~ours.flows.capture.imu_reader.ImuReaderFlow` in response to each
+    :class:`~ours.flows.imu_reader.ImuReaderFlow` in response to each
     :class:`CamSync`. This is the synchronised unit downstream consumers (state
     estimation, visualiser) work on: a stereo pair plus exactly the inertial
     measurements that fall in this frame's interval ``(prev_frame_ts, ts_ns]``,

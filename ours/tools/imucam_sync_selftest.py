@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Offline integration test for the split camera/IMU acquisition front-end.
 
-Wires the real flows -- :class:`~ours.flows.capture.cam_reader.CamReaderFlow` and
-:class:`~ours.flows.capture.imu_reader.ImuReaderFlow` -- over a real
+Wires the real flows -- :class:`~ours.flows.cam_reader.CamReaderFlow` and
+:class:`~ours.flows.imu_reader.ImuReaderFlow` -- over a real
 :class:`~ours.lib.flow.pubsub.Bus`, fed by a recorded gold session (no device),
 and verifies the synchronisation contract end to end:
 

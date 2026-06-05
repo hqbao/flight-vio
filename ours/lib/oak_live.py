@@ -87,6 +87,18 @@ class SharedLiveDevice:
         except Exception:
             return False
 
+    def read_calibration(self):
+        """Return the depthai ``CalibrationHandler`` of the open device.
+
+        The shared device must already be :meth:`acquire`-d. Used once by the
+        live front-end builder to read intrinsics + IMU->camera extrinsics, the
+        same handle the monolithic capture flow read.
+        """
+        with self._lock:
+            if self._handle is None:
+                raise RuntimeError("device not acquired")
+            return self._handle.getDefaultDevice().readCalibration()
+
 
 def _read_device_id(handle) -> str:
     """Best-effort unique id of the open device (the per-device cache key).

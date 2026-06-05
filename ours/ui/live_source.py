@@ -91,7 +91,7 @@ class FlowPoseSource(PoseSource):
         bus = Bus()
         ui = UiRenderFlow(bus, self._on_pose)
         try:
-            capture, flows, _ = build_live(
+            device, (cam_flow, imu_flow), flows, _ = build_live(
                 bus, width=self.width, height=self.height, fps=self.cam_fps,
                 kf_every=self.kf_every, use_gyro=self.use_gyro,
                 depth_fast=self.depth_fast,
@@ -102,12 +102,15 @@ class FlowPoseSource(PoseSource):
 
         for f in flows:
             f.start()
-        capture.start()
+        imu_flow.start()
+        cam_flow.start()
         try:
-            while not self._stop.is_set() and capture.is_alive():
+            while not self._stop.is_set() and cam_flow.is_alive():
                 time.sleep(0.05)
         finally:
-            capture.stop()
+            cam_flow.stop()
+            imu_flow.stop()
             ui.done.wait(timeout=5.0)
             for f in flows:
                 f.stop()
+            device.release()

@@ -85,22 +85,30 @@ not installable on this host (macOS arm64, py3.13).
 
 ---
 
-## 4. The six flows — `ours.flows`
+## 4. The flows — `ours.flows`
 
 One thread per flow; **one Task per file**; a `*_flow.py` only wires the tasks.
 
 ### Topic-level data flow (which flow publishes/subscribes which topic)
 
 ```
-capture ──frame.raw────► depth ──frame.depth──► odometry ──pose.odom────► ui-collector, ui-render
-        ──imu.sample──────────────────────────►          ──keyframe─────► backend, slam
-                                                 backend ──pose.refined─► ui-collector
-                                                 slam    ──loop.correction─► ui-collector
+cam-reader ──cam.sync──► imu-reader ──imucam.sample──► depth ──frame.depth──► odometry ──pose.odom──► ui-collector, ui-render
+                                    ──imucam.sample──────────────────────────►          ──keyframe──► backend, slam
+                                    ──imu.raw───────► (visualiser)
+                                                                       backend ──pose.refined──► ui-collector
+                                                                       slam    ──loop.correction──► ui-collector
 ```
 
 Edges above are exactly the `self.on(...)` subscriptions in each `*_flow.py`.
-Two things worth noting because the obvious guess is wrong:
+There is ONE acquisition front-end (cam-reader + imu-reader) shared by the VIO
+and the camera/IMU visualiser — no separate capture monolith. Things worth
+noting because the obvious guess is wrong:
 
+- **depth and odometry both consume `imucam.sample`** (the synced frame+IMU
+  packet); depth uses only the stereo pair, odometry also integrates the packet's
+  gyro into the per-frame rotation prior (`PreintegratePrior`).
+- **odometry is a two-input join** (`imucam.sample` + `frame.depth`); it sees an
+  END on each before it drains (`expected_ends = 2`).
 - **backend and slam both trigger off `keyframe`**, not `pose.odom`. odometry
   emits a keyframe every `kf_every` frames; backend refines it, slam loop-closes.
 - **`loop.correction` is consumed only by the UI collector** today — it is *not*
@@ -111,14 +119,17 @@ Two things worth noting because the obvious guess is wrong:
 
 ```mermaid
 flowchart TD
-    subgraph CAP["capture flow (SourceFlow)"]
-        PROD["produce()"] --> PCAP["PublishCapture"]
+    subgraph CAM["cam-reader flow (SourceFlow)"]
+        PRODC["produce()"] --> PCS["PublishCamSync"]
+    end
+    subgraph IMU["imu-reader flow"]
+        PIC["PackImuCam"] --> PIR["PublishImuRaw"] --> AC["ApplyCalibration"] --> PICAM["PublishImuCam"]
     end
     subgraph DEP["depth flow"]
         CD["ComputeDepth"] --> PD["PublishDepth"]
     end
     subgraph ODO["odometry flow"]
-        RI["RouteImu"]
+        PIP["PreintegratePrior"]
         PV["ProcessVO"] --> PP["PublishPose"] --> EK["EmitKeyframe"]
     end
     subgraph BCK["backend flow"]
@@ -136,8 +147,9 @@ flowchart TD
         RP["RenderPose"]
     end
 
-    PCAP -- "frame.raw" --> CD
-    PCAP -- "imu.sample" --> RI
+    PCS -- "cam.sync" --> PIC
+    PICAM -- "imucam.sample" --> CD
+    PICAM -- "imucam.sample" --> PIP
     PD -- "frame.depth" --> PV
     PP -- "pose.odom" --> COd
     PP -- "pose.odom" --> RP
@@ -146,35 +158,41 @@ flowchart TD
     PR -- "pose.refined" --> CRf
     PC2 -- "loop.correction" --> CCo
 
-    RI -. "ctx.state['priors'][seq]\n(same thread, not via Bus)" .-> PV
+    PIP -. "ctx.state['priors'][seq]\n(same thread, not via Bus)" .-> PV
 ```
 
-The dotted edge is the one **intra-flow** hand-off: `RouteImu` stashes the gyro
-prior for sequence `seq` in the flow's own `ctx.state`, and `ProcessVO` pops it
-when the matching depth frame arrives. This is shared state inside a single
-thread/flow — it does **not** cross the Bus and does **not** violate the §2 rule
-(which only forbids *cross-flow* calls).
+The dotted edge is the one **intra-flow** hand-off: `PreintegratePrior` stashes
+the gyro prior for sequence `seq` in the odometry flow's own `ctx.state`, and
+`ProcessVO` pops it when the matching depth frame arrives. This is shared state
+inside a single thread/flow — it does **not** cross the Bus and does **not**
+violate the §2 rule (which only forbids *cross-flow* calls).
 
 | Flow | Tasks (in order) | Subscribes | Publishes |
 |---|---|---|---|
-| **capture** | `produce` → `PublishCapture` | — (source) | `frame.raw`, `imu.sample` |
-| **depth** | `ComputeDepth` → `PublishDepth` | `frame.raw` | `frame.depth` |
-| **odometry** | `RouteImu` ⟂ `ProcessVO` → `PublishPose` → `EmitKeyframe` | `imu.sample`, `frame.depth` | `pose.odom`, `keyframe` |
+| **cam-reader** | `produce` → `PublishCamSync` | — (source) | `cam.sync` |
+| **imu-reader** | `PackImuCam` → `PublishImuRaw` → `ApplyCalibration` → `PublishImuCam` | `cam.sync` | `imu.raw`, `imucam.sample` |
+| **depth** | `ComputeDepth` → `PublishDepth` | `imucam.sample` | `frame.depth` |
+| **odometry** | `PreintegratePrior` ⟂ `ProcessVO` → `PublishPose` → `EmitKeyframe` | `imucam.sample`, `frame.depth` | `pose.odom`, `keyframe` |
 | **backend** | `RunBA` → `PublishRefined` | `keyframe` | `pose.refined` |
 | **slam** | `SlamStep` → `PublishCorrection` | `keyframe` | `loop.correction` |
 | **ui-collector** | `CollectOdom` / `CollectRefined` / `CollectCorrection` | `pose.odom`, `pose.refined`, `loop.correction` | — (sink) |
 | **ui-render** | `RenderPose` | `pose.odom` | — (sink) |
 
-`capture` is the only device-specific flow. `ReplayCaptureFlow` and the live
-`LiveCaptureFlow` publish the **identical** topics, so depth→ui are unchanged on
-hardware. Replay rebuilds the gyro prior (`GyroPreintegrator`) so it stays
-bit-exact vs the offline `vio_run` oracle.
+`cam-reader` + `imu-reader` are the only device-specific flows; their sources are
+injected (`ReplayCamSource`/`ReplayImuSource` offline, `LiveCamSource`/
+`LiveImuSource` off one shared OAK-D on the bench), so depth→ui are unchanged on
+hardware. The replay path subtracts a startup gyro bias (mean of the first ~1 s)
+in `ApplyCalibration` and seeds the odometry gravity-align from the first ~0.3 s
+of accel, mirroring what the live front-end measures once at boot.
 
 ### Per-flow files
-- `capture/`: `replay.py`, `live.py`, `imu_stream.py` (IMU-only reader for calib
-  wizards), `publish_capture.py` (shared publish task).
+- `cam_reader/`: `sources.py` (replay/live `CamSource`), `publish_cam_sync.py`,
+  `cam_reader_flow.py`.
+- `imu_reader/`: `sources.py` (replay/live `ImuSource`), `pack_imucam.py`,
+  `apply_calibration.py`, `publish_imu_raw.py`, `publish_imucam.py`,
+  `imu_stream.py` (IMU-only reader for the calib wizards), `imu_reader_flow.py`.
 - `depth/`: `compute_depth.py`, `publish_depth.py`, `depth_flow.py`.
-- `odometry/`: `route_imu.py`, `process_vo.py`, `publish_pose.py`,
+- `odometry/`: `preintegrate_prior.py`, `process_vo.py`, `publish_pose.py`,
   `emit_keyframe.py`, `step.py` (carrier), `odometry_flow.py`.
 - `backend/`: `run_ba.py`, `publish_refined.py`, `backend_flow.py`.
 - `slam/`: `slam_step.py`, `publish_correction.py`, `slam_flow.py`.
@@ -238,12 +256,14 @@ The stable public API is the flat re-export from `ours/lib/__init__.py`
 5. Offline self-test sweep + replay parity must stay green before committing:
    ```
    for t in orb klt stereo vio_ba ba posegraph imu_preint motion_predict \
-            inertial_filter accel_calib calib_store calib_collect; do
+            inertial_filter accel_calib calib_store calib_collect \
+            imucam_sync flow_replay; do
      python -m ours.tools.${t}_selftest; done
    QT_QPA_PLATFORM=offscreen python -m ours.tools.ui_calib_selftest
    python -m ours.app --session sessions/gold/lab_loop_30s --max-frames 60 --depth-fast
    ```
-   Expected replay: 60 `pose.odom` + 10 `pose.refined`.
+   Expected replay: 60 `pose.odom` + 10 `pose.refined`. (`flow_replay_selftest`
+   now gates this app-graph contract automatically.)
 
 ---
 
