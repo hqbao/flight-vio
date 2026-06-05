@@ -147,8 +147,10 @@ def main() -> int:
     history = PoseHistory(capacity=8192)
     source = _build_source(args.source, args)
 
-    # Core-profile GL context (macOS needs it for pyqtgraph's shaded-mesh items
-    # in the accel 3D view) -- must be set before the QApplication.
+    # Shared Core-profile GL context: pyqtgraph caches shader programs per
+    # process but GL program ids are per-context, so the app's two GL views
+    # (pose Viewer3D + accel 3D) must share contexts or the second one throws
+    # GLError(1281). Must be set before the QApplication. See theme docstring.
     from ours.ui import theme
     theme.ensure_gl_format()
     app = QApplication(sys.argv)

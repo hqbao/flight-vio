@@ -8,22 +8,41 @@ from __future__ import annotations
 
 
 def ensure_gl_format() -> None:
-    """Request a Core-profile OpenGL 4.1 context for pyqtgraph's GL widgets.
+    """Prepare a shared Core-profile OpenGL context for pyqtgraph's GL widgets.
 
-    Must be called BEFORE the ``QApplication`` is created. pyqtgraph 0.13+ draws
-    every GL item (incl. ``GLMeshItem(shader="shaded")``) with modern GLSL that
-    needs a core-profile context. On macOS the default context is a legacy 2.1
-    compatibility profile, so the shaded-mesh shader fails to link and paint
-    raises ``GLError(1281, glGetAttribLocation)``. Core 4.1 is the newest macOS
-    exposes and is universally available, so we request it on every platform.
+    Must be called BEFORE the ``QApplication`` is created.
+
+    Two things are set, both required for the app's *two* GL views (the pose
+    ``Viewer3D`` and the IMU ``Accel3DView``) to coexist on macOS:
+
+    * **AA_ShareOpenGLContexts** -- the real fix for ``GLError(1281,
+      glGetAttribLocation)``. pyqtgraph caches each compiled ``ShaderProgram`` in
+      a process-global singleton, but a GL *program id* is only valid in the
+      context that created it. With two un-shared ``QOpenGLWidget`` contexts the
+      "shaded" mesh program compiled in the first view is reused (by id) in the
+      second, where it is an invalid handle -> ``GL_INVALID_VALUE`` on
+      ``glGetAttribLocation``. Sharing the contexts makes one program namespace
+      for all GL views, so the cached id stays valid everywhere.
+    * **Core-profile 4.1 default format** -- pyqtgraph's own ``es2_compat`` path
+      targets "macOS OpenGL 4.1 Core" (it marks its legacy shaders ``#version
+      100`` when ``GL_ARB_ES2_compatibility`` is present), and ``GLViewWidget``
+      creates the Core-profile VAO it needs. A single explicit default format
+      also gives every shared context a compatible format.
+
     Idempotent: safe to call more than once.
     """
+    from PyQt6.QtCore import Qt
     from PyQt6.QtGui import QSurfaceFormat
+    from PyQt6.QtWidgets import QApplication
 
     fmt = QSurfaceFormat()
     fmt.setProfile(QSurfaceFormat.OpenGLContextProfile.CoreProfile)
     fmt.setVersion(4, 1)
     QSurfaceFormat.setDefaultFormat(fmt)
+
+    # Must be set before the QApplication is constructed; harmless if an app
+    # already exists (Qt simply keeps the attribute for context creation).
+    QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
 
 
 # ---- palette ---------------------------------------------------------------
