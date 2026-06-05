@@ -101,11 +101,41 @@ def test_happy_path(app) -> None:
            f"footer formatted ({win._status.text()!r})")
     _check("|a|" in win._imu_readout.text() and "tilt" in win._imu_readout.text(),
            f"accel readout shows tilt + |a| ({win._imu_readout.text()!r})")
+    _check("RAW" in win._imu_title.text(),
+           f"IMU title flags RAW with no calibration ({win._imu_title.text()!r})")
     _check(len(seqs) >= 1, f"reported rendered frames (saw seq {seqs[:5]})")
     _check(min(widths) == max(widths),
            f"window width stayed stable (no pixmap feedback growth) {set(widths)}")
     win.close()
     _check(not win._running, "window stopped the worker on close")
+
+
+def test_calibrated_imu(app) -> None:
+    print(" calibrated IMU -> title CALIBRATED + bias applied")
+    from ours.lib.imu.accel_calib import AccelCalibration
+    from ours.lib.imu.imu_calib import ImuCalibration
+
+    bias = np.array([0.05, -0.03, 0.02])
+    calib = ImuCalibration(gyro_bias=bias, accel=None)
+    _check(not calib.is_identity, "injected calibration is non-identity")
+
+    # Sanity: apply() subtracts the bias (raw -> calibrated differs by bias).
+    raw = np.array([[0.10, 0.20, 0.30]])
+    g_cal, _ = calib.apply(raw, np.empty((0, 3)))
+    _check(np.allclose(g_cal, raw - bias), "gyro calibration subtracts the bias")
+
+    win = SyncedViewWindow(
+        lambda: ReplayTripletWorker(_SESSION, fps=120, max_frames=_MAX_FRAMES,
+                                    calibration=calib), fps=120)
+    win.show()
+
+    def _calibrated() -> bool:
+        return win._first_seen and "CALIBRATED" in win._imu_title.text()
+
+    _run_until(app, _calibrated, 15.0)
+    _check("CALIBRATED" in win._imu_title.text(),
+           f"IMU title shows CALIBRATED ({win._imu_title.text()!r})")
+    win.close()
 
 
 def test_state_logic() -> None:
@@ -158,6 +188,7 @@ def main() -> int:
     _check(reader_ok, f"gold session present: {_SESSION}")
     test_happy_path(app)
     test_state_logic()
+    test_calibrated_imu(app)
     test_no_imu_frame(app)
     test_device_absent(app)
     print("\nALL PASS")

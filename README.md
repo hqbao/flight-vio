@@ -136,11 +136,13 @@ primary START/STOP):
 
     This is the view for verifying the camera↔IMU time-sync.
   - **Camera + Depth + IMU** triplet opens an in-app Qt window
-    (`ours/ui/synced_window.py`): themed `image | depth | IMU` panels reusing the
-    same gyro chart + interactive 3D accel view, with a fixed-range TURBO depth
-    colormap (+ scale bar, `valid %`) — live off the OAK-D (host SGM) or a
-    recorded session. **Stereo Depth** (`stereo_view --live`) launches the proven
-    cv2 viewer in its own process.
+    (`ours/ui/synced_window.py`): cameras on top (`image | depth`) and the IMU
+    panels below (the same gyro chart + interactive 3D accel view), with a
+    fixed-range TURBO depth colormap (+ scale bar, `valid %`). The IMU shown is
+    **calibrated** (`gyro − bias`, accel affine) when a per-device calibration is
+    cached — the panel title reads `IMU · CALIBRATED` vs `IMU · RAW`. Live off the
+    OAK-D (host SGM) or a recorded session. **Stereo Depth** (`stereo_view --live`)
+    launches the proven cv2 viewer in its own process.
 
 The same synced split front-end can be inspected **without the GUI** — a cv2
 window over a recorded session or the live device:

@@ -64,6 +64,7 @@ class TripletSample:
     seq: int
     t_s: float
     frame_label: str = "IMU frame"
+    imu_calibrated: bool = False   # True once a per-device calibration applied
 
     @property
     def imu_n(self) -> int:
@@ -119,11 +120,13 @@ class ReplayTripletWorker(TripletWorker):
     mode = "REPLAY"
 
     def __init__(self, session_dir, fps: float = 20.0,
-                 max_frames: int | None = None) -> None:
+                 max_frames: int | None = None, calibration=None) -> None:
         super().__init__()
         self._session_dir = session_dir
         self._fps = max(float(fps), 1e-3)
         self._max_frames = max_frames
+        self._calib = calibration
+
     def _produce(self):
         from ..lib import SessionReader, slice_imu
 
@@ -131,6 +134,8 @@ class ReplayTripletWorker(TripletWorker):
         if len(reader) == 0:
             self.error = f"no frames in {self._session_dir}"
             return
+        calib = self._calib
+        calibrated = calib is not None and not calib.is_identity
         imu = reader.load_imu()
         ts_i, gyro, accel = imu["ts_ns"], imu["gyro"], imu["accel"]
         frame_ts = [int(r["ts_ns"]) for r in reader._frames]
@@ -145,11 +150,15 @@ class ReplayTripletWorker(TripletWorker):
             t_prev = frame_ts[0] if i == 0 else frame_ts[i - 1]
             seg = slice_imu(ts_i, gyro, accel, t_prev, frame_ts[i],
                             bracket=False)
+            grows = np.asarray(seg.gyro, dtype=np.float64)
+            arows = np.asarray(seg.accel, dtype=np.float64)
+            if calibrated:
+                grows, arows = calib.apply(grows, arows)
             yield TripletSample(
                 gray_left=fr.gray_left, depth_m=fr.depth_m,
-                gyro_rows=np.asarray(seg.gyro, dtype=np.float64),
-                accel_rows=np.asarray(seg.accel, dtype=np.float64),
-                seq=fr.seq, t_s=fr.ts_s, frame_label="IMU frame")
+                gyro_rows=grows, accel_rows=arows,
+                seq=fr.seq, t_s=fr.ts_s, frame_label="IMU frame",
+                imu_calibrated=calibrated)
             dt = period - (time.perf_counter() - t0)
             if dt > 0:
                 self._stop.wait(dt)
@@ -222,6 +231,14 @@ class LiveTripletWorker(TripletWorker):
             dummy = np.zeros((self._h, self._w), np.uint8)
             matcher.dense_depth(dummy, dummy)          # one-time JIT warmup
 
+            # Load this device's cached IMU calibration (gyro bias + accel
+            # affine) so the synced view shows CALIBRATED IMU -- the same
+            # correction the imucam.sample packet carries. Missing -> raw.
+            from ..lib.imu.imu_calib import ImuCalibration
+            from ..lib.oak_live import _read_device_id
+            imu_calib = ImuCalibration.load(_read_device_id(p))
+            imu_calibrated = not imu_calib.is_identity
+
             def _as_gray(msg):
                 g = msg.getCvFrame()
                 if g.ndim == 3:
@@ -267,13 +284,17 @@ class LiveTripletWorker(TripletWorker):
                     pend_l = {k: v for k, v in pend_l.items() if k > seq}
                     pend_r = {k: v for k, v in pend_r.items() if k > seq}
                     rect_left, depth = matcher.dense_depth_rectified_left(gl, gr)
+                    g_arr = np.asarray(grows, dtype=np.float64)
+                    a_arr = np.asarray(arows, dtype=np.float64)
+                    if imu_calibrated:
+                        g_arr, a_arr = imu_calib.apply(g_arr, a_arr)
                     yield TripletSample(
                         gray_left=np.clip(rect_left, 0, 255).astype(np.uint8),
                         depth_m=depth,
-                        gyro_rows=np.asarray(grows, dtype=np.float64),
-                        accel_rows=np.asarray(arows, dtype=np.float64),
+                        gyro_rows=g_arr,
+                        accel_rows=a_arr,
                         seq=int(seq), t_s=time.monotonic() - t0,
-                        frame_label="IMU frame")
+                        frame_label="IMU frame", imu_calibrated=imu_calibrated)
                 if not got:
                     self._stop.wait(0.002)
 
@@ -369,8 +390,8 @@ class SyncedViewWindow(QWidget):
 
         self.setWindowTitle("Synced view — image · depth · IMU (live)")
         self.setObjectName("SyncedViewWindow")
-        self.resize(1500, 640)
-        self.setMinimumSize(1100, 560)
+        self.resize(1280, 820)
+        self.setMinimumSize(900, 620)
         self.setStyleSheet(theme.QSS)
 
         root = QVBoxLayout(self)
@@ -379,18 +400,25 @@ class SyncedViewWindow(QWidget):
 
         root.addWidget(self._build_header())
 
-        body = QSplitter(QtCore.Qt.Orientation.Horizontal)
+        # Layout mirrors ImuCamWindow: cameras on top (image | depth), the IMU
+        # panels below spanning the full width (gyro chart | 3D accel vector).
+        body = QSplitter(QtCore.Qt.Orientation.Vertical)
         body.setChildrenCollapsible(False)
         body.setHandleWidth(6)
 
+        cams = QSplitter(QtCore.Qt.Orientation.Horizontal)
+        cams.setChildrenCollapsible(False)
+        cams.setHandleWidth(6)
         img_panel, img_lay, _ = _panel("IMAGE · RECT-LEFT")
         self._image = _raster_label()
         img_lay.addWidget(self._image, stretch=1)
-        body.addWidget(img_panel)
+        cams.addWidget(img_panel)
+        cams.addWidget(self._build_depth_panel())
+        cams.setSizes([1, 1])
 
-        body.addWidget(self._build_depth_panel())
+        body.addWidget(cams)
         body.addWidget(self._build_imu_panel())
-        body.setSizes([5, 5, 6])
+        body.setSizes([440, 360])
         root.addWidget(body, stretch=1)
 
         self._status = QLabel("—")
@@ -467,12 +495,26 @@ class SyncedViewWindow(QWidget):
         return panel, lay, title
 
     def _build_imu_panel(self) -> QWidget:
-        panel, lay, _ = _panel("IMU")
-        split = QSplitter(QtCore.Qt.Orientation.Vertical)
-        split.setChildrenCollapsible(False)
-        split.setHandleWidth(6)
+        from PyQt6.QtWidgets import QFrame
+
+        panel = QFrame()
+        panel.setObjectName("Panel")
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(6, 6, 6, 6)
+        lay.setSpacing(4)
+        # Title carries the honest calibration state (CALIBRATED vs RAW), set
+        # per-frame from the sample so the operator always knows which they see.
+        self._imu_title = QLabel("IMU · RAW")
+        self._imu_title.setObjectName("PanelTitle")
+        lay.addWidget(self._imu_title)
+
+        # Gyro chart | 3D accel vector, side by side and spanning the full
+        # width (same arrangement as ImuCamWindow's bottom row).
+        row = QSplitter(QtCore.Qt.Orientation.Horizontal)
+        row.setChildrenCollapsible(False)
+        row.setHandleWidth(6)
         self._gyro = GyroPlot()
-        split.addWidget(self._gyro)
+        row.addWidget(self._gyro)
 
         accel_box = QWidget()
         av = QVBoxLayout(accel_box)
@@ -483,9 +525,9 @@ class SyncedViewWindow(QWidget):
         self._imu_readout = QLabel("tilt — · |a| —")
         self._imu_readout.setObjectName("ImuCamStatus")
         av.addWidget(self._imu_readout, stretch=0)
-        split.addWidget(accel_box)
-        split.setSizes([6, 5])
-        lay.addWidget(split, stretch=1)
+        row.addWidget(accel_box)
+        row.setSizes([1, 1])
+        lay.addWidget(row, stretch=1)
         return panel
 
     # -- lifecycle -------------------------------------------------------- #
@@ -539,8 +581,21 @@ class SyncedViewWindow(QWidget):
         if sample.imu_n > 0:
             self._gyro.add(sample.gyro_rows)
             self._accel.set_accel(sample.accel_rows)
+        self._update_imu_title(sample)
         self._update_imu_readout(sample)
         self._update_footer(sample)
+
+    def _update_imu_title(self, s: TripletSample) -> None:
+        # Match the global PanelTitle selector so this color override wins over
+        # the app QSS (equal specificity, but the widget's own sheet is local).
+        if s.imu_calibrated:
+            self._imu_title.setText("IMU · CALIBRATED")
+            self._imu_title.setStyleSheet(
+                f"QLabel#PanelTitle {{ color: {theme.GOOD}; }}")
+        else:
+            self._imu_title.setText("IMU · RAW")
+            self._imu_title.setStyleSheet(
+                f"QLabel#PanelTitle {{ color: {theme.ACCENT}; }}")
 
     def _update_imu_readout(self, s: TripletSample) -> None:
         if s.imu_n == 0:
