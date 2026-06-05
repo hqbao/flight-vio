@@ -195,9 +195,19 @@ class SixFaceStatus:
 @dataclass
 class SixFaceConfig:
     static: StaticCollectorConfig = field(default_factory=StaticCollectorConfig)
-    # A still mean only counts as a face if its dominant axis carries at least
-    # this fraction of g (i.e. the device is held close enough to a true face).
-    axis_min_frac: float = 0.92
+    # A still mean counts as a face only if the pose is SQUARE: the dominant
+    # axis must carry at least this fraction of the vector's LENGTH (i.e. the
+    # off-axis tilt is small). This is judged RELATIVE to the measured vector,
+    # not against an absolute g, so an axis whose UNCALIBRATED gain/bias is off
+    # still classifies. Gating on absolute magnitude (>= 0.92 g) would make a
+    # mis-scaled axis impossible to ever capture -- the exact axis the user is
+    # trying to calibrate -- a chicken-and-egg trap. 0.95 ~= within 18 deg of
+    # square (a 45 deg tilt gives only 0.71 and is rejected).
+    axis_dom_frac: float = 0.95
+    # Loose sanity band on |a| (as multiples of g) to reject free-fall / heavy
+    # vibration; deliberately wide so per-axis scale errors still pass.
+    mag_lo_frac: float = 0.6
+    mag_hi_frac: float = 1.4
     # Reject the solved calibration if its sphere residual exceeds this (the
     # faces were held too crooked / unsteady to trust the fit).
     max_residual_g: float = ACCEL_MAX_RESIDUAL_G
@@ -257,10 +267,19 @@ class SixFaceCollector:
         self._cal = None
 
     def _identify_face(self, accel_mean: np.ndarray) -> int | None:
-        """Which face (0..5) the mean accel implies, or None if ambiguous."""
+        """Which face (0..5) the mean accel implies, or None if ambiguous.
+
+        Judges the pose by SQUARENESS (the dominant axis dominates the vector's
+        length), not by hitting an absolute g -- so an axis with a real scale or
+        bias error is still classifiable and therefore calibratable.
+        """
+        norm = float(np.linalg.norm(accel_mean))
+        g = self.cfg.g
+        if norm < self.cfg.mag_lo_frac * g or norm > self.cfg.mag_hi_frac * g:
+            return None
         ax = int(np.argmax(np.abs(accel_mean)))
-        val = accel_mean[ax]
-        if abs(val) < self.cfg.axis_min_frac * self.cfg.g:
+        val = float(accel_mean[ax])
+        if abs(val) < self.cfg.axis_dom_frac * norm:
             return None
         return ax * 2 + (0 if val > 0 else 1)
 

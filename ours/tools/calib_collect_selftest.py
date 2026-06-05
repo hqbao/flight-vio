@@ -139,6 +139,22 @@ def main() -> int:
     print(f"ambiguous tilt rejected: {'OK' if ok_amb else 'FAIL'}")
     ok &= ok_amb
 
+    # --- mis-scaled axis is still captured (the "+Y won't calibrate" bug) --
+    # A real device can have one axis whose UNCALIBRATED reading at a square
+    # face is well below g (e.g. a ~15% low gain on +Y -> ~8.3 m/s^2). The old
+    # gate required >= 0.92 g absolute, so that exact face could never be
+    # captured -- you cannot calibrate the axis that needs it most. A square but
+    # low-magnitude pose must now still register as its face.
+    six_lowy = SixFaceCollector()
+    t = 0.0
+    low_force = np.array([0.0, 0.84 * G_STANDARD, 0.0])   # +Y up, 16% low, square
+    t = _feed_motion(six_lowy, 0.3, t, rng)
+    t, _, cap_lowy = _feed_still(six_lowy, low_force, 1.0, t, rng, gyro_noise=0.004)
+    ok_lowy = cap_lowy == 2 and 2 in six_lowy.captured_faces   # face 2 == "+Y up"
+    print(f"mis-scaled +Y captured: {'OK' if ok_lowy else 'FAIL'} "
+          f"(captured={cap_lowy})")
+    ok &= ok_lowy
+
     # --- quality gate: gyro window steadiness -----------------------------
     # A clean still window's worst-axis std is well under the bound and passes;
     # a noisy window or a too-short one is refused.
