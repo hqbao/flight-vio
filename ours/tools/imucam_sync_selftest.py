@@ -27,11 +27,11 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from ours.flows.capture.cam_reader import CamReaderFlow              # noqa: E402
-from ours.flows.capture.cam_sources import ReplayCamSource          # noqa: E402
-from ours.flows.capture.imu_reader import ImuReaderFlow             # noqa: E402
-from ours.flows.capture.imu_sources import ReplayImuSource          # noqa: E402
-from ours.lib.flow import Bus, Flow, topics                         # noqa: E402
+from ours.flows.cam_reader import CamReaderFlow                   # noqa: E402
+from ours.flows.cam_reader.sources import ReplayCamSource         # noqa: E402
+from ours.flows.imu_reader import ImuReaderFlow                  # noqa: E402
+from ours.flows.imu_reader.sources import ReplayImuSource        # noqa: E402
+from ours.lib.flow import Bus, Flow, topics                       # noqa: E402
 from ours.lib.io.reader import SessionReader                        # noqa: E402
 
 

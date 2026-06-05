@@ -1,20 +1,19 @@
-"""IMU sample sources for the split-acquisition :class:`ImuReaderFlow`.
+"""IMU sample sources for :class:`~ours.flows.imu_reader.ImuReaderFlow`.
 
-The IMU-reader flow owns a :class:`~ours.lib.imu.timed_buffer.TimedImuBuffer` but
+The imu-reader flow owns a :class:`~ours.lib.imu.timed_buffer.TimedImuBuffer` but
 not the *origin* of the samples -- that is injected as an ``ImuSource`` so the
 exact same flow runs offline (deterministic replay of a recorded session) and on
 the bench (the OAK-D IMU). A source is a tiny lifecycle object:
 
 * :meth:`ImuSource.start` -- begin pushing ``(t_ns, gyro, accel)`` to a callback
-  on a background thread (the IMU never blocks the camera/consumer threads).
+  on a background I/O thread (the IMU never blocks the camera/consumer threads).
 * :meth:`ImuSource.stop`  -- stop and join that thread.
 
 ``on_exhausted`` (replay only) lets the flow know the recorded stream ended so it
 can close the buffer; the live source never exhausts until stopped.
 
-Only :class:`LiveImuSource` touches depthai, and it imports it lazily inside
-``start`` -- importing this module on the offline path never pulls the device
-library.
+Only :class:`LiveImuSource` touches depthai, imported lazily inside ``start`` --
+importing this module on the offline path never pulls the device library.
 """
 from __future__ import annotations
 

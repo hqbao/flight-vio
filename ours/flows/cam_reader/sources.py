@@ -1,9 +1,9 @@
-"""Stereo-frame sources for the split-acquisition :class:`CamReaderFlow`.
+"""Stereo-frame sources for :class:`~ours.flows.cam_reader.CamReaderFlow`.
 
-Mirrors :mod:`ours.flows.capture.imu_sources`: the camera-reader flow drives the
-*schedule* (it pulls one stereo pair per scheduler tick) but the *origin* of the
-frames is injected as a ``CamSource`` so the same flow runs offline (replay of a
-recorded session) and on the bench (the OAK-D cameras).
+The cam-reader flow drives the *schedule* (it pulls one stereo pair per scheduler
+tick) but the *origin* of the frames is injected as a ``CamSource`` so the same
+flow runs offline (replay of a recorded session) and on the bench (the OAK-D
+cameras).
 
 A source is pull-based -- :meth:`CamSource.read` returns the next
 ``(seq, ts_ns, gray_left, gray_right)`` or ``None`` when exhausted -- because the
@@ -18,9 +18,6 @@ import time
 import numpy as np
 
 from ...lib.io.reader import SessionReader
-
-# (seq, ts_ns, gray_left, gray_right|None)
-Stereo = "tuple[int, int, np.ndarray, np.ndarray | None]"
 
 
 class CamSource:

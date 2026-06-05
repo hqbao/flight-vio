@@ -13,6 +13,16 @@ library ``ours.lib.flow`` (``Flow`` / ``SourceFlow`` / ``Task`` / ``Bus`` /
     slam      ORB loop closure + pose graph        -> loop.correction
     ui        collects poses for display / scoring
 
+A second, parallel front-end splits acquisition into two independent flows (each
+its own subpackage, not wired into the monolithic ``capture`` above):
+
+    cam-reader  pull stereo on a schedule           -> cam.sync
+    imu-reader  buffer IMU, pack per cam.sync        -> imucam.sample
+
+``cam-reader`` publishes a frame + timestamp trigger; ``imu-reader`` drains its
+timestamped IMU buffer up to that timestamp and emits the combined
+``ImuCamPacket``. They share no state -- only the two bus messages.
+
 ================================ HARD RULE ================================
 Flows NEVER call each other directly. The ONLY way one flow influences another
 is by publishing a message on a :class:`~ours.lib.flow.pubsub.Bus` topic that the
