@@ -34,6 +34,7 @@ from ours.lib import (  # noqa: E402
     SessionReader,
     SlamMap,
     WindowedRGBDOdometry,
+    WindowedConfig,
     WindowedVIORGBDOdometry,
 )
 from ours.lib.loop.slam import SlamConfig       # noqa: E402
@@ -131,6 +132,10 @@ def main() -> int:
     ap.add_argument("--depth-fast", action="store_true",
                     help="with --depth ours, use the faster SGMConfig.live() "
                          "preset (half-res, 4-path) instead of the full one")
+    ap.add_argument("--marg", action="store_true",
+                    help="backend 'ba'/'slam': carry a Schur marginalization "
+                         "prior across the sliding window instead of plain-"
+                         "dropping the oldest keyframe")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -143,7 +148,8 @@ def main() -> int:
                        slam_kf_min_trans=args.slam_kf_min_trans,
                        slam_kf_min_rot=args.slam_kf_min_rot,
                        slam_max_kf=args.slam_max_kf, use_gyro=use_gyro,
-                       depth_source=args.depth, depth_fast=args.depth_fast)
+                       depth_source=args.depth, depth_fast=args.depth_fast,
+                       marg=args.marg)
 
     score_session(Path(args.session), args.max_frames, args.verbose,
                   use_imu=use_imu, backend=args.backend,
@@ -152,7 +158,8 @@ def main() -> int:
                   slam_kf_min_trans=args.slam_kf_min_trans,
                   slam_kf_min_rot=args.slam_kf_min_rot,
                   slam_max_kf=args.slam_max_kf, use_gyro=use_gyro,
-                  depth_source=args.depth, depth_fast=args.depth_fast)
+                  depth_source=args.depth, depth_fast=args.depth_fast,
+                  marg=args.marg)
     return 0
 
 
@@ -175,7 +182,8 @@ def run_all(use_imu: bool = True, backend: str = "f2f",
             slam_kf_every: int = 5, slam_radius_m: float = 0.0,
             slam_kf_min_trans: float = 0.0, slam_kf_min_rot: float = 0.0,
             slam_max_kf: int = 0, use_gyro: bool = True,
-            depth_source: str = "chip", depth_fast: bool = False) -> int:
+            depth_source: str = "chip", depth_fast: bool = False,
+            marg: bool = False) -> int:
     gold = Path("sessions/gold")
     rows = []
     for d in sorted(gold.iterdir()):
@@ -192,7 +200,8 @@ def run_all(use_imu: bool = True, backend: str = "f2f",
                                                 slam_max_kf=slam_max_kf,
                                                 use_gyro=use_gyro,
                                                 depth_source=depth_source,
-                                                depth_fast=depth_fast)
+                                                depth_fast=depth_fast,
+                                                marg=marg)
         rows.append((d.name, res, note))
         print(f"  {d.name:18s} done")
 
@@ -234,7 +243,7 @@ def score_session(session_dir: Path, max_frames: int, verbose: bool,
                   slam_radius_m: float = 0.0, slam_kf_min_trans: float = 0.0,
                   slam_kf_min_rot: float = 0.0, slam_max_kf: int = 0,
                   use_gyro: bool = True, depth_source: str = "chip",
-                  depth_fast: bool = False, sgm_cfg=None):
+                  depth_fast: bool = False, sgm_cfg=None, marg: bool = False):
     reader = SessionReader(session_dir)
     n = len(reader) if max_frames <= 0 else min(max_frames, len(reader))
 
@@ -267,7 +276,8 @@ def score_session(session_dir: Path, max_frames: int, verbose: bool,
 
     slam = None
     if backend in ("ba", "slam"):
-        vo = WindowedRGBDOdometry(reader.K, odom_cfg=odom_cfg)
+        vo = WindowedRGBDOdometry(
+            reader.K, cfg=WindowedConfig(use_marg=marg), odom_cfg=odom_cfg)
         if backend == "slam":
             slam = SlamMap(reader.K, SlamConfig(
                 loop_search_radius_m=slam_radius_m,

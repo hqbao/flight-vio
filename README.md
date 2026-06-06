@@ -288,10 +288,22 @@ Offline scoring of the same backends against the Basalt reference:
 ```bash
 .venv/bin/python ours/tools/vio_run.py --all --backend f2f    # frame-to-frame VO
 .venv/bin/python ours/tools/vio_run.py --all --backend ba     # + windowed BA
+.venv/bin/python ours/tools/vio_run.py --all --backend ba --marg   # + marginalization prior
 .venv/bin/python ours/tools/vio_run.py --all --backend slam   # + loop closure
 .venv/bin/python ours/tools/vio_run.py --all --backend slam --slam-kf-every 8
 .venv/bin/python ours/tools/vio_run.py --all --backend vio    # tight-coupled VIO (experimental)
 ```
+
+`--marg` is **opt-in** (off by default): when sliding the BA window it
+Schur-marginalizes the dropped keyframe into a linear-Gaussian pose prior over
+the survivors (FEJ) instead of plain-dropping it, so old information keeps
+constraining the window (`ours/lib/backend/marginalize.py`). On the gold sessions
+it **tightens metric scale** toward 1.0 (e.g. `corridor` 1.040→1.007, `lab_loop`
+1.022→1.008, `lab_static` 2.963→1.358) and trades a little local ATE; it is not a
+clean ATE win on this RGB-D BA, so it stays off by default. The maths is
+certified offline (`ours/tools/ba_marg_selftest.py`: Schur identity to 1e-17,
+marginalize==full-batch on a noise-free window, and a drift reduction on a
+scale-ambiguous forward run).
 
 `--backend vio` is the **experimental tight-coupled** path: it folds the IMU
 preintegration factors (rotation + velocity + position increments) and the

@@ -50,6 +50,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from .bundle import BAConfig, optimize
+from .marginalize import MargPrior, marginalize_keyframe
 from ..frontend.frontend import FrontendConfig, KLTFrontend
 from ..odometry.odometry import OdometryConfig, RGBDVisualOdometry
 
@@ -61,6 +62,10 @@ class WindowedConfig:
     min_depth_m: float = 0.2
     max_depth_m: float = 8.0
     min_ba_views: int = 2       # landmark needs >= this many KF views for BA
+    # Marginalization prior: when True, a dropped keyframe is Schur-marginalized
+    # into a pose prior over the survivors (carries gauge/yaw/scale forward)
+    # instead of being plain-dropped. Off by default keeps the BA byte-identical.
+    use_marg: bool = False
     ba: BAConfig = field(default_factory=lambda: BAConfig(max_iters=8, huber_px=2.0))
 
 
@@ -81,6 +86,9 @@ class WindowedBAMap:
         self.landmarks: dict[int, np.ndarray] = {}
         self.keyframes: list[dict] = []
         self.last_info: dict = {}
+        self._kf_counter = 0                 # monotonic keyframe id
+        self._lm_host: dict[int, int] = {}   # landmark -> first-observing kf id
+        self.prior: MargPrior | None = None  # carried marginalization prior
 
     def _backproject_world(self, T_cw: np.ndarray, u: float, v: float,
                            z: float) -> np.ndarray:
@@ -101,6 +109,8 @@ class WindowedBAMap:
         prior that keeps the keyframe's roll/pitch leveled inside BA.
         """
         h, w = depth_m.shape
+        kf_id = self._kf_counter
+        self._kf_counter += 1
         obs: dict[int, np.ndarray] = {}
         for tid, px in zip(ids, pts):
             tid = int(tid)
@@ -114,16 +124,45 @@ class WindowedBAMap:
                 if not z_ok:
                     continue
                 self.landmarks[tid] = self._backproject_world(T_cw, u, v, z)
+                self._lm_host[tid] = kf_id
             obs[tid] = np.array([u, v, z if z_ok else 0.0])
-        kf = {"T_cw": np.asarray(T_cw, float).copy(), "obs": obs}
+        kf = {"id": kf_id, "T_cw": np.asarray(T_cw, float).copy(), "obs": obs}
         kf["accel"] = (None if accel_cam is None
                        else np.asarray(accel_cam, float).copy())
         self.keyframes.append(kf)
         self._marginalize()
 
     def _marginalize(self) -> None:
-        """Drop oldest keyframes beyond the window; prune orphan landmarks."""
+        """Drop oldest keyframes beyond the window; prune orphan landmarks.
+
+        With ``cfg.use_marg`` each dropped keyframe is first Schur-marginalized
+        into a pose prior over the survivors (so its information is carried
+        forward); otherwise it is plain-dropped (the original behaviour).
+        """
         while len(self.keyframes) > self.cfg.window:
+            if self.cfg.use_marg:
+                drop_id = int(self.keyframes[0]["id"])
+                # Bootstrap: until a prior exists the oldest KF was the hard-fixed
+                # gauge, so it is marginalized as a fixed anchor (pose has no DoF).
+                drop_fixed = self.prior is None
+                new_prior, marg_lms = marginalize_keyframe(
+                    self.K, self.cfg.ba, self.keyframes, self.landmarks,
+                    self._lm_host, drop_id, self.prior, drop_fixed=drop_fixed)
+                if new_prior is not None:
+                    self.prior = new_prior
+                elif self.prior is not None:
+                    # The marginalization consumed the last carried keyframe (no
+                    # survivor holds any of its information). Clear the prior so
+                    # it can never reference a keyframe that has left the window.
+                    self.prior = None
+                # The marginalized landmarks' information now lives in the prior;
+                # delete them + their observations so the next window's BA does
+                # not double-count those constraints.
+                for tid in marg_lms:
+                    self.landmarks.pop(tid, None)
+                    self._lm_host.pop(tid, None)
+                    for kf in self.keyframes:
+                        kf["obs"].pop(tid, None)
             self.keyframes.pop(0)
         live = set()
         for kf in self.keyframes:
@@ -131,6 +170,7 @@ class WindowedBAMap:
         for tid in list(self.landmarks.keys()):
             if tid not in live:
                 del self.landmarks[tid]
+                self._lm_host.pop(tid, None)
 
     def run_ba(self) -> np.ndarray | None:
         """Optimise the window; return the refined latest ``T_cw`` (or None)."""
@@ -149,7 +189,16 @@ class WindowedBAMap:
         landmarks_arr = np.array([self.landmarks[t] for t in ba_tids])
 
         poses = [kf["T_cw"] for kf in kfs]
-        fixed = [i == 0 for i in range(len(kfs))]
+        # Gauge: with a carried prior the prior anchors the window (all KFs
+        # free); during bootstrap (no prior yet) the oldest KF is held fixed.
+        prior_args = None
+        if self.cfg.use_marg and self.prior is not None:
+            id_to_index = {int(kf["id"]): i for i, kf in enumerate(kfs)}
+            prior_args = self.prior.resolve(id_to_index)
+        if prior_args is not None:
+            fixed = [False] * len(kfs)
+        else:
+            fixed = [i == 0 for i in range(len(kfs))]
         obs_cam, obs_lm, obs_uv, obs_depth = [], [], [], []
         for ci, kf in enumerate(kfs):
             for tid, uvz in kf["obs"].items():
@@ -171,11 +220,17 @@ class WindowedBAMap:
                 if a is not None:
                     grav_meas[i] = a
 
+        prior_cams = prior_H = prior_b0 = prior_lin = None
+        if prior_args is not None:
+            prior_cams, prior_H, prior_b0, prior_lin = prior_args
+
         res = optimize(
             self.K, poses, fixed, landmarks_arr,
             np.array(obs_cam), np.array(obs_lm), np.array(obs_uv),
             obs_depth=np.array(obs_depth),
             grav_meas=grav_meas, grav_world=np.array([0.0, 1.0, 0.0]),
+            prior_cams=prior_cams, prior_H=prior_H, prior_b0=prior_b0,
+            prior_lin=prior_lin,
             cfg=self.cfg.ba,
         )
         for kf, P in zip(kfs, res.poses):
@@ -186,6 +241,7 @@ class WindowedBAMap:
         self.last_info = {
             "ba_kfs": len(kfs), "ba_lms": len(ba_tids),
             "ba_obs": len(obs_cam), "ba_reproj_px": res.mean_reproj_px,
+            "ba_prior": 0 if prior_args is None else len(prior_args[0]),
         }
         return kfs[-1]["T_cw"].copy()
 

@@ -68,6 +68,44 @@ def se3_exp(xi: np.ndarray) -> np.ndarray:
     return T
 
 
+def so3_log(R: np.ndarray) -> np.ndarray:
+    """Logarithm map SO3 -> so3 (inverse of :func:`so3_exp`)."""
+    cos_t = (np.trace(R) - 1.0) * 0.5
+    cos_t = float(np.clip(cos_t, -1.0, 1.0))
+    theta = float(np.arccos(cos_t))
+    w = np.array([R[2, 1] - R[1, 2],
+                  R[0, 2] - R[2, 0],
+                  R[1, 0] - R[0, 1]])
+    if theta < 1e-8:
+        # near identity: R - R^T ~= 2*skew(phi)
+        return 0.5 * w
+    return (theta / (2.0 * np.sin(theta))) * w
+
+
+def se3_log(T: np.ndarray) -> np.ndarray:
+    """Logarithm map SE3 -> se3 (inverse of :func:`se3_exp`).
+
+    Returns ``xi = [rho(3); phi(3)]`` such that ``se3_exp(xi) == T`` (to the
+    SE3 left-perturbation convention used throughout this module).
+    """
+    R = T[:3, :3]
+    t = T[:3, 3]
+    phi = so3_log(R)
+    theta = float(np.linalg.norm(phi))
+    if theta < 1e-8:
+        V = np.eye(3) + 0.5 * skew(phi)
+    else:
+        K = skew(phi / theta)
+        V = (np.eye(3)
+             + (1.0 - np.cos(theta)) / theta * K
+             + (theta - np.sin(theta)) / theta * (K @ K))
+    rho = np.linalg.solve(V, t)
+    xi = np.empty(6)
+    xi[:3] = rho
+    xi[3:] = phi
+    return xi
+
+
 # --------------------------------------------------------------------------- #
 # Configuration / result
 # --------------------------------------------------------------------------- #
@@ -140,6 +178,10 @@ def optimize(
     grav_meas: np.ndarray | None = None,
     grav_world: np.ndarray | None = None,
     grav_gref: float | None = None,
+    prior_cams: list[int] | None = None,
+    prior_H: np.ndarray | None = None,
+    prior_b0: np.ndarray | None = None,
+    prior_lin: np.ndarray | None = None,
     cfg: BAConfig | None = None,
 ) -> BAResult:
     """Refine ``poses`` (world->cam) and ``landmarks`` by reprojection BA.
@@ -164,6 +206,19 @@ def optimize(
                optical-world down ``[0, 1, 0]``.
     grav_gref: reference gravity magnitude for the |accel| band gate; defaults
                to the median of the valid ``grav_meas`` norms.
+    prior_cams: list of ``len(prior_cams)=k`` keyframe indices (into ``poses``)
+               that the marginalization prior constrains, in the prior's block
+               order. ``None`` disables the prior. All referenced cameras must be
+               free (not in ``fixed``).
+    prior_H  : (6k,6k) symmetric PSD prior information matrix (the Schur-condensed
+               Hessian of the marginalized states), in the same ``[rho;phi]``
+               left-perturbation ordering as the solver.
+    prior_b0 : (6k,) prior gradient at the linearization point (same sign as the
+               solver's ``b = J^T r``).
+    prior_lin: (k,4,4) linearization-point ``T_cw`` per prior block. First-Estimate
+               Jacobians: the prior Jacobian is held at identity, so the prior
+               contributes ``H_p`` to the camera Hessian and ``b0 + H_p @ delta``
+               to the gradient, where ``delta_a = se3_log(T_cur @ T_lin^-1)``.
     """
     cfg = cfg or BAConfig()
     fx, fy = float(K[0, 0]), float(K[1, 1])
@@ -233,6 +288,30 @@ def optimize(
         g_sig = 1.0
         g_thr = 0.0
 
+    # --- marginalization prior precompute ----------------------------------
+    # A linear-Gaussian prior over k keyframe poses, condensed from previously
+    # marginalized keyframes/landmarks (see ours.lib.backend.marginalize). It is
+    # camera-only (couples poses, no landmarks) and uses First-Estimate
+    # Jacobians: the prior Jacobian is frozen at the linearization point, so it
+    # contributes ``H_p`` to the camera Hessian and ``b0 + H_p @ delta`` to the
+    # gradient, with ``delta_a = se3_log(T_cur @ T_lin^-1)`` per block. No robust
+    # kernel (the whitening is already baked into H_p/b0).
+    use_prior = (prior_cams is not None and prior_H is not None
+                 and len(prior_cams) > 0)
+    if use_prior:
+        pri_cams = np.asarray(prior_cams, np.int64)
+        pri_H = np.asarray(prior_H, np.float64)
+        pri_b0 = np.asarray(prior_b0, np.float64)
+        pri_lin_inv = np.stack([np.linalg.inv(np.asarray(prior_lin[a], np.float64))
+                                for a in range(len(prior_cams))])
+        k_pri = len(prior_cams)
+
+        def _prior_delta(poses_):
+            d = np.empty(6 * k_pri)
+            for a in range(k_pri):
+                d[6 * a:6 * a + 6] = se3_log(poses_[pri_cams[a]] @ pri_lin_inv[a])
+            return d
+
     def _stack(poses_):
         Rs = np.stack([p[:3, :3] for p in poses_])    # (nC,3,3)
         ts = np.stack([p[:3, 3] for p in poses_])     # (nC,3)
@@ -273,6 +352,9 @@ def optimize(
                 else:
                     gc += g_thr * (e_rho - 0.5 * g_thr)
             cost += gc
+        if use_prior:
+            d = _prior_delta(poses_)
+            cost += float(0.5 * d @ (pri_H @ d) + pri_b0 @ d)
         return cost, mean_e
 
     # Pre-group free-camera observations by landmark (for the Schur S block).
@@ -404,6 +486,27 @@ def optimize(
             s = slice(6 * fcc, 6 * fcc + 6)
             Hcc[s, s] = Hcc_blk[fcc]
             bc[s] = bc_blk[fcc]
+        # --- marginalization prior (camera-only, FEJ identity Jacobian) -----
+        # Inject H_p into the (possibly off-diagonal) camera blocks and the
+        # gradient b0 + H_p @ delta into bc, mapping each prior block to its free
+        # camera column. Done before LM damping so the prior is damped with the
+        # rest of the camera system.
+        if use_prior and nf > 0:
+            d = _prior_delta(poses)
+            g_pri = pri_H @ d + pri_b0                     # (6k,) gradient
+            fcols = free_col[pri_cams]                     # (k,) free col per block
+            for a in range(k_pri):
+                fa = fcols[a]
+                if fa < 0:
+                    continue
+                ra = slice(6 * fa, 6 * fa + 6)
+                bc[ra] += g_pri[6 * a:6 * a + 6]
+                for b_ in range(k_pri):
+                    fb = fcols[b_]
+                    if fb < 0:
+                        continue
+                    cb = slice(6 * fb, 6 * fb + 6)
+                    Hcc[ra, cb] += pri_H[6 * a:6 * a + 6, 6 * b_:6 * b_ + 6]
         if nf > 0:
             dd = np.diag(Hcc)
             Hcc[np.diag_indices_from(Hcc)] += lam * np.clip(dd, 1e-9, None)

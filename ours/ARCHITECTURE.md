@@ -265,7 +265,7 @@ the many folders are domain decomposition, not leftovers).
 | `stereo/` | stereo | rectification + SGM dense depth |
 | `imu/` | imu, inertial_filter, accel_calib, calib_collect, calib_store, bias_store | gyro preintegration, inertial filter, IMU calibration |
 | `odometry/` | odometry, pnp | RGB-D visual odometry |
-| `backend/` | bundle, windowed, vio_window | windowed bundle adjustment / VIO |
+| `backend/` | bundle, windowed, marginalize, vio_window | windowed bundle adjustment (+ optional Schur marginalization prior) / VIO |
 | `loop/` | orb, loopclosure, posegraph, slam | ORB loop closure + pose-graph SLAM |
 | `io/` | reader, synced | session readers, frame/IMU sync |
 | `config/` | resolution | resolution profiles |
