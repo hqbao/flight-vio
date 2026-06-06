@@ -21,17 +21,42 @@ Measured on our gold suite (offline, `--depth ours`, post VO‑prior fix):
 * windowed BA collapsed to 0.30–0.39 **before** the VO‑prior fix; after it,
   the offline live‑replay tracks **0.95–0.97** with no frame drops.
 
-So on recorded data our path is already good. The residual on‑device undershoot
-is **fast‑motion tracking** (KLT loses tracks across large inter‑frame motion;
-reproduced offline only by dropping frames, scale 0.96→0.69), plus the live
-correction ease. **None of our loosely‑coupled tricks remove the root cause**:
-when vision momentarily can't measure translation (blur, few/large‑motion
-tracks, a dropped frame), we have *no metric anchor* and the marker stalls.
+So on recorded data our path is already good.
+
+### Why `ours` moves full but `ours-ba/slam` stalls (verified from source, 2026‑06‑06)
+Both live sources run the **same KLT frontend** on the same device: `ours`
+(`FlowPoseSource` → `OdometryFlow` → `RGBDVisualOdometry`) uses the default
+`FrontendConfig()` = win21/lvl3/400; `ours-ba` (`OakOursVioSource`) uses
+`res.frontend(numba=HAVE_NUMBA)` which on a Numba‑capable device is **the exact
+same** win21/lvl3/400. So KLT is **not** what separates them. The difference is
+entirely in the **display/translation path**:
+
+* `ours` paints the **raw `pose.odom`** (frame‑to‑frame VO translation) — instant,
+  unfiltered, uncapped.
+* `ours-ba` paints `filt_p` from `InertialTranslationFilter` (an EMA on velocity,
+  `vision_trust=0.8`) **and then** crawls toward an **async, rate‑limited BA
+  correction** `C_applied`, capped at `_CORR_MAX_STEP_T=0.015 m/frame = 0.3 m/s`.
+
+On a super‑fast push the EMA softens the onset and the **0.3 m/s correction cap**
+is the smoking gun: when the displayed position lags the true motion, BA wants a
+forward correction but the marker can only *crawl* there at 0.3 m/s — exactly
+"đi 50%, **ì lại**, rồi **đi từ từ** 30%". The crawl speed is the rate cap, not a
+tracking failure. (Earlier note blamed KLT; that was wrong — KLT is identical on
+both branches. Corrected here.)
+
+This is a *display* artefact of loose coupling, and it is **offline‑verifiable**:
+`ours/tools/live_replay.py` already models the filter + rate‑limit + async BA
+latency. A recorded super‑fast‑push session will let us A/B (raw‑tip vs filtered
+vs rate‑limited‑corrected) and confirm the mechanism before any change.
 
 Basalt does not have this failure because the **IMU is inside the estimator**:
 during the fast push the preintegrated accelerometer *predicts* the translation
-(`predictState`) and vision only *refines* it. That is the fundamental fix, and
-it is the reason this rebuild is the real answer, not another tuning pass.
+(`predictState`) and vision only *refines* it — one consistent state, no separate
+"filter then crawl a correction" stage. That is the fundamental fix, and it is the
+reason this rebuild is the real answer, not another loose‑coupling tuning pass.
+
+> See `docs/TIGHT_COUPLED_TASKS.md` for the smallest‑possible, each‑step‑visualised
+> task breakdown of the tight‑coupled rebuild.
 
 ---
 
