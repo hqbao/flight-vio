@@ -50,7 +50,7 @@ def build_graph(bus: Bus, K, *, ui, R_imu_cam=None, accel_align=None,
                 with_backend_slam: bool = True, realtime_latest: bool = False,
                 slam_cfg: SlamConfig | None = None,
                 backend: bool | None = None, slam: bool | None = None,
-                worker: bool = False):
+                worker: bool = False, level_tilt: bool = False):
     """Build the shared odometry/backend/slam flows around a ``ui`` sink.
 
     The acquisition front-end (``cam`` + ``imu_cam``, the latter owning the depth
@@ -83,13 +83,18 @@ def build_graph(bus: Bus, K, *, ui, R_imu_cam=None, accel_align=None,
     It is set ONLY by the live source; the offline replay/scoring path must keep
     the default (in-process, synchronous) engine so its output stays deterministic
     and byte-identical (the ``flow_replay`` self-test count depends on it).
+
+    ``level_tilt`` (default ``False``) enables continuous at-rest roll/pitch
+    leveling in the odometry flow (``CorrectTilt``). LIVE-only -- the live builder
+    sets it so the view self-levels without a startup hold-still; the offline path
+    leaves it off so ``pose.odom`` stays byte-identical.
     """
     do_backend = with_backend_slam if backend is None else bool(backend)
     do_slam = with_backend_slam if slam is None else bool(slam)
     odom = OdometryFlow(bus, K, R_imu_cam=R_imu_cam, accel_align=accel_align,
                         odom_cfg=OdometryConfig(gyro_fuse=use_gyro),
                         kf_every=kf_every, use_gyro=use_gyro,
-                        latest_only=realtime_latest)
+                        latest_only=realtime_latest, level_tilt=level_tilt)
     flows = [odom]
     if do_backend:
         flows.append(BackendFlow(bus, K, latest_only=realtime_latest, worker=worker))
@@ -265,7 +270,8 @@ def build_live(bus: Bus, *, width: int = 640, height: int = 400, fps: int = 20,
                         accel_align=cal.accel_align, kf_every=kf_every,
                         use_gyro=use_gyro, with_backend_slam=with_backend_slam,
                         realtime_latest=realtime_latest, slam_cfg=slam_cfg,
-                        backend=backend, slam=slam, worker=worker)
+                        backend=backend, slam=slam, worker=worker,
+                        level_tilt=True)        # live self-levels (no startup hold-still)
     return device, (cam_flow, imu_flow), flows, ui
 
 

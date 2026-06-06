@@ -7,8 +7,10 @@ old monolithic capture flow read in ``LiveCaptureFlow.open()``:
 * camera intrinsics ``K`` and the stereo :class:`~ours.lib.io.reader.StereoCalib`
   (so the SGM matcher can rectify the raw cameras),
 * the IMU->camera rotation ``R_imu_cam`` (gyro prior conjugation),
-* a per-device gyro bias (cached, calibrated once) and the startup gravity-align
-  accelerometer (measured each boot while the device is held still).
+* a per-device gyro bias (cached, calibrated once -- only that first calibration
+  needs the device held still) and a startup gravity-align accelerometer seed
+  (measured each boot; once the bias is cached this is a quick non-gated read, since
+  the odometry flow's continuous ``CorrectTilt`` re-levels roll/pitch at rest).
 
 This module is the single place that turns an acquired shared device into those
 references, so the live graph and any future tool apply identical maths. It is
@@ -88,16 +90,22 @@ def _read_stereo_calib(ch, width: int, height: int):
 
 
 def _collect_startup(device: SharedLiveDevice, R_imu_cam, accel_cal,
-                     *, estimate_bias: bool, window_s: float = 0.4,
-                     timeout_s: float = 6.0):
-    """Mean startup accel (gravity-align, cam frame) over a STILL window.
+                     *, estimate_bias: bool, gate: bool = True,
+                     window_s: float = 0.4, timeout_s: float = 6.0):
+    """Mean startup accel (gravity-align, cam frame). Returns ``(accel_align, gyro_bias)``.
 
-    Returns ``(accel_align, gyro_bias)``. A sample is accepted only while the
-    device is at rest (``|gyro| < _STILL_GYRO`` and accel within ``_STILL_ACCEL``
-    of the window mean); any motion clears the buffer and restarts the window so a
-    shake right after boot cannot poison the level (or the bias). When
-    ``estimate_bias`` is True the gyro bias is also taken from the same still
-    window; otherwise ``gyro_bias`` is ``None`` (the cached one is used instead).
+    Two modes:
+
+    * ``gate=True`` (used when the per-device gyro **bias** must be measured -- the
+      first-ever run or ``--recalibrate-bias``): a sample is accepted only while the
+      device is at rest (``|gyro| < _STILL_GYRO`` and accel within ``_STILL_ACCEL``
+      of the window mean); any motion clears the buffer and restarts the window, so
+      the bias mean is a true still-window. This is the only path that asks the
+      operator to hold still, and it runs at most once per device.
+    * ``gate=False`` (bias already cached -- the normal Start): collect over
+      ``window_s`` with NO motion gate, a quick *rough* gravity seed. It need not be
+      accurate because the odometry flow's continuous ``CorrectTilt`` re-levels
+      roll/pitch on any at-rest frame -- so the operator does not hold still at Start.
     """
     q = device.q_imu
     accel: list[np.ndarray] = []
@@ -118,15 +126,16 @@ def _collect_startup(device: SharedLiveDevice, R_imu_cam, accel_cal,
         for w, v, _ in decode_imu_packets(msg):
             if not (np.all(np.isfinite(v)) and np.all(np.isfinite(w))):
                 continue
-            moving = float(np.linalg.norm(w)) > _STILL_GYRO
-            if accel and float(np.linalg.norm(
-                    v - np.mean(accel, axis=0))) > _STILL_ACCEL:
-                moving = True
-            if moving:
-                accel.clear()
-                gyro.clear()
-                win_start = None
-                continue
+            if gate:
+                moving = float(np.linalg.norm(w)) > _STILL_GYRO
+                if accel and float(np.linalg.norm(
+                        v - np.mean(accel, axis=0))) > _STILL_ACCEL:
+                    moving = True
+                if moving:
+                    accel.clear()
+                    gyro.clear()
+                    win_start = None
+                    continue
             accel.append(v)
             gyro.append(w)
             now = time.monotonic()
@@ -163,8 +172,14 @@ def read_live_calibration(device: SharedLiveDevice, *, width: int, height: int,
         dev_id = device.device_id
         cached = None if recalibrate_bias else load_gyro_bias(dev_id)
         accel_cal: AccelCalibration | None = load_accel_calib(dev_id)
+        # Hold-still ONLY when the gyro bias must be measured (first run /
+        # --recalibrate-bias). Once cached, take a quick non-gated gravity seed --
+        # the continuous CorrectTilt in the odometry flow re-levels at rest, so the
+        # operator never has to hold the camera still at Start.
+        need_bias = cached is None
         accel_align, measured = _collect_startup(
-            device, R_imu_cam, accel_cal, estimate_bias=cached is None)
+            device, R_imu_cam, accel_cal, estimate_bias=need_bias,
+            gate=need_bias, window_s=0.4 if need_bias else 0.2)
         gyro_bias = cached if cached is not None else measured
         if measured is not None and cached is None:
             try:

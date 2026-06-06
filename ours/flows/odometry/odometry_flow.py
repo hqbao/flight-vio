@@ -54,6 +54,7 @@ from .publish_tracks import PublishTracks
 from .align_gravity import AlignGravity
 from .pull_prior import PullPrior
 from .estimate_motion import EstimateMotion
+from .correct_tilt import CorrectTilt
 from .publish_inliers import PublishInliers
 from .publish_pose import PublishPose
 from .emit_keyframe import EmitKeyframe
@@ -65,11 +66,15 @@ class OdometryFlow(Flow):
                  accel_align: np.ndarray | None = None,
                  odom_cfg: OdometryConfig | None = None,
                  kf_every: int = 5, use_gyro: bool = True,
-                 latest_only: bool = False) -> None:
+                 latest_only: bool = False, level_tilt: bool = False) -> None:
         super().__init__("odometry", bus, latest_only=latest_only)
         self.ctx.state["vo"] = RGBDVisualOdometry(K, odom_cfg or OdometryConfig())
         self.ctx.state["kf_every"] = int(kf_every)
         self.ctx.state["use_gyro"] = bool(use_gyro)
+        # Continuous at-rest roll/pitch leveling (CorrectTilt). LIVE-only so the
+        # offline replay/scoring pose.odom stays byte-identical; the live builder
+        # turns it on. Lets the live view self-level without a startup hold-still.
+        self.ctx.state["level_tilt"] = bool(level_tilt)
         self.ctx.state["priors"] = {}
         self.ctx.state["R_imu_cam"] = (
             None if R_imu_cam is None else np.asarray(R_imu_cam, dtype=np.float64))
@@ -79,7 +84,7 @@ class OdometryFlow(Flow):
         self.on(topics.IMUCAM_SAMPLE, [PreintegratePrior()])
         self.on(topics.FRAME_DEPTH,
                 [TrackFeatures(), PublishTracks(), AlignGravity(), PullPrior(),
-                 EstimateMotion(), PublishInliers(), PublishPose(),
+                 EstimateMotion(), CorrectTilt(), PublishInliers(), PublishPose(),
                  EmitKeyframe()])
         self.forwards_to(topics.POSE_ODOM, topics.KEYFRAME, topics.FRAME_TRACKS,
                          topics.FRAME_INLIERS)
