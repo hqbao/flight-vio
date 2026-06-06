@@ -160,6 +160,27 @@ class BAConfig:
     gravity_sigma_rad: float = 0.05   # ~2.9 deg; smaller => trust accel more
     gravity_huber: float = 0.2        # robust threshold on tilt residual (rad)
     gravity_band: float = 0.15        # accept |a| within +/- this frac of g_ref
+    # --- front-end relative-translation prior (the scale anchor) ------------
+    # WHY: pure reprojection BA is scale-free along a low-parallax axis (a
+    # straight forward push), so the metric-depth residual is the ONLY thing
+    # holding metric scale there -- and it is too weak (1 row/obs, huberized) to
+    # stop the window's inter-keyframe baseline from shrinking. Measured (gold,
+    # --depth ours): frame-to-frame PnP keeps Sim3 scale 0.90-0.98 on a forward
+    # push while windowed BA collapses to 0.30-0.39 on the SAME depth + SAME
+    # frontend; no depth-weight retune fixes it (host-anchor/huber sweeps all
+    # plateaued ~0.5). The frame-to-frame PnP translation IS metric (depth-
+    # anchored 3D-2D), so we feed it back as a soft prior on the relative
+    # translation between consecutive keyframes -- exactly the role IMU
+    # preintegration plays in a tight-coupled VIO, but from our own VO. BA is
+    # then still free to refine rotation, landmarks and loop drift, but can no
+    # longer shrink the baseline below the front-end's correctly-scaled value.
+    # ``sigma`` is the 1-sigma (m) on that relative translation; smaller => trust
+    # the front-end more. ``huber`` robustifies against an occasional bad VO step
+    # (tracking loss) so one wrong reference cannot warp the window. 0 = off
+    # (byte-identical to plain BA); the caller passes the per-pair references.
+    use_vo_trans_prior: bool = False
+    vo_trans_sigma_m: float = 0.01    # 1-sigma on inter-KF relative translation
+    vo_trans_huber_m: float = 0.10    # robust threshold on the residual (m)
 
 
 @dataclass
@@ -198,6 +219,9 @@ def optimize(
     prior_H: np.ndarray | None = None,
     prior_b0: np.ndarray | None = None,
     prior_lin: np.ndarray | None = None,
+    vo_rel_a: np.ndarray | None = None,
+    vo_rel_b: np.ndarray | None = None,
+    vo_rel_t: np.ndarray | None = None,
     cfg: BAConfig | None = None,
 ) -> BAResult:
     """Refine ``poses`` (world->cam) and ``landmarks`` by reprojection BA.
@@ -235,6 +259,13 @@ def optimize(
                Jacobians: the prior Jacobian is held at identity, so the prior
                contributes ``H_p`` to the camera Hessian and ``b0 + H_p @ delta``
                to the gradient, where ``delta_a = se3_log(T_cur @ T_lin^-1)``.
+    vo_rel_a : (P,) int or None. Older-keyframe pose index of each front-end
+               relative-translation prior pair.
+    vo_rel_b : (P,) int or None. Newer-keyframe pose index of each pair.
+    vo_rel_t : (P,3) float or None. The front-end (f2f PnP) relative translation
+               ``t_rel`` for each pair; the prior (with ``cfg.use_vo_trans_prior``)
+               softly pulls the optimised relative translation toward it,
+               anchoring metric scale. See ``BAConfig.use_vo_trans_prior``.
     """
     cfg = cfg or BAConfig()
     fx, fy = float(K[0, 0]), float(K[1, 1])
@@ -328,6 +359,31 @@ def optimize(
                 d[6 * a:6 * a + 6] = se3_log(poses_[pri_cams[a]] @ pri_lin_inv[a])
             return d
 
+    # --- front-end relative-translation prior precompute -------------------
+    # Soft constraint pulling each consecutive-keyframe relative translation
+    # ``t_rel = t_b - R_b R_a^T t_a`` toward the front-end (f2f PnP) value
+    # ``vo_rel_t``. Camera-only (couples the two cameras of each pair, no
+    # landmarks). Jacobian (left SE3 perturbation, [rho|phi] columns):
+    #   d t_rel / d xi_b = [ I            , -skew(t_rel) ]
+    #   d t_rel / d xi_a = [ -R_b R_a^T   ,  0           ]
+    # At least one of the pair must be a free camera for the prior to bite; a
+    # fixed camera contributes no columns (it acts as the anchor).
+    use_vt = bool(cfg.use_vo_trans_prior and vo_rel_a is not None
+                  and vo_rel_b is not None and vo_rel_t is not None
+                  and len(vo_rel_a) > 0)
+    if use_vt:
+        vt_a = np.asarray(vo_rel_a, np.int64)
+        vt_b = np.asarray(vo_rel_b, np.int64)
+        vt_t = np.asarray(vo_rel_t, np.float64)
+        vt_sig = max(cfg.vo_trans_sigma_m, 1e-6)
+        vt_thr = cfg.vo_trans_huber_m / vt_sig
+    else:
+        vt_a = np.array([], dtype=np.int64)
+        vt_b = np.array([], dtype=np.int64)
+        vt_t = np.zeros((0, 3))
+        vt_sig = 1.0
+        vt_thr = 0.0
+
     def _stack(poses_):
         Rs = np.stack([p[:3, :3] for p in poses_])    # (nC,3,3)
         ts = np.stack([p[:3, 3] for p in poses_])     # (nC,3)
@@ -371,6 +427,17 @@ def optimize(
         if use_prior:
             d = _prior_delta(poses_)
             cost += float(0.5 * d @ (pri_H @ d) + pri_b0 @ d)
+        if use_vt and vt_a.size:
+            Rs_, ts_ = _stack(poses_)
+            for p in range(vt_a.size):
+                a, b = vt_a[p], vt_b[p]
+                t_rel = ts_[b] - Rs_[b] @ Rs_[a].T @ ts_[a]
+                r = t_rel - vt_t[p]
+                e_t = float(np.linalg.norm(r)) / vt_sig
+                if e_t <= vt_thr:
+                    cost += 0.5 * e_t * e_t
+                else:
+                    cost += vt_thr * (e_t - 0.5 * vt_thr)
         return cost, mean_e
 
     # Pre-group free-camera observations by landmark (for the Schur S block).
@@ -523,6 +590,43 @@ def optimize(
                         continue
                     cb = slice(6 * fb, 6 * fb + 6)
                     Hcc[ra, cb] += pri_H[6 * a:6 * a + 6, 6 * b_:6 * b_ + 6]
+        # --- front-end relative-translation prior (camera-only, 2-cam block) -
+        # For each pair add the Gauss-Newton contribution of the 3-vector
+        # residual r = t_rel - vo_rel_t, with the analytic Jacobians above,
+        # whitened by 1/sigma and Huber-robustified. Fixed cameras drop their
+        # columns (no free_col), so a pair anchored on the fixed gauge still
+        # constrains the free camera's baseline.
+        if use_vt and vt_a.size and nf > 0:
+            for p in range(vt_a.size):
+                a, b = int(vt_a[p]), int(vt_b[p])
+                Ra, Rb = Rs[a], Rs[b]
+                ta, tb = ts[a], ts[b]
+                t_rel = tb - Rb @ Ra.T @ ta
+                r = t_rel - vt_t[p]
+                e_t = float(np.linalg.norm(r)) / vt_sig
+                wh = 1.0 if e_t <= vt_thr else np.sqrt(
+                    vt_thr / max(e_t, 1e-12))
+                c = (wh / vt_sig) ** 2
+                Jb = np.zeros((3, 6))
+                Jb[:, :3] = np.eye(3)
+                Jb[:, 3:] = -skew(t_rel)
+                Ja = np.zeros((3, 6))
+                Ja[:, :3] = -(Rb @ Ra.T)
+                fa, fb = free_col[a], free_col[b]
+                if fb >= 0:
+                    sb = slice(6 * fb, 6 * fb + 6)
+                    Hcc[sb, sb] += c * (Jb.T @ Jb)
+                    bc[sb] += c * (Jb.T @ r)
+                if fa >= 0:
+                    sa = slice(6 * fa, 6 * fa + 6)
+                    Hcc[sa, sa] += c * (Ja.T @ Ja)
+                    bc[sa] += c * (Ja.T @ r)
+                if fa >= 0 and fb >= 0:
+                    sa = slice(6 * fa, 6 * fa + 6)
+                    sb = slice(6 * fb, 6 * fb + 6)
+                    Hab = c * (Ja.T @ Jb)
+                    Hcc[sa, sb] += Hab
+                    Hcc[sb, sa] += Hab.T
         if nf > 0:
             dd = np.diag(Hcc)
             Hcc[np.diag_indices_from(Hcc)] += lam * np.clip(dd, 1e-9, None)

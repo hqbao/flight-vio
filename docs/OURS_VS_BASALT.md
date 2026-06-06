@@ -73,6 +73,16 @@ These are the deltas to attack if the goal is "be Basalt".
      real-translate 58–63 mm — **they overlap**, so no vision-only discriminator
      exists). Our guards in §3 are band-aids around this, not a fix.
 
+   *Update:* on the **windowed-BA** path the worst of this (BA collapsing the
+   forward baseline far below even the frame-to-frame VO — offline default window
+   gave Sim3 scale 0.30–0.39 vs f2f 0.90–0.98) is now fixed by the **front-end
+   relative-translation prior** (`BAConfig.use_vo_trans_prior`): the metric f2f
+   PnP inter-keyframe translation is fed back as a soft scale anchor, the same
+   role IMU preintegration plays for Basalt but sourced from our own VO
+   (push_straight 0.39→0.97, push_fwdback 0.30→0.78). This anchors `ours-ba`/
+   `ours-slam` to the VO scale; closing the remaining gap to Basalt still needs
+   true IMU-in-the-estimator (the `ours-vio` tight-coupled path).
+
 2. **RGB-D depth map instead of raw stereo triangulation.** We consume the
    chip's SGBM depth blob; it is blur-biased and noisy at range (capped at 8 m
    in `OdometryConfig`). Basalt triangulates from raw stereo across the window,
@@ -81,7 +91,9 @@ These are the deltas to attack if the goal is "be Basalt".
 3. **No sliding-window joint optimisation on the production path.** `ours` is
    pure frame-to-frame; error is never re-linearised against older frames.
    `ours-ba` adds a window but with **no marginalisation prior**, so it cannot
-   carry information forward the way Basalt does.
+   carry information forward the way Basalt does. (It does carry a front-end
+   relative-translation prior — see §2.1 — which anchors scale but not the full
+   pose information a marginalisation prior would.)
 
 4. **No online gravity-direction / accel-bias state.** Roll/pitch come from an
    EMA complementary filter, not an estimated state, so a slow gravity/bias

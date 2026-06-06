@@ -86,7 +86,7 @@ This gives camera-frame axes (right-handed, OpenCV convention):
 ./run.sh                       # our frame-to-frame RGB-D PnP VO (default)
 ./run.sh --source fake         # device-free procedural trajectory
 ./run.sh --source ours         # our frame-to-frame RGB-D PnP VO
-./run.sh --source ours-ba      # + sliding-window bundle adjustment (depth-anchored)
+./run.sh --source ours-ba      # + sliding-window bundle adjustment (depth-anchored, VO scale prior)
 ./run.sh --source ours-slam    # + ORB loop closure + SE(3) pose graph (full SLAM)
 ```
 

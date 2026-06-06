@@ -1310,11 +1310,18 @@ class OakOursVioSource(PoseSource):
         # real gravity (no display-side correction needed). Only at-rest accel
         # samples are submitted per keyframe (see the read loop), so a moving
         # keyframe simply carries no gravity constraint.
+        # use_vo_trans_prior=True feeds the frame-to-frame PnP relative
+        # translation back as a soft scale anchor: it stops the windowed BA from
+        # collapsing the forward baseline on a low-parallax push (the "đi một
+        # đoạn rồi ì lại" undershoot). Measured on the gold suite (live SGM
+        # depth): push_straight Sim3 scale 0.39->0.97, push_fwdback 0.30->0.78,
+        # ATE on looping/straight motion unchanged. See BAConfig.use_vo_trans_prior.
         cfg = WindowedConfig(window=self.ba_window, kf_every=self.ba_kf_every,
                              use_marg=self.ba_marg,
                              ba=BAConfig(max_iters=self.ba_iters,
                                          huber_px=self.res.ba_huber_px(),
-                                         use_gravity=True))
+                                         use_gravity=True,
+                                         use_vo_trans_prior=True))
         ba_map = WindowedBAMap(K, cfg)
 
         snap_lock = threading.Lock()

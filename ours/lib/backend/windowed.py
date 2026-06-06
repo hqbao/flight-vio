@@ -47,6 +47,15 @@ forward scale on a straight push (Sim3 scale fell to ~0.40 vs f2f ~0.87, the
 physically-honest ~1 px SGM disparity noise (0.05), the empirical peak for the
 live window (push_straight_fast scale 0.40 -> 0.91, push_fwdback 0.81 -> 0.85);
 see the note on that field in ``ours.lib.backend.bundle``.
+
+The depth residual alone is still too weak to hold scale on a pure forward push
+in the OFFLINE default window (8/4): there Sim3 scale collapses to 0.30-0.39
+while frame-to-frame PnP keeps 0.90-0.98 on the SAME depth + frontend. The real
+fix is the front-end relative-translation prior (``BAConfig.use_vo_trans_prior``,
+enabled by the live source): feeding the metric f2f PnP inter-keyframe
+translation back as a soft scale anchor restores it (push_straight 0.39 -> 0.97,
+push_fwdback 0.30 -> 0.78, looping/straight ATE unchanged). It plays the role
+IMU preintegration plays in a tight-coupled VIO, using our own VO instead.
 """
 from __future__ import annotations
 
@@ -133,6 +142,11 @@ class WindowedBAMap:
                 self._lm_host[tid] = kf_id
             obs[tid] = np.array([u, v, z if z_ok else 0.0])
         kf = {"id": kf_id, "T_cw": np.asarray(T_cw, float).copy(), "obs": obs}
+        # Front-end pose snapshot at insertion, never mutated by BA. The
+        # relative translation between consecutive snapshots is the metric,
+        # depth-anchored f2f PnP motion -- the reference for the optional
+        # relative-translation prior that stops BA from collapsing the baseline.
+        kf["T_cw_vo"] = np.asarray(T_cw, float).copy()
         kf["accel"] = (None if accel_cam is None
                        else np.asarray(accel_cam, float).copy())
         self.keyframes.append(kf)
@@ -230,6 +244,22 @@ class WindowedBAMap:
         if prior_args is not None:
             prior_cams, prior_H, prior_b0, prior_lin = prior_args
 
+        # Front-end relative-translation prior: reference the f2f relative
+        # motion between consecutive keyframes (gauge-invariant, metric).
+        vo_rel_a = vo_rel_b = vo_rel_t = None
+        if self.cfg.ba.use_vo_trans_prior and len(kfs) >= 2:
+            a_idx, b_idx, t_ref = [], [], []
+            for m in range(len(kfs) - 1):
+                Ta = kfs[m].get("T_cw_vo", kfs[m]["T_cw"])
+                Tb = kfs[m + 1].get("T_cw_vo", kfs[m + 1]["T_cw"])
+                t_rel = Tb[:3, 3] - Tb[:3, :3] @ Ta[:3, :3].T @ Ta[:3, 3]
+                a_idx.append(m)
+                b_idx.append(m + 1)
+                t_ref.append(t_rel)
+            vo_rel_a = np.asarray(a_idx, np.int64)
+            vo_rel_b = np.asarray(b_idx, np.int64)
+            vo_rel_t = np.asarray(t_ref, np.float64)
+
         res = optimize(
             self.K, poses, fixed, landmarks_arr,
             np.array(obs_cam), np.array(obs_lm), np.array(obs_uv),
@@ -237,6 +267,7 @@ class WindowedBAMap:
             grav_meas=grav_meas, grav_world=np.array([0.0, 1.0, 0.0]),
             prior_cams=prior_cams, prior_H=prior_H, prior_b0=prior_b0,
             prior_lin=prior_lin,
+            vo_rel_a=vo_rel_a, vo_rel_b=vo_rel_b, vo_rel_t=vo_rel_t,
             cfg=self.cfg.ba,
         )
         for kf, P in zip(kfs, res.poses):
