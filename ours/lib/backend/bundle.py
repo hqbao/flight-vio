@@ -125,8 +125,24 @@ class BAConfig:
     # a valid depth, weighted by a stereo-like quadratic noise model
     # ``sigma_z = depth_sigma_coeff * z_meas^2`` (so far, noisy points count
     # less). Set ``use_depth=False`` to recover plain reprojection BA.
+    #
+    # ``depth_sigma_coeff`` IS the stereo noise constant: from triangulation
+    # ``z = f*B/d`` the depth error is ``sigma_z = z^2 * sigma_disp / (f*B)``, so
+    # ``coeff = sigma_disp / (f*B)``. For this OAK-D ``f*B = 282.2 px * 0.0751 m
+    # = 21.2 px*m``, so a standard ~1 px SGM disparity noise gives ``coeff ~=
+    # 0.05``. The earlier ``0.02`` implied a sub-pixel disparity precision of only
+    # 0.42 px -- far too optimistic for block-matched SGM. Measured on the LIVE
+    # SGM depth with the live window (kf_every=5, window=6, iters=5), the Sim3
+    # scale vs Basalt is NON-MONOTONIC in this coefficient with a sharp optimum:
+    # on push_straight_fast 0.02 -> 0.40 (badly collapsed, the "moves a bit then
+    # stalls" symptom), 0.05 -> 0.91; push_fwdback 0.81 -> 0.85 (f2f ~0.87). The
+    # plateau is broad (0.04-0.06 all land ~0.90), so 0.05 is both the physically
+    # honest value AND the empirical optimum -- not a fragile tuned constant.
+    # NB: this is sensitive to the depth SOURCE (recorded chip depth behaves
+    # differently) and to the window/kf cadence -- validate any retune on the
+    # LIVE SGM depth with the live window (window=6, kf_every=5, iters=5).
     use_depth: bool = True
-    depth_sigma_coeff: float = 0.02   # sigma_z = coeff * z^2  (metres)
+    depth_sigma_coeff: float = 0.05   # sigma_z = coeff * z^2  (m); = sigma_disp/(f*B)
     depth_huber: float = 0.10         # robust threshold on depth residual (m)
     # --- gravity prior (accelerometer leveling inside BA) -------------------
     # Pure reprojection (+depth) BA optimises all 6-DoF of every keyframe but has

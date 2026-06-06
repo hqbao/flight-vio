@@ -38,9 +38,15 @@ Measured benefit (ATE %path vs Basalt, gold sessions, vs frame-to-frame VO)
     quick_motion_15s 2.08 -> 1.97%   (better)
     lab_straight_20s 1.09 -> 1.11%   (tie)
     corridor_60s     0.66 -> 0.82%   (slightly worse; long low-parallax hall)
-Scale lands at 0.98-1.07 (vs 0.99-1.12 for f2f) — the metric depth residual in
-the BA is what anchors scale; plain reprojection BA is scale-free and was
-strictly worse. Net: a real win on varied/looping motion, no per-session tuning.
+The metric depth residual in the BA is what anchors scale (plain reprojection BA
+is scale-free and was strictly worse on looping motion). Its WEIGHT matters a
+lot, and on OUR live SGM depth it is NON-MONOTONIC with a sharp optimum: an
+over-confident ``BAConfig.depth_sigma_coeff`` collapses the weakly-observed
+forward scale on a straight push (Sim3 scale fell to ~0.40 vs f2f ~0.87, the
+"moves a bit then stalls" symptom of ours-ba/slam). It is set to the
+physically-honest ~1 px SGM disparity noise (0.05), the empirical peak for the
+live window (push_straight_fast scale 0.40 -> 0.91, push_fwdback 0.81 -> 0.85);
+see the note on that field in ``ours.lib.backend.bundle``.
 """
 from __future__ import annotations
 
