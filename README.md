@@ -213,12 +213,19 @@ mostly pure-Python and held the GIL ~17–30% of the time — measured 43 ms mea
 dropped frames and the displayed path "đẩy nhanh rồi ì lại" / undershot. Moving
 it out-of-process removes that contention; the corrections are bit-identical, see
 `ours/tools/ba_worker_proc_selftest.py`.) The BA/loop correction is also
-**speed-gated**: while the camera pushes fast (filter speed > 1 m/s) the
-correction is frozen so the live marker rides it as a rigid transform and tracks
-the full distance (like `ours`); it only slews in BA drift / loop closures when
-slow. This kills the residual "đẩy nhanh rồi ì lại" drag (the live BA map can
-diverge from the f2f filter pose, and slewing that large correction during a
-fast push dragged the marker back). The accelerometer levels roll/pitch to
+**speed-gated**: the correction is folded into the live marker only while the
+camera is essentially still (filter speed < 0.1 m/s); during any real motion it
+is frozen, so the marker rides it as a rigid transform and tracks the full
+distance (like `ours`). This kills two stalls with one gate: (1) the fast-push
+"đẩy nhanh rồi ì lại" drag (the live BA map can diverge from the f2f filter
+pose), and (2) the `ours-slam` "đi không đủ 100%, không kéo thêm" stall in a small
+room, where a premature loop closure publishes a ~0.4 m *backward* correction
+that, slewed in at the 0.3 m/s rate-limit, almost exactly cancels a slow forward
+push (~0.3 m/s) so the marker tracked only ~50 %. Freezing during motion makes
+the correction rigid (path-preserving), and the fully loop-corrected map is still
+shown live by the keyframe-dot overlay; the cost is that the live *trail* folds
+in loop accuracy only when you pause (lab_loop display-trail ATE ~126 → ~156 mm),
+which is the right trade for a responsive live marker. The accelerometer levels roll/pitch to
 gravity at rest, while the **gyroscope** drives the inter-frame rotation prior:
 vision (PnP) corrects that rotation weighted by its inlier confidence, *and* by
 how far it disagrees with the gyro — so when a fast yaw makes the KLT tracker

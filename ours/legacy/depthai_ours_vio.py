@@ -121,24 +121,30 @@ _VIO_CORR_MAX_T = 0.25           # m; reject corrections larger than this
 _CORR_MAX_STEP_T = 0.015                 # m per frame   (~0.3 m/s @ 20 fps)
 _CORR_MAX_STEP_R = float(np.deg2rad(0.5))  # rad per frame (~10 deg/s @ 20 fps)
 
-# Speed gate for the loose BA / loop-closure correction slew. The live BA map
-# can diverge from the frame-to-frame filter pose; slewing that (large)
-# correction onto the displayed tip WHILE the camera is pushing fast drags the
-# marker backward -- measured on device as ``disp/filt`` falling to 0.70-0.84
-# during a fast push (the "đẩy nhanh rồi ì lại" stall), even though the filter
-# pose itself tracks the motion faithfully (``filt/vo ~ 1.0``). So we FREEZE the
-# correction (no slew) whenever the filter speed is above this threshold: a
-# frozen correction is a rigid transform, which preserves the path length of the
-# live motion (``disp/filt = 1`` -> full-distance tracking, like ``ours``). Below
-# the threshold (slow / looping) the correction slews normally so BA drift and
-# SLAM loop closures still fold in. 1.0 m/s is chosen from the gold + fast_push
-# Basalt speed profiles: a loop / gentle motion stays almost entirely below it
-# (lab_loop p90=0.80 m/s -> the loop-closure correction is untouched, ATE
-# identical offline), while a fast hand push spends ~36% of its time above it
-# (fast_push p90=2.2 m/s) -> the fastest part of the push always freezes and
-# tracks the full distance. Verified offline: freeze@1.0 leaves every gold
-# session's Sim3 scale/ATE unchanged (the correction there is already small).
-_CORR_FREEZE_SPEED = 1.0                 # m/s; above this, freeze the loose corr
+# Speed gate for the loose BA / loop-closure correction slew. The live BA / SLAM
+# map can diverge from the frame-to-frame filter pose; slewing that (large)
+# correction onto the displayed tip WHILE the camera is moving drags the marker.
+# Two on-device symptoms, same cause:
+#   * fast push -> ``disp/filt`` falls to 0.70-0.84 ("đẩy nhanh rồi ì lại").
+#   * SLAM in a small room -> a premature loop closure publishes a backward
+#     correction (~0.4 m); slewed in at the 0.3 m/s rate-limit it CANCELS a slow
+#     forward push (~0.3 m/s) almost exactly, so the marker tracks only ~50% of
+#     the real motion and never catches up while loops keep re-firing ("đi không
+#     đủ 100%, không kéo thêm"). ``ours`` has no correction stage, so it never
+#     sees this.
+# A FROZEN correction is a rigid transform, which preserves the path length of
+# the live motion (``disp/filt = 1`` -> full-distance tracking, like ``ours``).
+# So we freeze the correction during ANY real motion and only let it settle when
+# the camera is essentially still. Deterministic unit sim (slow push + a -0.40 m
+# loop correction): at the OLD 1.0 m/s gate a 0.25-0.50 m/s push tracks only
+# 47-73%; at 0.1 m/s every moving speed tracks ~98% (the correction is rigid
+# while moving and folds in when you pause). The fully loop-corrected map is
+# still shown live by the keyframe-dot overlay (real SlamMap output), so freezing
+# the tip correction during motion costs the live TRAIL some loop accuracy
+# (lab_loop display ATE ~126 -> ~156 mm, = the uncorrected filter trail) but
+# restores the realtime responsiveness the user needs; the offline gold scoring
+# (vio_run) does not use this live ease path, so its ATE is unchanged.
+_CORR_FREEZE_SPEED = 0.1                  # m/s; above this, freeze the loose corr
 
 # Column reorder optical (right, down, fwd) -> body FRD (fwd, right, down).
 # The viewer triad expects the attitude columns to be [forward, right, down],
