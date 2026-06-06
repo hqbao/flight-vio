@@ -163,10 +163,15 @@ primary START/STOP):
     keypoint's metric depth** (the same fixed khaki 0.3–8 m ramp + scale bar as
     the depth panel), so colour means the same distance everywhere; keypoints with
     no stereo return are **hollow grey rings** (never a faked colour), fresh
-    tracks get an amber ring. A faint per-id **trail** shows where the *same*
-    keypoint moved over the last 20 frames. The footer prints honest stats
-    (`trk`, `valid-z %`, `mean-age`, `new`). Live off the OAK-D or a recorded
-    session — both run the same flow graph the VIO runs.
+    tracks get an amber ring, and tracks the **RGB-D PnP kept as inliers** — the
+    clean subset the motion solve actually trusted — get a **green ring**. Those
+    inlier ids are a separate REAL solve output the odometry flow publishes on
+    `frame.inliers` (the noisy/no-depth points are dropped before PnP and the rest
+    pass a RANSAC reprojection gate), so the green ring honestly marks the points
+    behind the pose, not every tracked corner. A faint per-id **trail** shows where
+    the *same* keypoint moved over the last 20 frames. The footer prints honest
+    stats (`trk`, `valid-z %`, `inlier`, `mean-age`, `new`). Live off the OAK-D or
+    a recorded session — both run the same flow graph the VIO runs.
 
 The same synced split front-end can be inspected **without the GUI** — a cv2
 window over a recorded session or the live device:

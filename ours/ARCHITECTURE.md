@@ -116,7 +116,8 @@ One thread per flow; **one Task per file**; a `*_flow.py` only wires the tasks.
 ```
 cam ──cam.sync──► imu_cam ──imucam.sample──► odometry ──pose.odom──► ui-collector, ui-render
                           ──frame.depth─────►          ──frame.tracks─► ui-tracks (keypoints view)
-                          ──imu.raw───────► (visualiser) ──keyframe──► backend, slam
+                          ──imu.raw───────► (visualiser) ──frame.inliers─► ui-tracks (keypoints view)
+                                                         ──keyframe──► backend, slam
                           (imucam.sample + frame.depth ──► ui-triplet, the image|depth|IMU view)
                                                        backend ──pose.refined──► ui-collector
                                                        slam    ──loop.correction──► ui-collector
@@ -139,8 +140,11 @@ noting because the obvious guess is wrong:
   `imu_cam`); it integrates the packet's gyro into the per-frame rotation prior
   (`PreintegratePrior`) and runs RGB-D PnP against the depth (`EstimateMotion`).
 - **the keypoint-depth view subscribes `frame.tracks`** (the odometry frontend's
-  real `{id: pixel}` tracks, published by `PublishTracks`); it does NOT run its
-  own frontend — it is a UI sink like ui-render, honest about its data source.
+  real `{id: pixel}` tracks, published by `PublishTracks`) AND `frame.inliers`
+  (the RGB-D PnP inlier ids, a separate REAL solve output published by
+  `PublishInliers` after `EstimateMotion`); it marks the clean inlier subset with
+  a green ring but does NOT run its own frontend — it is a UI sink like ui-render,
+  honest about its data source.
 - **odometry is a two-input join** (`imucam.sample` + `frame.depth`); it sees an
   END on each before it drains (`expected_ends = 2`).
 - **backend and slam both trigger off `keyframe`**, not `pose.odom`. odometry
@@ -161,7 +165,7 @@ flowchart TD
     end
     subgraph ODO["odometry flow"]
         PIP["PreintegratePrior"]
-        TF["TrackFeatures"] --> PT["PublishTracks"] --> PV["EstimateMotion"] --> PP["PublishPose"] --> EK["EmitKeyframe"]
+        TF["TrackFeatures"] --> PT["PublishTracks"] --> AG["AlignGravity"] --> PL["PullPrior"] --> PV["EstimateMotion"] --> PI["PublishInliers"] --> PP["PublishPose"] --> EK["EmitKeyframe"]
     end
     subgraph BCK["backend flow"]
         RB["RunBA"] --> PR["PublishRefined"]
@@ -179,6 +183,7 @@ flowchart TD
     end
     subgraph UITR["ui-tracks flow (keypoints view)"]
         RT["RenderTracks"]
+        RI["RenderInliers"]
     end
 
     PCS -- "cam.sync" --> PIC
@@ -187,17 +192,18 @@ flowchart TD
     PP -- "pose.odom" --> COd
     PP -- "pose.odom" --> RP
     PT -- "frame.tracks" --> RT
+    PI -- "frame.inliers" --> RI
     EK -- "keyframe" --> RB
     EK -- "keyframe" --> SS
     PR -- "pose.refined" --> CRf
     PC2 -- "loop.correction" --> CCo
 
-    PIP -. "ctx.state['priors'][seq]\n(same thread, not via Bus)" .-> PV
+    PIP -. "ctx.state['priors'][seq]\n(same thread, not via Bus)" .-> PL
 ```
 
 The dotted edge is the one **intra-flow** hand-off: `PreintegratePrior` stashes
 the gyro prior for sequence `seq` in the odometry flow's own `ctx.state`, and
-`EstimateMotion` pops it when the matching depth frame arrives. This is shared
+`PullPrior` pops it when the matching depth frame arrives. This is shared
 state inside a single thread/flow — it does **not** cross the Bus and does **not**
 violate the §2 rule (which only forbids *cross-flow* calls).
 
@@ -205,12 +211,12 @@ violate the §2 rule (which only forbids *cross-flow* calls).
 |---|---|---|---|
 | **cam** | `produce` → `PublishCamSync` | — (source) | `cam.sync` |
 | **imu_cam** | `PackImuCam` → `PublishImuRaw` → `ApplyCalibration` → `PublishImuCam` → `ComputeDepth` → `PublishDepth` | `cam.sync` | `imu.raw`, `imucam.sample`, `frame.depth` |
-| **odometry** | `PreintegratePrior` ⟂ `TrackFeatures` → `PublishTracks` → `EstimateMotion` → `PublishPose` → `EmitKeyframe` | `imucam.sample`, `frame.depth` | `pose.odom`, `keyframe`, `frame.tracks` |
+| **odometry** | `PreintegratePrior` ⟂ `TrackFeatures` → `PublishTracks` → `AlignGravity` → `PullPrior` → `EstimateMotion` → `PublishInliers` → `PublishPose` → `EmitKeyframe` | `imucam.sample`, `frame.depth` | `pose.odom`, `keyframe`, `frame.tracks`, `frame.inliers` |
 | **backend** | `RunBA` → `PublishRefined` | `keyframe` | `pose.refined` |
 | **slam** | `SlamStep` → `PublishCorrection` | `keyframe` | `loop.correction` |
 | **ui-collector** | `CollectOdom` / `CollectRefined` / `CollectCorrection` | `pose.odom`, `pose.refined`, `loop.correction` | — (sink) |
 | **ui-render** | `RenderPose` | `pose.odom` | — (sink) |
-| **ui-tracks** | `RenderTracks` | `frame.tracks` | — (sink) |
+| **ui-tracks** | `RenderTracks` ⟂ `RenderInliers` | `frame.tracks`, `frame.inliers` | — (sink) |
 
 `cam` + `imu_cam` are the only device-specific flows; their sources are
 injected (`ReplayCamSource`/`ReplayImuSource` offline, `LiveCamSource`/
@@ -242,14 +248,17 @@ queue that raises if read post-stop).
   the keypoints view), `align_gravity.py` (one-shot startup attitude bootstrap),
   `pull_prior.py` (IMU↔vision join: pops the preintegrated prior by seq),
   `estimate_motion.py` (pure-NumPy PnP + gyro fusion, lock-free),
+  `publish_inliers.py` (emits the PnP inlier ids on `frame.inliers` for the
+  keypoints view to mark the clean subset),
   `tracked.py` (TrackFeatures→PullPrior carrier), `primed.py`
   (PullPrior→EstimateMotion carrier: tracks + joined prior),
   `publish_pose.py`, `emit_keyframe.py`, `step.py` (carrier), `odometry_flow.py`.
 - `backend/`: `run_ba.py`, `publish_refined.py`, `backend_flow.py`.
 - `slam/`: `slam_step.py`, `publish_correction.py`, `slam_flow.py`.
 - `ui/`: `collect_odom.py`, `collect_refined.py`, `collect_correction.py`,
-  `collector.py`, `render_pose.py`, `render.py`, `render_tracks.py`, `tracks.py`
-  (the keypoint-depth sink), `stash_imucam.py` + `render_triplet.py` + `triplet.py`
+  `collector.py`, `render_pose.py`, `render.py`, `render_tracks.py`,
+  `render_inliers.py`, `tracks.py`
+  (the keypoint-depth sink: `frame.tracks` + `frame.inliers`), `stash_imucam.py` + `render_triplet.py` + `triplet.py`
   (the image|depth|IMU triplet sink: joins `frame.depth` + `imucam.sample` by seq).
 
 ---

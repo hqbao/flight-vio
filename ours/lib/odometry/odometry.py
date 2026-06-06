@@ -403,10 +403,11 @@ class RGBDVisualOdometry:
         ``R_prior`` / ``dt_s`` semantics.
         """
         info = {"n_tracks": len(cur_obs), "n_pnp": 0, "n_inliers": 0,
-                "ok": False, "reason": ""}
+                "ok": False, "reason": "",
+                "inlier_ids": np.empty((0,), dtype=np.int64)}
 
         if self._prev_depth is not None and self._prev_obs:
-            obj_pts, img_pts = [], []
+            obj_pts, img_pts, id_list = [], [], []
             h, w = self._prev_depth.shape
             for tid, cur_px in cur_obs.items():
                 prev_px = self._prev_obs.get(tid)
@@ -420,6 +421,7 @@ class RGBDVisualOdometry:
                     continue
                 obj_pts.append(self._backproject_px(prev_px[0], prev_px[1], z))
                 img_pts.append(cur_px)
+                id_list.append(int(tid))
 
             info["n_pnp"] = len(obj_pts)
             if len(obj_pts) >= self.cfg.min_pnp_points:
@@ -470,6 +472,10 @@ class RGBDVisualOdometry:
                         import cv2
                         R, _ = cv2.Rodrigues(rvec)
                     ninl = int(len(inliers))
+                    # Track ids PnP kept as inliers (the clean subset the motion
+                    # solve actually used) -> exposed for the keypoint visualiser.
+                    inl_idx = np.asarray(inliers, dtype=np.int64).reshape(-1)
+                    info["inlier_ids"] = np.asarray(id_list, dtype=np.int64)[inl_idx]
                     t_use = t_own if self.cfg.use_own_pnp else tvec.reshape(3)
                     # Freeze translation when vision is untrustworthy (too few
                     # inliers -> textureless / white wall). Advance rotation by

@@ -33,9 +33,11 @@ _REF_SHORT = 400.0
 
 # Neutral markers/colours pulled from theme.py (BGR, since we draw on a BGR
 # frame): TEXT_DIM #8b949e for invalid-depth points, WARN #ffb000 for fresh
-# tracks, pure black for the legibility halo under every dot.
+# tracks, SUCCESS #3fb950 for PnP inliers, pure black for the legibility halo
+# under every dot.
 _INVALID_BGR = (158, 148, 139)   # #8b949e
 _FRESH_BGR = (0, 176, 255)       # #ffb000
+_INLIER_BGR = (80, 185, 63)      # #3fb950
 _HALO_BGR = (0, 0, 0)
 
 
@@ -134,13 +136,16 @@ class TrackTrails:
 def draw_overlay(gray: np.ndarray, depth_m: np.ndarray,
                  ids: np.ndarray, points: np.ndarray,
                  trails: TrackTrails, *, fresh_age: int = 3,
-                 draw_trails: bool = True) -> np.ndarray:
+                 draw_trails: bool = True,
+                 inlier_ids: set[int] | None = None) -> np.ndarray:
     """Render the keypoint/depth/trail overlay; returns an ``(H, W, 3)`` RGB image.
 
     Background is the grayscale frame, dimmed so the colour dots pop. Each live
     track: a black halo + a depth-coloured dot (valid depth) or a hollow grey
-    ring (no stereo return), an amber ring if it is a fresh track, and -- when
-    ``draw_trails`` -- a faint depth-coloured polyline of its last positions.
+    ring (no stereo return), an amber ring if it is a fresh track, a green ring
+    if the RGB-D PnP kept it as an inlier (``inlier_ids``, the clean subset the
+    motion solve actually trusted), and -- when ``draw_trails`` -- a faint
+    depth-coloured polyline of its last positions.
     """
     import cv2
 
@@ -157,6 +162,8 @@ def draw_overlay(gray: np.ndarray, depth_m: np.ndarray,
     valid = z > 1e-6
     colors = depth_colors(z)                          # (M, 3) uint8 BGR
     dot_r, halo_r, fresh_r, line_w = marker_sizes(bg.shape[:2])
+    inl = ({int(i) for i in inlier_ids}               # clean PnP subset (real)
+           if inlier_ids is not None else set())
 
     if draw_trails:
         layer = bg.copy()
@@ -179,5 +186,8 @@ def draw_overlay(gray: np.ndarray, depth_m: np.ndarray,
             cv2.circle(bg, (ix, iy), dot_r, _INVALID_BGR, 1, cv2.LINE_AA)
         if trails.age(int(tid)) < fresh_age:
             cv2.circle(bg, (ix, iy), fresh_r, _FRESH_BGR, 1, cv2.LINE_AA)
+        if int(tid) in inl:
+            cv2.circle(bg, (ix, iy), fresh_r + line_w, _INLIER_BGR,
+                       line_w, cv2.LINE_AA)
 
     return np.ascontiguousarray(bg[:, :, ::-1])

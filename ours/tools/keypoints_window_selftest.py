@@ -142,6 +142,17 @@ def test_draw_overlay() -> None:
     sat = (patch.max(axis=1) - patch.min(axis=1)).max()
     _check(sat > 40, f"valid keypoint painted a coloured (non-grey) dot (sat={sat})")
     _check(rgb.max() > 0, "overlay is not blank")
+    # An inlier id must paint a green ring (the PnP-inlier mark) near its dot:
+    rgb_inl = draw_overlay(gray, depth, ids, pts, tr, inlier_ids={1})
+    g_patch = rgb_inl[14:27, 24:37].reshape(-1, 3).astype(np.int32)
+    # green ring -> some pixel with G clearly dominating R and B (#3fb950).
+    green = ((g_patch[:, 1] - g_patch[:, 0] > 30)
+             & (g_patch[:, 1] - g_patch[:, 2] > 30)).any()
+    _check(bool(green), "inlier id painted a green PnP-inlier ring")
+    base_patch = rgb[14:27, 24:37].reshape(-1, 3).astype(np.int32)
+    base_green = ((base_patch[:, 1] - base_patch[:, 0] > 30)
+                  & (base_patch[:, 1] - base_patch[:, 2] > 30)).any()
+    _check(not bool(base_green), "no green ring when inlier_ids is omitted")
     # Empty keypoint set must not crash and returns the (dimmed) background.
     blank = draw_overlay(gray, depth, np.empty((0,), np.int64),
                          np.empty((0, 2), np.float32), TrackTrails())

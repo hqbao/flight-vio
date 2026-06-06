@@ -78,6 +78,26 @@ class FrameTracks:
 
 
 @dataclass(frozen=True)
+class FrameInliers:
+    """One frame's PnP inlier track ids for the keypoint-depth visualiser.
+
+    Published on ``topics.FRAME_INLIERS`` by the odometry flow's
+    :class:`~ours.flows.odometry.publish_inliers.PublishInliers` task, AFTER
+    :class:`~ours.flows.odometry.estimate_motion.EstimateMotion` solves the
+    RGB-D PnP. ``ids`` are the subset of that frame's tracks the PnP RANSAC kept
+    as inliers -- the clean points the motion solve actually trusted (a REAL
+    odometry output read from ``last_info``, not a re-derivation). The UI marks
+    these so the operator can see which tracks survived outlier rejection.
+
+    * ``ids`` -- ``(M,)`` int64 inlier track ids (subset of the frame's tracks).
+    """
+
+    seq: int
+    ts_ns: int
+    ids: np.ndarray
+
+
+@dataclass(frozen=True)
 class PoseMsg:
     """An estimated camera pose (4x4 ``T_world_cam``) for one frame."""
 

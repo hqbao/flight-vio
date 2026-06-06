@@ -72,6 +72,7 @@ class KeypointSample:
     n_valid: int
     mean_age: float
     new_count: int
+    n_inliers: int = 0
 
     @property
     def valid_pct(self) -> float:
@@ -113,6 +114,17 @@ class KeypointWorker(threading.Thread):
 
         trails = TrackTrails()
         t0_ns: list[int | None] = [None]
+        # Latest PnP inlier set, updated off ``frame.inliers``. The odometry flow
+        # publishes a frame's inliers right AFTER its tracks (PnP runs after the
+        # tracks emit), so when ``on_tracks`` for frame N renders it carries the
+        # inliers from the previous solve -- at most one frame stale. Tracks
+        # persist frame-to-frame, so a track that was an inlier still is, and the
+        # green ring stays honest: it marks tracks the solve actually trusted.
+        latest_inl: dict[str, set] = {"ids": set()}
+
+        def on_inliers(msg) -> None:
+            latest_inl["ids"] = {int(i) for i in
+                                 np.asarray(msg.ids, dtype=np.int64).reshape(-1)}
 
         def on_tracks(msg) -> None:
             ids = np.asarray(msg.ids, dtype=np.int64).reshape(-1)
@@ -128,13 +140,15 @@ class KeypointWorker(threading.Thread):
             if self.queue.full():
                 return
             depths = sample_depths(msg.depth_m, pts)
-            rgb = draw_overlay(msg.gray_left, msg.depth_m, ids, pts, trails)
+            rgb = draw_overlay(msg.gray_left, msg.depth_m, ids, pts, trails,
+                               inlier_ids=latest_inl["ids"])
             sample = KeypointSample(
                 rgb=rgb, ids=ids, points=pts, depths=depths,
                 seq=int(msg.seq), t_s=(msg.ts_ns - t0_ns[0]) * 1e-9,
                 n_tracks=int(ids.shape[0]),
                 n_valid=int(np.count_nonzero(depths > 1e-6)),
-                mean_age=trails.mean_age(), new_count=trails.new_count)
+                mean_age=trails.mean_age(), new_count=trails.new_count,
+                n_inliers=len(latest_inl["ids"]))
             try:
                 self.queue.put_nowait(sample)
             except queue.Full:
@@ -142,7 +156,7 @@ class KeypointWorker(threading.Thread):
 
         bus = Bus()
         try:
-            self._drive(bus, UiTracksFlow(bus, on_tracks,
+            self._drive(bus, UiTracksFlow(bus, on_tracks, on_inliers=on_inliers,
                                           latest_only=self.latest_only))
         except Exception as exc:           # surface, don't crash the UI
             self.error = str(exc)
@@ -285,7 +299,7 @@ class KeypointTrackWindow(QWidget):
         rasters.addWidget(_DepthScaleBar(), stretch=0)
         lay.addLayout(rasters, stretch=1)
         hint = QLabel("colour = depth · hollow grey = no stereo · amber = fresh "
-                      "track · trail = last 20 frames")
+                      "track · green = PnP inlier · trail = last 20 frames")
         hint.setObjectName("ScaleTick")
         lay.addWidget(hint, stretch=0)
         root.addWidget(panel, stretch=1)
@@ -386,8 +400,8 @@ class KeypointTrackWindow(QWidget):
             col = theme.BAD
         self._status.setText(
             f"trk {s.n_tracks}  ·  valid-z {s.n_valid} ({pct:.0f}%)  ·  "
-            f"mean-age {s.mean_age:.1f} f  ·  new {s.new_count}  ·  "
-            f"SEQ {s.seq}  ·  t {s.t_s:5.1f}s")
+            f"inlier {s.n_inliers}  ·  mean-age {s.mean_age:.1f} f  ·  "
+            f"new {s.new_count}  ·  SEQ {s.seq}  ·  t {s.t_s:5.1f}s")
         self._status.setStyleSheet(f"color: {col};")
 
     def _show_rgb(self, rgb: np.ndarray) -> None:

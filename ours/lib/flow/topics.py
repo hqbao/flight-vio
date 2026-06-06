@@ -45,6 +45,12 @@ LOOP_CORRECTION = "loop.correction"
 # motion estimate consumes -- no parallel detector. Consumed only by the UI.
 FRAME_TRACKS = "frame.tracks"
 
+# Per-frame PnP inlier track ids -- the clean subset the RGB-D PnP RANSAC actually
+# kept for the motion solve (a REAL odometry output, not a re-derivation). Lets the
+# keypoint-depth visualiser mark which tracks survived outlier rejection. Consumed
+# only by the UI; published after EstimateMotion runs.
+FRAME_INLIERS = "frame.inliers"
+
 # Acquisition front-end (``cam`` <-> ``imu_cam``).
 CAM_SYNC = "cam.sync"
 IMUCAM_SAMPLE = "imucam.sample"

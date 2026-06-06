@@ -10,6 +10,7 @@ edges of the unified acquisition front-end:
   :class:`~ours.flows.odometry.align_gravity.AlignGravity`,
   :class:`~ours.flows.odometry.pull_prior.PullPrior`,
   :class:`~ours.flows.odometry.estimate_motion.EstimateMotion`,
+  :class:`~ours.flows.odometry.publish_inliers.PublishInliers`,
   :class:`~ours.flows.odometry.publish_pose.PublishPose`,
   :class:`~ours.flows.odometry.emit_keyframe.EmitKeyframe`]
 
@@ -23,7 +24,9 @@ instead of serialising against it. ``PublishTracks`` emits the same KLT tracks o
 ``frame.tracks`` for the keypoint-depth visualiser. ``AlignGravity`` does the
 one-shot startup attitude bootstrap; ``PullPrior`` is the IMU<->vision join that
 pops the preintegrated prior for the frame's ``seq``; ``EstimateMotion`` is then
-just the RGB-D PnP (+ gyro fusion) solve. The
+just the RGB-D PnP (+ gyro fusion) solve. ``PublishInliers`` then emits that
+solve's PnP inlier track ids on ``frame.inliers`` so the visualiser can mark the
+clean subset the motion estimate actually trusted. The
 :class:`~ours.flows.odometry.tracked.Tracked` carrier threads the frame + tracks
 down to ``PullPrior``, which swaps it for the
 :class:`~ours.flows.odometry.primed.Primed` carrier (tracks + joined prior); the
@@ -51,6 +54,7 @@ from .publish_tracks import PublishTracks
 from .align_gravity import AlignGravity
 from .pull_prior import PullPrior
 from .estimate_motion import EstimateMotion
+from .publish_inliers import PublishInliers
 from .publish_pose import PublishPose
 from .emit_keyframe import EmitKeyframe
 
@@ -75,5 +79,7 @@ class OdometryFlow(Flow):
         self.on(topics.IMUCAM_SAMPLE, [PreintegratePrior()])
         self.on(topics.FRAME_DEPTH,
                 [TrackFeatures(), PublishTracks(), AlignGravity(), PullPrior(),
-                 EstimateMotion(), PublishPose(), EmitKeyframe()])
-        self.forwards_to(topics.POSE_ODOM, topics.KEYFRAME, topics.FRAME_TRACKS)
+                 EstimateMotion(), PublishInliers(), PublishPose(),
+                 EmitKeyframe()])
+        self.forwards_to(topics.POSE_ODOM, topics.KEYFRAME, topics.FRAME_TRACKS,
+                         topics.FRAME_INLIERS)
