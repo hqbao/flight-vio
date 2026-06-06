@@ -205,8 +205,14 @@ covered by offline self-tests (`accel_calib_selftest`, `calib_collect_selftest`,
 without an OAK-D.
 
 
-Both `ours-ba` and `ours-slam` run their heavy optimisation on a background
-thread, so the display stays smooth. The accelerometer levels roll/pitch to
+Both `ours-ba` and `ours-slam` run their heavy optimisation in a **background
+process** (`ours/legacy/ba_worker_proc.py`), so the BA refine can never steal the
+GIL from the camera read loop. (It used to run on a *thread*; the BA refine is
+mostly pure-Python and held the GIL ~17–30% of the time — measured 43 ms mean /
+74 ms peak every 250 ms — which starved the read loop on a fast push so it
+dropped frames and the displayed path "đẩy nhanh rồi ì lại" / undershot. Moving
+it out-of-process removes that contention; the corrections are bit-identical, see
+`ours/tools/ba_worker_proc_selftest.py`.) The accelerometer levels roll/pitch to
 gravity at rest, while the **gyroscope** drives the inter-frame rotation prior:
 vision (PnP) corrects that rotation weighted by its inlier confidence, *and* by
 how far it disagrees with the gyro — so when a fast yaw makes the KLT tracker

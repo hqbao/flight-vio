@@ -1299,20 +1299,22 @@ class OakOursVioSource(PoseSource):
 
     # ----------------------------------------------------------------------- #
     def _start_ba_worker(self, K: np.ndarray) -> dict:
-        """Spawn the background sliding-window BA thread.
+        """Spawn the background sliding-window BA worker (separate PROCESS).
 
-        Returns a state dict with ``submit(T_cw, ids, pts, depth)`` and
+        Returns a state dict with ``submit(T_cw, ids, pts, depth_m, accel)`` and
         ``poll() -> C | None``. The worker keeps the BA map in the *raw f2f*
         world frame (it is always fed raw f2f poses), so the published
         correction ``C = inv(T_ba) @ T_cw`` maps that frame onto the BA-refined
-        one. Because the BA core is vectorised NumPy (which releases the GIL on
-        its heavy linear-algebra), a thread is enough to keep the device read
-        loop responsive — no separate process needed.
+        one. The BA refine is mostly pure-Python (only the inner solve releases
+        the GIL), so an in-thread worker stole ~17-30% of the read loop's GIL and
+        starved the frame reader on a fast push (dropped frames -> the
+        "đẩy nhanh rồi ì lại" undershoot). It therefore runs out-of-process; see
+        :mod:`ours.legacy.ba_worker_proc` for the rationale and the identical
+        ``submit``/``poll``/``stop``/``event``/``thread`` interface this keeps.
         """
-        import threading
-
-        from ours.lib import WindowedBAMap, WindowedConfig
+        from ours.lib import WindowedConfig
         from ours.lib.backend.bundle import BAConfig
+        from .ba_worker_proc import start_ba_process
 
         # use_gravity=True adds the accelerometer leveling prior INSIDE the
         # sliding-window BA, so the optimised map keeps its roll/pitch pinned to
@@ -1331,55 +1333,7 @@ class OakOursVioSource(PoseSource):
                                          huber_px=self.res.ba_huber_px(),
                                          use_gravity=True,
                                          use_vo_trans_prior=True))
-        ba_map = WindowedBAMap(K, cfg)
-
-        snap_lock = threading.Lock()
-        out_lock = threading.Lock()
-        event = threading.Event()
-        stop = threading.Event()
-        state = {
-            "event": event,
-            "stop": stop,
-            "kf_every": cfg.kf_every,
-            "_pending": None,
-            "_corr": None,
-        }
-
-        def submit(T_cw, ids, pts, depth_m, accel):
-            with snap_lock:
-                state["_pending"] = (T_cw, ids, pts, depth_m, accel)
-            event.set()
-
-        def poll():
-            with out_lock:
-                C = state["_corr"]
-                state["_corr"] = None
-            return C
-
-        def worker():
-            while not stop.is_set():
-                event.wait()
-                event.clear()
-                if stop.is_set():
-                    break
-                with snap_lock:
-                    snap = state["_pending"]
-                    state["_pending"] = None
-                if snap is None:
-                    continue
-                T_cw, ids, pts, depth_m, accel = snap
-                ba_map.add_keyframe(T_cw, ids, pts, depth_m, accel_cam=accel)
-                post = ba_map.run_ba()
-                if post is not None:
-                    with out_lock:
-                        state["_corr"] = np.linalg.inv(post) @ T_cw
-
-        th = threading.Thread(target=worker, name="OursBAWorker", daemon=True)
-        th.start()
-        state["thread"] = th
-        state["submit"] = submit
-        state["poll"] = poll
-        return state
+        return start_ba_process(K, cfg)
 
     # ----------------------------------------------------------------------- #
     def _start_vio_worker(self, K: np.ndarray, R_imu_cam: np.ndarray) -> dict:

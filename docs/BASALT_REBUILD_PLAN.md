@@ -77,8 +77,12 @@ needed to confirm which knob bites on the actual device:
 
 ### Candidate loose‑path mitigations (offline‑verify before shipping)
 Ordered cheapest‑first; each must be A/B'd on `fast_push_15s` first:
-1. **Move the BA worker to a true `multiprocessing.Process`** so its CPU no longer
-   shares the GIL with the read loop (removes the ~17–30 % tax).
+1. **DONE (2026‑06‑06):** the BA worker now runs as a true
+   `multiprocessing.Process` (`ours/legacy/ba_worker_proc.py`, spawn), so its CPU
+   no longer shares the GIL with the read loop — the ~17–30 % tax is removed by
+   construction. Corrections are bit‑identical to the in‑thread worker
+   (`ours/tools/ba_worker_proc_selftest.py`). Confirm on the bench via the
+   `drop=` / `proc` vs `recv` diag.
 2. **Throttle / cap BA cost** (smaller window, fewer iters, lower kf rate) so each
    burst is shorter than one frame budget.
 3. Ensure the device has **Numba** (so KLT is ~15 ms, not ~140 ms) — the single
