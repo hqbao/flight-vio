@@ -105,6 +105,18 @@ not installable on this host (macOS arm64, py3.13). Note this lock caps the
 cam→imu_cam→odometry chain below the camera frame rate, which is exactly why the
 realtime visualiser path needs the latest-only inbox above.
 
+### JIT warmup (live startup)
+The SGM + KLT numba kernels are `cache=True`, but on a COLD cache (first run after
+a code change) the one-time LLVM compile (~2 s, measured) lands on the first live
+frame and stalls the viewer. `lib/warmup.py::warmup_jit` compiles them with tiny
+dummy inputs; `app.build_live_frontend` kicks it on a daemon thread at
+device-open so the compile overlaps the OAK-D boot + the startup IMU still-window
+(dead time anyway). The dispatchers are module singletons, so the warmed
+functions are the same ones the frame path calls. It only compiles — never
+changes results — and any failure (e.g. numba absent) is swallowed, so frame one
+just compiles as before. `warmup_selftest` proves the cold first call drops from
+~2000 ms to ~4 ms.
+
 ---
 
 ## 4. The flows — `ours.flows`

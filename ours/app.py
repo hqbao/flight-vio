@@ -188,6 +188,21 @@ def build_live_frontend(bus: Bus, *, width: int = 640, height: int = 400,
     from .flows.imu_cam.sources import LiveImuSource
 
     device = SharedLiveDevice(width=width, height=height, fps=fps)
+    # Compile the KLT + SGM numba kernels on a background thread NOW, so the
+    # ~1-3 s LLVM compile (cold cache) overlaps the device boot + the startup
+    # IMU still-window below instead of stalling frame one. Uses the live configs
+    # so the compiled signatures match. Never blocks: a slow warmup just means
+    # frame one compiles as it always did.
+    import threading
+    from .lib.warmup import warmup_jit
+    from .lib.config.resolution import ResolutionProfile
+    _res = ResolutionProfile.for_resolution(width, height)
+    threading.Thread(
+        target=warmup_jit,
+        kwargs={"klt_cfg": _res.frontend(numba=True),
+                "sgm_cfg": _res.sgm(fast=depth_fast)},
+        name="jit-warmup", daemon=True).start()
+
     cal = read_live_calibration(device, width=width, height=height,
                                 use_gyro=use_gyro, depth_fast=depth_fast,
                                 recalibrate_bias=recalibrate_bias)

@@ -340,6 +340,7 @@ Self-tests (run before/after touching the from-scratch VIO):
 .venv/bin/python -m ours.tools.flow_replay_selftest  # full ours.app VIO graph over a gold session (60 pose.odom + refined)
 .venv/bin/python -m ours.tools.flow_latest_selftest  # latest-only coalescing inbox (realtime visualiser stays fresh, bounded lag)
 .venv/bin/python -m ours.tools.oak_live_selftest     # single-client shared OAK-D (cam+IMU open once; teardown race-safe)
+.venv/bin/python -m ours.tools.warmup_selftest       # JIT warmup: cold first frame ~2000ms -> ~4ms (compiles SGM+KLT off the boot path)
 QT_QPA_PLATFORM=offscreen .venv/bin/python -m ours.tools.imucam_window_selftest  # in-app synced view renders (offscreen Qt)
 QT_QPA_PLATFORM=offscreen .venv/bin/python -m ours.tools.synced_window_selftest  # image|depth|IMU triplet window renders (offscreen Qt)
 QT_QPA_PLATFORM=offscreen .venv/bin/python -m ours.tools.keypoints_window_selftest # keypoints coloured by depth + per-id trails (offscreen Qt)
