@@ -248,6 +248,34 @@ XLink) tripped the device firmware watchdog. Verified offline by
 `oak_live_selftest` (readers hammer `poll` while a concurrent `release` destroys a
 queue that raises if read post-stop).
 
+### 4.1 The engine layer — in-process vs out-of-process heavy solve
+
+`backend` and `slam` do not run their solve inline. Each holds an
+`ours.lib.engine.Engine` (`ctx.state["engine"]`, also `flow.engine`) and its task
+(`RunBA` / `SlamStep`) just `submit`s the keyframe snapshot and `poll`s a result —
+the maths lives in the engine, picked by one `worker` flag:
+
+- **`worker=False` (default, OFFLINE)** → `InProcessEngine`: runs the whole solve
+  synchronously on the flow thread; `submit`+`poll` happen in the same task
+  invocation, so the result is byte-identical to the old in-thread path. The
+  replay/scoring path (`run_replay`, `flow_replay_selftest`) **always** uses this —
+  determinism + the `pose.refined` count contract (§7) depend on it.
+- **`worker=True` (LIVE)** → `SubprocessEngine`: ships each keyframe to a spawned
+  process and reads the result back asynchronously. The BA Jacobian assembly / ORB
+  / pose-graph solve is mostly pure-Python and would otherwise hold ~17-30 % of the
+  read-loop's GIL → dropped frames → the frame-to-frame PnP under-measures fast
+  translation → the displayed path "ì lại" (undershoots). Out-of-process removes
+  that contention entirely, so the live `ours-ba`/`ours-slam` **marker stays the
+  responsive `pose.odom` tip — full distance, exactly like bare `ours`**.
+
+The engine also exposes `poll_overlay()`: a **separate** channel carrying the live
+MAP snapshot (BA refined keyframe positions / SLAM corrected keyframe poses + loop
+events) so the 3D viewer can draw the refined map BEHIND the marker without
+stealing the correction the flow task consumes. `FlowPoseSource` polls it on its
+own thread into a lock-guarded mirror; the viewer reads that mirror at 60 Hz.
+Parity (in-process == out-of-process, bit-for-bit) is gated by
+`ours.tools.engine_parity_selftest`.
+
 ### Per-flow files
 - `cam/`: `sources.py` (replay/live `CamSource`), `publish_cam_sync.py`,
   `cam_flow.py`.
@@ -277,7 +305,7 @@ queue that raises if read post-stop).
 
 ## 5. The libraries — `ours.lib`
 
-All 11 subpackages are live (each referenced from ≥5 places — **no dead code**;
+All 12 subpackages are live (each referenced from ≥5 places — **no dead code**;
 the many folders are domain decomposition, not leftovers).
 
 | Package | Contents | What it does |
@@ -288,6 +316,7 @@ the many folders are domain decomposition, not leftovers).
 | `odometry/` | odometry, pnp | RGB-D visual odometry |
 | `backend/` | bundle, windowed, marginalize, vio_window | windowed bundle adjustment (+ optional Schur marginalization prior) / VIO |
 | `loop/` | orb, loopclosure, posegraph, slam | ORB loop closure + pose-graph SLAM |
+| `engine/` | base, inprocess, subprocess, steps | swappable runner for the heavy BA/SLAM solve — in-process (offline, deterministic) or **out-of-process** (live, so the solve never holds the read-loop GIL); see §4.1 |
 | `io/` | reader, synced | session readers, frame/IMU sync |
 | `config/` | resolution | resolution profiles |
 | `misc/` | frames, geometry, pose, pngio | shared `Pose` / frame / geometry / PNG helpers |

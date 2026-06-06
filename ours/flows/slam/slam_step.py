@@ -1,21 +1,24 @@
-"""``slam_step`` task: add a keyframe to the SLAM map, optimise on loop close."""
+"""``slam_step`` task: submit a keyframe to the SLAM engine, forward a closure.
+
+Offline (in-process engine) ``submit`` adds the keyframe and, on a confirmed loop,
+optimises synchronously; ``poll`` returns this keyframe's :class:`SlamResult` --
+identical to the old in-thread path. Live (subprocess engine) it is async; the
+responsive marker rides ``pose.odom`` and never waits on this.
+"""
 from __future__ import annotations
 
 from ...lib.flow.messages import Keyframe, LoopCorrection
 from ...lib.flow.task import Task
-from ...lib.loop.slam import SlamMap
+from ...lib.engine import Engine, SlamResult
 
 
 class SlamStep(Task):
     name = "slam_step"
 
     def run(self, ctx, kf: Keyframe):
-        slam: SlamMap = ctx.state["slam"]
-        events = slam.add_keyframe(kf.T_world_cam, kf.gray_left, kf.depth_m,
-                                   seq=kf.seq)
-        if not events:
+        engine: Engine = ctx.state["engine"]
+        engine.submit((kf.T_world_cam, kf.gray_left, kf.depth_m, kf.seq))
+        res: SlamResult | None = engine.poll()
+        if res is None:
             return None
-        slam.optimize()
-        kf_poses = {int(slam.kf_seq[i]): slam.kf_pose[i].copy()
-                    for i in range(len(slam.kf_pose))}
-        return LoopCorrection(kf.seq, kf_poses, len(slam.loop_events))
+        return LoopCorrection(kf.seq, res.kf_poses, res.n_loops)

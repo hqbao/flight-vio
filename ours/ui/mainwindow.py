@@ -90,9 +90,13 @@ class MainWindow(QMainWindow):
 
         self.viewer = Viewer3D(history, default_view=default_view)
         # Live SLAM map overlay (keyframe dots + loop-closure links), only when
-        # the source publishes one (backend='slam'); harmless no-op otherwise.
+        # the source publishes one (ours-slam); harmless no-op otherwise.
         if hasattr(source, "slam_overlay_snapshot"):
             self.viewer.set_overlay_source(source.slam_overlay_snapshot)
+        # BA/SLAM-refined trajectory line behind the live marker, only when the
+        # source publishes one (ours-ba/ours-slam); harmless no-op otherwise.
+        if hasattr(source, "refined_path_snapshot"):
+            self.viewer.set_refined_path_source(source.refined_path_snapshot)
         self.panel = TelemetryPanel(history, source_fps_getter=lambda: source.fps)
         self.panel.setFixedWidth(260)
 

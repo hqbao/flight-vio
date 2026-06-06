@@ -31,10 +31,18 @@ the OAK-D watchdog crashes the device), and the cam/imu_cam/odometry inboxes are
 ``realtime_latest=True`` (newest-frame-wins, bounded latency). This mirrors the
 already-stable keypoint-depth live view.
 
+Crucially the heavy flow also runs ``worker=True``: the BA / SLAM solve executes
+**out-of-process** (see :mod:`ours.lib.engine.subprocess`), so its mostly-pure-Python
+work never holds the camera read loop's GIL. That is the actual fix for the
+fast-push "ì lại" undershoot -- a marker that is merely *data*-decoupled from the
+correction still lagged because an in-thread solve starved the read loop and
+dropped frames; out-of-process removes that contention entirely.
+
 Only exercisable on real hardware (it opens the OAK-D device).
 """
 from __future__ import annotations
 
+import threading
 import time
 
 import numpy as np
@@ -89,6 +97,22 @@ class FlowPoseSource(PoseSource):
         self._frames = 0
         self._last_fps_t = 0.0
 
+        # ---- live MAP overlay (read by the 3D viewer, written by _run) -------
+        # The heavy optimiser's refined map, mirrored here so the Qt viewer can
+        # read a consistent snapshot under a lock while the source thread updates
+        # it from the (out-of-process) engine. All in NED so the viewer applies
+        # only its NED->ENU display transform. REAL engine outputs: ours-ba ->
+        # refined keyframe trajectory; ours-slam -> corrected keyframe dots +
+        # loop-closure flash. Empty for bare ours (no engine).
+        self._engine = None                          # heavy flow's Engine (or None)
+        self._ov_lock = threading.Lock()
+        self._ba_pts: dict[int, np.ndarray] = {}     # ba: {kf_id: world pos (opt)}
+        self._refined_ned = np.zeros((0, 3), np.float32)   # refined trajectory line
+        self._slam_kf_ned = np.zeros((0, 3), np.float32)   # slam keyframe dots
+        self._slam_match_ned = np.zeros((0, 3), np.float32)  # last revisit dots
+        self._slam_n_loops = 0
+        self._slam_flash_id = 0
+
     def _on_pose(self, msg: PoseMsg) -> None:
         T = msg.T_world_cam
         pos_opt = T[:3, 3]
@@ -116,6 +140,66 @@ class FlowPoseSource(PoseSource):
             self._frames = 0
             self._last_fps_t = now
 
+    # ---- live map overlay (engine -> mirror -> viewer) -------------------
+
+    def _poll_overlay(self) -> None:
+        """Drain the heavy engine's latest map snapshot into the locked mirror.
+
+        Runs on the source thread (the ``_run`` loop). Reads a REAL engine output
+        (ours-ba: ``{kf_id: refined world pos}``; ours-slam:
+        ``(kf_pos, n_loops, match_pos)``), transforms optical->NED with the same
+        matrix the marker uses, and updates the buffers the viewer reads.
+        """
+        if self._engine is None:
+            return
+        ov = self._engine.poll_overlay()
+        if ov is None:
+            return
+        if self.mode == "ba":
+            self._ba_pts.update(ov)              # finalise window kfs by id
+            ids = sorted(self._ba_pts)
+            pos = np.array([self._ba_pts[i] for i in ids], dtype=np.float64)
+            ned = (pos @ _M_OPT_TO_NED.T).astype(np.float32) if len(pos) else \
+                np.zeros((0, 3), np.float32)
+            with self._ov_lock:
+                self._refined_ned = ned
+        else:                                    # slam
+            kf_pos, n_loops, match_pos = ov
+            kf_ned = ((np.asarray(kf_pos) @ _M_OPT_TO_NED.T).astype(np.float32)
+                      if len(kf_pos) else np.zeros((0, 3), np.float32))
+            with self._ov_lock:
+                self._refined_ned = kf_ned
+                self._slam_kf_ned = kf_ned
+                if n_loops > self._slam_n_loops:     # a NEW loop just closed
+                    self._slam_n_loops = int(n_loops)
+                    self._slam_flash_id += 1
+                    self._slam_match_ned = (
+                        (np.asarray(match_pos) @ _M_OPT_TO_NED.T).astype(np.float32)
+                        if len(match_pos) else np.zeros((0, 3), np.float32))
+
+    def refined_path_snapshot(self) -> np.ndarray:
+        """The BA/SLAM-refined trajectory in NED (read by the viewer)."""
+        with self._ov_lock:
+            return self._refined_ned.copy()
+
+    def slam_overlay_snapshot(self):
+        """``(kf_ned, match_ned, loop_segs, flash_id)`` for the SLAM map overlay."""
+        with self._ov_lock:
+            return (self._slam_kf_ned.copy(), self._slam_match_ned.copy(),
+                    [], self._slam_flash_id)
+
+    def clear_slam_map(self) -> None:
+        """UI "clear keyframes": forget the heavy map + wipe the overlay buffers."""
+        if self._engine is not None:
+            self._engine.reset()
+        with self._ov_lock:
+            self._ba_pts.clear()
+            self._refined_ned = np.zeros((0, 3), np.float32)
+            self._slam_kf_ned = np.zeros((0, 3), np.float32)
+            self._slam_match_ned = np.zeros((0, 3), np.float32)
+            self._slam_n_loops = 0
+            self._slam_flash_id += 1
+
     def _run(self) -> None:
         from ..app import build_live           # lazy: pulls depthai only here
         from ..flows.ui import UiRenderFlow
@@ -130,10 +214,16 @@ class FlowPoseSource(PoseSource):
                 depth_fast=self.depth_fast,
                 recalibrate_bias=self.recalibrate_bias, ui=ui,
                 with_backend_slam=False, realtime_latest=True,
-                backend=(self.mode == "ba"), slam=(self.mode == "slam"))
+                backend=(self.mode == "ba"), slam=(self.mode == "slam"),
+                worker=(self.mode in ("ba", "slam")))
         except Exception as e:                                    # noqa: BLE001
             self._fail(f"device open failed: {e}")
             return
+
+        # The heavy flow (BackendFlow/SlamFlow) exposes its Engine; poll its map
+        # overlay here on the source thread (never the marker's path -- that stays
+        # pose.odom). None for bare ours (no heavy flow), so the overlay is empty.
+        self._engine = next((f.engine for f in flows if hasattr(f, "engine")), None)
 
         for f in flows:
             f.start()
@@ -141,11 +231,18 @@ class FlowPoseSource(PoseSource):
         cam_flow.start()
         try:
             while not self._stop.is_set() and cam_flow.is_alive():
+                self._poll_overlay()
                 time.sleep(0.05)
         finally:
+            self._engine = None
             cam_flow.stop()
             imu_flow.stop()
             ui.done.wait(timeout=5.0)
             for f in flows:
                 f.stop()
+            # Join so each heavy flow's run()-finally has reaped its subprocess
+            # engine (sentinel -> join -> terminate) BEFORE we release the device;
+            # otherwise a lingering worker could outlive the parent's teardown.
+            for f in flows:
+                f.join(timeout=3.0)
             device.release()

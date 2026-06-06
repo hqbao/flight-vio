@@ -147,6 +147,23 @@ class Viewer3D(gl.GLViewWidget):
         )
         self.addItem(self._traj)
 
+        # ---- refined-map polyline (optional) -----------------------------
+        # The BA/SLAM-refined keyframe trajectory, drawn in HUD cyan BEHIND the
+        # green live path so ours-ba/ours-slam visibly show the corrected map the
+        # heavy optimiser produced while the marker stays the responsive f2f tip.
+        # Populated only when the source exposes ``refined_path_snapshot`` (set via
+        # ``set_refined_path_source``); a harmless empty line otherwise. Fed REAL
+        # refined poses (BA window kf positions / SLAM corrected kf poses).
+        self._refined_getter: Callable[[], np.ndarray] | None = None
+        self._refined = gl.GLLinePlotItem(
+            pos=np.zeros((1, 3), dtype=np.float32),
+            color=_qcolor(theme.REFINED_PATH, 0.85),
+            width=2.0,
+            antialias=True,
+            mode="line_strip",
+        )
+        self.addItem(self._refined)
+
         # ---- drone triad --------------------------------------------------
         self._drone = _DroneTriad(length=0.6)
         for it in self._drone.items():
@@ -218,6 +235,15 @@ class Viewer3D(gl.GLViewWidget):
         """
         self._overlay_getter = getter
 
+    def set_refined_path_source(self, getter: Callable[[], np.ndarray]) -> None:
+        """Register a callable returning the BA/SLAM-refined trajectory.
+
+        ``getter()`` returns an ``(N, 3)`` array of refined positions in NED
+        (the corrected keyframe path). Polled each refresh and drawn as the cyan
+        refined-map line behind the live green path; pass ``None`` to disable.
+        """
+        self._refined_getter = getter
+
     # ---- internal --------------------------------------------------------
 
     def _refresh(self) -> None:
@@ -242,7 +268,18 @@ class Viewer3D(gl.GLViewWidget):
                 p_enu = frames.ned_to_enu(latest.pos_ned)
                 self.opts["center"] = QtGui.QVector3D(*p_enu.astype(float))
                 self.update()
+        self._refresh_refined()
         self._refresh_overlay()
+
+    def _refresh_refined(self) -> None:
+        if self._refined_getter is None:
+            return
+        pts = self._refined_getter()
+        if pts is None or len(pts) < 2:
+            self._refined.setData(pos=np.zeros((1, 3), dtype=np.float32))
+            return
+        enu = frames.ned_to_enu(np.asarray(pts, np.float64)).astype(np.float32)
+        self._refined.setData(pos=enu)
 
     def _refresh_overlay(self) -> None:
         if self._overlay_getter is None:

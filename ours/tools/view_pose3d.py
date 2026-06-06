@@ -50,9 +50,11 @@ def _build_source(name: str, args):
         # Rebuilt on the SAME flow pipeline as ``ours`` (NOT the legacy
         # monolith): the live marker stays the responsive pose.odom tip (tracks
         # the full distance like ``ours``, never dragged), while the windowed-BA
-        # (``ours-ba``) or loop-closure SLAM (``ours-slam``) flow runs latest-only
-        # in the background to refine the map behind it. ``mode`` selects which
-        # optimiser runs.
+        # (``ours-ba``) or loop-closure SLAM (``ours-slam``) flow runs the heavy
+        # solve OUT-OF-PROCESS (so it never holds the read loop's GIL) and refines
+        # the MAP behind the marker: ours-ba draws the cyan BA-refined trajectory,
+        # ours-slam the corrected keyframe dots + loop-closure flash. ``mode``
+        # selects which optimiser runs.
         from ours.ui.live_source import FlowPoseSource
         return FlowPoseSource(width=args.width, height=args.height,
                               fps=args.fps,
@@ -92,10 +94,11 @@ def main() -> int:
                              "ours-legacy", "ours-legacy-ba", "ours-legacy-slam",
                              "ours-vio"),
                     help="pose provider (ours = flow pipeline, f2f live; "
-                         "ours-ba = flow pipeline + windowed BA (map refine, "
-                         "marker stays responsive f2f); ours-slam = flow "
-                         "pipeline + loop-closure SLAM; ours-legacy* = the old "
-                         "monolithic sources; ours-vio = tight-coupled VIO)")
+                         "ours-ba = flow pipeline + out-of-process windowed BA "
+                         "(cyan refined-map line, marker stays responsive f2f); "
+                         "ours-slam = flow pipeline + out-of-process loop-closure "
+                         "SLAM (keyframe dots + loop flash); ours-legacy* = the "
+                         "old monolithic sources; ours-vio = tight-coupled VIO)")
     ap.add_argument("--fps", type=int, default=20,
                     help="camera frame rate (ours/ours-ba/ours-slam) [20]")
     ap.add_argument("--recalibrate-bias", action="store_true",

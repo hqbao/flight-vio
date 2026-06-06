@@ -61,6 +61,8 @@ WARN        = "#ffb000"   # caution amber
 BAD         = "#ff3b30"   # master warning red
 
 TRACE_PATH  = "#7cff5c"   # trajectory line (NVG green)
+REFINED_PATH = "#5ce1ff"  # BA/SLAM-refined map line — HUD cyan, reads as the
+                          # corrected map BEHIND the live green marker path
 AXIS_N      = "#ff3b30"   # North/Forward — red
 AXIS_E      = "#7cff5c"   # East/Right    — green
 AXIS_U      = "#5ce1ff"   # Up            — HUD cyan
