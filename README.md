@@ -8,7 +8,6 @@ to a Raspberry Pi 5 later.
 oak-d/
   ours/                  OUR from-scratch pipeline (library-free; self-contained)
     app.py               wire + run the 6 flows over a pub/sub bus (live + replay)
-    depthai_ours_vio.py  live OAK-D source driving ours.lib (ours/-ba/-slam/-vio)
     lib/                 the algorithm library + runtime building blocks
       pose.py            own Pose dataclass + ring buffer (copy, kept independent)
       frames.py          own camera/body/world transforms (copy)
@@ -21,6 +20,7 @@ oak-d/
       odometry/          frame-to-frame RGB-D PnP (+ gyro fusion) + own RANSAC PnP
       backend/           sliding-window bundle adjustment (analytic Schur)
       loop/              own ORB + F-matrix loop closure + SE(3) pose graph + SLAM
+      engine/            in-process | out-of-process runner for the heavy BA/SLAM solve
       io/                recorded-session reader + time-synced bundles
       config/            resolution-aware tuning profiles
     flows/               live-pipeline orchestration (one thread + tasks per flow)
@@ -98,8 +98,9 @@ The **baseline** (DepthAI/Basalt) viewer is a separate entry point:
 ```
 
 `--source ours` is the flow pipeline (cam + imu_cam → odometry → backend →
-slam → ui flows over a pub/sub bus); the older single-file source is still
-available as `--source ours-legacy`. For a device run with no GUI:
+slam → ui flows over a pub/sub bus); `--source ours-ba` / `ours-slam` add an
+out-of-process BA / loop-closure optimiser refining the map behind the marker.
+For a device run with no GUI:
 
 ```bash
 .venv/bin/python -m ours.app --live          # headless: stream the OAK-D, print pose/loops
@@ -205,27 +206,22 @@ covered by offline self-tests (`accel_calib_selftest`, `calib_collect_selftest`,
 without an OAK-D.
 
 
-Both `ours-ba` and `ours-slam` run their heavy optimisation in a **background
-process** (`ours/legacy/ba_worker_proc.py`), so the BA refine can never steal the
-GIL from the camera read loop. (It used to run on a *thread*; the BA refine is
-mostly pure-Python and held the GIL ~17–30% of the time — measured 43 ms mean /
-74 ms peak every 250 ms — which starved the read loop on a fast push so it
-dropped frames and the displayed path "đẩy nhanh rồi ì lại" / undershot. Moving
-it out-of-process removes that contention; the corrections are bit-identical, see
-`ours/tools/ba_worker_proc_selftest.py`.) The BA/loop correction is also
-**speed-gated**: the correction is folded into the live marker only while the
-camera is essentially still (filter speed < 0.1 m/s); during any real motion it
-is frozen, so the marker rides it as a rigid transform and tracks the full
-distance (like `ours`). This kills two stalls with one gate: (1) the fast-push
-"đẩy nhanh rồi ì lại" drag (the live BA map can diverge from the f2f filter
-pose), and (2) the `ours-slam` "đi không đủ 100%, không kéo thêm" stall in a small
-room, where a premature loop closure publishes a ~0.4 m *backward* correction
-that, slewed in at the 0.3 m/s rate-limit, almost exactly cancels a slow forward
-push (~0.3 m/s) so the marker tracked only ~50 %. Freezing during motion makes
-the correction rigid (path-preserving), and the fully loop-corrected map is still
-shown live by the keyframe-dot overlay; the cost is that the live *trail* folds
-in loop accuracy only when you pause (lab_loop display-trail ATE ~126 → ~156 mm),
-which is the right trade for a responsive live marker. The accelerometer levels roll/pitch to
+Both `ours-ba` and `ours-slam` run their heavy optimisation **out-of-process**
+(`ours/lib/engine/subprocess.py`), so the BA / loop solve can never steal the GIL
+from the camera read loop. (Run in-thread the solve is mostly pure-Python and held
+the GIL ~17–30% of the time — measured 43 ms mean / 74 ms peak every 250 ms — which
+starved the read loop on a fast push so it dropped frames and the displayed path
+"đẩy nhanh rồi ì lại" / undershot. A separate process removes that contention
+entirely; the corrections are bit-identical, see
+`ours/tools/engine_parity_selftest.py`.) The live **marker is always the responsive
+`pose.odom` tip** — it is never touched by the correction, so it tracks the full
+distance exactly like `ours`. The BA / loop output refines only the **map drawn
+behind the marker**: `ours-ba` shows the cyan BA-refined keyframe trajectory,
+`ours-slam` the corrected keyframe dots + a loop-closure flash. (The earlier design
+folded an eased, rate-limited correction into the marker itself, which caused the
+fast-push drag and a slow-push cancellation in small rooms — a premature loop
+closure's ~0.4 m backward correction nearly cancelled a slow forward push;
+decoupling the marker from the correction removed both.) The accelerometer levels roll/pitch to
 gravity at rest, while the **gyroscope** drives the inter-frame rotation prior:
 vision (PnP) corrects that rotation weighted by its inlier confidence, *and* by
 how far it disagrees with the gyro — so when a fast yaw makes the KLT tracker
@@ -269,7 +265,7 @@ gold sessions, not guessed:
   rest). The accelerometer residual vs its EMA is the honest discriminator, so
   the freeze fires **only when still** (`> _REST_MOTION_THRESH` vetoes it).
   Offline on `shake_linear_20s` this recovered the frozen frames (12 → 0,
-  display path 15.05 → 16.29 m, matching `ours` 16.51 m). The legacy tools pass
+  display path 15.05 → 16.29 m, matching `ours` 16.51 m). The offline tools pass
   no flag (`imu_moving=False`) so every offline/gold score is byte-identical.
 - **`resolve_translation_on_disagree`** — kept available but **left off live**:
   measured on `push_shake_20s` its disagreement gate fires on only ~8% of frames

@@ -2,8 +2,8 @@
 """Offline replay of the LIVE display path over a recorded session.
 
 This is the honest self-test that lets us iterate on the live translation
-pipeline WITHOUT a device. It reproduces, frame-for-frame, exactly what
-``ours/legacy/depthai_ours_vio.py`` does on the OAK-D:
+pipeline WITHOUT a device. It reproduces, frame-for-frame, the live display
+path the odometry flow drives on the OAK-D:
 
   1. gyro preintegration between frames -> per-frame rotation prior ``R_prior``
   2. accelerometer averaged into the camera frame + gravity leveling
@@ -50,6 +50,51 @@ from ours.tools.vio_run import load_basalt_positions, umeyama  # noqa: E402
 
 
 _REST_MOTION_THRESH = 0.35   # m/s^2, same as the live source
+
+# Correction-easing helper for the optional ``--ba`` offline analysis stage (it
+# replays what an eased BA correction WOULD do to the displayed tip). Self-contained
+# here so this tool has no dependency on any removed monolith. The live ours-ba
+# marker no longer uses an eased correction at all (it rides pose.odom; the BA
+# output only refines the map overlay) -- this stage is kept purely for offline
+# regression comparison against that earlier design.
+_CORR_MAX_STEP_T = 0.015                    # m per frame   (~0.3 m/s @ 20 fps)
+_CORR_MAX_STEP_R = float(np.deg2rad(0.5))   # rad per frame (~10 deg/s @ 20 fps)
+
+
+def _ease_se3(C_cur: np.ndarray, C_tgt: np.ndarray, alpha: float,
+              max_t: float = 0.0, max_ang: float = 0.0) -> np.ndarray:
+    """Move ``C_cur`` a fraction ``alpha`` toward ``C_tgt`` (smooth SE3 ease).
+
+    Rotation eases along the geodesic (scaled axis-angle); translation eases
+    linearly. ``max_t`` / ``max_ang`` (when > 0) clamp the per-call STEP to a
+    bounded translation (m) / rotation (rad) so a large jump bleeds in over
+    several frames; the clamp is a no-op when both are 0.
+    """
+    R_cur, R_tgt = C_cur[:3, :3], C_tgt[:3, :3]
+    dR = R_tgt @ R_cur.T
+    ang = np.arccos(np.clip((np.trace(dR) - 1.0) * 0.5, -1.0, 1.0))
+    a = alpha * ang
+    if max_ang > 0.0:
+        a = min(a, max_ang)
+    out = np.eye(4)
+    if ang < 1e-8:
+        out[:3, :3] = R_tgt
+    else:
+        axis = np.array([dR[2, 1] - dR[1, 2],
+                         dR[0, 2] - dR[2, 0],
+                         dR[1, 0] - dR[0, 1]]) / (2.0 * np.sin(ang))
+        K_ = np.array([[0, -axis[2], axis[1]],
+                       [axis[2], 0, -axis[0]],
+                       [-axis[1], axis[0], 0]])
+        R_step = np.eye(3) + np.sin(a) * K_ + (1.0 - np.cos(a)) * (K_ @ K_)
+        out[:3, :3] = R_step @ R_cur
+    dt = alpha * (C_tgt[:3, 3] - C_cur[:3, 3])
+    if max_t > 0.0:
+        n = float(np.linalg.norm(dt))
+        if n > max_t:
+            dt *= max_t / n
+    out[:3, 3] = C_cur[:3, 3] + dt
+    return out
 
 
 def replay(session_dir: Path, max_frames: int = 0, verbose: bool = False,
@@ -114,9 +159,10 @@ def replay(session_dir: Path, max_frames: int = 0, verbose: bool = False,
     tfilt = InertialTranslationFilter(InertialFilterConfig(vel_damp=vel_damp))
     tfilt.reset(vo.pose[:3, 3].copy())
 
-    # --- optional ours-ba correction stage (faithful to the live source) ----
-    # Mirrors depthai_ours_vio.py: a background WindowedBAMap is fed the filtered
-    # f2f display pose every kf_every frames; it returns a world-frame correction
+    # --- optional ours-ba correction stage (offline regression analysis) ----
+    # Models the EARLIER eased-correction design: a background WindowedBAMap is
+    # fed the filtered f2f display pose every kf_every frames; it returns a
+    # world-frame correction
     # C = inv(T_ba) @ T_cw that is eased (15%/frame, optionally rate-limited)
     # onto the displayed tip. The worker latency + single-slot drop are modelled
     # so the offline trajectory matches what the device shows for ours-ba.
@@ -129,8 +175,6 @@ def replay(session_dir: Path, max_frames: int = 0, verbose: bool = False,
     if ba:
         from ours.lib import WindowedBAMap, WindowedConfig
         from ours.lib.backend.bundle import BAConfig
-        from ours.legacy.depthai_ours_vio import (
-            _ease_se3, _CORR_MAX_STEP_T, _CORR_MAX_STEP_R)
         bacfg = WindowedConfig(window=6, kf_every=5,
                                ba=BAConfig(max_iters=5, use_gravity=True,
                                            use_vo_trans_prior=True))
@@ -192,7 +236,7 @@ def replay(session_dir: Path, max_frames: int = 0, verbose: bool = False,
         # IMU motion gate for the low-inlier translation freeze (mirror the live
         # source): a motion-blurred shake also starves PnP of inliers, but only a
         # still textureless wall should freeze. Computed from the previous
-        # frame's accel EMA, exactly as depthai_ours_vio.py does.
+        # frame's accel EMA, exactly as the live odometry flow does.
         imu_moving = bool(
             accel_raw is not None and accel_ema is not None
             and float(np.linalg.norm(accel_raw - accel_ema)) > _REST_MOTION_THRESH)

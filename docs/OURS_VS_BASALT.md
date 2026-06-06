@@ -5,8 +5,8 @@ VIO differs from the BasaltVIO black box we are replacing*, so that future work
 to close the gap (or to deliberately keep a difference) has a concrete basis and
 does not have to re-derive it.
 
-**Last updated**: 2026-06-05
-**Our code**: `ours/legacy/depthai_ours_vio.py` (live)
+**Last updated**: 2026-06-07
+**Our code**: `ours/flows/` (live flow pipeline) + `ours/ui/live_source.py` (viewer bridge) + `ours/lib/engine/` (out-of-process BA/SLAM)
 **Basalt (reference)**: `dai.node.BasaltVIO` consumed in `baseline/depthai_vio.py`
 **Scoring**: `ours/tools/vio_run.py` (offline, vs recorded Basalt poses) + `ours/tools/live_replay.py`
 
@@ -81,7 +81,8 @@ These are the deltas to attack if the goal is "be Basalt".
    role IMU preintegration plays for Basalt but sourced from our own VO
    (push_straight 0.39→0.97, push_fwdback 0.30→0.78). This anchors `ours-ba`/
    `ours-slam` to the VO scale; closing the remaining gap to Basalt still needs
-   true IMU-in-the-estimator (the `ours-vio` tight-coupled path).
+   true IMU-in-the-estimator (the tight-coupled path: `ours/lib/backend/vio_window.py`,
+   offline `vio_run.py --backend vio` — see §4.1).
 
 2. **RGB-D depth map instead of raw stereo triangulation.** We consume the
    chip's SGBM depth blob; it is blur-biased and noisy at range (capped at 8 m
@@ -157,44 +158,36 @@ by `ours/tools/vio_ba_selftest.py` scenario C (tilt-locked yaw+pos recovery) and
 `ours/tools/vio_scale_probe.py --measure-b`. **`vio` is still opt-in / experimental
 and touches no production path.**
 
-### 4.1 Live `--source ours-vio`: VPU-free depth + a real-time background solve
+### 4.1 The tight-coupled path today (offline) + what a live rebuild inherits
 
-`ours/legacy/depthai_ours_vio.py` runs the tight-coupled window **live** with
-two deliberate properties, both **measured** (no device-only guesses):
+The tight-coupled window solver lives in `ours/lib/backend/vio_window.py`
+(`optimize_vio`, `WindowedVIOMap`, `VioConfig`) and is exercised **offline** by
+`ours/tools/vio_run.py --backend vio` and validated by `ours/tools/vio_ba_selftest.py`.
 
-1. **Fully portable depth (no VPU / no `StereoDepth`).** The source taps the two
-   **RAW** mono cameras and does *everything* itself: our own `LeftRectifier` +
-   `RightRectifier` (library-free, verified to ~1e-7 vs `cv2.stereoRectify`) →
-   our own dense **SGM** matcher (`ours/vio/stereo.py`, census + N-path
-   Hirschmüller, numba-accelerated) → metric depth. The chip stereo/depth
-   engine is never used, so this front-end ports unchanged to any 2-camera +
-   CPU target. The chip depth survives **only** as the offline oracle
-   (`ours/tools/stereo_selftest.py`, `ours/tools/vio_run.py --depth chip`).
-   - **Grid invariant (bug fixed 2026-06-04):** depth is defined on the
-     RECTIFIED-left grid, so tracking MUST run on the rectified left too.
-     `dense_depth_rectified_left()` returns `(rectified_left, depth)` and the
-     live loop tracks on that. Feeding the *raw* left to PnP while depth was
-     rectified read every feature's depth at the wrong pixel (raw→rectified
-     displacement: median 27 px, p95 85 px) → garbage 3D points → PnP churn.
+> The old live `--source ours-vio` viewer rode the legacy monolith, which has been
+> removed; a live tight-coupled viewer would be rebuilt on the flow pipeline exactly
+> like `ours-ba` / `ours-slam` (an `EngineFlow` + a `FlowPoseSource` mode), reusing
+> the out-of-process engine so the solve never holds the camera read-loop GIL.
 
-2. **The background VIO solve no longer starves the camera loop.** `run_ba()`
-   runs on a worker thread. Two fixes made it real-time:
-   - **Worker trim** (window 5→**4**, LM iters 6→**3**): ~320 ms → ~125 ms solve
-     (~30% duty at the kf-every-5 cadence), ATE on gold essentially unchanged
-     (lab_loop 184→190 mm, straight 212→236, quick 112→117; all <0.1% of path).
-   - **Vectorised `optimize_vio` (2026-06-05).** The projection/depth factor
-     assembly was a scalar Python finite-difference loop that **held the GIL**
-     for the whole solve → blocked the live read loop → frame drops → feature
-     loss on fast motion ("chỉ ăn một đoạn ngắn"). It is now batched numpy
-     (einsum + `np.add.at` scatter) that releases the GIL; the IMU factor loop
-     evaluates the 10 adjacent nav vectors directly (no per-column state copy).
-     **Validated numerically identical** to the old scalar version (A/B on the
-     self-test worlds: iters equal, cost1 diff 6e-18, state maxabs ~1e-13;
-     `vio_ba_selftest` A/B/C all PASS). Measured effect: max contiguous
-     main-thread stall while a solve runs dropped from ~120 ms (≈3–4 dropped
-     frames) to **3.45 ms** — below one frame interval, so no frame-length
-     stall. This mirrors the earlier BA + PGO GIL vectorisations; `optimize_vio`
-     was the last un-vectorised solver.
+Two properties measured on the legacy live experiment are **already inherited by the
+flow pipeline**, so a rebuild starts from them:
+
+1. **Fully portable depth (no VPU / no `StereoDepth`).** The acquisition front-end
+   taps the two **RAW** mono cameras and does everything itself: our own
+   `LeftRectifier`/`RightRectifier` (library-free, ~1e-7 vs `cv2.stereoRectify`) →
+   our own dense **SGM** matcher (`ours/lib/stereo/stereo.py`, census + N-path
+   Hirschmüller, numba) → metric depth. The chip stereo engine is never used, so the
+   front-end ports to any 2-camera + CPU target. (In the flow pipeline this is the
+   `imu_cam` flow's `ComputeDepth` task.) **Grid invariant:** depth is on the
+   RECTIFIED-left grid, so tracking runs on the rectified left too — feeding the raw
+   left to PnP read depth at the wrong pixel (median 27 px off) → PnP churn.
+
+2. **The window solve does not starve the camera loop.** `optimize_vio` was
+   vectorised (batched numpy: einsum + `np.add.at` scatter) so it releases the GIL,
+   **numerically identical** to the old scalar version (`vio_ba_selftest` A/B/C
+   PASS). On the rebuilt path the heavy solve runs **out-of-process**
+   (`ours/lib/engine/subprocess.py`), which removes GIL contention entirely — the
+   same mechanism that fixed the `ours-ba`/`ours-slam` fast-push undershoot.
 
 ---
 
@@ -239,11 +232,14 @@ Do these on the `vio` path (`vio_window.py`) so production `ours` stays safe.
 ## 6. Run / score commands (for the next session)
 
 ```bash
-# Live (device): our loosely-coupled VIO with the guards on
+# Live (device): our loosely-coupled VIO (bare f2f marker)
 ./run.sh --source ours --fps 60
+# Live (device): + out-of-process windowed BA / loop-closure SLAM refining the map
+./run.sh --source ours-ba                  # cyan BA-refined trajectory behind the marker
+./run.sh --source ours-slam                # keyframe dots + loop-closure flash
 
-# Live (device): tight-coupled window + fully VPU-free depth (our SGM)
-./run.sh --source ours-vio                 # watch the sgm=/vo=/loop= split + drop=0
+# Tight-coupled window is offline-only today (no live viewer; rebuild on flows when needed):
+.venv/bin/python ours/tools/vio_run.py --backend vio --depth ours --depth-fast
 
 # Offline scoring vs Basalt
 .venv/bin/python ours/tools/vio_run.py --all --backend f2f    # production frontend

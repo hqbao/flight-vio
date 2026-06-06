@@ -147,8 +147,8 @@ def main() -> int:
         P = np.array([[0, 1, 0.0], [0, 0, 1], [1, 0, 0]])
         Rned = M @ R0 @ P
         # matrix -> quat -> rpy
-        from ours.legacy.depthai_ours_vio import _rot_to_quat_wxyz
-        r, pi, y = np.degrees(quat_to_rpy(_rot_to_quat_wxyz(Rned)))
+        from ours.lib.misc.frames import rot_to_quat
+        r, pi, y = np.degrees(quat_to_rpy(rot_to_quat(Rned)))
         gdir = g_cam / (np.linalg.norm(g_cam) + 1e-12)
         print(f"\n[{label}] {extra}")
         print(f"  gravity-in-cam (optical, unit) = [{gdir[0]:+.3f} {gdir[1]:+.3f} {gdir[2]:+.3f}]")

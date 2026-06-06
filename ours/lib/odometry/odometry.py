@@ -376,9 +376,8 @@ class RGBDVisualOdometry:
         """Advance odometry by one frame; returns the current 4x4 world pose.
 
         Thin wrapper: :meth:`track` then :meth:`estimate`. Kept so every existing
-        caller (the legacy source, the offline tools, the regression tests) stays
-        byte-for-byte unchanged; the live flow runs the two halves as separate
-        tasks instead.
+        caller (the offline tools + the regression tests) stays byte-for-byte
+        unchanged; the live flow runs the two halves as separate tasks instead.
 
         ``R_prior`` (optional) is the predicted previous->current camera rotation
         (e.g. from gyro preintegration). When given it seeds the PnP solver, which

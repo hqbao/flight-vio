@@ -340,7 +340,7 @@ def run_live(width: int, height: int, fps: int, scale: float,
              use_bias: bool, fast: bool, bias_window_s: float = 1.0) -> int:
     """Live (image, depth, IMU) triplet from a connected OAK-D.
 
-    Mirrors the VPU-free live VIO input exactly (ours.legacy.depthai_ours_vio):
+    Mirrors the VPU-free live VIO input exactly (the imu_cam acquisition flow):
     taps the two RAW cameras + the IMU, rectifies BOTH frames and runs our SGM
     ourselves (no chip StereoDepth), and integrates/averages the IMU the same way
     the VIO does -- so the triplet shown here is the real pipeline input.

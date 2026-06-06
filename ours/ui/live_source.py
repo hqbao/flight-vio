@@ -6,8 +6,8 @@ whose callback converts each streamed ``pose.odom`` (camera-optical world) into 
 viewer :class:`~ours.lib.misc.pose.Pose` in NED and pushes it through the
 :class:`~ours.ui.source.PoseSource` callback the viewer already understands.
 
-It replaces the monolithic ``OakOursVioSource`` as the live source for every
-mode while keeping the same UI contract (start / stop / fps / error). The
+It is the live source for every mode, keeping the UI contract the viewer expects
+(start / stop / fps / error). The
 displayed MARKER is always the real-time frame-to-frame VO (``pose.odom``) -- the
 responsive tip that tracks the camera at full distance.
 
@@ -20,8 +20,8 @@ map behind that marker:
 
 Crucially the marker is **decoupled** from the heavy flow: the BA/SLAM output
 (``pose.refined`` / ``loop.correction``) feeds the map overlay, never the marker,
-so an async correction can never drag or stall the live tip -- the failure mode
-that made the legacy source "ì lại" under fast / shaky motion. Offline-verified:
+so an async correction can never drag or stall the live tip -- the "ì lại"
+(undershoot) failure mode under fast / shaky motion. Offline-verified:
 ``pose.odom`` is byte-identical with and without BA running.
 
 The graph is built **realtime-bounded**: the heavy flow is ``latest_only=True``
@@ -55,7 +55,7 @@ from .source import PoseSource
 
 # Camera optical (x right, y down, z forward) -> world NED, and the column
 # reorder that maps the optical attitude columns to the body [forward, right,
-# down] triad the viewer expects. Identical convention to the legacy source.
+# down] triad the viewer expects (the optical->NED display convention).
 _M_OPT_TO_NED = np.array([[0.0, 0.0, 1.0],
                           [1.0, 0.0, 0.0],
                           [0.0, 1.0, 0.0]])
@@ -86,8 +86,8 @@ class FlowPoseSource(PoseSource):
         #   "slam" -> SlamFlow (loop closure). The heavy flow is built latest-only
         # so it can never backlog the marker. Its refined output (pose.refined /
         # loop.correction) feeds the map overlay, NOT the marker -- so the marker
-        # can never be dragged/stalled by an async correction (the failure mode of
-        # the legacy OakOursVioSource).
+        # can never be dragged/stalled by an async correction (the earlier "ì lại"
+        # undershoot failure mode).
         if mode not in ("odom", "ba", "slam"):
             raise ValueError(f"FlowPoseSource mode must be odom|ba|slam, got {mode!r}")
         self.mode = mode

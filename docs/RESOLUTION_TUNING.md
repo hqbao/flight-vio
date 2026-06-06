@@ -23,7 +23,7 @@ be overridden at runtime for the co-tuning workflow below.
 The startup log prints the active profile, e.g.:
 
 ```
-[ours-vio] resolution profile: 320x200 (s=0.50): corners=200 min_dist=6.0px
+[ours] resolution profile: 320x200 (s=0.50): corners=200 min_dist=6.0px
            klt=11px/2lvl reproj=1.0px ndisp=48 orb=400
 ```
 

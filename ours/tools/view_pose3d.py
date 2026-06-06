@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """Entry point — launch the 3D pose viewer for *our* from-scratch VIO.
 
-Standalone to the ``ours/`` pipeline: it wires our live RGB-D VIO source
-(:class:`ours.legacy.depthai_ours_vio.OakOursVioSource`) into our own copy of the Qt
-3D viewer (:mod:`ours.ui`). It shares nothing with ``baseline/`` — the Basalt
-backends live in ``baseline/tools/view_pose3d.py``.
+Standalone to the ``ours/`` pipeline: it wires our live RGB-D VIO source (the flow
+graph from :mod:`ours.app`, bridged to the viewer by
+:class:`ours.ui.live_source.FlowPoseSource`) into our own copy of the Qt 3D viewer
+(:mod:`ours.ui`). It shares nothing with ``baseline/`` — the Basalt backends live in
+``baseline/tools/view_pose3d.py``.
+
+Sources: ``ours`` (bare f2f), ``ours-ba`` / ``ours-slam`` (same flow pipeline + an
+out-of-process BA / loop-closure optimiser refining the map behind the responsive
+marker), and ``fake`` (device-free figure-8 for UI bring-up).
 """
 from __future__ import annotations
 
@@ -26,146 +31,46 @@ def _build_source(name: str, args):
     name = name.lower()
     if name == "fake":
         return FakePoseSource(rate_hz=100.0, radius_m=3.0, period_s=12.0)
-    # Resolution + per-resolution vision overrides shared by every ours-* source.
-    # Each override defaults to None -> the source auto-scales it from the
-    # 640x400 baseline (see ours/vio/resolution.py + docs/RESOLUTION_TUNING.md).
-    res_kw = dict(
-        width=args.width, height=args.height,
-        max_corners=args.max_corners, min_distance=args.min_distance,
-        klt_win=args.klt_win, klt_levels=args.klt_levels,
-        reproj_px=args.reproj_px, num_disparities=args.num_disparities,
-        orb_features=args.orb_features,
-    )
-    if name == "ours":
-        # Default live source = the new flow pipeline (cam/imu_cam/odometry/ui
-        # flows over a pub/sub bus). Displays the real-time f2f trajectory
-        # (pose.odom) with realtime-bounded inboxes; the heavy backend/SLAM flows
-        # are NOT run here (they would only backlog and crash the device link —
-        # see FlowPoseSource).
+    if name in ("ours", "ours-ba", "ours-slam"):
+        # The live source is the flow pipeline (cam/imu_cam/odometry/ui flows over
+        # a pub/sub bus). The displayed MARKER is always the realtime f2f pose
+        # (pose.odom) with realtime-bounded inboxes. ``ours-ba`` / ``ours-slam``
+        # additionally run the windowed-BA / loop-closure SLAM solve
+        # OUT-OF-PROCESS (so it never holds the read loop's GIL) and refine the MAP
+        # behind the marker: ours-ba draws the cyan BA-refined trajectory,
+        # ours-slam the corrected keyframe dots + loop-closure flash.
         from ours.ui.live_source import FlowPoseSource
-        return FlowPoseSource(width=args.width, height=args.height,
-                              fps=args.fps,
-                              recalibrate_bias=args.recalibrate_bias)
-    if name in ("ours-ba", "ours-slam"):
-        # Rebuilt on the SAME flow pipeline as ``ours`` (NOT the legacy
-        # monolith): the live marker stays the responsive pose.odom tip (tracks
-        # the full distance like ``ours``, never dragged), while the windowed-BA
-        # (``ours-ba``) or loop-closure SLAM (``ours-slam``) flow runs the heavy
-        # solve OUT-OF-PROCESS (so it never holds the read loop's GIL) and refines
-        # the MAP behind the marker: ours-ba draws the cyan BA-refined trajectory,
-        # ours-slam the corrected keyframe dots + loop-closure flash. ``mode``
-        # selects which optimiser runs.
-        from ours.ui.live_source import FlowPoseSource
+        mode = {"ours": "odom", "ours-ba": "ba", "ours-slam": "slam"}[name]
         return FlowPoseSource(width=args.width, height=args.height,
                               fps=args.fps,
                               recalibrate_bias=args.recalibrate_bias,
-                              mode="ba" if name == "ours-ba" else "slam")
-    if name == "ours-legacy":
-        from ours.legacy.depthai_ours_vio import OakOursVioSource
-        return OakOursVioSource(fps=args.fps, backend="f2f", **res_kw)
-    if name == "ours-legacy-ba":
-        from ours.legacy.depthai_ours_vio import OakOursVioSource
-        return OakOursVioSource(
-            fps=args.fps, backend="ba",
-            ba_window=args.ba_window, ba_kf_every=args.ba_kf_every,
-            ba_iters=args.ba_iters, ba_marg=args.marg, **res_kw)
-    if name == "ours-legacy-slam":
-        from ours.legacy.depthai_ours_vio import OakOursVioSource
-        return OakOursVioSource(
-            fps=args.fps, backend="slam",
-            slam_kf_every=args.slam_kf_every, slam_radius_m=args.slam_radius,
-            slam_kf_min_trans=args.slam_kf_min_trans,
-            slam_kf_min_rot=args.slam_kf_min_rot,
-            slam_max_kf=args.slam_max_kf, **res_kw)
-    if name == "ours-vio":
-        from ours.legacy.depthai_ours_vio import OakOursVioSource
-        return OakOursVioSource(
-            fps=args.fps, backend="vio",
-            ba_window=args.ba_window, ba_kf_every=args.ba_kf_every, **res_kw)
+                              mode=mode)
     raise SystemExit(f"unknown --source '{name}' "
-                     f"(expected: fake|ours|ours-ba|ours-slam|ours-legacy|"
-                     f"ours-legacy-ba|ours-legacy-slam|ours-vio)")
+                     f"(expected: fake|ours|ours-ba|ours-slam)")
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="3D pose viewer (our VIO)")
     ap.add_argument("--source", default="ours",
-                    choices=("fake", "ours", "ours-ba", "ours-slam",
-                             "ours-legacy", "ours-legacy-ba", "ours-legacy-slam",
-                             "ours-vio"),
+                    choices=("fake", "ours", "ours-ba", "ours-slam"),
                     help="pose provider (ours = flow pipeline, f2f live; "
-                         "ours-ba = flow pipeline + out-of-process windowed BA "
-                         "(cyan refined-map line, marker stays responsive f2f); "
-                         "ours-slam = flow pipeline + out-of-process loop-closure "
-                         "SLAM (keyframe dots + loop flash); ours-legacy* = the "
-                         "old monolithic sources; ours-vio = tight-coupled VIO)")
+                         "ours-ba = + out-of-process windowed BA (cyan refined-map "
+                         "line, marker stays responsive f2f); ours-slam = + "
+                         "out-of-process loop-closure SLAM (keyframe dots + loop "
+                         "flash); fake = device-free figure-8)")
     ap.add_argument("--fps", type=int, default=20,
                     help="camera frame rate (ours/ours-ba/ours-slam) [20]")
     ap.add_argument("--recalibrate-bias", action="store_true",
                     dest="recalibrate_bias",
-                    help="live (--source ours): ignore the cached gyro bias and "
-                         "re-measure it (saved per device); otherwise it is "
-                         "calibrated once and reused across runs")
-    # Frame resolution (any ours-* source). Lower = lighter on CPU; the pipeline
-    # auto-scales its pixel-unit vision thresholds from the 640x400 baseline, and
-    # the per-resolution overrides below let us co-tune (docs/RESOLUTION_TUNING.md).
+                    help="live: ignore the cached gyro bias and re-measure it "
+                         "(saved per device); otherwise it is calibrated once and "
+                         "reused across runs")
+    # Frame resolution. Lower = lighter on CPU; the flow pipeline auto-scales its
+    # pixel-unit vision thresholds from the 640x400 baseline (docs/RESOLUTION_TUNING.md).
     ap.add_argument("--width", type=int, default=640,
                     help="capture width in px (lower = lighter) [640]")
     ap.add_argument("--height", type=int, default=400,
                     help="capture height in px [400]")
-    # Per-resolution vision overrides. Default None = auto-scale from baseline.
-    ap.add_argument("--max-corners", type=int, default=None, dest="max_corners",
-                    help="frontend: Shi-Tomasi corner budget "
-                         "[auto: round(400*width/640)]")
-    ap.add_argument("--min-distance", type=float, default=None,
-                    dest="min_distance",
-                    help="frontend: min px between corners [auto: 12*width/640]")
-    ap.add_argument("--klt-win", type=int, default=None, dest="klt_win",
-                    help="frontend: KLT window in px, odd [auto: 21*width/640]")
-    ap.add_argument("--klt-levels", type=int, default=None, dest="klt_levels",
-                    help="frontend: KLT pyramid levels [auto: 3 at 640, -1/halving]")
-    ap.add_argument("--reproj-px", type=float, default=None, dest="reproj_px",
-                    help="odometry: PnP RANSAC reprojection gate px "
-                         "[auto: 2*width/640]")
-    ap.add_argument("--num-disparities", type=int, default=None,
-                    dest="num_disparities",
-                    help="stereo: SGM disparity search range px [auto: 96*width/640]")
-    ap.add_argument("--orb-features", type=int, default=None, dest="orb_features",
-                    help="loop closure (ours-slam): ORB budget [auto: 800*width/640]")
-    # SLAM tuning (ours-slam)
-    ap.add_argument("--slam-kf-every", type=int, default=5, dest="slam_kf_every",
-                    help="SLAM update cadence: insert+loop-detect every N frames "
-                         "(lower = more frequent loop closure) [5]")
-    ap.add_argument("--slam-radius", type=float, default=0.0,
-                    help="spatial gate (m): only loop-check keyframes within this "
-                         "radius; bounds cost on very long runs. 0 = check all "
-                         "(default; the appearance gate already rejects distant "
-                         "keyframes cheaply) [0]")
-    ap.add_argument("--slam-kf-min-trans", type=float, default=0.0,
-                    dest="slam_kf_min_trans",
-                    help="motion gate: skip a keyframe unless the camera moved "
-                         ">= this many metres since the last one. Bounds the map "
-                         "by trajectory length, not run time (a hovering drone "
-                         "stops adding keyframes). 0 = disabled [0]")
-    ap.add_argument("--slam-kf-min-rot", type=float, default=0.0,
-                    dest="slam_kf_min_rot",
-                    help="motion gate: skip a keyframe unless the camera rotated "
-                         ">= this many degrees since the last one. 0 = disabled [0]")
-    ap.add_argument("--slam-max-kf", type=int, default=0, dest="slam_max_kf",
-                    help="hard cap on stored keyframes (drops the oldest when "
-                         "exceeded; forgets old places so loops there can no "
-                         "longer close). 0 = unlimited [0]")
-    # BA tuning (ours-ba)
-    ap.add_argument("--ba-window", type=int, default=6, dest="ba_window",
-                    help="BA sliding-window size in keyframes [6]")
-    ap.add_argument("--ba-kf-every", type=int, default=5, dest="ba_kf_every",
-                    help="BA keyframe cadence: submit every N frames [5]")
-    ap.add_argument("--ba-iters", type=int, default=5, dest="ba_iters",
-                    help="BA iterations per solve [5]")
-    ap.add_argument("--marg", action="store_true", dest="marg",
-                    help="ours-ba: carry a Schur marginalization prior across "
-                         "the sliding window instead of plain-dropping the "
-                         "oldest keyframe (tightens metric scale; opt-in)")
     args = ap.parse_args()
 
     history = PoseHistory(capacity=8192)

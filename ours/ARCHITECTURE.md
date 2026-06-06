@@ -341,8 +341,6 @@ The stable public API is the flat re-export from `ours/lib/__init__.py`
   (`FlowPoseSource` bridges the live flow graph → Qt viewer, optical→NED).
 - **`ours/tools/`** — offline scripts that call `ours.lib` directly: per-module
   self-tests (`*_selftest.py`), the `vio_run` oracle, diagnostics, viewers.
-- **`ours/legacy/depthai_ours_vio.py`** — LEGACY monolith, kept temporarily until the
-  live flow graph is verified on-device; demoted from default.
 
 ---
 
