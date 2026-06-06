@@ -210,7 +210,7 @@ class OakOursVioSource(PoseSource):
     def __init__(self, width: int = 640, height: int = 400, fps: int = 20,
                  backend: str = "f2f", slam_kf_every: int = 5,
                  slam_radius_m: float = 0.0, ba_window: int = 6,
-                 ba_kf_every: int = 5, ba_iters: int = 5,
+                 ba_kf_every: int = 5, ba_iters: int = 5, ba_marg: bool = False,
                  slam_kf_min_trans: float = 0.0,
                  slam_kf_min_rot: float = 0.0, slam_max_kf: int = 0,
                  depth_fast: bool = True,
@@ -274,6 +274,11 @@ class OakOursVioSource(PoseSource):
         self.ba_window = int(ba_window)
         self.ba_kf_every = int(ba_kf_every)
         self.ba_iters = int(ba_iters)
+        # Marginalization prior (opt-in): Schur-marginalize the dropped keyframe
+        # into a pose prior over the survivors instead of plain-dropping it.
+        # Tightens metric scale; trades a little local ATE (see ba_marg_selftest
+        # + vio_run --marg). Off by default.
+        self.ba_marg = bool(ba_marg)
 
         # --- live SLAM overlay (read by the 3D viewer) ----------------------
         # Thread-safe snapshot of the SLAM map for the UI: keyframe dots, the
@@ -1260,6 +1265,7 @@ class OakOursVioSource(PoseSource):
         # samples are submitted per keyframe (see the read loop), so a moving
         # keyframe simply carries no gravity constraint.
         cfg = WindowedConfig(window=self.ba_window, kf_every=self.ba_kf_every,
+                             use_marg=self.ba_marg,
                              ba=BAConfig(max_iters=self.ba_iters,
                                          huber_px=self.res.ba_huber_px(),
                                          use_gravity=True))

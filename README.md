@@ -262,6 +262,7 @@ Tuning knobs (all optional, shown with their defaults):
 
 # Bundle-adjustment tuning (ours-ba)
 ./run.sh --source ours-ba --ba-window 6 --ba-kf-every 5 --ba-iters 5
+./run.sh --source ours-ba --marg                   # + Schur marginalization prior (opt-in)
 ./run.sh --source ours --fps 20                    # camera frame rate (any ours-* source)
 
 # Run lighter at a lower resolution (any ours-* source). Cost scales with the

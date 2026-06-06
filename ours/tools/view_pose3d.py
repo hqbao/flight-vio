@@ -52,7 +52,7 @@ def _build_source(name: str, args):
         return OakOursVioSource(
             fps=args.fps, backend="ba",
             ba_window=args.ba_window, ba_kf_every=args.ba_kf_every,
-            ba_iters=args.ba_iters, **res_kw)
+            ba_iters=args.ba_iters, ba_marg=args.marg, **res_kw)
     if name == "ours-slam":
         from ours.legacy.depthai_ours_vio import OakOursVioSource
         return OakOursVioSource(
@@ -142,6 +142,10 @@ def main() -> int:
                     help="BA keyframe cadence: submit every N frames [5]")
     ap.add_argument("--ba-iters", type=int, default=5, dest="ba_iters",
                     help="BA iterations per solve [5]")
+    ap.add_argument("--marg", action="store_true", dest="marg",
+                    help="ours-ba: carry a Schur marginalization prior across "
+                         "the sliding window instead of plain-dropping the "
+                         "oldest keyframe (tightens metric scale; opt-in)")
     args = ap.parse_args()
 
     history = PoseHistory(capacity=8192)
