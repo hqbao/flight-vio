@@ -107,6 +107,20 @@ _REST_MOTION_THRESH = 0.35
 # the "linear acceleration has no effect" symptom.)
 _VIO_CORR_MAX_T = 0.25           # m; reject corrections larger than this
 
+# --- live BA / loop-closure correction rate limit ------------------------
+# The BA (ours-ba) and pose-graph loop-closure (ours-slam) corrections are eased
+# onto the LIVE marker. A loop closure can produce a large, sudden world-frame
+# correction; without a rate limit the fractional ease applies ~15% of it in one
+# frame, which teleports the marker. Measured on device (ours-slam in a loopy
+# lab): right after each loop the displayed step jumped ~0.2 m in a single frame
+# (disp/filt up to 99x) while the camera was nearly still, so the marker stopped
+# tracking the live push ("đi một đoạn rồi ì lại"). We cap the per-frame
+# correction STEP to a bounded velocity so the correction bleeds in smoothly
+# (still converges within ~1 s) instead of yanking. 0.015 m/frame ~= 0.3 m/s at
+# 20 fps -- well below a hand push, so live motion always stays visible.
+_CORR_MAX_STEP_T = 0.015                 # m per frame   (~0.3 m/s @ 20 fps)
+_CORR_MAX_STEP_R = float(np.deg2rad(0.5))  # rad per frame (~10 deg/s @ 20 fps)
+
 # Column reorder optical (right, down, fwd) -> body FRD (fwd, right, down).
 # The viewer triad expects the attitude columns to be [forward, right, down],
 # but our VO's rotation columns are the optical axes [right, down, fwd]. The
@@ -122,16 +136,30 @@ _P_OPT_TO_FRD = np.array(
 )
 
 
-def _ease_se3(C_cur: np.ndarray, C_tgt: np.ndarray, alpha: float) -> np.ndarray:
+def _ease_se3(C_cur: np.ndarray, C_tgt: np.ndarray, alpha: float,
+              max_t: float = 0.0, max_ang: float = 0.0) -> np.ndarray:
     """Move ``C_cur`` a fraction ``alpha`` toward ``C_tgt`` (smooth correction).
 
     Rotation eases along the geodesic (scaled axis-angle); translation eases
     linearly. Keeps the applied correction continuous so BA updates never snap
     the displayed trajectory.
+
+    ``max_t`` / ``max_ang`` (when > 0) additionally clamp the per-call STEP to a
+    bounded translation (m) and rotation (rad). This rate-limits the correction
+    so that a large pose-graph jump after a loop closure bleeds in over several
+    frames instead of teleporting the live marker: measured on device a single
+    loop closure moved the displayed pose ~0.2 m in one frame (disp/filt up to
+    99x) while the camera was still, so the marker stopped following the live
+    push. With the clamp the correction still fully converges (within ~1 s) but
+    never moves faster than the cap, so live motion stays visible. The clamp is a
+    no-op (exact old behaviour) when both limits are 0.
     """
     R_cur, R_tgt = C_cur[:3, :3], C_tgt[:3, :3]
     dR = R_tgt @ R_cur.T
     ang = np.arccos(np.clip((np.trace(dR) - 1.0) * 0.5, -1.0, 1.0))
+    a = alpha * ang
+    if max_ang > 0.0:
+        a = min(a, max_ang)            # cap the rotation STEP (rad), not fraction
     out = np.eye(4)
     if ang < 1e-8:
         out[:3, :3] = R_tgt
@@ -139,13 +167,17 @@ def _ease_se3(C_cur: np.ndarray, C_tgt: np.ndarray, alpha: float) -> np.ndarray:
         axis = np.array([dR[2, 1] - dR[1, 2],
                          dR[0, 2] - dR[2, 0],
                          dR[1, 0] - dR[0, 1]]) / (2.0 * np.sin(ang))
-        a = alpha * ang
         K_ = np.array([[0, -axis[2], axis[1]],
                        [axis[2], 0, -axis[0]],
                        [-axis[1], axis[0], 0]])
         R_step = np.eye(3) + np.sin(a) * K_ + (1.0 - np.cos(a)) * (K_ @ K_)
         out[:3, :3] = R_step @ R_cur
-    out[:3, 3] = (1.0 - alpha) * C_cur[:3, 3] + alpha * C_tgt[:3, 3]
+    dt = alpha * (C_tgt[:3, 3] - C_cur[:3, 3])
+    if max_t > 0.0:
+        n = float(np.linalg.norm(dt))
+        if n > max_t:
+            dt *= max_t / n            # cap the translation STEP (m)
+    out[:3, 3] = C_cur[:3, 3] + dt
     return out
 
 
@@ -893,8 +925,10 @@ class OakOursVioSource(PoseSource):
                     newC = ba_state["poll"]()
                     if newC is not None:
                         C_target = newC
-                    # Ease toward the target so the correction never snaps.
-                    C_applied = _ease_se3(C_applied, C_target, 0.15)
+                    # Ease toward the target so the correction never snaps, and
+                    # rate-limit the step so a big BA jump cannot yank the marker.
+                    C_applied = _ease_se3(C_applied, C_target, 0.15,
+                                          _CORR_MAX_STEP_T, _CORR_MAX_STEP_R)
                     pose = C_applied @ pose
 
                 if vio_state is not None:
@@ -931,7 +965,8 @@ class OakOursVioSource(PoseSource):
                     if (newC is not None and
                             np.linalg.norm(newC[:3, 3]) < _VIO_CORR_MAX_T):
                         C_target = newC
-                    C_applied = _ease_se3(C_applied, C_target, 0.15)
+                    C_applied = _ease_se3(C_applied, C_target, 0.15,
+                                          _CORR_MAX_STEP_T, _CORR_MAX_STEP_R)
                     pose = C_applied @ pose
 
                 if slam_state is not None:
@@ -959,12 +994,15 @@ class OakOursVioSource(PoseSource):
                         slam_state["submit"](pose.copy(), gray.copy(),
                                              depth_m.copy())
                     # Pull the latest loop-closure correction (drain to last) and
-                    # ease it on, exactly like the BA correction.
+                    # ease it on, exactly like the BA correction. Rate-limited so
+                    # a big pose-graph jump after a loop bleeds in smoothly
+                    # instead of teleporting the live marker.
                     newC = slam_state["poll"]()
                     if newC is not None:
                         C_target = newC
                     C_prev = C_applied
-                    C_applied = _ease_se3(C_applied, C_target, 0.15)
+                    C_applied = _ease_se3(C_applied, C_target, 0.15,
+                                          _CORR_MAX_STEP_T, _CORR_MAX_STEP_R)
                     # Teleport displacement = how far THIS pose moves purely from
                     # the correction slewing (same vo pose, only the correction
                     # changed). Real camera motion never enters this delta, so a
