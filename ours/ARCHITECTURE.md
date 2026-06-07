@@ -342,6 +342,12 @@ The stable public API is the flat re-export from `ours/lib/__init__.py`
   `source.py` (`PoseSource` ABC + `FakePoseSource`), `live_source.py`
   (`FlowPoseSource` bridges the live flow graph → Qt viewer, optical→NED),
   `map_window.py` (the SLAM keyframe point-cloud viewer for `tools/slam_map3d`).
+  > **`ours/ui/` vs `ours/flows/ui/` — two layers, same name, NOT duplicates.**
+  > `ours/flows/ui/` are the bus **SINK flows** (`UiCollectorFlow`/`UiRenderFlow`/
+  > `UiTracksFlow`/`UiTripletFlow`) that consume topics for display/scoring and hold
+  > **no Qt** (so the pipeline stays GUI-free + offline-testable). `ours/ui/` is the
+  > **Qt GUI** that wires a flow graph and plugs those sinks in via a callback.
+  > One-way dependency: `ui` → `flows.ui` → `lib`; `flows.ui` never imports Qt.
 - **`ours/tools/`** — offline scripts that call `ours.lib` directly: per-module
   self-tests (`*_selftest.py`), the `vio_run` oracle, `slam_map3d` (3D room map),
   diagnostics, viewers.
