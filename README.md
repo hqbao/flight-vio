@@ -345,9 +345,8 @@ validated by self-tests (`imu_preint_selftest.py`, `vio_ba_selftest.py`); on
 real gold it currently **regresses vs `ba`** on healthy motion (the dense
 finite-difference solver is rougher than the analytic Schur BA, and long
 sessions show slow accel/gravity drift -- corridor scale ~1.15). It is opt-in
-and touches no production path; `ours/tools/vio_diag.py` A/Bs the IMU factor on/off to
-attribute the gap. Closing it needs online gravity-direction estimation, which
-is the next step.
+and touches no production path. Closing it needs online gravity-direction
+estimation, which is the next step.
 
 **How our pipeline differs from BasaltVIO** (and the ordered roadmap to match
 it) is documented in [`docs/OURS_VS_BASALT.md`](docs/OURS_VS_BASALT.md) — read

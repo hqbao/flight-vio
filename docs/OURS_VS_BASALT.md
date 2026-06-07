@@ -154,9 +154,8 @@ motion** (push_fwdback scale ~0.35). Why:
 **4 DoF (3 translation + yaw about world-vertical)** instead of 6; roll/pitch
 are held to the accel-levelled gravity. This stops gravity leaking into a
 horizontal translation and tightened the IMU vel/pos sigmas (0.15→0.03). Verified
-by `ours/tools/vio_ba_selftest.py` scenario C (tilt-locked yaw+pos recovery) and
-`ours/tools/vio_scale_probe.py --measure-b`. **`vio` is still opt-in / experimental
-and touches no production path.**
+by `ours/tools/vio_ba_selftest.py` scenario C (tilt-locked yaw+pos recovery).
+**`vio` is still opt-in / experimental and touches no production path.**
 
 ### 4.1 The tight-coupled path today (offline) + what a live rebuild inherits
 
@@ -254,9 +253,6 @@ Do these on the `vio` path (`vio_window.py`) so production `ours` stays safe.
 # Live-path replay without a device (reproduces the display pipeline frame-for-frame)
 .venv/bin/python ours/tools/live_replay.py --session sessions/gold/<name> \
     --clamp 4 --min-inliers 12
-
-# Tight-coupled diagnostics
-.venv/bin/python ours/tools/vio_scale_probe.py --measure-b   # OLD(loose,6DoF) vs NEW(tight,lock_tilt)
 
 # Self-tests (must pass before/after touching VIO)
 .venv/bin/python ours/tools/imu_preint_selftest.py
