@@ -100,7 +100,7 @@ class ReplayImuSource(ImuSource):
 class LiveImuSource(ImuSource):
     """Streams the OAK-D IMU (accelerometer + gyroscope) from a shared device.
 
-    Reads the IMU output queue of a :class:`~ours.lib.oak_live.SharedLiveDevice`
+    Reads the IMU output queue of a :class:`~ours.lib.device.oak_live.SharedLiveDevice`
     -- the SAME device/pipeline the camera reader uses, because the OAK-D is
     single-client -- and pushes every decoded sample to the callback, tagged with
     the gyro device timestamp (the clock shared with the camera frames).

@@ -27,7 +27,7 @@ def test_compiles_signatures() -> None:
     print("warmup compiles the KLT + SGM kernels")
     from ours.lib.frontend.klt_numba import HAVE_NUMBA, _track_level
     from ours.lib.stereo.stereo import _census, _cost_volume
-    from ours.lib.warmup import warmup_jit
+    from ours.lib.misc.warmup import warmup_jit
 
     if not HAVE_NUMBA:
         _check(warmup_jit() is False, "numba absent -> warmup is a safe no-op")
@@ -44,7 +44,7 @@ def test_compiles_signatures() -> None:
 
 def test_never_raises_on_bad_cfg() -> None:
     print("warmup never raises (swallows failures)")
-    from ours.lib.warmup import warmup_jit
+    from ours.lib.misc.warmup import warmup_jit
 
     class _Bad:
         win_size = "not-an-int"   # forces an internal failure
@@ -59,7 +59,7 @@ sys.path.insert(0, {root!r})
 from ours.lib.frontend.frontend import FrontendConfig
 from ours.lib.stereo.stereo import SGMConfig, sgm_disparity
 from ours.lib.frontend.klt import calc_optical_flow_pyr_lk
-from ours.lib.warmup import warmup_jit
+from ours.lib.misc.warmup import warmup_jit
 import numpy as np
 rng = np.random.default_rng(1)
 L = rng.integers(0, 255, (64, 96)).astype(np.float32)

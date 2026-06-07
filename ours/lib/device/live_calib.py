@@ -1,7 +1,7 @@
 """Read the live OAK-D calibration + startup IMU references for the VIO graph.
 
 The unified front-end (``cam`` + ``imu_cam`` off ONE
-:class:`~ours.lib.oak_live.SharedLiveDevice`) needs the same boot-time facts the
+:class:`~ours.lib.device.oak_live.SharedLiveDevice`) needs the same boot-time facts the
 old monolithic capture flow read in ``LiveCaptureFlow.open()``:
 
 * camera intrinsics ``K`` and the stereo :class:`~ours.lib.io.reader.StereoCalib`
@@ -26,12 +26,12 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .config.resolution import ResolutionProfile
-from .imu.accel_calib import AccelCalibration
-from .imu.calib_store import load_accel_calib, load_gyro_bias, save_gyro_bias
-from .imu.decode import decode_imu_packets
-from .imu.imu_calib import ImuCalibration
-from .io.reader import StereoCalib
+from ..config.resolution import ResolutionProfile
+from ..imu.accel_calib import AccelCalibration
+from ..imu.calib_store import load_accel_calib, load_gyro_bias, save_gyro_bias
+from ..imu.decode import decode_imu_packets
+from ..imu.imu_calib import ImuCalibration
+from ..io.reader import StereoCalib
 from .oak_live import SharedLiveDevice
 
 # Startup stillness gates (identical to the legacy capture path): the gravity
@@ -156,7 +156,7 @@ def read_live_calibration(device: SharedLiveDevice, *, width: int, height: int,
                           recalibrate_bias: bool = False) -> LiveFrontEndCalib:
     """Acquire the shared device and read all VIO boot references.
 
-    The device is :meth:`~ours.lib.oak_live.SharedLiveDevice.acquire`-d here and
+    The device is :meth:`~ours.lib.device.oak_live.SharedLiveDevice.acquire`-d here and
     kept open (the caller releases it when the run ends); the camera/IMU sources
     attach to the same reference-counted device when they start.
     """

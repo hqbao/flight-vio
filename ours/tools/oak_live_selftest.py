@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from ours.flows.cam.sources import LiveCamSource                    # noqa: E402
 from ours.flows.imu_cam.sources import LiveImuSource                # noqa: E402
-from ours.lib.oak_live import SharedLiveDevice                      # noqa: E402
+from ours.lib.device.oak_live import SharedLiveDevice               # noqa: E402
 
 
 def _check(cond: bool, msg: str) -> None:

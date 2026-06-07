@@ -209,8 +209,8 @@ def build_live_frontend(bus: Bus, *, width: int = 640, height: int = 400,
     bundle (``cal.imu_calibration`` etc.); the caller starts the threads and
     releases ``device`` when the run ends. Hardware-only.
     """
-    from .lib.oak_live import SharedLiveDevice
-    from .lib.live_calib import read_live_calibration
+    from .lib.device.oak_live import SharedLiveDevice
+    from .lib.device.live_calib import read_live_calibration
     from .flows.cam.sources import LiveCamSource
     from .flows.imu_cam.sources import LiveImuSource
 
@@ -221,7 +221,7 @@ def build_live_frontend(bus: Bus, *, width: int = 640, height: int = 400,
     # so the compiled signatures match. Never blocks: a slow warmup just means
     # frame one compiles as it always did.
     import threading
-    from .lib.warmup import warmup_jit
+    from .lib.misc.warmup import warmup_jit
     from .lib.config.resolution import ResolutionProfile
     _res = ResolutionProfile.for_resolution(width, height)
     threading.Thread(

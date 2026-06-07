@@ -61,7 +61,7 @@ def live_source_factory(width: int = 640, height: int = 400,
     def _make() -> tuple[CamSource, ImuSource]:
         from ..flows.cam.sources import LiveCamSource
         from ..flows.imu_cam.sources import LiveImuSource
-        from ..lib.oak_live import SharedLiveDevice
+        from ..lib.device.oak_live import SharedLiveDevice
         device = SharedLiveDevice(width=width, height=height, fps=fps)
         return LiveCamSource(device), LiveImuSource(device)
     return _make

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .flow.runtime import NUMBA_PARALLEL_LOCK
+from ..flow.runtime import NUMBA_PARALLEL_LOCK
 
 
 def warmup_jit(klt_cfg=None, sgm_cfg=None) -> bool:
@@ -35,12 +35,12 @@ def warmup_jit(klt_cfg=None, sgm_cfg=None) -> bool:
     frame one exactly as before).
     """
     try:
-        from .frontend.klt_numba import HAVE_NUMBA
+        from ..frontend.klt_numba import HAVE_NUMBA
         if not HAVE_NUMBA:
             return False
-        from .frontend.frontend import FrontendConfig
-        from .frontend.klt import calc_optical_flow_pyr_lk
-        from .stereo.stereo import SGMConfig, sgm_disparity
+        from ..frontend.frontend import FrontendConfig
+        from ..frontend.klt import calc_optical_flow_pyr_lk
+        from ..stereo.stereo import SGMConfig, sgm_disparity
 
         klt = klt_cfg or FrontendConfig()
         sgm = sgm_cfg or SGMConfig()

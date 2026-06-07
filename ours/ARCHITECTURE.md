@@ -108,7 +108,7 @@ realtime visualiser path needs the latest-only inbox above.
 ### JIT warmup (live startup)
 The SGM + KLT numba kernels are `cache=True`, but on a COLD cache (first run after
 a code change) the one-time LLVM compile (~2 s, measured) lands on the first live
-frame and stalls the viewer. `lib/warmup.py::warmup_jit` compiles them with tiny
+frame and stalls the viewer. `lib/misc/warmup.py::warmup_jit` compiles them with tiny
 dummy inputs; `app.build_live_frontend` kicks it on a daemon thread at
 device-open so the compile overlaps the OAK-D boot + the startup IMU still-window
 (dead time anyway). The dispatchers are module singletons, so the warmed
@@ -305,7 +305,7 @@ Parity (in-process == out-of-process, bit-for-bit) is gated by
 
 ## 5. The libraries — `ours.lib`
 
-All 12 subpackages are live (each referenced from ≥5 places — **no dead code**;
+All 13 subpackages are live (each referenced from ≥5 places — **no dead code**;
 the many folders are domain decomposition, not leftovers).
 
 | Package | Contents | What it does |
@@ -319,8 +319,10 @@ the many folders are domain decomposition, not leftovers).
 | `engine/` | base, inprocess, subprocess, steps | swappable runner for the heavy BA/SLAM solve — in-process (offline, deterministic) or **out-of-process** (live, so the solve never holds the read-loop GIL); see §4.1 |
 | `io/` | reader, synced | session readers, frame/IMU sync |
 | `config/` | resolution | resolution profiles |
-| `misc/` | frames, geometry, pose, pngio | shared `Pose` / frame / geometry / PNG helpers |
+| `misc/` | frames, geometry, pose, pngio, warmup | shared `Pose` / frame / geometry / PNG helpers + numba JIT warmup |
 | `flow/` | flow, task, pubsub, messages, topics, runtime | the flow framework (see §3) |
+| `device/` | oak_live, live_calib | the only hardware corner: open the one shared OAK-D + read boot calibration (depthai imported lazily) |
+| `viz/` | depth_render, imucam_render, keypoint_overlay | shared render helpers for the in-app visualiser windows (keypoints / triplet / cam-IMU) |
 
 The stable public API is the flat re-export from `ours/lib/__init__.py`
 (`from ours.lib import RGBDVisualOdometry, ORB, SessionReader, ...`).
