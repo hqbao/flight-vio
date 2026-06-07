@@ -76,27 +76,52 @@ def test_landmark_synthetic() -> None:
     _check(len(p0) == 0, "no inliers -> no points")
 
 
+def test_voxel_downsample() -> None:
+    print("voxel_downsample fuses + drops low-count (noise) voxels")
+    from ours.lib.misc.geometry import voxel_downsample
+    # A dense 10x10x10 block at the origin (1000 pts in ~one 0.5 m voxel region)
+    # + 5 isolated far-flung noise points (each alone in its voxel).
+    g = np.linspace(0, 0.09, 10)
+    block = np.array(np.meshgrid(g, g, g)).reshape(3, -1).T          # 1000 pts
+    noise = np.array([[5, 0, 0], [0, 5, 0], [0, 0, 5], [9, 9, 9], [-9, -9, -9.]])
+    pts = np.vstack([block, noise]).astype(np.float32)
+    col = np.full((len(pts), 3), 0.5, np.float32)
+    out, oc = voxel_downsample(pts, col, voxel=0.1, min_count=3)
+    _check(len(out) >= 1, f"the dense block survives ({len(out)} voxel(s))")
+    # Every isolated noise point (count 1 < 3) must be gone.
+    for n in noise:
+        _check(not np.any(np.all(np.abs(out - n) < 0.6, axis=1)),
+               f"isolated noise {n.tolist()} dropped")
+    _check(bool(np.all(np.isfinite(out))), "voxel centroids finite")
+
+
 def test_gold_smoke() -> None:
-    print("build_map on a gold session (offline): inlier landmarks << dense")
-    m = build_map("sessions/gold/lab_loop_30s", kf_every=5, max_frames=120,
-                  use_slam=False, max_depth=6.0)                  # default = inliers
-    d = build_map("sessions/gold/lab_loop_30s", kf_every=5, max_frames=120,
-                  use_slam=False, stride=6, max_depth=6.0, dense=True)
-    pts = m["points"]
-    _check(m["n_kf"] > 0, f"keyframes collected ({m['n_kf']})")
-    _check(len(pts) > 200, f"inlier cloud has points ({len(pts)})")
-    _check(len(pts) < len(d["points"]),
-           f"inlier cloud is sparser than dense ({len(pts)} < {len(d['points'])})")
-    _check(bool(np.all(np.isfinite(pts))), "all points finite")
-    extent = float(np.linalg.norm(pts.max(0) - pts.min(0))) if len(pts) else 0.0
+    print("build_map on a gold session (offline): room/landmarks/dense")
+    room = build_map("sessions/gold/lab_loop_30s", kf_every=5, max_frames=120,
+                     use_slam=False, mode="room")                 # default
+    lm = build_map("sessions/gold/lab_loop_30s", kf_every=5, max_frames=120,
+                   use_slam=False, mode="landmarks")
+    dense = build_map("sessions/gold/lab_loop_30s", kf_every=5, max_frames=120,
+                      use_slam=False, mode="dense", stride=6)
+    rp = room["points"]
+    _check(room["n_kf"] > 0, f"keyframes collected ({room['n_kf']})")
+    _check(len(rp) > 1000, f"room cloud has points ({len(rp)})")
+    _check(len(rp) < len(dense["points"]),
+           f"room (voxel-fused) sparser than raw dense "
+           f"({len(rp)} < {len(dense['points'])})")
+    _check(len(lm["points"]) < len(rp),
+           f"landmarks sparser than room ({len(lm['points'])} < {len(rp)})")
+    _check(bool(np.all(np.isfinite(rp))), "all room points finite")
+    extent = float(np.linalg.norm(rp.max(0) - rp.min(0))) if len(rp) else 0.0
     _check(0.1 < extent < 100.0, f"room-scale extent ({extent:.1f} m)")
-    _check(m["cams"].shape[0] == m["n_kf"], "one camera position per keyframe")
+    _check(room["cams"].shape[0] == room["n_kf"], "one camera per keyframe")
 
 
 def main() -> int:
     print("map3d_selftest")
     test_synthetic()
     test_landmark_synthetic()
+    test_voxel_downsample()
     test_gold_smoke()
     print("ALL MAP3D SELFTESTS PASSED" if _FAILS == 0
           else f"MAP3D SELFTEST FAILED ({_FAILS})")

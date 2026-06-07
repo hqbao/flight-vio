@@ -35,7 +35,8 @@ def valid_mask(depth_m: np.ndarray) -> np.ndarray:
 
 
 def keyframe_pointcloud(poses, depths, grays, K, *, stride: int = 4,
-                        min_depth: float = 0.3, max_depth: float = 6.0):
+                        min_depth: float = 0.3, max_depth: float = 6.0,
+                        edge_max: float = 0.0):
     """Fuse per-keyframe depth maps into ONE world point cloud.
 
     The building block of the SLAM 3D-map viewer: each keyframe's depth is
@@ -60,8 +61,14 @@ def keyframe_pointcloud(poses, depths, grays, K, *, stride: int = 4,
         depth = np.asarray(depths[idx], dtype=np.float32)
         T = np.asarray(poses[idx], dtype=np.float64)
         cloud = backproject(depth, K)                       # (H,W,3) camera frame
-        keep = (valid_mask(depth) & (depth >= min_depth)
-                & (depth <= max_depth))[::stride, ::stride]
+        m = valid_mask(depth) & (depth >= min_depth) & (depth <= max_depth)
+        if edge_max > 0.0:
+            # Drop "flying pixels" on depth discontinuities (a foreground/background
+            # edge interpolates to points floating between the two surfaces).
+            dv = np.abs(np.diff(depth, axis=0, append=depth[-1:]))
+            dh = np.abs(np.diff(depth, axis=1, append=depth[:, -1:]))
+            m &= (dv <= edge_max) & (dh <= edge_max)
+        keep = m[::stride, ::stride]
         cam = cloud[::stride, ::stride][keep]               # (M,3)
         if cam.shape[0] == 0:
             continue
@@ -76,6 +83,36 @@ def keyframe_pointcloud(poses, depths, grays, K, *, stride: int = 4,
     if not pts_all:
         return (np.zeros((0, 3), np.float32), np.zeros((0, 3), np.float32))
     return np.concatenate(pts_all), np.concatenate(col_all)
+
+
+def voxel_downsample(points: np.ndarray, colors: np.ndarray, *,
+                     voxel: float = 0.05, min_count: int = 3):
+    """Voxel-grid fuse: clean a noisy cloud into one point per occupied voxel.
+
+    Quantise to a ``voxel`` (m) grid; for each cell output the centroid + mean
+    colour, but KEEP only cells holding ``>= min_count`` points. Real surfaces are
+    hit by many rays across keyframes so their cells are dense and survive; stereo
+    depth noise is spread thin (few points per cell) and is dropped -- so this both
+    removes the "flying"/radial-spread noise AND gives an even, recognisable density.
+    Returns ``(points, colors)`` (empty in -> empty out). Pure numpy (no KD-tree).
+    """
+    points = np.asarray(points, dtype=np.float64)
+    colors = np.asarray(colors, dtype=np.float64)
+    if points.shape[0] == 0:
+        return (np.zeros((0, 3), np.float32), np.zeros((0, 3), np.float32))
+    keys = np.floor(points / float(voxel)).astype(np.int64)
+    _, inv, counts = np.unique(keys, axis=0, return_inverse=True,
+                               return_counts=True)
+    inv = inv.ravel()
+    n = counts.shape[0]
+    sum_p = np.stack([np.bincount(inv, points[:, k], minlength=n)
+                      for k in range(3)], axis=1)
+    sum_c = np.stack([np.bincount(inv, colors[:, k], minlength=n)
+                      for k in range(3)], axis=1)
+    cen = sum_p / counts[:, None]
+    col = sum_c / counts[:, None]
+    keep = counts >= int(min_count)
+    return cen[keep].astype(np.float32), col[keep].astype(np.float32)
 
 
 def keyframe_landmark_cloud(poses, track_ids, track_px, depths, inlier_ids, K,

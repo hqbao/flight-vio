@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
 """Build a 3D point-cloud map of the room from a session's keyframes.
 
-Every keyframe carries a pose + a metric depth map; back-project each depth into
-its camera frame, lift it to the world by that keyframe's pose, and stack them all
-into ONE cloud -- so the room is reconstructed from every viewpoint at once. This
-is the honest "what did SLAM see" view: pure REAL outputs (keyframe poses + the
-chip/SGM depth), no invented geometry.
+Every keyframe carries a pose + a metric depth map + its image; back-project each
+depth into the world by that keyframe's pose and fuse all keyframes into ONE cloud
+-- the room reconstructed from every viewpoint at once. Honest: only REAL outputs
+(keyframe poses + chip/SGM depth + the keyframe image for colour).
 
-It runs OFFLINE over a recorded session (no device): it replays the same flow
-graph the live run uses, taps the ``keyframe`` messages off the bus, and -- with
-``--slam`` -- the loop-closure corrections so the map uses drift-corrected poses.
+Three ``--mode`` views (raw stereo depth is noisy, so the default cleans it):
+* ``room`` (default) -- clean dense reconstruction: drop flying-pixel depth edges,
+  then voxel-fuse with a min-count so real surfaces survive and noise is dropped.
+* ``landmarks`` -- only the PnP-inlier features: very clean but sparse.
+* ``dense`` -- raw back-projection of every depth pixel (noisy; for comparison).
 
-    # interactive 3D viewer (point cloud + keyframe camera path)
+Runs OFFLINE over a recorded session (no device): replays the live flow graph,
+taps ``keyframe`` off the bus, and -- with ``--slam`` -- the loop-closure
+corrections so the map uses drift-corrected poses.
+
+    # interactive 3D viewer (clean room reconstruction)
     python ours/tools/slam_map3d.py --session sessions/gold/lab_loop_30s
-    # loop-corrected poses (slower: runs SLAM), denser cloud
-    python ours/tools/slam_map3d.py --session sessions/gold/loop_closure_45s --slam --stride 2
+    # loop-corrected poses (slower: runs SLAM)
+    python ours/tools/slam_map3d.py --session sessions/gold/loop_closure_45s --slam
+    # sparse trusted landmarks only / raw dense (compare)
+    python ours/tools/slam_map3d.py --session sessions/gold/lab_loop_30s --mode landmarks
     # headless: write a coloured PLY to open in MeshLab / CloudCompare
     python ours/tools/slam_map3d.py --session sessions/gold/lab_loop_30s --export /tmp/room.ply
 """
@@ -34,7 +41,8 @@ from ours.lib.flow.pubsub import Bus                              # noqa: E402
 from ours.lib.flow.messages import END                            # noqa: E402
 from ours.lib.flow import topics                                  # noqa: E402
 from ours.lib.misc.geometry import (keyframe_pointcloud,           # noqa: E402
-                                    keyframe_landmark_cloud)
+                                    keyframe_landmark_cloud,
+                                    voxel_downsample)
 
 
 def collect_keyframes(session: str, *, kf_every: int, max_frames: int,
@@ -88,26 +96,37 @@ def _corrected_poses(keyframes, corrections):
 
 
 def build_map(session: str, *, kf_every: int, max_frames: int, use_slam: bool,
-              stride: int = 4, max_depth: float = 6.0, max_points: int = 0,
-              dense: bool = False):
+              stride: int = 2, max_depth: float = 5.0, max_points: int = 0,
+              mode: str = "room", voxel: float = 0.04, min_count: int = 3,
+              edge_max: float = 0.12):
     K, kfs, corr = collect_keyframes(session, kf_every=kf_every,
                                      max_frames=max_frames, use_slam=use_slam)
     poses = _corrected_poses(kfs, corr)
     depths = [kf.depth_m for kf in kfs]
     grays = [kf.gray_left for kf in kfs]
-    if dense:
-        print(f"[map3d] fusing {len(kfs)} keyframes (DENSE depth)…", flush=True)
-        points, colors = keyframe_pointcloud(poses, depths, grays, K,
-                                             stride=stride, max_depth=max_depth)
-    else:
-        # Default: only the PnP-inlier landmarks (clean) — the dense depth the
-        # solve rejected is noise (flying points before/behind real surfaces).
+    if mode == "landmarks":
+        # Only the PnP-inlier features: very clean but sparse.
         print(f"[map3d] fusing {len(kfs)} keyframes (PnP-inlier landmarks)…",
               flush=True)
         points, colors = keyframe_landmark_cloud(
             poses, [kf.track_ids for kf in kfs], [kf.track_px for kf in kfs],
             depths, [kf.inlier_ids for kf in kfs], K, grays=grays,
             max_depth=max_depth)
+    elif mode == "dense":
+        # Raw dense back-projection: every depth pixel (noisy).
+        print(f"[map3d] fusing {len(kfs)} keyframes (raw DENSE depth)…", flush=True)
+        points, colors = keyframe_pointcloud(poses, depths, grays, K,
+                                             stride=stride, max_depth=max_depth)
+    else:  # "room": clean dense reconstruction (default)
+        # Dense back-projection minus flying-pixel edges, then voxel-fused with a
+        # min-count so real surfaces survive and depth noise is dropped -> a
+        # recognisable, even room reconstruction from the keyframe images+depth.
+        print(f"[map3d] reconstructing room from {len(kfs)} keyframes "
+              f"(edge-reject + {voxel*100:.0f}cm voxel fuse)…", flush=True)
+        pts, cols = keyframe_pointcloud(poses, depths, grays, K, stride=stride,
+                                        max_depth=max_depth, edge_max=edge_max)
+        points, colors = voxel_downsample(pts, cols, voxel=voxel,
+                                          min_count=min_count)
     # Cap the cloud so the interactive GL viewer stays responsive (a full session
     # is millions of points; pyqtgraph's scatter bogs down well before that).
     # Deterministic random subsample keeps the room shape; raise --max-points or
@@ -144,13 +163,22 @@ def main() -> int:
     ap.add_argument("--slam", action="store_true",
                     help="run loop-closure SLAM and use the drift-corrected poses "
                          "(slower; cleaner map on sessions that revisit a place)")
-    ap.add_argument("--dense", action="store_true",
-                    help="back-project the FULL depth map instead of only the "
-                         "PnP-inlier landmarks (noisier; the default shows just the "
-                         "clean trusted points)")
-    ap.add_argument("--stride", type=int, default=4,
-                    help="DENSE only: depth subsample (lower = more points) [4]")
-    ap.add_argument("--max-depth", type=float, default=6.0,
+    ap.add_argument("--mode", choices=("room", "landmarks", "dense"),
+                    default="room",
+                    help="room = clean dense reconstruction (edge-reject + voxel "
+                         "fuse, default); landmarks = only PnP-inlier features "
+                         "(sparse but very clean); dense = raw depth (noisy)")
+    ap.add_argument("--voxel", type=float, default=0.04,
+                    help="room: voxel size in m for the fuse [0.04]")
+    ap.add_argument("--min-count", type=int, default=3,
+                    help="room: keep a voxel only if >= this many points land in "
+                         "it (higher = stricter noise rejection) [3]")
+    ap.add_argument("--edge", type=float, default=0.12,
+                    help="room/dense: drop pixels at a depth jump > this (m) to kill "
+                         "flying-pixel edges; 0 = off [0.12]")
+    ap.add_argument("--stride", type=int, default=2,
+                    help="room/dense: depth subsample (lower = more points) [2]")
+    ap.add_argument("--max-depth", type=float, default=5.0,
                     help="drop points beyond this many metres (far depth is noisy)")
     ap.add_argument("--max-points", type=int, default=500_000,
                     help="cap the cloud for the interactive viewer so GL stays "
@@ -164,7 +192,8 @@ def main() -> int:
     cap = 0 if args.export else args.max_points
     m = build_map(args.session, kf_every=args.kf_every, max_frames=args.max_frames,
                   use_slam=args.slam, stride=args.stride, max_depth=args.max_depth,
-                  max_points=cap, dense=args.dense)
+                  max_points=cap, mode=args.mode, voxel=args.voxel,
+                  min_count=args.min_count, edge_max=args.edge)
     print(f"[map3d] {Path(args.session).name}: {m['n_kf']} keyframes, "
           f"{m['n_loops']} loop(s) -> {len(m['points'])} points", flush=True)
     if len(m["points"]) == 0:

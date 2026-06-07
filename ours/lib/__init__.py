@@ -27,7 +27,7 @@ algorithm libraries); offline tools call the algorithm libraries directly.
 """
 from .frontend.frontend import FrontendConfig, KLTFrontend, TrackState
 from .misc.geometry import (backproject, valid_mask, keyframe_pointcloud,
-                            keyframe_landmark_cloud)
+                            keyframe_landmark_cloud, voxel_downsample)
 from .imu.imu import GyroPreintegrator, gravity_aligned_R0, so3_exp
 from .imu.inertial_filter import InertialFilterConfig, InertialTranslationFilter
 from .loop.loopclosure import KeyframeAppearance, LoopConfig, LoopDetector
