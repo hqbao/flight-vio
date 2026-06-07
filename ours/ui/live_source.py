@@ -248,19 +248,23 @@ class FlowPoseSource(PoseSource):
                 self._poll_overlay()
                 time.sleep(0.05)
         finally:
-            # Tear down so NOTHING touches the depthai pipeline when it is
-            # destroyed (the lifetime race behind the ``mutex lock failed`` crash):
-            # stop producing, stop+join the reactive flows (each heavy flow's
-            # run()-finally reaps its subprocess engine), JOIN the cam/imu readers,
-            # and only THEN release the device. ``stop()`` blocks the GUI until this
-            # whole block completes, so the process never exits mid-teardown.
+            # CLOSE THE DEVICE FIRST. The OAK-D firmware watchdog is only ~1.5 s
+            # (crash dump: WATCHDOG_TIMEOUT=1500ms). If we stop reading the device
+            # and then spend a couple seconds joining the flows + reaping the
+            # subprocess engine BEFORE releasing the pipeline, the watchdog fires in
+            # that gap and the device resets ("Device has crashed"). So stop the
+            # readers and release the pipeline immediately (SharedLiveDevice's
+            # poll-lock makes release safe even if a reader is mid-poll; afterwards
+            # every poll just returns None), THEN do the slower flow/engine teardown
+            # with the device already gone. ``stop()`` blocks the GUI until this
+            # whole block completes, so the process never exits mid-teardown either.
             self._engine = None
             cam_flow.stop()
             imu_flow.stop()
+            device.release()                      # before the 1.5 s watchdog can fire
             for f in flows:                       # ui render flow is in `flows` too
                 f.stop()
             for f in flows:
                 f.join(timeout=2.0)
             cam_flow.join(timeout=1.5)
             imu_flow.join(timeout=1.5)
-            device.release()                      # last: no reader/worker alive now
