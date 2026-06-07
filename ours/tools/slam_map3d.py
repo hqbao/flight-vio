@@ -51,9 +51,20 @@ def collect_keyframes(session: str, *, kf_every: int, max_frames: int,
         slam=use_slam, backend=False)
     kfs: list = []
     corr: list = []
-    bus.subscribe(topics.KEYFRAME, lambda m: None if m is END else kfs.append(m))
+
+    def _on_kf(m):
+        if m is END:
+            return
+        kfs.append(m)
+        if len(kfs) % 20 == 0:                  # live progress (replay is silent)
+            print(f"[map3d] replaying… {len(kfs)} keyframes", flush=True)
+
+    bus.subscribe(topics.KEYFRAME, _on_kf)
     bus.subscribe(topics.LOOP_CORRECTION,
                   lambda m: None if m is END else corr.append(m))
+    n_frames = max_frames or "all"
+    print(f"[map3d] replaying {Path(session).name} ({n_frames} frames)"
+          f"{' + SLAM' if use_slam else ''}…", flush=True)
     odom = flows[0]
     for f in flows:
         f.start()
@@ -76,14 +87,23 @@ def _corrected_poses(keyframes, corrections):
 
 
 def build_map(session: str, *, kf_every: int, max_frames: int, use_slam: bool,
-              stride: int, max_depth: float):
+              stride: int, max_depth: float, max_points: int = 0):
     K, kfs, corr = collect_keyframes(session, kf_every=kf_every,
                                      max_frames=max_frames, use_slam=use_slam)
     poses = _corrected_poses(kfs, corr)
     depths = [kf.depth_m for kf in kfs]
     grays = [kf.gray_left for kf in kfs]
+    print(f"[map3d] fusing {len(kfs)} keyframes into a cloud…", flush=True)
     points, colors = keyframe_pointcloud(poses, depths, grays, K,
                                          stride=stride, max_depth=max_depth)
+    # Cap the cloud so the interactive GL viewer stays responsive (a full session
+    # is millions of points; pyqtgraph's scatter bogs down well before that).
+    # Deterministic random subsample keeps the room shape; raise --max-points or
+    # use --export for the full cloud.
+    if max_points and len(points) > max_points:
+        idx = np.random.default_rng(0).choice(len(points), max_points,
+                                              replace=False)
+        points, colors = points[idx], colors[idx]
     cams = np.array([np.asarray(p)[:3, 3] for p in poses], dtype=np.float32) \
         if poses else np.zeros((0, 3), np.float32)
     n_loops = corr[-1].n_loops if corr else 0
@@ -116,14 +136,21 @@ def main() -> int:
                     help="depth subsample (lower = denser cloud, more points) [4]")
     ap.add_argument("--max-depth", type=float, default=6.0,
                     help="drop points beyond this many metres (far depth is noisy)")
+    ap.add_argument("--max-points", type=int, default=500_000,
+                    help="cap the cloud for the interactive viewer so GL stays "
+                         "responsive (0 = no cap; --export always writes the full "
+                         "cloud) [500000]")
     ap.add_argument("--export", default="",
                     help="write a coloured PLY here and exit (headless, no GUI)")
     args = ap.parse_args()
 
+    # --export gets the full cloud; the GUI gets the capped one (responsiveness).
+    cap = 0 if args.export else args.max_points
     m = build_map(args.session, kf_every=args.kf_every, max_frames=args.max_frames,
-                  use_slam=args.slam, stride=args.stride, max_depth=args.max_depth)
+                  use_slam=args.slam, stride=args.stride, max_depth=args.max_depth,
+                  max_points=cap)
     print(f"[map3d] {Path(args.session).name}: {m['n_kf']} keyframes, "
-          f"{m['n_loops']} loop(s) -> {len(m['points'])} points")
+          f"{m['n_loops']} loop(s) -> {len(m['points'])} points", flush=True)
     if len(m["points"]) == 0:
         print("[map3d] no points (no valid keyframe depth) — nothing to show",
               file=sys.stderr)
@@ -135,9 +162,16 @@ def main() -> int:
         return 0
 
     # Interactive 3D viewer (Qt). Imported lazily so --export stays headless.
-    from PyQt6.QtWidgets import QApplication
-    from ours.ui import theme
-    from ours.ui.map_window import MapWindow
+    try:
+        from PyQt6.QtWidgets import QApplication
+        from ours.ui import theme
+        from ours.ui.map_window import MapWindow
+    except Exception as e:                                          # noqa: BLE001
+        print(f"[map3d] Qt viewer unavailable ({e}). Use --export <file>.ply and "
+              f"open it in MeshLab / CloudCompare instead.", file=sys.stderr)
+        return 1
+    print(f"[map3d] opening viewer ({len(m['points'])} points)… "
+          f"close the window to exit", flush=True)
     theme.ensure_gl_format()
     app = QApplication(sys.argv)
     win = MapWindow(m["points"], m["colors"], m["cams"],
