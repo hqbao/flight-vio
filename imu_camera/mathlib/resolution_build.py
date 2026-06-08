@@ -26,4 +26,13 @@ def sgm_config(res: ResolutionProfile, *, fast: bool) -> SGMConfig:
     byte-identical.
     """
     base = SGMConfig.live() if fast else SGMConfig()
-    return replace(base, num_disparities=int(res.num_disparities))
+    # The ``live`` preset downsamples SGM by 2x for speed. At a LOW capture
+    # resolution that is counter-productive: 160x100 -> a 80x50 internal match
+    # whose disparity border + coarse census leave too few valid-depth pixels at
+    # the tracked keypoints, so RGB-D PnP starves (measured: only ~20 of ~60 KLT
+    # tracks get depth -> PnP fails on the majority -> phantom poses). Below the
+    # 160px floor we compute SGM at native resolution (cheap there anyway) for a
+    # dense, accurate depth. 320/640 keep the 2x downscale -> 640 byte-identical.
+    downscale = 1 if res.width <= 160 else base.downscale
+    return replace(base, num_disparities=int(res.num_disparities),
+                   downscale=downscale)
