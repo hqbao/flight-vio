@@ -82,6 +82,29 @@ def _build_calib_bundle_replay(reader: SessionReader) -> WireCalibBundle:
     )
 
 
+def _scale_bundle_to_tof(bundle: WireCalibBundle, *,
+                         src_w: int, src_h: int) -> WireCalibBundle:
+    """Return a copy of ``bundle`` with K + dims scaled to the ToF grid.
+
+    The ToF frame is a NON-uniform resize of the source (54/W_src != 42/H_src),
+    so K is scaled ANISOTROPICALLY: fx, cx by ``TOF_W/src_w`` and fy, cy by
+    ``TOF_H/src_h``. Depth metres are unchanged (the world distance a pixel sees
+    does not change when the image is resized -- only the focal length in pixels
+    does). Every other field (extrinsics, IMU calib, device id) carries through.
+    """
+    from imu_camera.modules.pipeline import TOF_W, TOF_H
+    import dataclasses
+
+    sx = TOF_W / float(src_w)
+    sy = TOF_H / float(src_h)
+    K = np.asarray(bundle.K, dtype=np.float64).copy()
+    K[0, 0] *= sx          # fx
+    K[0, 2] *= sx          # cx
+    K[1, 1] *= sy          # fy
+    K[1, 2] *= sy          # cy
+    return dataclasses.replace(bundle, K=K, width=TOF_W, height=TOF_H)
+
+
 def _build_calib_bundle_live(cal) -> WireCalibBundle:
     """Wire-bundle from a live `read_live_calibration` result."""
     T = cal.calib.T_imu_left if cal.calib.has_imu_extrinsics else None
@@ -109,18 +132,25 @@ def _build_calib_bundle_live(cal) -> WireCalibBundle:
 def run_capture_replay(session: Path, endpoint: str, *,
                        width: int, height: int,
                        max_frames: int = 0,
-                       depth_fast: bool = True) -> int:
+                       depth_fast: bool = True,
+                       tof_sim: bool = False) -> int:
     """Replay-driven capture: SessionReader -> bridge -> IPC."""
     from imu_camera.modules.pipeline import (
-        _replay_imu_startup, build_replay_frontend)
+        TOF_W, TOF_H, _replay_imu_startup, build_replay_frontend)
     from imu_camera.mathlib.imu.imu_calib import ImuCalibration
 
     reader = SessionReader(session)
     # Use the session's native resolution so the rings line up with the frames.
     width, height = int(reader.calib.left.width), int(reader.calib.left.height)
 
+    # VL53L9CX simulation: depth is computed at the session SOURCE resolution
+    # (width x height, where SGM works) but the PUBLISHED frames/depth are
+    # downsampled to the fixed ToF grid by ToFDownsampleStep. The rings + the
+    # broadcast calib bundle must therefore match the 54x42 grid, not the source.
+    pub_w, pub_h = (TOF_W, TOF_H) if tof_sim else (width, height)
+
     rings = RingRegistry().create_all(default_capture_specs(
-        endpoint=endpoint, width=width, height=height))
+        endpoint=endpoint, width=pub_w, height=pub_h))
     # Live mode uses non-blocking publish (drop-oldest on stall so the OAK-D
     # firmware watchdog never fires). Replay mode below uses blocking=True so
     # every replayed frame reaches VIO.
@@ -128,9 +158,17 @@ def run_capture_replay(session: Path, endpoint: str, *,
                        blocking=False)
     local = LocalPubSub()
 
+    # In the ToF path cam.sync carries the SOURCE-res stereo pair (640x400) on the
+    # local bus only; it must NOT cross the IPC boundary because the rings are
+    # sized to 54x42 (writing a 640x400 array would raise). No IPC consumer needs
+    # cam.sync (VIO subscribes only to imucam.sample + frame.depth), so drop it
+    # from the bridged topics for the ToF run.
+    data_topics = ([t for t in _DATA_TOPICS if t != topics.CAM_SYNC]
+                   if tof_sim else _DATA_TOPICS)
+
     # Build the publisher BEFORE the front-end so subscribers connecting at any
     # time are wired in (the publisher subscribes to the local bus eagerly).
-    pub = IPCPublisher(local, server, rings, _DATA_TOPICS, endpoint=endpoint)
+    pub = IPCPublisher(local, server, rings, data_topics, endpoint=endpoint)
     pub.start()
 
     # Replay startup IMU references for the imu_cam module's calibration.
@@ -140,14 +178,19 @@ def run_capture_replay(session: Path, endpoint: str, *,
 
     cam_module, imu_module = build_replay_frontend(
         bus=local, reader=reader, depth_fast=depth_fast,
-        max_frames=int(max_frames), calibration=calibration)
+        max_frames=int(max_frames), calibration=calibration, tof_sim=tof_sim)
 
     # Broadcast the retained calibration bundle BEFORE starting the front-end
     # so any subscriber that connects mid-run gets the cached one immediately.
+    # ToF: scale K to the 54x42 grid so a consumer that reads calib.bundle solves
+    # against the SAME pixel grid the published frames/depth use.
     bundle = _build_calib_bundle_replay(reader)
+    if tof_sim:
+        bundle = _scale_bundle_to_tof(bundle, src_w=width, src_h=height)
     server.publish(_CALIB_TOPIC, bundle)
-    LOG.info("capture[%s] replay session=%s frames=%d %dx%d",
-             endpoint, session, len(reader), width, height)
+    LOG.info("capture[%s] replay session=%s frames=%d src=%dx%d pub=%dx%d%s",
+             endpoint, session, len(reader), width, height, pub_w, pub_h,
+             " (vl53l9cx ToF sim)" if tof_sim else "")
 
     # Install SIGTERM handler BEFORE starting the modules so the launcher's
     # SIGTERM is observed even if the producer is mid-frame. Without this the
@@ -217,12 +260,17 @@ def run_capture_live(endpoint: str, *,
                      width: int, height: int, fps: int,
                      depth_fast: bool = True,
                      use_gyro: bool = True,
-                     recalibrate_bias: bool = False) -> int:
+                     recalibrate_bias: bool = False,
+                     tof_sim: bool = False) -> int:
     """Live OAK-D capture: device -> bridge -> IPC."""
-    from imu_camera.modules.pipeline import build_live_frontend
+    from imu_camera.modules.pipeline import TOF_W, TOF_H, build_live_frontend
+
+    # ToF sim: depth runs at the SOURCE width x height (SGM), but the published
+    # frames/depth + the rings + the calib bundle are the 54x42 ToF grid.
+    pub_w, pub_h = (TOF_W, TOF_H) if tof_sim else (width, height)
 
     rings = RingRegistry().create_all(default_capture_specs(
-        endpoint=endpoint, width=width, height=height))
+        endpoint=endpoint, width=pub_w, height=pub_h))
     # Live: the IPC server is non-blocking (drop-oldest on stall) so a slow
     # downstream subscriber never stalls the OAK-D producer (firmware watchdog
     # ~1.5 s). The local front-end stays FIFO (`latest_only=False`): coalescing
@@ -233,14 +281,20 @@ def run_capture_live(endpoint: str, *,
     server = IPCPubSub(endpoint, role="server", retain_topics={_CALIB_TOPIC},
                        blocking=False)
     local = LocalPubSub()
-    pub = IPCPublisher(local, server, rings, _DATA_TOPICS, endpoint=endpoint)
+    # ToF: drop cam.sync from the bridge -- it carries the source-res pair, which
+    # would not fit the 54x42 rings, and no IPC consumer reads it (see the replay
+    # path for the full rationale).
+    data_topics = ([t for t in _DATA_TOPICS if t != topics.CAM_SYNC]
+                   if tof_sim else _DATA_TOPICS)
+    pub = IPCPublisher(local, server, rings, data_topics, endpoint=endpoint)
     pub.start()
 
     try:
         device, cam_module, imu_module, cal = build_live_frontend(
             bus=local, width=width, height=height, fps=fps,
             use_gyro=use_gyro, depth_fast=depth_fast,
-            recalibrate_bias=recalibrate_bias, latest_only=False)
+            recalibrate_bias=recalibrate_bias, latest_only=False,
+            tof_sim=tof_sim)
     except Exception as e:                                         # noqa: BLE001
         LOG.error("capture: live build failed: %s", e)
         pub.stop()
@@ -250,9 +304,12 @@ def run_capture_live(endpoint: str, *,
         return 1
 
     bundle = _build_calib_bundle_live(cal)
+    if tof_sim:
+        bundle = _scale_bundle_to_tof(bundle, src_w=width, src_h=height)
     server.publish(_CALIB_TOPIC, bundle)
-    LOG.info("capture[%s] live %dx%d@%d depth_fast=%s",
-             endpoint, width, height, fps, depth_fast)
+    LOG.info("capture[%s] live src=%dx%d pub=%dx%d@%d depth_fast=%s%s",
+             endpoint, width, height, pub_w, pub_h, fps, depth_fast,
+             " (vl53l9cx ToF sim)" if tof_sim else "")
 
     stop = [False]
     def _on_sigterm(_signo, _frame):
@@ -315,6 +372,10 @@ def main() -> int:
                     help="live: disable IMU gyro use in the calibration bundle")
     ap.add_argument("--recalibrate-bias", action="store_true",
                     help="live: ignore the cached gyro bias and re-measure it")
+    ap.add_argument("--vl53l9cx", action="store_true",
+                    help="simulate a VL53L9CX-class ToF camera: compute depth at "
+                         "the source resolution then downsample gray + depth to "
+                         "54x42 (accurate per-pixel ToF depth + intensity + IMU)")
     args = ap.parse_args()
 
     if args.live:
@@ -322,11 +383,13 @@ def main() -> int:
             endpoint=args.endpoint, width=args.width, height=args.height,
             fps=args.fps, depth_fast=args.depth_fast,
             use_gyro=not args.no_gyro,
-            recalibrate_bias=args.recalibrate_bias)
+            recalibrate_bias=args.recalibrate_bias,
+            tof_sim=args.vl53l9cx)
     return run_capture_replay(
         session=Path(args.session), endpoint=args.endpoint,
         width=args.width, height=args.height,
-        max_frames=args.max_frames, depth_fast=args.depth_fast)
+        max_frames=args.max_frames, depth_fast=args.depth_fast,
+        tof_sim=args.vl53l9cx)
 
 
 if __name__ == "__main__":

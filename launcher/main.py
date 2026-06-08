@@ -229,6 +229,10 @@ def main() -> int:
                     help="derive endpoint suffix from this launcher's PID")
     ap.add_argument("--no-ui", action="store_true",
                     help="don't open the UI -- useful for capture-only headless runs")
+    ap.add_argument("--vl53l9cx", action="store_true",
+                    help="simulate a VL53L9CX-class ToF camera in the capture "
+                         "process: compute depth at the source resolution then "
+                         "downsample gray + depth to 54x42 (works live + replay)")
     args = ap.parse_args()
 
     # SLAM keeps its live map current via a LATEST-ONLY in-process inbox (set in
@@ -283,6 +287,10 @@ def main() -> int:
             capture_args += ["--no-gyro"]
         if args.recalibrate_bias:
             capture_args += ["--recalibrate-bias"]
+    # ToF simulation applies to BOTH live + replay capture (the downsample stage
+    # is the same), so forward it after the mode branch.
+    if args.vl53l9cx:
+        capture_args += ["--vl53l9cx"]
 
     vio_args = ["--capture-endpoint", cap_ep, "--endpoint", vio_ep,
                 "--kf-every", str(args.kf_every)]

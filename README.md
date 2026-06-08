@@ -118,14 +118,12 @@ to replay instead of going live, or `--no-ui` for headless.
 | 640×400  | 20 | 5 | on  | Best quality + realtime on a good CPU — the tuning baseline |
 | 320×200  | 20 | 5 | off | Balanced; light CPU — good default for a modest machine |
 | 160×100  | 20 | 4 | off | **Practical VIO floor** (SBC / low-power); pose noisier but tracks |
-| 80×50    | 30 | 4 | off | **Below the VIO floor** — depth/IMU view + smoke ONLY (VIO goes LOST) |
 
 ```bash
 ./run.sh --width 1280 --height 800 --fps 10 --kf-every 8 --worker
 ./run.sh --width 640  --height 400 --fps 20 --kf-every 5 --worker
 ./run.sh --width 320  --height 200 --fps 20 --kf-every 5
 ./run.sh --width 160  --height 100 --fps 20 --kf-every 4
-./run.sh --width 80   --height 50  --fps 30 --kf-every 4
 ```
 
 What auto-scales with width (for reference — **not** CLI knobs):
@@ -136,7 +134,6 @@ What auto-scales with width (for reference — **not** CLI knobs):
 | 640×400  | 96  | 400 | 21px / 3lvl | 800  | ~0.40 m |
 | 320×200  | 48  | 200 | 11px / 2lvl | 400  | ~0.40 m |
 | 160×100  | 32  | 100 | 7px / 1lvl  | 200  | ~0.30 m |
-| 80×50    | 32  | 80  | 7px / 1lvl  | 200  | ~0.15 m |
 
 Tips:
 - **`--worker`** runs the heavy windowed-BA / SLAM solves in subprocesses
@@ -150,13 +147,41 @@ Tips:
 - **`--recalibrate-bias`** on a new device (hold still ~1 s, once); **`--no-gyro`**
   for pure-vision if the IMU calibration is untrusted.
 - The half-res live SGM preset (`depth_fast`) is always on — no flag needed.
-- ⚠️ **160×100 is the practical VIO floor.** At **80×50** VIO goes `LOST`: the
-  32-disparity search floor spans ~40 % of the 80 px width so the depth map is
-  structurally starved (~17 % valid vs ~77 % at 160×100), only ~15 corners survive,
-  and PnP finds 0 inliers. It is *information*-starved, not CPU-starved (it runs at
-  ~30 fps). Use 80×50 for the depth/IMU view or a pipeline smoke only — not for VIO.
-  Going below 160×100 for real odometry needs a different strategy (OAK-D on-chip
-  depth + IMU-led odometry), not a tuning tweak.
+- ⚠️ **160×100 is the practical stereo VIO floor.** Below it the depth map is
+  structurally starved (the disparity-search floor spans an ever-larger fraction
+  of the width), too few corners survive, and PnP finds no inliers — *information*-
+  starved, not CPU-starved. Going below 160×100 for real odometry needs a
+  different strategy (on-chip / ToF depth + IMU-led odometry), not a tuning tweak.
+
+## VL53L9CX ToF simulation (`--vl53l9cx`)
+
+We have no real ToF sensor, so we **simulate a VL53L9CX-class ToF camera using
+the OAK-D as the stand-in**. The flag publishes an accurate per-pixel depth map +
+a synced intensity (gray) frame + IMU at the fixed ToF grid **54×42**.
+
+The trick is **compute high, downsample** — *not* a direct low-res stereo solve:
+depth is computed on the OAK-D at the normal source resolution
+(`--width`/`--height`, default 640×400, where SGM actually works), then the
+rectified-left gray and the metric depth are downsampled to 54×42 before publish.
+Gray is reduced by area averaging; depth by a **block-median of the valid (>0)
+source pixels per output cell** (median-of-valid fills the small holes a low-res
+solve would leave and averages the noise, the way a real ToF returns dense depth)
+— never a linear resize, which would blend across object edges and holes. The
+published `imucam.sample` gray, `frame.depth`, and the retained `calib.bundle` K
+are all at 54×42 and consistent (K is scaled **anisotropically**: `fx,cx ×54/W`,
+`fy,cy ×42/H`; depth metres are unchanged). Measured valid coverage is ~99 % at
+54×42 (vs ~19 % for direct low-res stereo). The same downsample stage runs on both
+**live** (OAK-D) and **replay** (gold session) sources.
+
+```bash
+./run.sh --vl53l9cx                                          # live
+./run.sh --session sessions/gold/lab_loop_30s --vl53l9cx     # replay
+```
+
+> This is the **sensor simulation** — the deliverable here is the accurate 54×42
+> ToF frame + depth flowing through the pipeline. Making VIO actually *track* at
+> 54×42 is a separate WIP (54×42 is feature-starved by design); VIO logging `LOST`
+> at this resolution is expected and not a regression.
 
 The **baseline** (DepthAI/Basalt) reference pipeline has its own launcher,
 `run-baseline.sh`, the sibling of `run.sh` (run.sh = the 5-project from-scratch

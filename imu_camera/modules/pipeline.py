@@ -37,6 +37,15 @@ from .publish_imu_raw import PublishImuRawStep
 from .publish_imucam import PublishImuCamStep
 from .read_cam import ReadCamModule, ReplayCamSource
 from .read_imu import ImuSource, ReplayImuSource
+from .tof_downsample import ToFDownsampleStep
+
+#: VL53L9CX-class ToF sensor simulation output grid. The OAK-D is the stand-in:
+#: depth is computed on it at the SOURCE resolution (``--width``/``--height``,
+#: where stereo actually works) and then DOWNSAMPLED to this fixed ToF grid --
+#: a clean, dense, accurate low-res depth (median-of-valid fills holes + averages
+#: noise), exactly what a real ToF returns. NOT a direct low-res stereo solve.
+TOF_W = 54
+TOF_H = 42
 
 
 class ImuCamModule(Module):
@@ -81,6 +90,7 @@ class ImuCamModule(Module):
                  calibration_provider:
                      Callable[[], ImuCalibration | None] | None = None,
                  latest_only: bool = False,
+                 tof_sim: bool = False,
                  ) -> None:
         super().__init__("imu-cam", bus, latest_only=latest_only)
         self.source = source
@@ -90,13 +100,29 @@ class ImuCamModule(Module):
             PackSyncedStep(self.buffer, wait_timeout),
             PublishImuRawStep(),
             ApplyCalibrationStep(calibration, provider=calibration_provider),
-            PublishImuCamStep(),
         ]
         downstream = [topics.IMU_RAW, topics.IMUCAM_SAMPLE]
         if matcher is not None:
             self.ctx.state["matcher"] = matcher
-            chain += [ComputeDepthStep(), PublishDepthStep()]
+            if tof_sim:
+                # VL53L9CX simulation: depth is still computed at the SOURCE
+                # resolution inside ToFDownsampleStep (where SGM works), then
+                # gray + depth are downsampled to TOF_W x TOF_H. The single step
+                # publishes the 54x42 imucam.sample (gray + calibrated IMU) AND
+                # the 54x42 frame.depth, so it REPLACES the normal
+                # PublishImuCam/ComputeDepth/PublishDepth trio. The published
+                # frames now match the 54x42 capture rings + the anisotropically
+                # scaled calib.bundle K (see imu_camera.main).
+                chain += [ToFDownsampleStep(TOF_W, TOF_H)]
+            else:
+                # Normal path (byte-identical to before): publish the synced
+                # packet at source res, then compute + publish dense SGM depth.
+                chain += [PublishImuCamStep(),
+                          ComputeDepthStep(), PublishDepthStep()]
             downstream.append(topics.FRAME_DEPTH)
+        else:
+            # No matcher (UI triplet view): just publish the synced packet.
+            chain += [PublishImuCamStep()]
 
         self.forwards_to(*downstream)
         self.on(topics.CAM_SYNC, chain)
@@ -150,7 +176,8 @@ def _replay_imu_startup(reader: SessionReader, use_gyro: bool):
 def build_replay_frontend(bus: LocalPubSub, reader: SessionReader, *,
                           depth_fast: bool = False, max_frames: int = 0,
                           calibration: ImuCalibration | None = None,
-                          latest_only: bool = False):
+                          latest_only: bool = False,
+                          tof_sim: bool = False):
     """Wire ONLY the acquisition front-end (``read_cam`` + ``imu_cam`` with depth)
     from a recorded session.
 
@@ -158,13 +185,16 @@ def build_replay_frontend(bus: LocalPubSub, reader: SessionReader, *,
     capture process, or the image|depth|IMU triplet) and need no
     odometry/backend/slam. ``calibration`` is the IMU correction the imu_cam
     module applies (``None`` -> the published IMU is raw); ``latest_only`` makes
-    the front-end coalescing so a realtime visualiser stays fresh. Returns
-    ``(cam_module, imu_module)``.
+    the front-end coalescing so a realtime visualiser stays fresh.
+    ``tof_sim`` enables the VL53L9CX simulation: depth is computed at the session's
+    SOURCE resolution then gray + depth are downsampled to ``TOF_W x TOF_H`` before
+    publish. Returns ``(cam_module, imu_module)``.
     """
     sgm = SGMConfig.live() if depth_fast else SGMConfig()
     matcher = SGMStereoMatcher.from_calib(reader.calib, sgm)
     imu_module = ImuCamModule(bus, ReplayImuSource(reader), matcher=matcher,
-                              calibration=calibration, latest_only=latest_only)
+                              calibration=calibration, latest_only=latest_only,
+                              tof_sim=tof_sim)
     cam_module = ReadCamModule(
         bus, ReplayCamSource(reader, max_frames=max_frames), fps=20)
     return cam_module, imu_module
@@ -173,13 +203,16 @@ def build_replay_frontend(bus: LocalPubSub, reader: SessionReader, *,
 def build_live_frontend(bus: LocalPubSub, *, width: int = 640, height: int = 400,
                         fps: int = 20, use_gyro: bool = True,
                         depth_fast: bool = True, recalibrate_bias: bool = False,
-                        latest_only: bool = False):
+                        latest_only: bool = False,
+                        tof_sim: bool = False):
     """Open the OAK-D and wire ONLY the acquisition front-end (``read_cam`` +
     ``imu_cam`` with depth) off ONE shared device.
 
     For consumers that read ``frame.depth`` / ``imucam.sample`` directly and need
     no odometry/backend/slam. The depth matcher rectifies BOTH cameras
-    (``rectify_left=True``) since the raw left is unrectified. Returns
+    (``rectify_left=True``) since the raw left is unrectified. ``tof_sim`` enables
+    the VL53L9CX simulation (depth at source res, then gray + depth downsampled to
+    ``TOF_W x TOF_H`` before publish). Returns
     ``(device, cam_module, imu_module, cal)`` where ``cal`` is the
     live-calibration bundle (``cal.imu_calibration`` etc.); the caller starts the
     threads and releases ``device`` when the run ends. Hardware-only.
@@ -214,6 +247,6 @@ def build_live_frontend(bus: LocalPubSub, *, width: int = 640, height: int = 400
                                           rectify_left=True)
     imu_module = ImuCamModule(bus, LiveImuSource(device), matcher=matcher,
                               calibration=cal.imu_calibration,
-                              latest_only=latest_only)
+                              latest_only=latest_only, tof_sim=tof_sim)
     cam_module = ReadCamModule(bus, LiveCamSource(device), fps=fps, realtime=True)
     return device, cam_module, imu_module, cal
