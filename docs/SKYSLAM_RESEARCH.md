@@ -870,7 +870,7 @@ If cutting Phase 8: M3 → ~40 days, M4 → ~55 days. Recommended cut if calenda
 - [ ] **Install pyDBoW3**: `pip install pyDBoW3 && python -c "import pyDBoW3"`.
 - [ ] **Download ORB vocab** to `assets/ORBvoc.txt`.
 - [ ] **Re-read Part 2** (decisions matrix) — confirm decisions still valid.
-- [ ] **Confirm quaternion convention** in existing codebase (`baseline/oakd/recorder.py`, `baseline/tools/compare_sessions.py`) is Hamilton scalar-first. Document in `skyslam/types.py`.
+- [ ] **Confirm quaternion convention** in existing codebase (`baseline/capture/recorder.py`, `baseline/tools/compare_sessions.py`) is Hamilton scalar-first. Document in `skyslam/types.py`.
 - [ ] **Extend `extract_kf_from_db.py`** to dump `Feature` + `Statistics` tables (gives free comparison data).
 - [ ] **Allan variance script** for IMU noise calibration on `lab_static_10s`.
 - [ ] **Decide cut scope**: full plan (9 weeks) vs Phase-8-skipped (7 weeks)?

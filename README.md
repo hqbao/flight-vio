@@ -36,11 +36,20 @@ oak-d/
   verification/ in-process byte-parity oracle (vs the frozen baseline_metrics.json)
                 + cross-copy comms parity gate + selftests.
   baseline/     DepthAI library pipeline (BasaltVIO + RTABMapSLAM); ATE baseline.
-    oakd/                baseline-only core (its Pose/frames/pngio/sources/ui)
-    depthai_vio.py       real stereo-inertial VIO (dai.node.BasaltVIO)
-    depthai_slam.py      VIO + SLAM with loop closure (BasaltVIO + RTABMapSLAM)
+    frames.py            NED/ENU/quat math
+    pose.py              Pose + PoseHistory
+    sources/             PoseSource ABC + fake + the two real device sources
+      base.py              PoseSource ABC
+      fake.py              FakePoseSource (UI bring-up, no device)
+      basalt_vio.py        OakBasaltVioSource — stereo-inertial VIO (dai.node.BasaltVIO)
+      basalt_slam.py       OakBasaltSlamSource — VIO + loop closure (BasaltVIO + RTABMapSLAM)
+    capture/             session recorder + PNG codec
+      recorder.py          SessionRecorder
+      pngio.py             PNG codec
+    ui/                  baseline-only Qt UI (theme, viewer3d, mainwindow, panels)
     tools/               live viewer, recorder, offline replay, ATE/RPE compare
-  run.sh
+  run.sh                 5-project live pipeline launcher
+  run-baseline.sh        DepthAI/Basalt reference launcher
   requirements.txt
 ```
 
@@ -78,7 +87,7 @@ This gives camera-frame axes (right-handed, OpenCV convention):
 ./run.sh --proc                                   # explicit; identical to the default
 ./run.sh --no-ui                                  # headless: imu_camera + vio + slam, no GUI
 ./run.sh --session sessions/gold/lab_loop_30s     # replay a recorded session through the pipeline
-./run.sh --width 1280 --height 800 --fps 15       # capture-resolution overrides (live)
+./run.sh --width 320 --height 200                 # lower capture resolution (see "Resolution presets")
 ```
 
 `run.sh` forwards to `python -m launcher.main --auto-suffix "$@"`. The launcher
@@ -94,13 +103,75 @@ on the capture process's `imu_cam` thread, so the launcher never spawns a depth
 process. `depth/` is an independent SOURCE TREE — promotable to a 5th process via
 its own `depth.main` harness (see [depth/README.md](depth/README.md)).
 
-The **baseline** (DepthAI/Basalt) viewer is a separate entry point that opens the
-device directly (run it only when the live pipeline is not holding the OAK-D):
+## Resolution presets (suggested run params)
+
+You only ever pass `--width/--height`, `--fps`, `--kf-every`, and (for heavy
+resolutions) `--worker`. Everything else — the SGM disparity range, the corner
+budget, the KLT window, the ORB budget — is **auto-scaled from the width** by
+`ResolutionProfile` ([comms/lib/config/resolution.py](imu_camera/comms/lib/config/resolution.py)),
+so there is nothing else to hand-tune. Append `--session sessions/gold/<name>`
+to replay instead of going live, or `--no-ui` for headless.
+
+| Resolution | fps | kf-every | `--worker` | Use case |
+|---|---|---|---|---|
+| 1280×800 | 10 | 8 | on  | Max accuracy. **Not CPU-realtime** (192-disparity SGM) |
+| 640×400  | 20 | 5 | on  | Best quality + realtime on a good CPU — the tuning baseline |
+| 320×200  | 20 | 5 | off | Balanced; light CPU — good default for a modest machine |
+| 160×100  | 20 | 4 | off | **Practical VIO floor** (SBC / low-power); pose noisier but tracks |
+| 80×50    | 30 | 4 | off | **Below the VIO floor** — depth/IMU view + smoke ONLY (VIO goes LOST) |
 
 ```bash
-.venv/bin/python baseline/tools/view_pose3d.py --source oak    # BasaltVIO
-.venv/bin/python baseline/tools/view_pose3d.py --source slam   # BasaltVIO + RTABMapSLAM
+./run.sh --width 1280 --height 800 --fps 10 --kf-every 8 --worker
+./run.sh --width 640  --height 400 --fps 20 --kf-every 5 --worker
+./run.sh --width 320  --height 200 --fps 20 --kf-every 5
+./run.sh --width 160  --height 100 --fps 20 --kf-every 4
+./run.sh --width 80   --height 50  --fps 30 --kf-every 4
 ```
+
+What auto-scales with width (for reference — **not** CLI knobs):
+
+| Resolution | SGM disparities | corners | KLT window | ORB feats | ~near-depth |
+|---|---|---|---|---|---|
+| 1280×800 | 192 | 800 | 43px / 3lvl | 1600 | ~0.40 m |
+| 640×400  | 96  | 400 | 21px / 3lvl | 800  | ~0.40 m |
+| 320×200  | 48  | 200 | 11px / 2lvl | 400  | ~0.40 m |
+| 160×100  | 32  | 100 | 7px / 1lvl  | 200  | ~0.30 m |
+| 80×50    | 32  | 80  | 7px / 1lvl  | 200  | ~0.15 m |
+
+Tips:
+- **`--worker`** runs the heavy windowed-BA / SLAM solves in subprocesses
+  (GIL-free, latest-wins) — worth it at 640+; below that the in-process
+  latest-only SLAM is already responsive. It prints one benign
+  `resource_tracker: leaked semaphore` line at shutdown (stdlib self-cleans).
+- **Watch `src fps`** in the UI telemetry panel — if it sits well below `--fps`,
+  the CPU is not keeping up; drop the resolution or the fps.
+- **`--kf-every`** ↑ at high resolution to lighten BA/SLAM; ↓ at low resolution
+  for a denser keyframe map.
+- **`--recalibrate-bias`** on a new device (hold still ~1 s, once); **`--no-gyro`**
+  for pure-vision if the IMU calibration is untrusted.
+- The half-res live SGM preset (`depth_fast`) is always on — no flag needed.
+- ⚠️ **160×100 is the practical VIO floor.** At **80×50** VIO goes `LOST`: the
+  32-disparity search floor spans ~40 % of the 80 px width so the depth map is
+  structurally starved (~17 % valid vs ~77 % at 160×100), only ~15 corners survive,
+  and PnP finds 0 inliers. It is *information*-starved, not CPU-starved (it runs at
+  ~30 fps). Use 80×50 for the depth/IMU view or a pipeline smoke only — not for VIO.
+  Going below 160×100 for real odometry needs a different strategy (OAK-D on-chip
+  depth + IMU-led odometry), not a tuning tweak.
+
+The **baseline** (DepthAI/Basalt) reference pipeline has its own launcher,
+`run-baseline.sh`, the sibling of `run.sh` (run.sh = the 5-project from-scratch
+pipeline; run-baseline.sh = the DepthAI/Basalt reference). It opens the OAK-D
+directly, so run it only when the live pipeline is not holding the device:
+
+```bash
+./run-baseline.sh                          # Basalt VIO (oak)  — default
+./run-baseline.sh --source slam            # Basalt VIO + RTABMap SLAM
+./run-baseline.sh --width 80 --height 50   # low-res reference run
+./run-baseline.sh --source fake            # UI bring-up, no device
+```
+
+`run-baseline.sh` forwards to `baseline/tools/view_pose3d.py`, which accepts
+`--source {fake,oak,slam}` plus `--width/--height/--fps`.
 
 ### Bootstrap
 

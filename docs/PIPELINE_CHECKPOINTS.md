@@ -6,7 +6,7 @@ compare each stage's output against the baseline for debugging and accuracy
 measurement.
 
 **Created**: 2026-05-29 (rewrite, principle: "only show real data")
-**Reference pipeline**: `baseline/depthai_slam.py` (live) + `depthai_vio.py` (VIO-only)
+**Reference pipeline**: `baseline/sources/basalt_slam.py` (live) + `baseline/sources/basalt_vio.py` (VIO-only)
 **Comparison target**: `skyslam/` (not written yet — detailed plan in `docs/SKYSLAM_RESEARCH.md`)
 
 ---
@@ -363,7 +363,7 @@ sessions/
 
 ## 5. How to record from the current pipeline
 
-Need an additional module `baseline/oakd/recorder.py`:
+Need an additional module `baseline/capture/recorder.py`:
 
 ```python
 class SessionRecorder:
@@ -465,7 +465,7 @@ When skyslam reaches each phase, replay these 5 sessions → compute metrics
 
 Pre-skyslam infra ✅ DONE:
 
-- [x] `baseline/oakd/recorder.py` — fan-out tap on every queue
+- [x] `baseline/capture/recorder.py` — fan-out tap on every queue
 - [x] `baseline/tools/record_session.py` — CLI with `--duration`, `--no-pcl`, `-f`
 - [x] `baseline/tools/compare_sessions.py` — ATE/RPE between two pose streams
 - [x] Recorded 6 gold sessions (see `docs/GOLD_SESSIONS.md`)
@@ -483,9 +483,9 @@ Skyslam work — see **`docs/SKYSLAM_RESEARCH.md`** Part 3 for plan v3
 - **Skyslam plan v3 (research-backed)**: `docs/SKYSLAM_RESEARCH.md`
 - Gold regression suite: `docs/GOLD_SESSIONS.md` + `docs/GOLD_BASELINE.md`
 - Long-term hardware/FC vision: `docs/SKYSLAM_ROADMAP.md`
-- Current SLAM source: `baseline/depthai_slam.py`
-- Current VIO source: `baseline/depthai_vio.py`
-- Pose data structure: `baseline/oakd/pose.py`
+- Current SLAM source: `baseline/sources/basalt_slam.py`
+- Current VIO source: `baseline/sources/basalt_vio.py`
+- Pose data structure: `baseline/pose.py`
 
 ---
 

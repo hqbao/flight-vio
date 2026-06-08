@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Record a baseline session: dump C0/C1/C2/C3 streams from the OAK-D.
 
-Same pipeline as ``baseline/depthai_slam.py`` (BasaltVIO + RTABMapSLAM),
+Same pipeline as ``baseline/sources/basalt_slam.py`` (BasaltVIO + RTABMapSLAM),
 but every relevant queue is also fanned out to a :class:`SessionRecorder`.
 
 Usage::
@@ -21,7 +21,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from baseline.oakd.recorder import SessionRecorder  # noqa: E402
+from baseline.capture.recorder import SessionRecorder  # noqa: E402
 
 
 def _read_calib(device, width: int, height: int, left_socket, right_socket) -> dict:

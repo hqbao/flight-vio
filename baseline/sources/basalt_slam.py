@@ -20,10 +20,10 @@ import time
 
 import numpy as np
 
-from baseline.oakd.frames import quat_to_rot
-from baseline.oakd.pose import Pose
-from baseline.oakd.sources.base import PoseSource
-from .depthai_vio import _M_FLU_TO_NED, _rot_to_quat_wxyz
+from baseline.frames import quat_to_rot
+from baseline.pose import Pose
+from .base import PoseSource
+from .basalt_vio import _M_FLU_TO_NED, _rot_to_quat_wxyz
 
 
 class OakBasaltSlamSource(PoseSource):

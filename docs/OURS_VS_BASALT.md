@@ -9,7 +9,7 @@ does not have to re-derive it.
 **Our code**: the 5-project split — `vio/` (odometry + windowed BA) + `slam/`
 (loop closure + pose graph) + `imu_camera/` (capture + inline depth) over the
 vendored `comms/` bus; `ui/` (viewer)
-**Basalt (reference)**: `dai.node.BasaltVIO` consumed in `baseline/depthai_vio.py`
+**Basalt (reference)**: `dai.node.BasaltVIO` consumed in `baseline/sources/basalt_vio.py`
 **Scoring**: `verification/vio_oracle_runner.py` (offline byte-parity oracle, vs
 recorded Basalt poses + the frozen `baseline_metrics.json`)
 
