@@ -69,12 +69,17 @@ class OakBasaltVioSource(PoseSource):
     """OAK-D + Basalt VIO -> NED pose stream."""
 
     def __init__(self, width: int = 640, height: int = 400, fps: int = 60,
-                 imu_rate_hz: int = 200) -> None:
+                 imu_rate_hz: int = 200,
+                 vio_config_path: str | None = None) -> None:
         super().__init__()
         self.width = int(width)
         self.height = int(height)
         self.cam_fps = int(fps)
         self.imu_rate_hz = int(imu_rate_hz)
+        # OPT-IN Basalt override: when set, a vio_config.json is loaded ON TOP
+        # of the stock hard-coded defaults via vio.setConfigPath(). Default
+        # None => stock auto-config (intrinsics/stereo/IMU from EEPROM), unchanged.
+        self.vio_config_path = vio_config_path
 
     def _run(self) -> None:
         import depthai as dai  # lazy: --source fake works without depthai/device
@@ -97,6 +102,11 @@ class OakBasaltVioSource(PoseSource):
             imu.setMaxBatchReports(10)
 
             vio.setImuUpdateRate(self.imu_rate_hz)
+
+            # Opt-in only: layer a Basalt vio_config.json over the stock defaults.
+            # Without this, BasaltVIO keeps its auto-calibrated, VGA-tuned config.
+            if self.vio_config_path:
+                vio.setConfigPath(self.vio_config_path)
 
             left.requestOutput((self.width, self.height)).link(vio.left)
             right.requestOutput((self.width, self.height)).link(vio.right)

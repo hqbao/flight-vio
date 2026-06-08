@@ -33,6 +33,10 @@ def _build_source(name: str, args):
     res = {"width": args.width, "height": args.height}
     if args.fps > 0:
         res["fps"] = args.fps
+    # Opt-in Basalt override: only forwarded when --vio-config is given, so the
+    # default stays stock auto-config for both the VIO and SLAM sources.
+    if name in ("oak", "slam") and args.vio_config:
+        res["vio_config_path"] = args.vio_config
     if name == "oak":
         from baseline.sources.basalt_vio import OakBasaltVioSource
         return OakBasaltVioSource(**res)
@@ -53,6 +57,10 @@ def main() -> int:
                     help="camera output height fed to Basalt (default 400)")
     ap.add_argument("--fps", type=int, default=0,
                     help="sensor fps (0 = source default: VIO 60, SLAM 20)")
+    ap.add_argument("--vio-config", type=str, default=None,
+                    help="path to a Basalt vio_config.json fed to "
+                         "BasaltVIO.setConfigPath (advanced; default = stock "
+                         "auto-config)")
     args = ap.parse_args()
 
     history = PoseHistory(capacity=8192)

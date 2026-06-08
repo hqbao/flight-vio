@@ -32,7 +32,8 @@ class OakBasaltSlamSource(PoseSource):
     def __init__(self, width: int = 640, height: int = 400, fps: int = 20,
                  imu_rate_hz: int = 200,
                  database_path: str | None = None,
-                 load_database: bool = False) -> None:
+                 load_database: bool = False,
+                 vio_config_path: str | None = None) -> None:
         super().__init__()
         self.width = int(width)
         self.height = int(height)
@@ -40,6 +41,9 @@ class OakBasaltSlamSource(PoseSource):
         self.imu_rate_hz = int(imu_rate_hz)
         self.database_path = database_path
         self.load_database = bool(load_database)
+        # OPT-IN Basalt override for the underlying BasaltVIO node (see
+        # basalt_vio.py). Default None => stock auto-config, unchanged.
+        self.vio_config_path = vio_config_path
 
     def _run(self) -> None:
         import depthai as dai  # lazy
@@ -64,6 +68,11 @@ class OakBasaltSlamSource(PoseSource):
             imu.setBatchReportThreshold(1)
             imu.setMaxBatchReports(10)
             vio.setImuUpdateRate(self.imu_rate_hz)
+
+            # Opt-in only: layer a Basalt vio_config.json over the stock defaults
+            # of the BasaltVIO odometry node. Default None => stock, unchanged.
+            if self.vio_config_path:
+                vio.setConfigPath(self.vio_config_path)
 
             # Stereo: rectified-left aligned depth for SLAM.
             # NOTE: setSubpixel(True) doubles VPU load and pushed the OAK-D W

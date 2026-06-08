@@ -166,12 +166,40 @@ directly, so run it only when the live pipeline is not holding the device:
 ```bash
 ./run-baseline.sh                          # Basalt VIO (oak)  — default
 ./run-baseline.sh --source slam            # Basalt VIO + RTABMap SLAM
-./run-baseline.sh --width 80 --height 50   # low-res reference run
+./run-baseline.sh --width 320 --height 200 # lower res (160/80 are below Basalt's envelope)
 ./run-baseline.sh --source fake            # UI bring-up, no device
 ```
 
 `run-baseline.sh` forwards to `baseline/tools/view_pose3d.py`, which accepts
-`--source {fake,oak,slam}` plus `--width/--height/--fps`.
+`--source {fake,oak,slam}` plus `--width/--height/--fps` (and the advanced
+`--vio-config`, below).
+
+#### Baseline (Basalt) tuning
+
+- **640×400 is the FAIR comparison point.** Stock `dai.node.BasaltVIO`
+  auto-reads its full calibration (intrinsics, stereo + IMU extrinsics, noise)
+  from the device EEPROM, and its optical-flow constants (grid_size=50,
+  levels=3, image_safe_radius=472) are tuned for ~VGA. It is already
+  well-configured there — **don't hand-tune it at 640×400.**
+- **Below ~VGA it falls apart, by design.** Those VGA-tuned pixel constants
+  starve features at 160×100 / 80×50 (a 50 px grid on a 160-wide image is only
+  ~3×2 cells), so Basalt drifts / loses tracking. This is **out of its design
+  envelope**, NOT a bug and NOT a calibration issue (intrinsics *do* auto-scale
+  with resolution). Our pipeline wins at low resolution because it is
+  resolution-adaptive by design — a real advantage for the embedded target, but a
+  **low-res-only** result. The honest head-to-head is at **640×400**, where Basalt
+  is the strong reference our `verification/` ATE numbers are scored against.
+- **`--vio-config PATH` (advanced, rarely worth it).** Forwarded to
+  `BasaltVIO.setConfigPath`. Basalt's cereal loader needs a **COMPLETE**
+  `vio_config.json` (a `value0` wrapper, every field keyed `config.<name>`, ALL
+  fields present) — a partial file fails with `JSON Parsing failed - provided NVP
+  (config.optical_flow_type) not found`. The only reliable way to get a valid one
+  is to dump a known-good config from your depthai/Basalt build and edit it, then
+  A/B it against stock on the device. Don't expect it to make 160×100 competitive
+  — that is below Basalt's floor regardless.
+- **Do NOT hand-set IMU noise / extrinsics.** The stock auto-config from EEPROM
+  is correct, and `setGyroNoiseStd` / `setAccelNoiseStd` carry an undocumented
+  square-root units trap. Leave them alone.
 
 ### Bootstrap
 
