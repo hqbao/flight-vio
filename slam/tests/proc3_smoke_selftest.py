@@ -17,9 +17,9 @@ map advances, kf dots growing) and ``loop.correction`` (the loop-event stream --
 * the loop session DOES close loops: ``1 <= confirmed loops <= oracle ceiling``.
   The exact count is INHERENTLY NON-DETERMINISTIC on the LIVE path -- SLAM runs
   ``latest_only=True``, whose coalescing keyframe inbox drops a variable number of
-  keyframes under real-time load (measured: the reference oracle
-  ``ours.tools.proc4_replay_selftest`` itself reports 2 / 3 / 4 on ``lab_loop_30s``
-  on consecutive runs). The deterministic byte-parity proof of the loop-closure
+  keyframes under real-time load (measured: the pre-split multi-process replay
+  reference itself reported 2 / 3 / 4 on ``lab_loop_30s`` on consecutive runs).
+  The deterministic byte-parity proof of the loop-closure
   MATH lives in :mod:`slam.tests.loop_closure_selftest`; this smoke proves the
   PLUMBING;
 * clean shutdown (no IPC connect / shared-memory error surfaced).
@@ -86,9 +86,9 @@ def main() -> int:
     ap.add_argument("--kf-every", type=int, default=5)
     ap.add_argument("--expect-loops", type=int, default=4,
                     help="oracle CEILING for confirmed loops on the session "
-                         "(live latest_only SLAM is non-deterministic: the oracle "
-                         "ours.tools.proc4_replay_selftest reports 2..4 on "
-                         "lab_loop_30s; we assert 1 <= observed <= this ceiling)")
+                         "(live latest_only SLAM is non-deterministic: the "
+                         "pre-split multi-process replay reference reported 2..4 "
+                         "on lab_loop_30s; we assert 1 <= observed <= this ceiling)")
     ap.add_argument("--keep-logs", action="store_true",
                     help="print subprocess stdout/stderr instead of capturing")
     args = ap.parse_args()
@@ -230,8 +230,8 @@ def _run_assertions(args, slam_ep, procs):
     # HONEST NOTE on the loop count. SLAM runs with ``latest_only=True`` (the LIVE
     # viewer path), whose coalescing keyframe inbox DROPS a variable number of
     # keyframes under real-time load -- so the confirmed-loop count is INHERENTLY
-    # NON-DETERMINISTIC across runs (measured: the reference oracle
-    # ``ours.tools.proc4_replay_selftest`` itself reports 2 / 3 / 4 loops on
+    # NON-DETERMINISTIC across runs (measured: the pre-split multi-process replay
+    # reference itself reported 2 / 3 / 4 loops on
     # lab_loop_30s on consecutive runs). The deterministic byte-parity proof of the
     # loop-closure MATH lives in ``slam.tests.loop_closure_selftest``; this smoke
     # proves the 3-process PLUMBING: the loop session DOES close loops, the map

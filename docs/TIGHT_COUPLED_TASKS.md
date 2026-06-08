@@ -37,7 +37,7 @@ Qt 3D viewer). Every task ships a `*_selftest.py` that must stay green.
 How it works   : the recorder dumps stereo C0/C1 + IMU + the Basalt/RTABMap pose
                  (our ground-truth reference) at 20 fps, exactly the live rate.
 Input          : the OAK-D on the bench (quit `./run.sh` first — single access).
-Visual output  : `ours/tools/viz_session.py sessions/fast_push_15s` — scrub the
+Visual output  : `baseline/tools/viz_session.py sessions/fast_push_15s` — scrub the
                  frames; the Basalt pose path is drawn so you see the true motion.
 Pass gate      : the session has the fast push that fails live (net ≥ ~1.0 m,
                  peak speed ≥ ~1.0 m/s — read from the Basalt pose).
@@ -46,18 +46,18 @@ Pass gate      : the session has the fast push that fails live (net ≥ ~1.0 m,
 Builds         : nothing (uses `baseline/tools/record_session.py`).
 
 ### T0.2 — Reproduce the stall offline (prove the mechanism BEFORE coding)
-How it works   : replay the recorded session through `live_replay.py` in 3 modes
-                 — raw VO tip (= `ours`), filtered tip (EMA), filtered + rate-
-                 limited BA correction (= `ours-ba`).
+How it works   : replay the recorded session through the offline oracle in 3 modes
+                 — raw VO tip (= VIO), filtered tip (EMA), filtered + rate-
+                 limited BA correction (= VIO-BA).
 Input          : `sessions/fast_push_15s`.
-Visual output  : `ours/tools/live_replay.py … --plot` → one figure, three
+Visual output  : `verification/vio_oracle_runner.py … --plot` → one figure, three
                  "distance travelled vs time" curves overlaid on the Basalt curve.
-Pass gate      : the `ours-ba` curve visibly **stalls then crawls at ~0.3 m/s**
+Pass gate      : the VIO-BA curve visibly **stalls then crawls at ~0.3 m/s**
                  while the raw-tip curve tracks Basalt. (Confirms the rate cap is
                  the culprit, not KLT.)
 Ý nghĩa        : nhìn tận mắt cái "ì lại" sinh ra từ EMA + giới hạn 0.3 m/s, chứ
                  không phải KLT. Đây là bằng chứng để chốt, trước khi sửa gì.
-Builds         : `--plot` flag on `live_replay.py` (distance-vs-time curves).
+Builds         : `--plot` flag on the oracle runner (distance-vs-time curves).
 
 > Tracks A–F below are the actual rebuild. They are ordered so each track is
 > useful on its own and every gate is offline. Stop after any track and you still
@@ -78,7 +78,7 @@ Visual output  : `imu_preint_viz.py --stage timeline` → plot accel.xyz & gyro.
                  vs time with vertical lines at each camera frame.
 Pass gate      : timestamps strictly increasing; IMU ≈ 200 Hz; 0 gaps > 2× median.
 Ý nghĩa        : nền móng — sai đồng hồ/dt thì mọi tích phân sau đều sai.
-Builds         : `ours/tools/imu_preint_viz.py` (grows each task), `ours/lib/imu/preintegration.py` (skeleton).
+Builds         : `vio/tools/imu_preint_viz.py` (grows each task), `vio/mathlib/imu/preintegration.py` (skeleton).
 
 ### A2 — Gyro-only ΔR per segment
 How it works   : integrate gyro between two frames → `ΔR` (SO3 exp), the rotation
@@ -144,15 +144,15 @@ Builds         : `residual` + Jacobians + selftest. **Track A done = Block 2 don
 How it works   : start from the Basalt initial state, integrate IMU only, frame to
                  frame, with the bias from `calib`.
 Input          : `sessions/fast_push_15s` IMU.
-Visual output  : `ours/tools/view_pose3d.py` overlay — IMU-only trajectory vs
-                 Basalt vs `ours` raw VO, all three in one 3D view.
+Visual output  : the `ui` Viewer3D overlay — IMU-only trajectory vs Basalt vs raw
+                 VO, all three in one 3D view.
 Pass gate      : qualitative — during the **first ~1 s of the fast push** the
                  IMU-only path follows the push shape (it WILL drift after; that's
                  expected and is exactly what vision will correct).
 Ý nghĩa        : đây là khoảnh khắc "thấy tận mắt" tại sao tight-coupling chữa
                  được đẩy nhanh — IMU một mình đã bắt được cú đẩy mà loose path
                  phải bò theo. Không viết optimiser vẫn thấy được giá trị.
-Builds         : `ours/tools/imu_only_odom.py` (thin driver over Track A).
+Builds         : `vio/tools/imu_only_odom.py` (thin driver over Track A).
 
 ---
 
@@ -169,7 +169,7 @@ Visual output  : `vi_bundle_viz.py --case two_frame` → before/after reprojecti
                  overlay on both frames + a printed recovered-vs-true transform.
 Pass gate      : recovers the known transform to < 1 mm / 0.1°.
 Ý nghĩa        : đơn vị nhỏ nhất của bộ tối ưu tight — vision + IMU cùng 1 hệ.
-Builds         : `ours/lib/backend/vio_solve.py` (2-state core) + selftest.
+Builds         : `vio/mathlib/backend/vio_solve.py` (2-state core) + selftest.
 
 ### C2 — N-state sliding window (vision + IMU, no marginalisation yet)
 How it works   : extend C1 to `vio_max_states` recent pose-vel-bias states; IMU
@@ -261,7 +261,7 @@ Pass gate      : trajectory continuous across marginalisation; ATE improves vs
                  Track C (C had no memory of dropped states).
 Ý nghĩa        : giữ thông tin quá khứ → quỹ đạo mượt, không giật khi keyframe rời
                  cửa sổ. Đây là thứ làm Basalt drift cực thấp.
-Builds         : `MargHelper` sqrt marginalisation in `ours/lib/backend/marginalize.py` (extend) + selftest.
+Builds         : `MargHelper` sqrt marginalisation in `vio/mathlib/backend/marginalize.py` (extend) + selftest.
 
 ### E2 — FEJ (first-estimates Jacobian) null-space check
 How it works   : freeze the linearisation point of marginalised states; convert
@@ -322,15 +322,15 @@ Builds         : nothing new (composes T0.2 `--plot` + `view_pose3d`).
 
 ## What gets built (all tiny, all self-tested)
 ```
-ours/lib/imu/preintegration.py        # Track A (Block 2)
-ours/lib/backend/vio_solve.py         # Track C (Block 3) — window solve
-ours/lib/backend/marginalize.py       # Track E (Block 5) — extend existing
-ours/tools/imu_preint_viz.py          # A1–A6 plots
-ours/tools/imu_only_odom.py           # B1
-ours/tools/vi_bundle_viz.py           # C1, C3
-ours/tools/kf_viz.py  lm_viz.py  marg_viz.py   # D1–D3, E1–E2
-ours/tools/*_selftest.py              # one per Track A/C/D/E unit
-# vio_run.py gains --backend vio2 ; live_replay.py gains --plot
+vio/mathlib/imu/preintegration.py     # Track A (Block 2)
+vio/mathlib/backend/vio_solve.py      # Track C (Block 3) — window solve
+vio/mathlib/backend/marginalize.py    # Track E (Block 5) — extend existing
+vio/tools/imu_preint_viz.py           # A1–A6 plots
+vio/tools/imu_only_odom.py            # B1
+vio/tools/vi_bundle_viz.py            # C1, C3
+vio/tools/kf_viz.py  lm_viz.py  marg_viz.py    # D1–D3, E1–E2
+vio/tests/*_selftest.py               # one per Track A/C/D/E unit
+# verification/vio_oracle_runner.py gains --backend vio2 ; the oracle runner gains --plot
 ```
 
 No task depends on hardware except T0.1 (the one recording). Everything else is

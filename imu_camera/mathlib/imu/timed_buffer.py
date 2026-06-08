@@ -24,7 +24,7 @@ final frame, whose timestamp may lie past the last IMU sample, drains whatever i
 available instead of hanging.
 
 Pure standard-library + numpy; no device or framework imports, so it is fully
-unit-testable offline (see ``ours.tools.timed_buffer_selftest``).
+unit-testable offline.
 """
 from __future__ import annotations
 

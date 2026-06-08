@@ -4,62 +4,52 @@ Companion-computer project to turn an **OAK-D W** stereo camera into a 6-DoF
 position source for the flight-controller. Runs on a Mac mini today, will move
 to a Raspberry Pi 5 later.
 
+The from-scratch VIO/SLAM pipeline (formerly the `ours/` monolith) is now split
+into **five independent projects** + a launcher + a verification harness. The
+DepthAI/Basalt reference (`baseline/`) is kept for ATE comparison.
+
 ```
 oak-d/
-  ours/                  OUR from-scratch pipeline (library-free; self-contained)
-    app.py               wire + run the 6 flows over a pub/sub bus (live + replay)
-    lib/                 the algorithm library + runtime building blocks
-      pose.py            own Pose dataclass + ring buffer (copy, kept independent)
-      frames.py          own camera/body/world transforms (copy)
-      pngio.py           own pure-Python PNG codec (copy)
-      geometry.py        SO(3)/SE(3) Lie-algebra helpers
-      pubsub.py flow.py task.py  thread-per-flow actor model + topics/messages
-      frontend/          KLT + Shi-Tomasi feature frontend (cv2-free; Numba KLT)
-      stereo/            own SGM dense depth + rectification
-      imu/               Forster IMU preintegration + translation filter
-      odometry/          frame-to-frame RGB-D PnP (+ gyro fusion) + own RANSAC PnP
-      backend/           sliding-window bundle adjustment (analytic Schur)
-      loop/              own ORB + F-matrix loop closure + SE(3) pose graph + SLAM
-      engine/            in-process | out-of-process runner for the heavy BA/SLAM solve
-      io/                recorded-session reader + time-synced bundles
-      config/            resolution-aware tuning profiles
-    flows/               live-pipeline orchestration (one thread + tasks per flow)
-      cam/ imu_cam/ odometry/ backend/ slam/ ui/
-                         (cam + imu_cam = ONE acquisition front-end;
-                          depth is a task inside imu_cam, not a separate flow)
-      live_source.py     bridge: run the live flow graph into the Qt viewer
-    ui/                  own Qt 3D viewer + PoseSource base + fake source (copy)
-    tools/               offline scoring + self-tests (call ours.lib directly)
-      view_pose3d.py     live 3D viewer (run.sh entry; ours backends)
-      vio_run.py         offline scoring of ours f2f/ba/slam/vio vs Basalt
-      live_replay.py     replay a recorded session through the live ours pipeline
-      synced_view.py     inspect the synced (image, depth, IMU) triplet
-      imucam_view.py     cv2 view of the split cam/IMU front-end (left|right|gyro|accel)
-      slam_map3d.py      3D room point-cloud fused from keyframe depths (+ PLY export)
-      *_selftest.py      regression guards (klt, ba, posegraph, imu_preint, vio_ba, imucam_*, flow_replay)
-  baseline/              DepthAI library pipeline (BasaltVIO + RTABMapSLAM)
+  imu_camera/   capture process: owns the OAK-D, syncs cam+IMU, applies IMU
+                calibration, computes dense depth (SGM, INLINE). main.py = the
+                capture process.
+                publishes: cam.sync, imu.raw, imucam.sample, frame.depth, calib.bundle
+  depth/        SGM stereo SOURCE-OF-TRUTH + the 2 depth steps. imu_camera vendors
+                a byte-identical copy and runs depth inline; depth/ is a standalone
+                depth-as-a-process harness (cam.sync -> frame.depth) + the tree a
+                future 5th process graduates from.
+  vio/          KLT frontend + RGB-D PnP (+ gyro fusion) + windowed bundle
+                adjustment. main.py = the VIO process.
+                publishes: pose.odom, pose.vo, pose.refined, keyframe,
+                           frame.tracks, frame.inliers
+  slam/         ORB loop closure + SE(3) pose-graph optimisation; a PURE VIO
+                consumer (subscribes VIO's keyframes, never closes back into VIO).
+                main.py = the SLAM process.
+                publishes: loop.correction, slam.map
+  ui/           PyQt6 single-view GUI: one Viewer3D drawing 5 trajectory lines
+                (VO / VIO / VIO-BA / SLAM-corrected VIO / SLAM) + per-line toggles
+                + Restart, plus Visualize / Calibration windows fed over IPC.
+                main.py = the UI process.
+  launcher/     process lifecycle only: spawns imu_camera + vio + slam (background)
+                and ui (foreground); restart loop + orphan SHM/socket cleanup.
+                ./run.sh (--proc) -> python -m launcher.main
+  verification/ in-process byte-parity oracle (vs the frozen baseline_metrics.json)
+                + cross-copy comms parity gate + selftests.
+  baseline/     DepthAI library pipeline (BasaltVIO + RTABMapSLAM); ATE baseline.
     oakd/                baseline-only core (its Pose/frames/pngio/sources/ui)
-      frames.py          camera <-> body (FRD) <-> world (NED) transforms
-      pose.py            Pose dataclass + ring buffer
-      recorder.py        live-run logger (C0..C9 streams to sessions/<name>/)
-      pngio.py           pure-Python 8-bit PNG codec (replaces cv2.imread/imwrite)
-      sources/           PoseSource base + the device-free fake source
-      ui/                Qt 3D viewer (theme/viewer3d/panels/mainwindow)
     depthai_vio.py       real stereo-inertial VIO (dai.node.BasaltVIO)
     depthai_slam.py      VIO + SLAM with loop closure (BasaltVIO + RTABMapSLAM)
-    tools/
-      view_pose3d.py     live 3D viewer from OAK over USB (Basalt backends)
-      record_session.py  dump C0..C9 + PCL from a live run to sessions/<name>/
-      viz_session.py     offline multi-tab replay of a recorded session
-      compare_sessions.py  ATE/RPE between two pose streams (VIO vs SLAM, etc.)
-      baseline_report.py scan sessions/gold/, emit Markdown baseline report
-      extract_kf_from_db.py  pull keyframes/loops out of rtabmap.db
+    tools/               live viewer, recorder, offline replay, ATE/RPE compare
   run.sh
   requirements.txt
 ```
 
-See `docs/PIPELINE_CHECKPOINTS.md` for the recording schema + migration
-plan, and `docs/GOLD_SESSIONS.md` for the regression suite scenarios.
+Each of the five projects **vendors a byte-identical `comms/` package** (the
+cross-project contract). One project = one self-contained, independently portable
+Python package. See [The `comms/` contract](#the-comms-contract) below.
+
+See `docs/PIPELINE_CHECKPOINTS.md` for the recording schema + migration plan, and
+`docs/GOLD_SESSIONS.md` for the regression suite scenarios.
 
 ## Camera mount
 
@@ -81,50 +71,135 @@ This gives camera-frame axes (right-handed, OpenCV convention):
 
 ## Quick start
 
-`run.sh` launches the viewer for **our** pipeline (the two roots share no code):
+`run.sh` launches the **5-project live pipeline** through the launcher:
 
 ```bash
-./run.sh                       # our frame-to-frame RGB-D PnP VO (default)
-./run.sh --source fake         # device-free procedural trajectory
-./run.sh --source ours         # our frame-to-frame RGB-D PnP VO
-./run.sh --source ours-ba      # + sliding-window bundle adjustment (depth-anchored, VO scale prior)
-./run.sh --source ours-slam    # + ORB loop closure + SE(3) pose graph (full SLAM)
+./run.sh                                          # live: imu_camera + vio + slam + ui
+./run.sh --proc                                   # explicit; identical to the default
+./run.sh --no-ui                                  # headless: imu_camera + vio + slam, no GUI
+./run.sh --session sessions/gold/lab_loop_30s     # replay a recorded session through the pipeline
+./run.sh --width 1280 --height 800 --fps 15       # capture-resolution overrides (live)
 ```
 
-The **baseline** (DepthAI/Basalt) viewer is a separate entry point:
+`run.sh` forwards to `python -m launcher.main --auto-suffix "$@"`. The launcher
+spawns `imu_camera` (capture), then `vio`, then `slam` in the background (each
+subscriber boots after its publisher's endpoint exists), and runs `ui` in the
+foreground so the Qt event loop owns GUI focus and a clean Ctrl-C / window-close
+tears the whole pipeline down. `imu_camera.main` **defaults to replay** and takes
+an explicit `--live` for hardware; the launcher's live branch passes `--live`, the
+replay branch passes `--session`.
+
+Runtime = **4 processes** (`imu_camera`, `vio`, `slam`, `ui`); depth runs INLINE
+on the capture process's `imu_cam` thread, so the launcher never spawns a depth
+process. `depth/` is an independent SOURCE TREE — promotable to a 5th process via
+its own `depth.main` harness (see [depth/README.md](depth/README.md)).
+
+The **baseline** (DepthAI/Basalt) viewer is a separate entry point that opens the
+device directly (run it only when the live pipeline is not holding the OAK-D):
 
 ```bash
 .venv/bin/python baseline/tools/view_pose3d.py --source oak    # BasaltVIO
 .venv/bin/python baseline/tools/view_pose3d.py --source slam   # BasaltVIO + RTABMapSLAM
 ```
 
+### Bootstrap
+
 ```bash
-# 4-process live pipeline (capture + vio + slam + ui in separate processes;
-# UI fault never kills capture; VIO and SLAM each own their own map).
-./run.sh --proc                      # full 4-proc with UI (single 5-trajectory view)
-./run.sh --proc --no-ui              # headless capture + vio + slam
-./run.sh --proc --session sessions/gold/lab_loop_30s   # replay through 4 procs
+python3.13 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ```
 
-`--proc` is the **production live path**; the default single-process viewer
-remains the offline / debug oracle (parity-checked by `proc4_replay_selftest`).
-Each proc owns its own pub/sub `Bus` exactly as before — inter-process traffic
-goes through stdlib bridges only (`multiprocessing.connection` AF_UNIX for
-control, `multiprocessing.shared_memory` rings for image payloads; no extra
-deps). Design + invariants are in [docs/PROC4_ARCHITECTURE.md](docs/PROC4_ARCHITECTURE.md);
-the dual codepath (single-proc oracle vs 4-proc live) is summarised in
-[ours/ARCHITECTURE.md](ours/ARCHITECTURE.md) §9.
+## The five projects
 
-The proc4 UI is a **single view** (the former VIO / SLAM tabs were collapsed into
-one `Viewer3D`) drawing **five trajectory lines**, each with its own enable/disable
-toggle button on the Controls toolbar. The lines form a progression — pure vision
-→ +IMU → +windowed BA → +loop closure on the dense path → the corrected keyframe
-map:
+Each project is a standalone Python package with its own `main.py` (the process),
+`comms/` (the vendored contract), `mathlib/` (the algorithm code it owns), and
+`modules/` (its reactive pipeline). The data flow between processes is fixed by
+the topic strings on the `comms` bus:
 
-1. **VO** (grey) — `pose.vo`, the PURE-VISION frame-to-frame path (no IMU, no BA);
-   drifts most.
+```
+imu_camera.main ──(oak.capture)──▶ vio.main ──(oak.vio)──▶ slam.main ──(oak.slam)──▶ ui.main
+   capture proc        IPC          VIO proc      IPC        SLAM proc      IPC        UI proc
+                                                               (depth runs INLINE inside imu_camera)
+```
+
+```mermaid
+flowchart LR
+    subgraph cap["imu_camera (capture)  ·  endpoint oak.capture"]
+        direction TB
+        CAM[read_cam] --> SYNC[imu_cam: sync + IMU calib]
+        SYNC --> DEPTH["depth steps (SGM, INLINE)"]
+    end
+    subgraph vio["vio  ·  endpoint oak.vio"]
+        ODOM[KLT + RGB-D PnP + gyro fuse] --> BA[windowed BA]
+    end
+    subgraph slam["slam  ·  endpoint oak.slam"]
+        LOOP[ORB loop closure] --> PGO[SE3 pose graph]
+    end
+    subgraph ui["ui (foreground)"]
+        VIEW["Viewer3D — 5 trajectory lines"]
+    end
+
+    cap -- "imucam.sample · frame.depth · calib.bundle" --> vio
+    vio -- "keyframe · calib.bundle" --> slam
+    vio -- "pose.odom · pose.vo · pose.refined · calib.bundle" --> ui
+    slam -- "slam.map · calib.bundle" --> ui
+    cap -. "imu.raw · imucam.sample · frame.depth (on-demand: Visualize/Calibration)" .-> ui
+    vio -. "frame.tracks · frame.inliers (on-demand: keypoint tracker)" .-> ui
+```
+
+| Project | main.py owns | Subscribes (IPC) | Publishes (IPC) |
+|---|---|---|---|
+| `imu_camera` | OAK-D (or session replay), cam+IMU sync, IMU calibration, **inline SGM depth** | — | `cam.sync`, `imu.raw`, `imucam.sample`, `frame.depth`, `calib.bundle` |
+| `vio` | RGB-D visual odometry (+ gyro prior) + windowed BA | `imucam.sample`, `frame.depth`, `calib.bundle` | `pose.odom`, `pose.vo` (live-only), `pose.refined`, `keyframe`, `frame.tracks`, `frame.inliers` |
+| `slam` | ORB loop closure + SE(3) pose-graph (the SLAM map) | `keyframe`, `calib.bundle` (from VIO) | `loop.correction`, `slam.map` (live-only) |
+| `ui` | Qt `MainWindow`, one 5-line `Viewer3D`, Visualize/Calibration windows | `pose.odom`/`pose.vo`/`pose.refined`/`calib.bundle` (vio); `slam.map`/`calib.bundle` (slam); on-demand `imu.raw`/`imucam.sample`/`frame.depth` (capture) + `frame.tracks`/`frame.inliers` (vio) | — (sink) |
+| `launcher` | process lifecycle (spawn / restart loop / orphan cleanup) | — | — |
+| `depth` | standalone SGM depth-as-a-process harness | `cam.sync`, `calib.bundle` (capture) | `frame.depth` |
+
+The architecture, endpoints, invariants, and byte-parity story are in
+[docs/PROC4_ARCHITECTURE.md](docs/PROC4_ARCHITECTURE.md).
+
+## The `comms/` contract
+
+Every project vendors a **byte-identical** `comms/` package — the single source of
+truth is `imu_camera/comms/`, copied verbatim into `depth`, `vio`, `slam`, `ui`,
+and `launcher`. A `diff -r` CI gate keeps the copies in lock-step; all its internal
+imports are RELATIVE, and it pulls **no depthai / no PyQt6 / no cv2** (headless-safe),
+so the package drops into any project unchanged. This is what makes each project
+independently portable.
+
+`comms/` is the merge + rename of the pre-split runtime layer. **The word "flow"
+is gone**; the topic strings are unchanged (the frozen contract).
+
+| New name | Was | Role |
+|---|---|---|
+| `LocalPubSub` | `Bus` | in-process pub/sub — passes Python objects **directly** (zero serialization); the deterministic offline / replay / oracle path |
+| `IPCPubSub(role="server"\|"client")` | `IpcServerBus` + `IpcClientBus` | cross-process pub/sub over a Unix-domain socket |
+| `Module` / `SourceModule` / `ModuleContext` | `Flow` / `SourceFlow` / `FlowContext` | the threaded reactive substrate |
+| `Step` | `Task` | the smallest input→output stage |
+| `IPCPublisher` / `IPCSubscriber` | `IpcPublisherFlow` / `IpcSubscriberFlow` | bridge a `LocalPubSub` ↔ an `IPCPubSub` at a process boundary |
+| `SharedArrayRing` / `SharedArrayRef` | (unchanged) | single-segment shared-memory ring for large image payloads |
+
+**The wire codec replaces pickle.** `pickle` bakes the publisher's module path into
+the bytes, so a decoder in a *different* vendored copy (`vio.comms.wire.WirePoseMsg`
+vs `slam.comms.wire.WirePoseMsg`) could fail to resolve. The new `comms.codec`
+(`encode`/`decode`) is **class-path-INDEPENDENT**: it is keyed by
+`(topic → Wire* class, dataclass-field-order)` from `wire.TOPIC_WIRE`, never the
+module path, so any copy decodes any other copy's bytes bit-identically into the
+*decoder's own* `Wire*` type. Large arrays travel through `SharedArrayRing` shared
+memory; only the metadata rides the codec. Full byte layout + the rename map are in
+[imu_camera/comms/README.md](imu_camera/comms/README.md).
+
+## The single 5-trajectory view (UI)
+
+The UI is a **single view** (one `Viewer3D`, no tabs) drawing **five trajectory
+lines**, each with its own enable/disable toggle on the Controls toolbar. The lines
+form a progression — pure vision → +IMU → +windowed BA → +loop closure on the dense
+path → the corrected keyframe map:
+
+1. **VO** (grey) — `pose.vo`, the PURE-VISION frame-to-frame path (raw PnP R/t, no
+   IMU, no BA); drifts most.
 2. **VIO** (green) — `pose.odom`, frame-to-frame RGB-D PnP + gyro fusion; the
-   responsive live marker + trail.
+   responsive live marker + trail (never lags — never waits on a back-end).
 3. **VIO-BA** (blue/violet) — `pose.refined`, the windowed **Bundle Adjustment**
    keyframe trajectory.
 4. **SLAM-corrected VIO** (orange) — the dense VIO trail rubber-sheeted by SLAM's
@@ -136,386 +211,154 @@ map:
 **Two different optimisers back the map: VIO runs windowed Bundle Adjustment (BA —
 landmarks + poses) → `pose.refined`; SLAM runs Pose-Graph Optimization (PGO —
 poses only, no landmarks) on loop closure, distributing drift over the whole
-trajectory → `slam.map`.** SLAM keyframe motion-gating is on in proc4
+trajectory → `slam.map`.** SLAM keyframe motion-gating is on live
 (`kf_min_trans_m=0.1`, `kf_min_rot_deg=5.0`): a keyframe joins the pose graph only
 if the camera moved ≥10 cm OR rotated ≥5° since the last one.
 
 Everything is fed over IPC — the UI imports no depthai and never opens the device
-(capture owns it). The continuous `slam.map` overlay (every keyframe) supersedes
-the old `loop.correction`-driven overlay, which only fired on a loop (so the old
-view showed no keyframe dots until the first loop closed). SLAM stays responsive
-because its proc4 flow uses a **latest-only (coalescing) inbox**: it drops a
-keyframe backlog and always solves the freshest keyframe, so `slam.map` stays
-current instead of lagging as the pose graph grows. The heavy BA/SLAM solves run
-**in-process by default**; `./run.sh --proc --worker` is an opt-in that moves them
-to GIL-free child subprocesses (off by default — no `resource_tracker` noise at
-shutdown).
+(capture owns it). SLAM stays responsive because its live module uses a
+**latest-only (coalescing) inbox**: it drops a keyframe backlog and always solves
+the freshest keyframe, so `slam.map` stays current instead of lagging as the pose
+graph grows. The heavy BA/SLAM solves run **in-process by default**; `--worker`
+(forwarded by the launcher) moves them to GIL-free child subprocesses.
 
-The **Controls toolbar** carries the five per-line toggle buttons (VO / VIO /
-VIO-BA / SLAM-corrected VIO / SLAM, all checkable, default visible), then the two
-most-used actions:
-
-- **Clear Trail** — clears the live trajectory trail (moved here out of the View
-  menu).
-- **Restart** — respawns the whole pipeline fresh. The IPC bus is one-way
-  (server→client) so the UI can't reset vio/slam in place; instead it quits with
-  `RESTART_EXIT_CODE = 42` and the launcher's restart loop cleans up and respawns
-  capture + vio + slam + ui from scratch.
+The **Controls toolbar** carries the five per-line toggle buttons (all checkable,
+default visible), then **Clear Trail** (clears the live trajectory trail) and
+**Restart**. The IPC bus is one-way (server→client), so the UI can't reset vio/slam
+in place; Restart quits with `RESTART_EXIT_CODE = 42` and the launcher's restart
+loop cleans up and respawns `imu_camera + vio + slam + ui` from scratch.
 
 The menu bar renders **in-window on every platform** (`setNativeMenuBar(False)`):
 
-- **View** — camera presets and Follow Camera (on the single viewer).
-- **Visualize** — *Camera + Depth + IMU (triplet)* and *Keypoint Depth Tracker*;
-  these reuse the unchanged `ours/ui` windows, subscribing capture's
-  `imucam.sample` / `frame.depth` and (for the tracker) VIO's `frame.tracks` /
-  `frame.inliers` via the adapters in `ours/proc/ui_ipc_sources.py`.
+- **View** — camera presets and Follow Camera.
+- **Visualize** — *Camera + Depth + IMU (triplet)* and *Keypoint Depth Tracker*,
+  reusing the unchanged `ui/qt` windows, fed over IPC by the adapters in
+  `ui/modules/ipc_sources.py` (capture's `imucam.sample` / `frame.depth`; for the
+  tracker also VIO's `frame.tracks` / `frame.inliers`).
 - **Calibration** — *Gyroscope Bias* and *Accelerometer (6-position)*, fed by
   capture's **raw** `imu.raw`. Because capture (not the UI) owns the device, a
-  saved calibration is keyed per device and **takes effect on the next capture
-  start**, not live mid-run (the dialog shows "Saved for device `<id>`").
+  saved calibration is keyed per device (`device_id` from the calib bundle) and
+  **takes effect on the next capture start**, not live mid-run.
 
-`--source ours` is the flow pipeline (cam + imu_cam → odometry → backend →
-slam → ui flows over a pub/sub bus); `--source ours-ba` / `ours-slam` add an
-out-of-process BA / loop-closure optimiser refining the map behind the marker.
-For a device run with no GUI:
+## VIO algorithm notes
 
-```bash
-.venv/bin/python -m ours.app --live          # headless: stream the OAK-D, print pose/loops
-```
+The accelerometer levels roll/pitch to gravity at rest, while the **gyroscope**
+drives the inter-frame rotation prior: vision (PnP) corrects that rotation weighted
+by its inlier confidence, *and* by how far it disagrees with the gyro — so when a
+fast yaw makes the KLT tracker slip the gyro takes over the rotation. When vision
+fails outright (too few tracks to even attempt PnP) the gyro still propagates the
+rotation, so the body frame keeps turning instead of freezing. On a healthy frame
+the fusion collapses to pure vision, so there is no accuracy cost on good data.
+Position is still vision-only — this is **loosely-coupled VIO**, not Basalt's
+tight-coupled optimisation.
 
-At START the live path measures only the **gravity-align level** (which depends
-on how the camera is held); the **gyro bias** is a sensor constant, so it is
-calibrated once, saved per device under `.cache/imu_calib.json`, and reused on
-later runs. Force a fresh bias measurement with `--recalibrate-bias`.
+Because position is vision-only, three **opt-in `OdometryConfig` guards** (off by
+default → offline gold scoring stays byte-identical; the live VIO process turns
+them on) stop the PnP solver from injecting *phantom* translation when vision
+cannot be trusted. Each was tuned by measurement on the gold sessions:
 
-All access to the shared OAK-D output queues goes through one lock
-(`SharedLiveDevice.poll`), so the camera and IMU reader threads never enter the
-depthai link concurrently and a queue is never read while another thread is
-tearing the pipeline down — the lifetime race that aborted the host with
-`mutex lock failed` and tripped the device watchdog.
-
-The 3D viewer groups its features in a **menu bar** (the toolbar keeps only the
-primary START/STOP):
-
-- **View** — camera presets (ISO/TOP/FRONT/BACK/LEFT/RIGHT), Follow Camera,
-  Clear Trail, and Clear Keyframes (SLAM backend only).
-- **Calibration** — guided wizards that own the device while they run:
-  **Gyroscope Bias** (one still window) and **Accelerometer (6-position)** (hold
-  each face up/down; solves bias + scale + misalignment as the affine
-  `a_cal = T·(a_raw − b)`). Both persist per device into `.cache/imu_calib.json`
-  and the live path applies the accel calibration automatically on the next run.
-- **Visualize** — inspect the raw sensor streams. These need exclusive device
-  access, so the live VIO pipeline is released first.
-  - **Camera + IMU (synced, live)** — opens an *in-app* window (no subprocess)
-    that runs the split `cam` + `imu_cam` flows live and draws every
-    synchronised `ImuCamPacket` in three honest panels (each is exactly what the
-    packet carries, no parallel pipeline):
-    - **cameras** — `left | right` stereo pair;
-    - **gyro** — an **auto-scaling** scrolling line chart (deg/s); the Y axis
-      tracks the signal with a minimum span + expand-fast/shrink-slow
-      hysteresis, so a still IMU doesn't strobe;
-    - **accel** — a **real interactive 3D** vector view (OpenGL): the specific
-      force is drawn as a solid arrow you can orbit with the mouse and snap to
-      **BACK / LEFT / TOP**. A checkerboard floor below + 1 G reference rings +
-      an X/Y/Z body-axis triad make the magnitude and direction readable.
-
-    This is the view for verifying the camera↔IMU time-sync.
-  - **Camera + Depth + IMU** triplet opens an in-app Qt window
-    (`ours/ui/synced_window.py`): cameras on top (`image | depth`) and the IMU
-    panels below (the same gyro chart + interactive 3D accel view), with a
-    fixed-range single-hue khaki depth ramp (+ scale bar, `valid %`). Like the
-    keypoints view, the triplet is **subscribed from the running acquisition
-    front-end** — it builds `cam + imu_cam` on a private Bus (no odometry / no
-    backend / no SLAM) and a `UiTripletFlow` sink that **joins `frame.depth` +
-    `imucam.sample` by seq**; it no longer runs its own SGM/`dai.Pipeline`. The
-    IMU shown is **calibrated** (`gyro − bias`, accel affine) when a per-device
-    calibration is cached — the panel title reads `IMU · CALIBRATED` vs `IMU ·
-    RAW`. Live off the OAK-D (latest-only inbox for bounded latency) or a
-    recorded session.
-  - **Keypoint Depth Tracker** opens an in-app Qt window
-    (`ours/ui/keypoints_window.py`): the rectified-left frame with every live
-    **KLT-frontend track** drawn on it. The tracks are **subscribed from the
-    running pipeline** — the odometry flow publishes the very `{id: pixel}` its
-    motion estimate consumes on `frame.tracks`, and this window is just a sink for
-    it (no parallel detector, no second frontend). The overlay's **background
-    image and per-keypoint depth** come from a **separate** subscription on
-    `frame.depth` (the capture-side rectified-left + metric depth); the
-    `UiTracksFlow` sink **joins them by `seq`** before handing the bundle to the
-    Qt widget. Splitting the two topics keeps `FrameTracks` as pure POD
-    (ids + pixels only) so the VIO process never republishes frame imagery into
-    capture's `SharedMemory` rings — capture stays the **single writer** of those
-    rings under the 4-proc layout (see `docs/PROC4_ARCHITECTURE.md` §9 invariant
-    6). Each dot's **colour = that keypoint's metric depth** (the same fixed
-    khaki 0.3–8 m ramp + scale bar as the depth panel), so colour means the same
-    distance everywhere; keypoints with no stereo return are **hollow grey rings**
-    (never a faked colour), fresh tracks get an amber ring, and tracks the
-    **RGB-D PnP kept as inliers** — the clean subset the motion solve actually
-    trusted — get a **green ring**. Those inlier ids are a separate REAL solve
-    output the odometry flow publishes on `frame.inliers` (the noisy/no-depth
-    points are dropped before PnP and the rest pass a RANSAC reprojection gate),
-    so the green ring honestly marks the points behind the pose, not every
-    tracked corner. A faint per-id **trail** shows where the *same* keypoint
-    moved over the last 20 frames. The footer prints honest stats (`trk`,
-    `valid-z %`, `inlier`, `mean-age`, `new`). Live off the OAK-D or a recorded
-    session — both run the same flow graph the VIO runs.
-
-The same synced split front-end can be inspected **without the GUI** — a cv2
-window over a recorded session or the live device:
-
-```bash
-.venv/bin/python -m ours.tools.imucam_view --session sessions/gold/lab_loop_30s   # replay
-.venv/bin/python -m ours.tools.imucam_view --live                                 # OAK-D
-```
-
-To self-verify the front-end with numbers instead of eyeballs (no device):
-
-```bash
-.venv/bin/python -m ours.tools.imucam_sync_selftest --session sessions/gold/lab_loop_30s
-.venv/bin/python -m ours.tools.imu_calib_selftest    # raw IMU on imu.raw, calibrated IMU in imucam.sample
-QT_QPA_PLATFORM=offscreen .venv/bin/python -m ours.tools.imucam_window_selftest
-QT_QPA_PLATFORM=offscreen .venv/bin/python -m ours.tools.synced_window_selftest   # image|depth|IMU triplet window
-QT_QPA_PLATFORM=offscreen .venv/bin/python -m ours.tools.keypoints_window_selftest # keypoints coloured by depth + per-id trails
-```
-
-The imu_cam flow publishes the **raw** IMU for every frame interval on `imu.raw`
-(exactly what the sensor reported) and bundles the **calibrated** IMU
-(`gyro − bias`, `a = T·(a_raw − b)`) into the synced `imucam.sample` packet when a
-per-device calibration is cached; with none, the packet carries the raw samples.
-The live path loads the calibration lazily by device id once the shared OAK-D
-opens (`ours/lib/imu/imu_calib.py`).
-
-The calibration math and capture state machines live in `ours/lib/imu/`
-(`accel_calib.py`, `calib_collect.py`, `calib_store.py`, `imu_calib.py`) and are
-covered by offline self-tests (`accel_calib_selftest`, `calib_collect_selftest`,
-`calib_store_selftest`, `imu_calib_selftest`, `ui_calib_selftest`) that run
-without an OAK-D.
-
-
-Both `ours-ba` and `ours-slam` run their heavy optimisation **out-of-process**
-(`ours/lib/engine/subprocess.py`), so the BA / loop solve can never steal the GIL
-from the camera read loop. (Run in-thread the solve is mostly pure-Python and held
-the GIL ~17–30% of the time — measured 43 ms mean / 74 ms peak every 250 ms — which
-starved the read loop on a fast push so it dropped frames and the displayed path
-stalled / undershot. A separate process removes that contention
-entirely; the corrections are bit-identical, see
-`ours/tools/engine_parity_selftest.py`.) The live **marker is always the responsive
-`pose.odom` tip** — it is never touched by the correction, so it tracks the full
-distance exactly like `ours`. The BA / loop output refines only the **map drawn
-behind the marker**: `ours-ba` shows the cyan BA-refined keyframe trajectory,
-`ours-slam` the corrected keyframe dots + a loop-closure flash. (The earlier design
-folded an eased, rate-limited correction into the marker itself, which caused the
-fast-push drag and a slow-push cancellation in small rooms — a premature loop
-closure's ~0.4 m backward correction nearly cancelled a slow forward push;
-decoupling the marker from the correction removed both.) The accelerometer levels roll/pitch to
-gravity at rest, while the **gyroscope** drives the inter-frame rotation prior:
-vision (PnP) corrects that rotation weighted by its inlier confidence, *and* by
-how far it disagrees with the gyro — so when a fast yaw makes the KLT tracker
-slip (PnP still reports inliers but under-rotates) the gyro takes over the
-rotation. When vision fails outright during the hardest part of a turn (too few
-tracks to even attempt PnP) the gyro still propagates the rotation, so the body
-frame keeps turning instead of freezing. On a healthy frame (plenty of inliers,
-small disagreement) the fusion collapses to pure vision, so there is no accuracy
-cost on good data. Position is still vision-only — this is loosely-coupled VIO,
-not Basalt's tight-coupled optimisation.
-
-Because the position is vision-only, three **opt-in `OdometryConfig` guards**
-(all off by default → offline gold scoring stays byte-identical; the live
-`ours` source turns them on) stop the PnP solver from injecting *phantom*
-translation when vision cannot be trusted. Each was tuned by measurement on the
-gold sessions, not guessed:
-
-- **`max_translation_speed`** (live 4.0 m/s) — under a hard shake or very fast
-  yaw the surviving KLT tracks are low-parallax and PnP reads the rotational
-  image flow as a per-frame translation *jump* far larger than any real hand
-  motion; integrated, the path wobbles (roller-coaster). A hand cannot move the
-  camera faster than a few m/s, so the per-frame translation is clamped to that
-  physical bound (needs the per-frame `dt_s`) — caps only the non-physical
-  spikes, real in-budget motion is untouched.
-- **`min_inliers_for_translation`** (live 12) — pointing at a textureless
-  surface (white wall / blank screen) KLT still fills its corner budget with
-  *garbage* corners, so `n_tracks` stays high, but PnP keeps only a handful of
-  inliers (measured: white-wall median 0 inliers, p95 11; a real fast push
-  median ~140). solvePnP still "succeeds" on the garbage and walks the body off
-  in a random direction. Below the gate the translation is **frozen** (rotation
-  still tracked by the gyro, position held put — the honest behaviour when
-  vision is untrustworthy, same as a covered camera). The gate sits well below
-  any real motion (fast-push p25 = 33 inliers), so normal use is untouched; the
-  few fast-push frames that dip below it genuinely lost tracking, where freezing
-  one frame is correct anyway (measured white-wall path-jitter 4.3 → 2.0,
-  fast-push ATE 2.14% → 1.82%). **IMU-gated** (`imu_moving`): a motion-blurred
-  shake *also* starves PnP of inliers, but there the camera is genuinely moving
-  and freezing would pin the marker through real motion (the "linear move +
-  shake → `ours-ba`/`ours-slam` freezes in place while `ours` tracks full" symptom —
-  the freeze fired on the shaky frames, which carry 2× the gyro/accel of the
-  rest). The accelerometer residual vs its EMA is the honest discriminator, so
-  the freeze fires **only when still** (`> _REST_MOTION_THRESH` vetoes it).
-  Offline on `shake_linear_20s` this recovered the frozen frames (12 → 0,
-  display path 15.05 → 16.29 m, matching `ours` 16.51 m). The offline tools pass
-  no flag (`imu_moving=False`) so every offline/gold score is byte-identical.
-  The `imu_moving` field is computed by `PreintegratePrior` from each frame's
-  IMU samples and threaded through `EstimateMotion` into the PnP guard
-  end-to-end; the wiring is regression-guarded by
-  `ours.tools.imu_moving_propagation_selftest`.
+- **`max_translation_speed`** (live 4.0 m/s) — under a hard shake or very fast yaw
+  the surviving KLT tracks are low-parallax and PnP reads rotational image flow as a
+  per-frame translation jump. A hand cannot move the camera faster than a few m/s,
+  so the per-frame translation is clamped to that physical bound — caps only the
+  non-physical spikes, real in-budget motion is untouched.
+- **`min_inliers_for_translation`** (live 12) — pointing at a textureless surface
+  KLT still fills its corner budget with garbage corners, but PnP keeps only a
+  handful of inliers. Below the gate the translation is **frozen** (rotation still
+  tracked by the gyro). **IMU-gated** (`imu_moving`): a motion-blurred shake also
+  starves PnP of inliers, but there the camera is genuinely moving, so the
+  accelerometer residual vs its EMA vetoes the freeze when actually in motion.
 - **`resolve_translation_on_disagree`** — kept available but **left off live**:
-  measured on `push_shake_20s` its disagreement gate fires on only ~8% of frames
-  and never zeroed the translation, so it was ineffective; the freeze under hard
-  shake is the missing tight-accel term, not this gate.
+  measured ineffective on the gold sessions (the freeze under hard shake is the
+  missing tight-accel term, not this gate).
 
+Own pure-NumPy frontend: pyramidal **Lucas-Kanade** optical flow + **Shi-Tomasi**
+corners (no cv2). The KLT inner loop is JIT-compiled with **Numba** (optional dep)
+so it runs in real time live (~15 ms/frame, vs ~140 ms pure-NumPy); without numba it
+falls back to a lighter live preset. PnP, the dense **SGM** stereo matcher, the
+**ORB** loop-closure frontend, and the 8-bit PNG codec are all library-free too.
 
-Tuning knobs (all optional, shown with their defaults):
+The pipeline auto-scales its pixel-unit vision thresholds from the 640×400
+baseline, so a lower capture resolution co-tunes automatically; the per-resolution
+knobs are documented in [docs/RESOLUTION_TUNING.md](docs/RESOLUTION_TUNING.md).
 
-```bash
-# SLAM update cadence — the main lever. Lower = more frequent loop closure AND a
-# smaller/cheaper pose graph. More frequent is not strictly better (see below).
-./run.sh --source ours-slam --slam-kf-every 5      # insert+loop-detect every N frames
-./run.sh --source ours-slam --slam-radius 0        # spatial loop gate (m), 0 = check all
+**How the pipeline differs from BasaltVIO** (and the ordered roadmap to match it)
+is in [docs/OURS_VS_BASALT.md](docs/OURS_VS_BASALT.md) — read that first before any
+tight-coupling work.
 
-# Keyframe budget for long runs (default off = grows with run time). The motion
-# gate bounds the map by TRAJECTORY length instead — a hovering/stationary drone
-# stops adding keyframes (cuts ~36% KF on lab_loop, ATE unchanged). Prefer this.
-./run.sh --source ours-slam --slam-kf-min-trans 0.10 --slam-kf-min-rot 8
-# Absolute safety cap (drops oldest). WARNING: forgets old places, so set it well
-# above your largest excursion or loops there can no longer close.
-./run.sh --source ours-slam --slam-max-kf 500
+## Verification
 
-# Bundle-adjustment tuning (ours-ba)
-./run.sh --source ours-ba --ba-window 6 --ba-kf-every 5 --ba-iters 5
-./run.sh --source ours-ba --marg                   # + Schur marginalization prior (opt-in)
-./run.sh --source ours --fps 20                    # camera frame rate (any ours-* source)
-
-# Run lighter at a lower resolution (any ours-* source). Cost scales with the
-# pixel count, so half the width = ~1/4 the work. The pipeline auto-scales its
-# pixel-unit vision thresholds from the 640x400 baseline; seven per-resolution
-# knobs can be overridden to co-tune. See docs/RESOLUTION_TUNING.md.
-./run.sh --source ours --width 320 --height 200    # half res, auto-scaled
-./run.sh --source ours --width 320 --height 200 --max-corners 240 --klt-win 13
-
-# --width/--height also set the capture resolution of the Visualize windows
-# (Camera + IMU, Camera + Depth + IMU), so what they show matches the pipeline.
-
-# Optical flow tracking AND corner detection have our own pure-NumPy
-# implementations (pyramidal Lucas-Kanade + Shi-Tomasi, no library). The KLT
-# inner loop is JIT-compiled with Numba (optional dep) so our own frontend runs
-# in real time live (~15 ms/frame, vs ~140 ms pure-NumPy); without numba it
-# falls back to a lighter live preset. The live `ours`/`ours-ba` path uses this
-# library-free frontend unconditionally (no cv2, no flag); offline scoring uses
-# the full config.
-```
-
-Offline scoring of the same backends against the Basalt reference:
+The live pipeline is separate OS processes over IPC, so process scheduling is
+nondeterministic and the live path cannot give byte-parity. `verification/` proves
+the split preserved the numerical behaviour **byte-for-byte** with an **in-process
+oracle** that imports each project's verbatim-ported math directly (single
+`LocalPubSub`, no `IPCPubSub`) and reproduces the pre-split deterministic scoring
+loop:
 
 ```bash
-.venv/bin/python ours/tools/vio_run.py --all --backend f2f    # frame-to-frame VO
-.venv/bin/python ours/tools/vio_run.py --all --backend ba     # + windowed BA
-.venv/bin/python ours/tools/vio_run.py --all --backend ba --marg   # + marginalization prior
-.venv/bin/python ours/tools/vio_run.py --all --backend slam   # + loop closure
-.venv/bin/python ours/tools/vio_run.py --all --backend slam --slam-kf-every 8
-.venv/bin/python ours/tools/vio_run.py --all --backend vio    # tight-coupled VIO (experimental)
+# end-to-end math parity: split-project math through the frozen ATE baseline
+.venv/bin/python verification/vio_oracle_runner.py \
+    --session sessions/gold/lab_loop_30s --backend vio --max-frames 20
+.venv/bin/python verification/oracle_replay_selftest.py        # byte-parity gate (gap = 0)
+
+# IPC contract parity: 5-copy comms dir-diff + codec sha256 + ring + bridge round-trip
+.venv/bin/python verification/ipc_comms_selftest.py
 ```
 
-`--marg` is **opt-in** (off by default): when sliding the BA window it
-Schur-marginalizes the dropped keyframe into a linear-Gaussian pose prior over
-the survivors (FEJ) instead of plain-dropping it, so old information keeps
-constraining the window (`ours/lib/backend/marginalize.py`). On the gold sessions
-it **tightens metric scale** toward 1.0 (e.g. `corridor` 1.040→1.007, `lab_loop`
-1.022→1.008, `lab_static` 2.963→1.358) and trades a little local ATE; it is not a
-clean ATE win on this RGB-D BA, so it stays off by default. The maths is
-certified offline (`ours/tools/ba_marg_selftest.py`: Schur identity to 1e-17,
-marginalize==full-batch on a noise-free window, and a drift reduction on a
-scale-ambiguous forward run).
+End-to-end byte-parity was verified live on a real OAK-D: the observed gap vs the
+pre-split baseline is `0.000e+00`. The tolerance (`1e-6` mm) is a guard, never
+weakened to force a pass — a divergence is a release VETO. Backends: `f2f`, `ba`,
+`slam`, `vio`. Details in [verification/README.md](verification/README.md).
 
-`--backend vio` is the **experimental tight-coupled** path: it folds the IMU
-preintegration factors (rotation + velocity + position increments) and the
-visual reprojection + depth into ONE joint optimisation per window, solving for
-each keyframe's pose, velocity and gyro/accel bias together with the landmarks
-(true Basalt style, vs the loosely-coupled gyro fusion above). The math is
-validated by self-tests (`imu_preint_selftest.py`, `vio_ba_selftest.py`); on
-real gold it currently **regresses vs `ba`** on healthy motion (the dense
-finite-difference solver is rougher than the analytic Schur BA, and long
-sessions show slow accel/gravity drift -- corridor scale ~1.15). It is opt-in
-and touches no production path. Closing it needs online gravity-direction
-estimation, which is the next step.
+## Self-tests
 
-**How our pipeline differs from BasaltVIO** (and the ordered roadmap to match
-it) is documented in [`docs/OURS_VS_BASALT.md`](docs/OURS_VS_BASALT.md) — read
-that first before any tight-coupling work.
-
-Self-tests (run before/after touching the from-scratch VIO):
+Per-project selftests run without an OAK-D (offline gold sessions). Each project's
+README lists its own; the headline gates:
 
 ```bash
-.venv/bin/python ours/tools/klt_selftest.py        # our optical flow + corners vs OpenCV
-.venv/bin/python ours/tools/ba_selftest.py         # sliding-window BA core
-.venv/bin/python ours/tools/posegraph_selftest.py  # SE(3) pose-graph + loop closure
-.venv/bin/python ours/tools/imu_preint_selftest.py # IMU preintegration vs closed form
-.venv/bin/python ours/tools/vio_ba_selftest.py     # tight-coupled VIO joint solve
-.venv/bin/python -m ours.tools.imucam_sync_selftest  # split cam/IMU sync contract (1 pkt/frame, samples in (prev,ts])
-.venv/bin/python -m ours.tools.flow_replay_selftest  # full ours.app VIO graph over a gold session (60 pose.odom + refined)
-.venv/bin/python -m ours.tools.flow_latest_selftest  # latest-only coalescing inbox (realtime visualiser stays fresh, bounded lag)
-.venv/bin/python -m ours.tools.oak_live_selftest     # single-client shared OAK-D (cam+IMU open once; teardown race-safe)
-.venv/bin/python -m ours.tools.warmup_selftest       # JIT warmup: cold first frame ~2000ms -> ~4ms (compiles SGM+KLT off the boot path)
-QT_QPA_PLATFORM=offscreen .venv/bin/python -m ours.tools.imucam_window_selftest  # in-app synced view renders (offscreen Qt)
-QT_QPA_PLATFORM=offscreen .venv/bin/python -m ours.tools.synced_window_selftest  # image|depth|IMU triplet window renders (offscreen Qt)
-QT_QPA_PLATFORM=offscreen .venv/bin/python -m ours.tools.keypoints_window_selftest # keypoints coloured by depth + per-id trails (offscreen Qt)
-.venv/bin/python -m ours.tools.ipc_bus_selftest                  # IPC primitives (pub/sub + retain + shared rings)
-.venv/bin/python -m ours.tools.proc4_replay_selftest --max-frames 60   # 4-proc parity vs single-proc baseline
-.venv/bin/python -m ours.tools.proc4_ui_selftest --max-frames 20      # UI data path + Qt MainWindow construct
-.venv/bin/python -m ours.tools.frametracks_no_capture_ring_write_selftest  # FrameTracks carries ids/points only; VIO bridge does not write capture rings (4-proc single-writer guard)
-.venv/bin/python -m ours.tools.capture_fifo_inbox_selftest               # capture front-end inboxes are FIFO; topics.VIO_PATH_TOPICS lists CAM_SYNC/IMUCAM_SAMPLE/FRAME_DEPTH
-.venv/bin/python -m ours.tools.imu_moving_propagation_selftest          # ImuPrior.imu_moving wired end-to-end PreintegratePrior -> EstimateMotion -> RGBDVisualOdometry.estimate
+# comms / codec contract (each project's copy must produce identical bytes)
+.venv/bin/python -m imu_camera.tests.codec_roundtrip_selftest   # codec round-trip + frozen sha256
+
+# math byte-parity vs the pre-split numbers
+.venv/bin/python -m vio.tests.vio_ba_selftest                   # windowed BA + tight-coupled VIO
+.venv/bin/python -m vio.tests.odometry_selftest                 # KLT + RGB-D PnP frontend
+.venv/bin/python -m slam.tests.loop_closure_selftest            # SE(3) pose graph + loop closure
+.venv/bin/python -m depth.tests.stereo_sgm_selftest             # SGM dense depth vs chip depth
+
+# multi-process smokes over a gold session (replay; no device)
+.venv/bin/python -m slam.tests.proc3_smoke_selftest \
+    --session sessions/gold/lab_loop_30s --expect-loops 4       # imu_camera + vio + slam
+
+# comms byte-identical across copies (build caches excluded)
+diff -r -x '__pycache__' -x '*.pyc' -x '*.nbc' -x '*.nbi' vio/comms imu_camera/comms
 ```
-
-`klt_selftest.py` is the regression guard for the library-free frontend: it
-proves correctness against a synthetic known-shift ground truth (independent of
-OpenCV), checks our corners + flow agree with OpenCV to sub-pixel, and prints
-per-frame timing vs the 20 fps live budget so a performance regression shows up
-in the numbers instead of as lag on the device.
-
 
 ## Status
 
 - [x] Project scaffold + dark 3D viewer
-- [x] Fake pose source (figure-8) for UI bring-up
-- [x] Real visual-inertial odometry from OAK-D (BasaltVIO)
-- [x] SLAM with loop closure (RTABMapSLAM)
-- [x] From-scratch RGB-D VIO (`ours` f2f → `ours-ba` windowed BA → `ours-slam`
-      ORB loop closure + SE(3) pose graph); gravity-leveled, scored vs Basalt in
-      `ours/tools/vio_run.py` (corridor ATE 0.61%, see `docs/SKYSLAM_ROADMAP.md`)
-- [x] Gyro complementary fusion (loosely-coupled): gyro rotation prior +
-      vision correction gated on inliers AND vision/gyro disagreement; gyro
-      propagates rotation when vision fails, so fast yaw no longer freezes the
-      pose. No-op on well-tracked frames (gold ATE unchanged)
-- [~] Tight-coupled VIO core (`ours/lib/backend/vio_window.py`): Forster on-manifold
-      IMU preintegration + joint visual-inertial window solve (pose + velocity
-      + gyro/accel bias + landmarks), self-test validated, wired offline as the
-      opt-in `--backend vio`. Experimental: still regresses vs `ba` on healthy
-      gold (rough dense FD solver + long-horizon accel/gravity drift); needs
-      online gravity estimation before it replaces the loosely-coupled path
-- [x] Own pure-NumPy optical flow (pyramidal Lucas-Kanade, `ours/lib/frontend/klt.py`)
-      and corner detection (Shi-Tomasi, `ours/lib/frontend/corners.py`) replacing cv2;
-      KLT inner loop JIT-accelerated with Numba (`ours/lib/frontend/klt_numba.py`,
-      optional) so the library-free frontend runs live (~15 ms/frame)
-- [x] Own library-free PnP (`ours/lib/odometry/pnp.py`: RANSAC DLT + robust-LM seed
-      rescue + plain-LS Levenberg-Marquardt refine) replacing
-      `cv2.solvePnPRansac` as the default. Measured vs cv2 on gold f2f: better
-      on the genuine forward-motion sessions (corridor 0.79->0.77,
-      lab_straight 1.11->1.09, push_straight_fast 1.65->1.20) and a wash
-      through windowed BA. The live `ours`/`ours-ba` path (own KLT + own PnP)
-      and the offline f2f/ba scoring are now fully cv2-free; cv2 is lazily
-      imported only for ORB loop closure (`ours-slam`) and the dev-only PnP A/B
-      oracle (`OAKD_OWN_PNP=0`)
-- [x] Pure-Python PNG codec (`ours/lib/pngio.py`, 8-bit grayscale, all 5 PNG
-      filters) for frame IO, replacing `cv2.imread`/`imwrite` (decode verified
-      byte-for-byte vs cv2)
-- [x] Logging + offline replay (`baseline/tools/record_session.py` + `baseline/tools/viz_session.py`)
-- [x] Transparent time-synced (image, depth, IMU) input building block
-      (`ours/lib/io/synced.py`) + inspector `ours/tools/synced_view.py` (replay + `--live`:
-      image | depth | gyro angular-velocity chart + 3D accel vector)
-- [x] Persistent SLAM database (auto save `rtabmap.db` + extract KF/loop via `baseline/tools/extract_kf_from_db.py`)
-- [x] Gold regression suite (12 sessions, see `docs/GOLD_SESSIONS.md`)
-- [x] 4-process live architecture (capture + vio + slam + ui in separate
-      processes; stdlib `multiprocessing.connection` + `SharedMemory` IPC;
-      VIO and SLAM each own their own map; UI fault never kills capture;
-      `./run.sh --proc`, see [docs/PROC4_ARCHITECTURE.md](docs/PROC4_ARCHITECTURE.md))
+- [x] Real visual-inertial odometry from OAK-D (baseline BasaltVIO) + SLAM (RTABMapSLAM)
+- [x] From-scratch RGB-D VIO: frame-to-frame VO → windowed BA → ORB loop closure +
+      SE(3) pose graph; gravity-leveled, scored vs Basalt (corridor ATE 0.61%, see
+      `docs/SKYSLAM_ROADMAP.md`)
+- [x] Gyro complementary fusion (loosely-coupled): gyro rotation prior + vision
+      correction gated on inliers AND vision/gyro disagreement; no-op on
+      well-tracked frames (gold ATE unchanged)
+- [~] Tight-coupled VIO core (`vio/mathlib/backend/vio_window.py`): Forster
+      on-manifold IMU preintegration + joint visual-inertial window solve, self-test
+      validated, wired offline as the `vio` backend. Experimental: still regresses
+      vs `ba` on healthy gold; needs online gravity estimation
+- [x] Own pure-NumPy optical flow + Shi-Tomasi corners (Numba-JIT KLT, optional)
+      replacing cv2; own library-free PnP, SGM dense depth, ORB loop closure, and
+      8-bit PNG codec — no cv2 in any runtime path
+- [x] Logging + offline replay (`baseline/tools/record_session.py` +
+      `baseline/tools/viz_session.py`)
+- [x] Gold regression suite (see `docs/GOLD_SESSIONS.md`)
+- [x] **5-project split**: `imu_camera` / `depth` / `vio` / `slam` / `ui` + launcher,
+      each vendoring a byte-identical `comms/` (codec replaces pickle); 4-process
+      live runtime (depth inline); UI fault never kills capture; VIO and SLAM each
+      own their own map; `./run.sh`, see [docs/PROC4_ARCHITECTURE.md](docs/PROC4_ARCHITECTURE.md)
+- [x] End-to-end byte-parity vs the pre-split baseline (gap = 0), verified live on
+      a real OAK-D; harness in `verification/`
 - [ ] UDP / UART link to flight-controller
 - [ ] Tracking-lost UI badge
 - [ ] Calibration check tool
@@ -524,12 +367,12 @@ in the numbers instead of as lag on the device.
 
 ## Long-term
 
-- **Software plan (current, research-backed)**: [docs/SKYSLAM_RESEARCH.md](docs/SKYSLAM_RESEARCH.md)
-  — plan v3 with 9 phases, `numpy + opencv + gtsam + pyDBoW3`, acceptance gates,
-  written after a thorough read of depthai-core / basalt / rtabmap / ORB-SLAM3 /
-  OpenVINS source code.
+- **Software plan (research-backed)**: [docs/SKYSLAM_RESEARCH.md](docs/SKYSLAM_RESEARCH.md)
+  — plan v3 with 9 phases, `numpy + opencv + gtsam + pyDBoW3`, acceptance gates.
 - **Pipeline checkpoints (debug contract)**: [docs/PIPELINE_CHECKPOINTS.md](docs/PIPELINE_CHECKPOINTS.md)
-  — schema C0–C9 used to compare skyslam against the baseline while building.
+  — schema C0–C9 used to compare against the baseline while building.
 - **Hardware vision (long-term)**: [docs/SKYSLAM_ROADMAP.md](docs/SKYSLAM_ROADMAP.md)
-  — read only the HW V1 / V2 / FC link parts (Section 3 software architecture
-  has been superseded by SKYSLAM_RESEARCH.md).
+  — read only the HW V1 / V2 / FC link parts (Section 3 software architecture has
+  been superseded by SKYSLAM_RESEARCH.md).
+</content>
+</invoke>

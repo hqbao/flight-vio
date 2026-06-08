@@ -25,7 +25,7 @@ Design choices (deliberate, to be correct and verifiable before fast):
     factor sees the 2 adjacent nav states), so FD is cheap AND immune to the
     hand-derivation sign errors that plague analytic VIO Jacobians. The IMU
     residual formulas themselves are the ones validated in
-    ``ours/tools/imu_preint_selftest.py``.
+    ``vio/tests/vio_ba_selftest.py``.
   * **Dense Levenberg-Marquardt** over the whole window (no Schur complement).
     Correctness first; the window is small, so a dense solve is fine. Schur is a
     speed optimisation left for later if the live path needs it.
@@ -34,7 +34,7 @@ One keyframe (``anchor``, default 0) has its pose held fixed to pin the global
 position+yaw gauge (gravity already fixes roll/pitch through the IMU factors).
 Its velocity and biases stay free.
 
-Validated end-to-end by ``ours/tools/vio_ba_selftest.py``: a synthetic multi-segment
+Validated end-to-end by ``vio/tests/vio_ba_selftest.py``: a synthetic multi-segment
 trajectory (fast yaw + translation under gravity) with consistent IMU + image
 measurements is perturbed and recovered to sub-mm / sub-mdeg.
 """

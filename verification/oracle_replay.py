@@ -30,8 +30,9 @@ The per-component math was ported VERBATIM (``vio.tests.vio_ba_selftest``,
 ``slam.tests.loop_closure_selftest``, the stereo / imucam-sync self-tests already
 proved byte-parity per module; this harness's own probe re-confirms the source is
 identical modulo import roots + docstrings). So the END-TO-END oracle below MUST
-reproduce ``ours``' ATE/Sim3 scores exactly. ``oracle_replay_selftest`` asserts
-that against both the stored baseline and the live OLD oracle.
+reproduce the PRE-SPLIT reference's ATE/Sim3 scores exactly. ``oracle_replay_selftest``
+asserts that against the FROZEN ``verification/baseline_metrics.json`` (the
+pre-split reference tree itself has since been removed).
 
 The ``ate`` / ``umeyama`` scoring below is COPIED VERBATIM from
 ``ours/tools/vio_run.py`` (no algorithm change) so the comparison is the SAME

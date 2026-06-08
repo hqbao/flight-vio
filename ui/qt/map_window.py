@@ -1,11 +1,11 @@
 """MapWindow: a standalone 3D viewer for the SLAM keyframe point cloud.
 
-Shows the room reconstructed from every keyframe at once (``ours.tools.slam_map3d``
-builds the cloud; this just renders it): a coloured point cloud plus the keyframe
-camera positions, on the same grid/axes the pose viewer uses. Points come in the
-camera-optical world frame and are rotated to the viewer's ENU display frame with
-the SAME convention as :class:`~ours.ui.viewer3d.Viewer3D`, so a map and a
-trajectory line up.
+Shows the room reconstructed from every keyframe at once (the caller passes the
+already-built ``points``/``colors``/``cams`` arrays; this just renders them): a
+coloured point cloud plus the keyframe camera positions, on the same grid/axes
+the pose viewer uses. Points come in the camera-optical world frame and are
+rotated to the viewer's ENU display frame with the SAME convention as
+:class:`~ui.qt.viewer3d.Viewer3D`, so a map and a trajectory line up.
 """
 from __future__ import annotations
 

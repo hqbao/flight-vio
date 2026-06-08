@@ -492,7 +492,7 @@ class RightRectifier:
 
     @classmethod
     def from_calib(cls, calib) -> "RightRectifier":
-        """Build from a :class:`ours.vio.reader.StereoCalib`."""
+        """Build from a :class:`depth.io.reader.StereoCalib`."""
         T = calib.T_left_right
         return cls(calib.left.K, calib.right.K, calib.right.dist,
                    T[:3, :3], T[:3, 3], calib.left.width, calib.left.height)
@@ -543,7 +543,7 @@ class LeftRectifier:
 
     @classmethod
     def from_calib(cls, calib) -> "LeftRectifier":
-        """Build from a :class:`ours.vio.reader.StereoCalib`."""
+        """Build from a :class:`depth.io.reader.StereoCalib`."""
         T = calib.T_left_right
         return cls(calib.left.K, calib.left.dist,
                    T[:3, :3], T[:3, 3], calib.left.width, calib.left.height)
@@ -915,7 +915,7 @@ class SGMStereoMatcher:
                    rectify_left: bool = False) -> "SGMStereoMatcher":
         """Build a matcher that rectifies the raw right frame from ``calib``.
 
-        ``calib`` is a :class:`ours.vio.reader.StereoCalib`. By default the
+        ``calib`` is a :class:`depth.io.reader.StereoCalib`. By default the
         matcher expects the chip's rectified-left and the **raw** right frame
         (exactly what the gold sessions store) and rectifies the right
         internally. Set ``rectify_left=True`` to ALSO rectify a raw left frame

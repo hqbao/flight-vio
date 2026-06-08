@@ -5,7 +5,7 @@ landmarks and 2D observations, it refines them by minimising the robust
 reprojection error. It knows nothing about cameras, KLT or sessions — that
 glue lives in :mod:`vio.mathlib.backend.windowed`. Keeping the solver standalone means we
 can unit-test it on a synthetic scene with a known answer (see
-``ours/tools/ba_selftest.py``) before trusting it on real data.
+``vio/tests/vio_ba_selftest.py``) before trusting it on real data.
 
 Conventions
 -----------

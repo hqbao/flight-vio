@@ -7,7 +7,7 @@ runs so the operator does not recalibrate every flight:
   property (it does drift slowly with temperature; see the ``temp_c`` field kept
   alongside each entry for a future temperature-aware model).
 * **accel calibration** -- the full affine correction ``a_cal = T (a_raw - b)``
-  from the six-position routine (see :mod:`ours.lib.imu.accel_calib`).
+  from the six-position routine (see :mod:`ui.mathlib.imu.accel_calib`).
 
 Both live in one tiny JSON file under the (gitignored) repo ``.cache`` dir, keyed
 by device id so several cameras never clobber each other::
@@ -37,7 +37,7 @@ import numpy as np
 from .accel_calib import AccelCalibration
 
 # Repo-root/.cache/imu_calib.json (.cache is gitignored). This file is
-# ours/lib/imu/calib_store.py, so parents[3] is the repo root.
+# ui/mathlib/imu/calib_store.py, so parents[3] is the repo root.
 _CACHE_DIR = Path(__file__).resolve().parents[3] / ".cache"
 _DEFAULT_PATH = _CACHE_DIR / "imu_calib.json"
 _LEGACY_PATH = _CACHE_DIR / "imu_bias.json"

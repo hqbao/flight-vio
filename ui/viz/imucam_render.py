@@ -1,16 +1,16 @@
 """Pure renderers for the split camera/IMU front-end's synchronised output.
 
-Every panel draws exactly what an :class:`~ours.lib.flow.messages.ImuCamPacket`
+Every panel draws exactly what an :class:`~ui.comms.messages.ImuCamPacket`
 carries -- the stereo pair, the raw gyro samples, the raw accel samples -- and
 nothing computed in a parallel pipeline (honest visualisation):
 
     [ left cam | right cam |  gyro line chart  |  accel 3D vector ]
 
 The functions are window-free (they return ``uint8`` BGR images) so the same
-drawing code feeds both the cv2 dev tool (``ours.tools.imucam_view``) and the
-in-app Qt window (``ours.ui.imucam_window``); there is a single, honest source of
-truth for what the synced front-end looks like. cv2 is only a drawing backend
-here -- importing this module is what pulls it, not the base UI.
+drawing code can feed any backend -- in this project the in-app Qt window
+(:mod:`ui.qt.imucam_window`); there is a single, honest source of truth for what
+the synced front-end looks like. cv2 is only a drawing backend here --
+importing this module is what pulls it, not the base UI.
 """
 from __future__ import annotations
 

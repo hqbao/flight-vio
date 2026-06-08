@@ -1,7 +1,7 @@
 """Interactive IMU panels for the in-app synced camera/IMU window.
 
 Two honest, real-data widgets fed straight from an
-:class:`~ours.lib.flow.messages.ImuCamPacket` (no parallel pipeline):
+:class:`~ui.comms.messages.ImuCamPacket` (no parallel pipeline):
 
 * :class:`GyroPlot` -- an **auto-scaling** scrolling 3-axis line chart of the raw
   gyro samples (rad/s shown as deg/s). pyqtgraph auto-ranges Y to whatever the

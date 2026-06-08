@@ -247,8 +247,8 @@ typedef struct {
 
 **PROTOTYPED in the from-scratch VIO (2026-06-03, commits `7312e50` + `7e74b7a`)** —
 both the pyramidal Lucas-Kanade tracker AND the Shi-Tomasi corner detector are
-already implemented library-free in pure NumPy (`ours/vio/klt.py` Bouguet KLT with
-active-set masking; `ours/vio/corners.py` Sobel gradients + integral-image box
+already implemented library-free in pure NumPy (`vio/mathlib/frontend/klt.py` Bouguet
+KLT with active-set masking; `vio/mathlib/frontend/corners.py` Sobel gradients + integral-image box
 sum + smaller-eigenvalue response + NMS + occupancy-grid min-distance). They are
 drop-ins for `cv2.calcOpticalFlowPyrLK` / `cv2.goodFeaturesToTrack`, agree with
 them closely (lab_loop: KLT adjacent-frame mean 0.025 px; corners same 173 points,
@@ -257,11 +257,12 @@ ONLY frontend now -- the cv2 fallback was removed, so the live `ours`/`ours-ba`
 path and offline f2f/ba scoring carry no cv2 (Numba JITs the KLT inner loop to
 ~15 ms/frame live; without Numba a lighter `live_own` preset keeps it real time).
 These are the reference to port to NEON-optimised `fast_detector.c` /
-`klt_tracker.c`. PnP is also our own (`ours/vio/pnp.py`) and frame IO uses a
-pure-Python PNG codec (`ours/pngio.py`). ORB loop closure is now library-free
-too (`ours/vio/orb.py`: oriented FAST + steered BRIEF + Hamming kNN matcher +
-normalised 8-point fundamental-matrix RANSAC, with the metric verify reusing
-`ours/vio/pnp.py`), so **no cv2 call remains in any `ours` runtime path**
+`klt_tracker.c`. PnP is also our own (`vio/mathlib/odometry/pnp.py`) and frame IO
+uses a pure-Python PNG codec (`comms/lib/misc/pngio.py`). ORB loop closure is now
+library-free too (`slam/mathlib/loop/orb.py`: oriented FAST + steered BRIEF +
+Hamming kNN matcher + normalised 8-point fundamental-matrix RANSAC, with the metric
+verify reusing `slam/mathlib/odometry/pnp.py`), so **no cv2 call remains in any
+runtime path**
 (`ours`/`ours-ba`/`ours-slam`). cv2 survives only as a dev-time oracle in the
 self-tests + the env-gated PnP A/B (`OAKD_OWN_PNP=0`) and the HighGUI inspector
 windows.
@@ -328,17 +329,18 @@ windows.
 **PROTOTYPED in the from-scratch VIO (2026-06-03, "Phase 5", commit `ec080a7`)** —
 a pure-NumPy offline version of the loop-closure stack now exists and measurably
 cuts drift on the gold sessions:
-- `ours/vio/posegraph.py`: SE(3) pose graph (`se3_log` / `se3_adjoint` / `se3_inv`,
-  Gauss-Newton + LM, Grisetti linearisation `J_r^{-1} ≈ I`, anchor node pinned).
-  A Huber robust kernel down-weights **loop** edges only.
-- `ours/vio/loopclosure.py`: ORB (no trained vocabulary yet — brute-force match
-  against earlier keyframes) + Lowe ratio → **fundamental-matrix RANSAC
+- `slam/mathlib/loop/posegraph.py`: SE(3) pose graph (`se3_log` / `se3_adjoint` /
+  `se3_inv`, Gauss-Newton + LM, Grisetti linearisation `J_r^{-1} ≈ I`, anchor node
+  pinned). A Huber robust kernel down-weights **loop** edges only.
+- `slam/mathlib/loop/loopclosure.py`: ORB (no trained vocabulary yet — brute-force
+  match against earlier keyframes) + Lowe ratio → **fundamental-matrix RANSAC
   pre-filter** → PnP-RANSAC geometric verification using the old keyframe's
   metric depth, yielding the relative `T_cur_old` loop constraint.
-- `ours/vio/slam.py`: `SlamMap` orchestrator — keyframes, odometry edges from the
-  VO relative motion, top-3 loop edges per keyframe, PGO, pose correction.
-- `ours/tools/vio_run.py --backend slam` scores it; `ours/tools/posegraph_selftest.py`
-  validates the Lie helpers + loop-closure drift reduction + the Huber kernel.
+- `slam/mathlib/loop/slam.py`: `SlamMap` orchestrator — keyframes, odometry edges
+  from the VO relative motion, top-3 loop edges per keyframe, PGO, pose correction.
+- `verification/vio_oracle_runner.py --backend slam` scores it;
+  `slam/tests/loop_closure_selftest.py` validates the Lie helpers + loop-closure
+  drift reduction + the Huber kernel.
 
   **Results** (ATE %path, BA → SLAM; end-start drift cm pre → post): corridor
   `0.82 → 0.61` (drift `59.2 → 3.9`, 196 loops), lab_loop `0.55 → 0.53`
@@ -357,9 +359,9 @@ cuts drift on the gold sessions:
   front-end (geometry), do not rely on a robust kernel.** (Also: `cv2.findFundamentalMat`
   needs a `≥ 8`-point and non-degenerate guard or it crashes on static scenes.)
 
-  Still **offline-scored** in `ours/tools/vio_run.py --backend slam`, and now also
-  wired **live** as `--source ours-slam` (commit `5d93e66`): the read loop runs
-  fast f2f VO for the display while a background thread owns the persistent
+  Still **offline-scored** in `verification/vio_oracle_runner.py --backend slam`, and
+  now also wired **live** as the `slam` process (`slam/main.py`): the VIO process runs
+  fast f2f VO for the display while the SLAM process owns the persistent
   `SlamMap` (fed the *raw* f2f poses so its odometry edges stay self-consistent),
   closes loops and publishes the world-frame correction, which is eased onto the
   trajectory like the BA correction. Gravity leveling stays the final step (the
@@ -413,9 +415,9 @@ different axes — they never compete**, because each owns only what it can obse
   (the real corridor failure mode): plain reprojection BA leaves 16.1° tilt
   while fitting at 0.24 px (reprojection is blind to absolute tilt); the gravity
   prior pulls it to 2.4° while keeping reprojection at 0.28 px. Default off, so
-  the offline path stays byte-identical. Code: `ours/vio/bundle.py`
+  the offline path stays byte-identical. Code: `vio/mathlib/backend/bundle.py`
   (`BAConfig.use_gravity`, `optimize(grav_meas, grav_world, grav_gref)`),
-  `ours/vio/windowed.py` (`add_keyframe(accel_cam=…)`).
+  `vio/mathlib/backend/windowed.py` (`add_keyframe(accel_cam=…)`).
 - **Reduced form** (also live in the prototype, on the DISPLAY pose): a one-axis
   complementary filter (`level_attitude`) corrects only roll/pitch toward gravity
   and leaves yaw untouched. It is gravity's marginal of the proper fusion above.

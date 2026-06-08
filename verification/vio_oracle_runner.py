@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""CLI mirror of ``ours/tools/vio_run.py`` that drives the IN-PROCESS split oracle.
+"""CLI for the IN-PROCESS split oracle (mirrors the PRE-SPLIT ``vio_run.py``).
 
 Same flags (``--session`` / ``--backend`` / ``--max-frames`` / ``--all``), same
 printed ATE block -- but every algorithm class comes from the SPLIT projects
-(imu_camera / vio / slam) via :mod:`verification.oracle_replay`, not ``ours.lib``.
+(imu_camera / vio / slam) via :mod:`verification.oracle_replay`.
 
-Run head-to-head against the reference::
+Run::
 
-    .venv/bin/python ours/tools/vio_run.py        --session sessions/gold/lab_loop_30s --backend vio --max-frames 20
     .venv/bin/python verification/vio_oracle_runner.py --session sessions/gold/lab_loop_30s --backend vio --max-frames 20
 
-Both must print the SAME ATE block (75.9 mm for that case).
+It must print the FROZEN reference ATE block (75.9 mm for that case); the frozen
+metrics live in ``verification/baseline_metrics.json``.
 """
 from __future__ import annotations
 

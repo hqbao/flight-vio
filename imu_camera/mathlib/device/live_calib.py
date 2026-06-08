@@ -1,10 +1,10 @@
 """Read the live OAK-D calibration + startup IMU references for the VIO graph.
 
 The unified front-end (``cam`` + ``imu_cam`` off ONE
-:class:`~ours.lib.device.oak_live.SharedLiveDevice`) needs the same boot-time facts the
+:class:`~imu_camera.mathlib.device.oak_live.SharedLiveDevice`) needs the same boot-time facts the
 old monolithic capture flow read in ``LiveCaptureFlow.open()``:
 
-* camera intrinsics ``K`` and the stereo :class:`~ours.lib.io.reader.StereoCalib`
+* camera intrinsics ``K`` and the stereo :class:`~imu_camera.io.reader.StereoCalib`
   (so the SGM matcher can rectify the raw cameras),
 * the IMU->camera rotation ``R_imu_cam`` (gyro prior conjugation),
 * a per-device gyro bias (cached, calibrated once -- only that first calibration
@@ -163,7 +163,7 @@ def read_live_calibration(device: SharedLiveDevice, *, width: int, height: int,
                           recalibrate_bias: bool = False) -> LiveFrontEndCalib:
     """Acquire the shared device and read all VIO boot references.
 
-    The device is :meth:`~ours.lib.device.oak_live.SharedLiveDevice.acquire`-d here and
+    The device is :meth:`~imu_camera.mathlib.device.oak_live.SharedLiveDevice.acquire`-d here and
     kept open (the caller releases it when the run ends); the camera/IMU sources
     attach to the same reference-counted device when they start.
     """

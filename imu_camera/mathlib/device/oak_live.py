@@ -2,8 +2,8 @@
 
 The OAK-D is **single-client**: only one ``depthai`` pipeline may be connected to
 a given device at a time. The split front-end has two independent sources
-(:class:`~ours.flows.cam.sources.LiveCamSource` and
-:class:`~ours.flows.imu_cam.sources.LiveImuSource`); if each opened its own
+(:class:`~imu_camera.modules.read_cam.LiveCamSource` and
+:class:`~imu_camera.modules.read_imu.LiveImuSource`); if each opened its own
 pipeline the second one would fail with ``X_LINK_DEVICE_NOT_FOUND``.
 
 :class:`SharedLiveDevice` is the fix: it owns ONE pipeline carrying both mono

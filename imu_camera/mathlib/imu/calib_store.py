@@ -7,7 +7,7 @@ runs so the operator does not recalibrate every flight:
   property (it does drift slowly with temperature; see the ``temp_c`` field kept
   alongside each entry for a future temperature-aware model).
 * **accel calibration** -- the full affine correction ``a_cal = T (a_raw - b)``
-  from the six-position routine (see :mod:`ours.lib.imu.accel_calib`).
+  from the six-position routine (see :mod:`imu_camera.mathlib.imu.accel_calib`).
 
 Both live in one tiny JSON file under the (gitignored) repo ``.cache`` dir, keyed
 by device id so several cameras never clobber each other::

@@ -2,14 +2,14 @@
 
 The split front-end publishes the *raw* IMU on ``topics.IMU_RAW`` (exactly what
 the sensor reported, before any correction) and the *calibrated* IMU inside the
-synced :class:`~ours.lib.flow.messages.ImuCamPacket`. This module is the single
+synced :class:`~ui.comms.messages.ImuCamPacket`. This module is the single
 place that turns the persisted per-device calibration into a function that maps a
 batch of raw samples to corrected ones, so the live flow and any offline test
 apply the identical maths:
 
 * **gyro**  -- subtract the zero-rate bias: ``w_cal = w_raw - bias``.
 * **accel** -- the affine six-position correction ``a_cal = T (a_raw - b)``
-  (see :class:`~ours.lib.imu.accel_calib.AccelCalibration`).
+  (see :class:`~ui.mathlib.imu.accel_calib.AccelCalibration`).
 
 A missing piece is a pass-through: with no cached gyro bias the gyro is returned
 unchanged, with no accel calibration the accel is returned unchanged. An

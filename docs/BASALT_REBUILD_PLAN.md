@@ -26,7 +26,7 @@ So on recorded data our path is already good.
 ### Why `ours` moves full but `ours-ba/slam` stalls — REPRODUCED & root-caused (2026‑06‑06, session `fast_push_15s`)
 The user recorded a genuine super‑fast push (Basalt path 14.3 m, peak ~2.2 m/s,
 1.1 m travelled in a 0.5 s window, 205/298 frames above the 0.3 m/s correction
-cap). Running it through `ours/tools/live_replay.py`:
+cap). Running it through the offline oracle (`verification/vio_oracle_runner.py`):
 
 | mode | scale vs Basalt | path ratio | stall? |
 |------|-----------------|-----------|--------|
@@ -77,11 +77,11 @@ needed to confirm which knob bites on the actual device:
 ### Candidate loose‑path mitigations (offline‑verify before shipping)
 Ordered cheapest‑first; each must be A/B'd on `fast_push_15s` first:
 1. **DONE (2026‑06‑07):** the BA/SLAM solve now runs as a true
-   `multiprocessing.Process` via the engine layer (`ours/lib/engine/subprocess.py`,
+   `multiprocessing.Process` via the engine layer (`vio/mathlib/engine/subprocess.py`,
    spawn) on the live path, so its CPU no longer shares the GIL with the read loop —
    the ~17–30 % tax is removed by construction. The live marker also rides
    `pose.odom` directly (never the correction). Corrections are bit‑identical to the
-   in‑process engine (`ours/tools/engine_parity_selftest.py`). Confirm on the bench
+   in‑process engine (the `--worker` vs in‑process byte-parity gate). Confirm on the bench
    via the `drop=` / `proc` vs `recv` diag.
 2. **Throttle / cap BA cost** (smaller window, fewer iters, lower kf rate) so each
    burst is shorter than one frame budget.
@@ -105,11 +105,11 @@ the fundamental fix, and it is the reason this rebuild is the real answer.
 
 | # | Block | Basalt file | Our current analogue | Status |
 |---|-------|-------------|----------------------|--------|
-| 1 | Optical‑flow frontend (patch KLT + grid FAST + stereo epipolar) | `frame_to_frame_optical_flow.h` | `ours/lib/frontend` (KLT + Shi‑Tomasi) | partial |
-| 2 | IMU preintegration (Forster, midpoint, bias Jacobian, sqrt cov) | `imu/preintegration.h` | `ours/lib/imu` (gyro preint only) | partial |
-| 3 | Sliding‑window sqrt VIO (joint pose+vel+bias+landmarks) | `sqrt_keypoint_vio.cpp::optimize` | `ours/lib/backend/vio_window.py` (immature) | weak |
+| 1 | Optical‑flow frontend (patch KLT + grid FAST + stereo epipolar) | `frame_to_frame_optical_flow.h` | `vio/mathlib/frontend` (KLT + Shi‑Tomasi) | partial |
+| 2 | IMU preintegration (Forster, midpoint, bias Jacobian, sqrt cov) | `imu/preintegration.h` | `vio/mathlib/imu` (gyro preint only) | partial |
+| 3 | Sliding‑window sqrt VIO (joint pose+vel+bias+landmarks) | `sqrt_keypoint_vio.cpp::optimize` | `vio/mathlib/backend/vio_window.py` (immature) | weak |
 | 4 | Keyframe management + triangulation (anchored inverse‑depth) | `sqrt_keypoint_vio.cpp::measure` | `WindowedBAMap` (XYZ landmarks) | different |
-| 5 | Square‑root marginalization (QR, FEJ prior) | `sqrt_keypoint_vio.cpp::marginalize` + `marg_helper` | `ours/lib/backend/marginalize.py` (opt‑in, plain Schur) | weak |
+| 5 | Square‑root marginalization (QR, FEJ prior) | `sqrt_keypoint_vio.cpp::marginalize` + `marg_helper` | `vio/mathlib/backend/marginalize.py` (opt‑in, plain Schur) | weak |
 
 ### Basalt default config (verbatim from `vio_config.cpp`)
 ```
@@ -193,7 +193,7 @@ epipolar** filter (we drive depth from the chip/SGM, not a tracked stereo pair).
   analytic Jacobians. `sqrt_cov_inv` (LDLT) whitens it.
 
 **What we have:** gyro‑only preintegration for the rotation prior
-(`ours/lib/imu`), accelerometer used *only* to level attitude. **Missing:** the
+(`vio/mathlib/imu`), accelerometer used *only* to level attitude. **Missing:** the
 accel inside an estimated‑bias velocity/translation state.
 
 **Rebuild tasks**
@@ -331,11 +331,11 @@ for good.
 
 | Basalt symbol | Our target file |
 |---|---|
-| `FrameToFrameOpticalFlow`, `detectKeypoints(grid)` | `ours/lib/frontend/frontend.py`, `corners.py`, `klt.py` |
-| `IntegratedImuMeasurement` | new `ours/lib/imu/preintegration.py` |
-| `SqrtKeypointVioEstimator::optimize` | `ours/lib/backend/vio_window.py` (rewrite over `bundle.py`) |
-| `measure` KF gate + `triangulate` + `lmdb` (inv‑depth) | `ours/lib/backend/vio_window.py`, `windowed.py` |
-| `marginalize` + `MargHelper` (sqrt, FEJ) | `ours/lib/backend/marginalize.py` |
+| `FrameToFrameOpticalFlow`, `detectKeypoints(grid)` | `vio/mathlib/frontend/frontend.py`, `corners.py`, `klt.py` |
+| `IntegratedImuMeasurement` | new `vio/mathlib/imu/preintegration.py` |
+| `SqrtKeypointVioEstimator::optimize` | `vio/mathlib/backend/vio_window.py` (rewrite over `bundle.py`) |
+| `measure` KF gate + `triangulate` + `lmdb` (inv‑depth) | `vio/mathlib/backend/vio_window.py`, `windowed.py` |
+| `marginalize` + `MargHelper` (sqrt, FEJ) | `vio/mathlib/backend/marginalize.py` |
 | `VioConfig` | `BAConfig`/`VioConfig` dataclasses |
 
 ---

@@ -2,7 +2,7 @@
 
 The IMU calibration cache grew from gyro-bias-only to a unified store (gyro bias
 + six-position accel calibration). The full API now lives in
-:mod:`ours.lib.imu.calib_store`; this module simply re-exports the gyro helpers
+:mod:`imu_camera.mathlib.imu.calib_store`; this module simply re-exports the gyro helpers
 so older imports keep working. Prefer importing from ``calib_store`` directly.
 """
 from __future__ import annotations

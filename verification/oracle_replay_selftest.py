@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Byte-parity gate: the in-process SPLIT oracle == the PRE-SPLIT baseline.
+"""Byte-parity gate: the in-process SPLIT oracle == the FROZEN baseline.
 
 For each entry in ``verification/baseline_metrics.json`` this:
 
 1. runs the NEW in-process oracle (split-project math) -- :func:`score_session_oracle`,
-2. asserts every metric == the STORED full-precision baseline within ``TOL_MM``,
-3. ALSO re-derives the OLD oracle LIVE (``ours.tools.vio_run.score_session``) and
-   asserts the new oracle == the old oracle BIT-FOR-BIT (``repr`` equality of the
-   float64s) -- the strongest parity check, immune to a stale JSON.
+2. asserts every metric == the STORED full-precision baseline within ``TOL_MM``.
+
+The baseline was frozen from the PRE-SPLIT reference oracle; it is the only
+reference now (the original ``ours`` tree has been removed, so there is no
+live-vs-old re-derivation -- the frozen JSON is the source of truth).
 
 Any mismatch FAILS LOUDLY with the exact metric, both values and the gap. The
 tolerance is NOT weakened to force a pass.
@@ -48,7 +49,7 @@ def _fmt(v: float) -> str:
     return repr(float(v))
 
 
-def _check_entry(entry: dict, run_old_live: bool) -> tuple[bool, list[str]]:
+def _check_entry(entry: dict) -> tuple[bool, list[str]]:
     """Run the new oracle for one baseline entry; return (ok, log_lines)."""
     sess = entry["session"]
     backend = entry["backend"]
@@ -63,7 +64,7 @@ def _check_entry(entry: dict, run_old_live: bool) -> tuple[bool, list[str]]:
         return False, log
 
     ok = True
-    # 1) New oracle vs stored full-precision baseline.
+    # New oracle vs stored full-precision baseline (the frozen source of truth).
     for metric, base_key in _METRICS:
         got = float(res[metric])
         want = float(base_m[base_key])
@@ -78,39 +79,21 @@ def _check_entry(entry: dict, run_old_live: bool) -> tuple[bool, list[str]]:
             log.append(f"        ^^ DIVERGES by {gap_mm:.6e}{unit} "
                        f"(> tol {TOL_MM}{unit})")
 
-    # 2) New oracle vs LIVE old oracle -- bit-for-bit (repr equality).
-    if run_old_live:
-        from ours.tools.vio_run import score_session as old_score  # noqa: E402
-        old = old_score(Path(sess), mf, False, quiet=True, backend=backend)
-        for metric, _ in _METRICS:
-            n_repr = _fmt(res[metric])
-            o_repr = _fmt(old[metric])
-            same = (n_repr == o_repr)
-            ok = ok and same
-            tag = "ok" if same else "FAIL"
-            log.append(f"  [{tag}] live-old {metric:7s}  new={n_repr}  "
-                       f"old={o_repr}  bit-identical={same}")
-            if not same:
-                gap = abs(float(res[metric]) - float(old[metric]))
-                log.append(f"        ^^ NEW vs LIVE-OLD DIFFER by {gap:.6e}")
-
     return ok, log
 
 
 def main() -> int:
-    run_old_live = "--no-live-old" not in sys.argv
     baseline = _load_baseline()
     entries = baseline["entries"]
 
-    print("oracle_replay_selftest  -- in-process SPLIT oracle vs PRE-SPLIT baseline")
+    print("oracle_replay_selftest  -- in-process SPLIT oracle vs FROZEN baseline")
     print(f"  baseline       : verification/baseline_metrics.json "
           f"({len(entries)} entries)")
     print(f"  parity tol     : {TOL_MM} mm  (port is VERBATIM -> expect 0.0)")
-    print(f"  live-old check : {'ON (bit-for-bit vs ours.vio_run)' if run_old_live else 'OFF'}")
 
     all_ok = True
     for entry in entries:
-        ok, log = _check_entry(entry, run_old_live)
+        ok, log = _check_entry(entry)
         for line in log:
             print(line)
         all_ok = all_ok and ok

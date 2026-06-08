@@ -17,7 +17,7 @@ Responsibilities
 
 The orchestrator is deliberately tracker-agnostic (it is handed ``T_wc`` +
 image + depth at each keyframe), so the same map works offline in
-``ours/tools/vio_run.py`` and, later, on a background thread in the live source.
+``verification/vio_oracle_runner.py`` and on a background thread in the live source.
 """
 from __future__ import annotations
 

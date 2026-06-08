@@ -7,17 +7,21 @@ threshold in the pipeline — corner spacing, the KLT window, the PnP
 reprojection gate, the stereo disparity range, the ORB budget — so the baseline
 numbers become too coarse and feature tracking / depth / pose quality degrade.
 
-`ours/vio/resolution.py` (`ResolutionProfile`) is the single place that scales
-those parameters from the baseline to the live `(width, height)`. Every
-ours-\* source builds one from `--width/--height` and auto-scales; any knob can
-be overridden at runtime for the co-tuning workflow below.
+`comms/lib/config/resolution.py` (`ResolutionProfile`, the data-only profile) is
+the single place that scales those parameters from the baseline to the live
+`(width, height)`; the math-coupled builders that turn it into the live
+frontend/odometry/BA/loop configs live in each project's
+`mathlib/resolution_build.py` (`vio/mathlib/resolution_build.py`,
+`slam/mathlib/resolution_build.py`, `imu_camera/mathlib/resolution_build.py`). The
+capture process builds one from `--width/--height` and auto-scales; any knob can be
+overridden at runtime for the co-tuning workflow below.
 
 ## How to run lighter
 
 ```bash
-./run.sh --source ours --width 320 --height 200      # half res (1/4 the pixels)
-./run.sh --source ours-slam --width 320 --height 200 # SLAM at half res
-./run.sh --source ours --width 480 --height 300      # 0.75x
+./run.sh --width 320 --height 200                                 # half res (1/4 the pixels)
+./run.sh --session sessions/gold/<name> --width 320 --height 200  # half res, replay
+./run.sh --width 480 --height 300                                 # 0.75x
 ```
 
 The startup log prints the active profile, e.g.:
@@ -109,5 +113,6 @@ Notes:
 - **160×100 is the practical floor** for VIO (≈58% coverage, ≈75 corners): much
   lighter than 640×400 while still tracking well. **96×60** is the edge if you
   need maximum lightness.
-- Preview any size live first (matches the VIO depth path exactly):
-  `python ours/tools/synced_view.py --live --fast --width 160 --height 100`.
+- Preview any size live first (matches the VIO depth path exactly): run
+  `./run.sh --width 160 --height 100` and open the UI's **Visualize → Camera +
+  Depth + IMU (triplet)** window (the capture resolution flows through to it).
