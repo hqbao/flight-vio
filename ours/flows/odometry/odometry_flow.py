@@ -57,6 +57,7 @@ from .estimate_motion import EstimateMotion
 from .correct_tilt import CorrectTilt
 from .publish_inliers import PublishInliers
 from .publish_pose import PublishPose
+from .publish_vo import PublishVo
 from .emit_keyframe import EmitKeyframe
 
 
@@ -66,7 +67,8 @@ class OdometryFlow(Flow):
                  accel_align: np.ndarray | None = None,
                  odom_cfg: OdometryConfig | None = None,
                  kf_every: int = 5, use_gyro: bool = True,
-                 latest_only: bool = False, level_tilt: bool = False) -> None:
+                 latest_only: bool = False, level_tilt: bool = False,
+                 publish_vo: bool = False) -> None:
         super().__init__("odometry", bus, latest_only=latest_only)
         self.ctx.state["vo"] = RGBDVisualOdometry(K, odom_cfg or OdometryConfig())
         self.ctx.state["kf_every"] = int(kf_every)
@@ -82,9 +84,21 @@ class OdometryFlow(Flow):
             self.ctx.state["accel_align"] = np.asarray(accel_align, dtype=np.float64)
         self.expected_ends = 2          # imucam.sample + frame.depth both end
         self.on(topics.IMUCAM_SAMPLE, [PreintegratePrior()])
-        self.on(topics.FRAME_DEPTH,
-                [TrackFeatures(), PublishTracks(), AlignGravity(), PullPrior(),
-                 EstimateMotion(), CorrectTilt(), PublishInliers(), PublishPose(),
-                 EmitKeyframe()])
-        self.forwards_to(topics.POSE_ODOM, topics.KEYFRAME, topics.FRAME_TRACKS,
-                         topics.FRAME_INLIERS)
+        # The frame chain. ``PublishVo`` is LIVE-only (publish_vo): it emits the
+        # pure-vision ``pose.vo`` after EstimateMotion has advanced ``pose_vo``.
+        # Off by default so the offline deterministic path never publishes it and
+        # pose.odom byte-parity holds (mirrors the level_tilt opt-in). It runs
+        # right after PublishPose; CorrectTilt only touches self.pose (never
+        # pose_vo), so placing it after CorrectTilt does not affect the VO line.
+        frame_chain = [TrackFeatures(), PublishTracks(), AlignGravity(),
+                       PullPrior(), EstimateMotion(), CorrectTilt(),
+                       PublishInliers(), PublishPose()]
+        if publish_vo:
+            frame_chain.append(PublishVo())
+        frame_chain.append(EmitKeyframe())
+        self.on(topics.FRAME_DEPTH, frame_chain)
+        fwd = [topics.POSE_ODOM, topics.KEYFRAME, topics.FRAME_TRACKS,
+               topics.FRAME_INLIERS]
+        if publish_vo:
+            fwd.append(topics.POSE_VO)
+        self.forwards_to(*fwd)

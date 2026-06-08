@@ -1,9 +1,27 @@
 """Fixed-shape ring of shared-memory slots for one image / depth stream.
 
 The IPC bus (:mod:`ours.lib.ipc.bus`) carries only metadata across the wire;
-large numpy arrays travel through a :class:`SharedArrayRing` -- N pre-allocated
-slots of identical shape / dtype that the producer fills in rotation and the
-consumer reads by index.
+large numpy arrays travel through a :class:`SharedArrayRing` -- a single
+pre-allocated shared-memory segment holding ``slots`` identically-shaped frames
+at fixed byte offsets, which the producer fills in rotation and the consumer
+reads by slot index.
+
+One segment per ring, slot = byte offset
+----------------------------------------
+The ring is ONE ``SharedMemory`` segment of size ``slots * nbytes``; slot ``i``
+is the offset view ``[i * nbytes : (i + 1) * nbytes]``. This keeps the file-
+descriptor cost at a small CONSTANT per ring, independent of ``slots`` -- the
+earlier design allocated one ``SharedMemory`` segment PER slot, so a 64-slot
+ring opened 64 segments and the fd cost scaled linearly with slots; an attaching
+consumer of 3 rings could trip macOS's 256-fd default (``shm_open`` -> EMFILE,
+``OSError: [Errno 24] Too many open files``) at boot. (CPython's
+``SharedMemory(create=True)`` holds a small constant number of fds per segment
+on macOS -- roughly two -- so the win is that fd/segment cost no longer scales
+with slot count, not that a ring costs literally one fd.) Alignment is exact:
+``nbytes`` is always a multiple of the dtype itemsize (uint8 -> 1; float32 ->
+H*W*4 divisible by 4), so ``i * nbytes`` lands every slot view on a correctly
+aligned boundary with no per-slot page padding (identical total RAM as the old
+per-slot design).
 
 Why a ring and not one-shot blocks
 ----------------------------------
@@ -35,8 +53,8 @@ discarded anyway.
 Lifecycle
 ---------
 The producer creates the ring with ``SharedArrayRing.create(name, slots, shape,
-dtype)`` -- this allocates the underlying :class:`SharedMemory` blocks and
-returns a handle that knows how to close + unlink them. Consumers attach to an
+dtype)`` -- this allocates the single underlying :class:`SharedMemory` block and
+returns a handle that knows how to close + unlink it. Consumers attach to an
 existing ring with ``SharedArrayRing.attach(name, slots, shape, dtype)`` -- they
 do NOT unlink, only close. On Linux/macOS shared memory persists until every
 attached process closes it AND the creator unlinks it.
@@ -72,27 +90,34 @@ class SharedArrayRef:
 
 
 class SharedArrayRing:
-    """A ring of ``slots`` identically-shaped shared-memory blocks.
+    """A ring of ``slots`` identically-shaped frames in ONE shared-memory segment.
 
+    Slot ``i`` is the byte range ``[i * nbytes : (i + 1) * nbytes]`` of the single
+    backing segment (see the module docstring for the constant-fd-per-ring
+    rationale -- one segment per ring, fd cost independent of ``slots``).
     Use :meth:`create` on the producer side, :meth:`attach` on each consumer.
     """
 
     def __init__(self, name: str, slots: int, shape: tuple[int, ...],
-                 dtype: np.dtype, _shm_blocks, _owner: bool) -> None:
+                 dtype: np.dtype, _shm, _owner: bool) -> None:
         self.name = name
         self.slots = int(slots)
         self.shape = tuple(int(s) for s in shape)
         self.dtype = np.dtype(dtype)
-        self._shm = _shm_blocks           # list[SharedMemory], len == slots
+        self._shm = _shm                  # single SharedMemory block, size slots*nbytes
         self._owner = bool(_owner)
         #: Set after the first successful :meth:`unlink` so a stray atexit
         #: callback (defence in depth -- see :meth:`create`) is a no-op.
         self._unlinked = False
-        # Pre-build np.ndarray views (one per slot) so the hot publish/poll path
-        # only does a memcpy, no fresh ndarray construction.
+        # Pre-build np.ndarray views (one per slot) as fixed-offset windows into
+        # the single block, so the hot publish/poll path only does a memcpy, no
+        # fresh ndarray construction. nbytes is a multiple of the dtype itemsize,
+        # so `i * nbytes` keeps every view correctly aligned.
+        nbytes = int(np.prod(self.shape)) * self.dtype.itemsize
         self._views: list[np.ndarray] = [
-            np.ndarray(self.shape, dtype=self.dtype, buffer=shm.buf)
-            for shm in self._shm
+            np.ndarray(self.shape, dtype=self.dtype,
+                       buffer=self._shm.buf, offset=i * nbytes)
+            for i in range(self.slots)
         ]
 
     # ------------------------------------------------------------------ #
@@ -101,43 +126,36 @@ class SharedArrayRing:
     @classmethod
     def create(cls, name: str, slots: int, shape: Iterable[int],
                dtype) -> "SharedArrayRing":
-        """Allocate ``slots`` shared blocks of shape × dtype. Producer-side.
+        """Allocate the single ``slots * nbytes`` shared block. Producer-side.
 
-        The slot's actual :class:`SharedMemory` is named ``"{name}.{i}"`` so
-        consumers can attach by index.
+        The block's :class:`SharedMemory` is named exactly ``name`` (no per-slot
+        suffix); slot ``i`` is the offset view ``[i * nbytes : (i + 1) * nbytes]``
+        so consumers attach once and index by offset.
         """
         shape = tuple(int(s) for s in shape)
         dt = np.dtype(dtype)
         nbytes = int(np.prod(shape)) * dt.itemsize
         # macOS limits POSIX shared-memory names to ~31 chars (PSHMNAMLEN, incl.
-        # the leading '/'). Fail loudly here rather than getting a cryptic
-        # ENAMETOOLONG from shm_open mid-build. Linux is much higher (NAME_MAX
-        # 255), so this is the lower of the two and the right gate.
-        longest = max(len(f"{name}.{i}") for i in range(int(slots)))
-        if longest > 30:
+        # the leading '/'). The name is now just `{name}` (no `.{i}` suffix), so
+        # gate on the bare name. Fail loudly here rather than getting a cryptic
+        # ENAMETOOLONG from shm_open. Linux is much higher (NAME_MAX 255), so
+        # this is the lower of the two and the right gate.
+        if len(name) > 30:
             raise ValueError(
-                f"shared-memory name {name!r} too long: '.{slots - 1}' suffix "
-                f"would make it {longest} chars; macOS limit is 30. "
-                f"Use a shorter endpoint / stream name.")
-        blocks = []
+                f"shared-memory name {name!r} too long: {len(name)} chars; "
+                f"macOS limit is 30. Use a shorter endpoint / stream name.")
         try:
-            for i in range(int(slots)):
-                blocks.append(shared_memory.SharedMemory(
-                    name=f"{name}.{i}", create=True, size=nbytes))
+            shm = shared_memory.SharedMemory(
+                name=name, create=True, size=slots * nbytes)
         except FileExistsError as e:
             # Stale ring from a previous run that crashed without unlink.
-            # Clean up partial allocations and re-raise so the caller can
-            # cleanup_stale + retry.
-            for shm in blocks:
-                try:
-                    shm.close()
-                    shm.unlink()
-                except Exception:                                  # noqa: BLE001
-                    pass
+            # Re-raise so the caller can cleanup_stale + retry. (Nothing partial
+            # to clean up now -- there is just the one block, and shm_open never
+            # created it on the EEXIST path.)
             raise RuntimeError(
                 f"shared memory ring {name!r} already exists -- "
                 f"call SharedArrayRing.cleanup_stale({name!r}, {slots}) first") from e
-        ring = cls(name, slots, shape, dt, blocks, _owner=True)
+        ring = cls(name, slots, shape, dt, shm, _owner=True)
         # Defence in depth: register an atexit fallback so an unhandled exception
         # path (or any creator-side teardown that forgets `unlink`) still frees
         # the shared blocks instead of leaking them as
@@ -165,28 +183,27 @@ class SharedArrayRing:
         """
         shape = tuple(int(s) for s in shape)
         dt = np.dtype(dtype)
-        blocks = [shared_memory.SharedMemory(name=f"{name}.{i}", create=False,
-                                             track=False)
-                  for i in range(int(slots))]
-        return cls(name, slots, shape, dt, blocks, _owner=False)
+        shm = shared_memory.SharedMemory(name=name, create=False, track=False)
+        return cls(name, slots, shape, dt, shm, _owner=False)
 
     @staticmethod
     def cleanup_stale(name: str, slots: int) -> None:
-        """Unlink leftover shared blocks from a previous run that crashed.
+        """Unlink the leftover shared block from a previous run that crashed.
 
-        Best-effort; missing blocks are silently skipped (the normal case).
+        ``slots`` is retained for API compatibility but no longer used for naming
+        (the block is named exactly ``name``). Best-effort; a missing block is
+        silently skipped (the normal case).
         """
-        for i in range(int(slots)):
-            try:
-                shm = shared_memory.SharedMemory(
-                    name=f"{name}.{i}", create=False)
-            except FileNotFoundError:
-                continue
-            try:
-                shm.close()
-                shm.unlink()
-            except Exception:                                      # noqa: BLE001
-                pass
+        del slots                          # kept for API compat; not used now
+        try:
+            shm = shared_memory.SharedMemory(name=name, create=False)
+        except FileNotFoundError:
+            return
+        try:
+            shm.close()
+            shm.unlink()
+        except Exception:                                          # noqa: BLE001
+            pass
 
     # ------------------------------------------------------------------ #
     # Producer / consumer ops
@@ -227,19 +244,18 @@ class SharedArrayRing:
     # Teardown
     # ------------------------------------------------------------------ #
     def close(self) -> None:
-        """Detach this process from the shared blocks (idempotent).
+        """Detach this process from the shared block (idempotent).
 
         Does NOT unlink -- only :meth:`unlink` (creator) destroys the memory.
         Consumers always call :meth:`close` only.
         """
-        for shm in self._shm:
-            try:
-                shm.close()
-            except Exception:                                      # noqa: BLE001
-                pass
+        try:
+            self._shm.close()
+        except Exception:                                          # noqa: BLE001
+            pass
 
     def unlink(self) -> None:
-        """Destroy the underlying shared blocks. Creator-only, idempotent.
+        """Destroy the underlying shared block. Creator-only, idempotent.
 
         After :meth:`unlink` no further reads / writes succeed. Always pair
         :meth:`close` after :meth:`unlink` in the creator to free the local
@@ -249,13 +265,12 @@ class SharedArrayRing:
         if not self._owner or self._unlinked:
             return
         self._unlinked = True
-        for shm in self._shm:
-            try:
-                shm.unlink()
-            except FileNotFoundError:
-                pass
-            except Exception:                                      # noqa: BLE001
-                pass
+        try:
+            self._shm.unlink()
+        except FileNotFoundError:
+            pass
+        except Exception:                                          # noqa: BLE001
+            pass
 
     def _safe_unlink(self) -> None:
         """atexit fallback: unlink wrapped in try/except so interpreter teardown

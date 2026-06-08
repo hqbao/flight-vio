@@ -28,7 +28,8 @@ from ...lib.ipc.shared_array import SharedArrayRing
 class RingSpec:
     """One ring's declared layout.
 
-    * ``name`` -- ring name (one shared-memory block per slot, suffix ``.{i}``).
+    * ``name`` -- ring name; one shared-memory segment named exactly ``name``
+      (no per-slot suffix), with each slot a byte-offset window into it.
     * ``slots`` -- ring depth. 8 slots @ 20 fps = 0.4 s of slack.
     * ``shape`` -- array shape (e.g. ``(400, 640)``).
     * ``dtype`` -- numpy dtype name (e.g. ``"uint8"``, ``"float32"``).

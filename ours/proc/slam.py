@@ -48,7 +48,9 @@ DEFAULT_VIO_ENDPOINT = "oak.vio"
 DEFAULT_SLAM_ENDPOINT = "oak.slam"
 
 _INPUT_TOPICS = [topics.KEYFRAME]
-_OUTPUT_TOPICS = [topics.LOOP_CORRECTION]
+# SLAM_MAP is the continuous keyframe-map overlay (pure POD, no shared-memory
+# ring); the publisher forwards it alongside the loop-event loop.correction.
+_OUTPUT_TOPICS = [topics.LOOP_CORRECTION, topics.SLAM_MAP]
 
 
 # --------------------------------------------------------------------------- #
@@ -75,9 +77,25 @@ def run_slam(*,
         endpoint=vio_endpoint, width=width, height=height))
 
     # 3. Build local bus + the SLAM flow (loop closure + pose graph).
+    # latest_only=True: this is the LIVE viewer's SLAM, not the deterministic
+    # scoring path (ours.tools.vio_run). The ORB + pose-graph solve grows with
+    # the map, so a strict FIFO inbox would back up without bound and the
+    # `slam.map` overlay would lag further and further behind real time. A
+    # coalescing inbox drops the backlog and always solves the FRESHEST keyframe,
+    # so the map stays current (it skips intermediate keyframes only when
+    # overloaded). END is never coalesced, so clean shutdown still propagates.
     local = Bus()
-    slam = SlamFlow(local, bundle.K, SlamConfig(loop_max_odom_rot_deg=30.0),
-                    latest_only=False, worker=worker)
+    # Motion-gated keyframe insertion (live-only; the offline SlamFlow default
+    # stays 0/0 = insert every keyframe). A new keyframe joins the pose graph
+    # only when the camera moved >= 10 cm OR rotated >= 5 deg since the LAST
+    # INSERTED keyframe, so a stationary / slowly-panning camera stops piling up
+    # near-identical redundant keyframes (the main driver of unbounded memory and
+    # the O(N^3) PGO cost on long live sessions). The odometry edge is still
+    # taken between consecutive INSERTED keyframes, so the chain stays exact.
+    slam = SlamFlow(local, bundle.K,
+                    SlamConfig(loop_max_odom_rot_deg=30.0,
+                               kf_min_trans_m=0.1, kf_min_rot_deg=5.0),
+                    latest_only=True, worker=worker, publish_map=True)
 
     # 4. Open output IpcServerBus + publisher for the loop corrections.
     #    Retain `calib.bundle` and re-broadcast capture's bundle so consumers

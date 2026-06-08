@@ -75,6 +75,9 @@ def _build_calib_bundle_replay(reader: SessionReader) -> WireCalibBundle:
                      else np.asarray(accel_align, dtype=np.float64)),
         gyro_bias=(None if gyro_bias is None
                    else np.asarray(gyro_bias, dtype=np.float64)),
+        # Replay has no live device -> the UI falls back to "default" when it
+        # keys any IMU calibration it saves.
+        device_id=None,
     )
 
 
@@ -95,6 +98,9 @@ def _build_calib_bundle_live(cal) -> WireCalibBundle:
                      else np.asarray(cal.accel_align, dtype=np.float64)),
         gyro_bias=(None if gyro_bias is None
                    else np.asarray(gyro_bias, dtype=np.float64)),
+        # Carry the live device id so the UI keys any saved IMU calib by the SAME
+        # id capture/VIO use -> the saved calib takes effect on the next start.
+        device_id=cal.device_id,
     )
 
 

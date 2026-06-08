@@ -114,6 +114,17 @@ class WireCalibBundle:
     subscriber on connect. ``K`` is the rectified-left intrinsic the rest of
     the pipeline expects; ``T_imu_left`` is the IMU->camera extrinsic
     (4x4), ``None`` when the session has no IMU calibration.
+
+    ``device_id`` is the per-device key for the IMU calibration store: the UI
+    keys any calibration it saves (gyro bias / accel calib) by this id, so the
+    saved values key IDENTICALLY to the id capture/VIO use on the next start and
+    actually take effect. It is ``None`` in replay (no live device -> the UI
+    falls back to ``"default"``).
+
+    NOTE (IPC schema): this is the cross-language wire contract. ``device_id``
+    is a deliberate, backward-compatible ADDITIVE field -- it has a default and
+    is placed AFTER the existing optional fields, so pickling stays safe and old
+    subscribers simply ignore it.
     """
 
     K: np.ndarray                                 # (3, 3) float64
@@ -124,6 +135,7 @@ class WireCalibBundle:
     R_imu_cam: np.ndarray | None = None           # (3, 3) float64
     accel_align: np.ndarray | None = None         # (3,) float64
     gyro_bias: np.ndarray | None = None           # (3,) float64
+    device_id: str | None = None                  # per-device IMU calib key
 
 
 # --------------------------------------------------------------------------- #
@@ -215,17 +227,26 @@ class WireLoopCorrection:
 
 @dataclass(frozen=True)
 class WireSlamMap:
-    """Periodic snapshot of the SLAM process's corrected keyframe trajectory.
+    """Wire form of :class:`ours.lib.flow.messages.SlamOverlay` (topic ``slam.map``).
 
-    Same shape as :class:`WireVioMap` but produced by the loop-closing SLAM
-    engine (``slam_overlay``). The UI's SLAM tab draws this; the VIO tab uses
-    :class:`WireVioMap` instead.
+    The continuous SLAM keyframe-map overlay, published EVERY keyframe by the
+    loop-closing SLAM engine (``slam_overlay``), LIVE-only. Pure POD -- the
+    keyframe positions are a handful of ``(3,)`` vectors, so they ride the
+    message itself (no shared-memory ring). The UI's SLAM tab draws this.
+
+    The converter (:func:`ours.flows.bridge.converters._slam_overlay_to_wire`)
+    carries the REAL source frame seqs in ``kf_ids`` so the UI can match each
+    corrected keyframe to its dense VIO pose (the rubber-sheet "corrected VIO"
+    line); it falls back to ``arange(K)`` only when the seqs are missing or
+    length-mismatched (the dots themselves render by POSITION). The structure
+    mirrors :class:`WireVioMap`, but note ``last_match`` here is ``(M, 3)`` (the
+    just-closed loop's keyframes, flashed) -- not a single ``(3,)`` point.
     """
 
-    kf_ids: np.ndarray
+    kf_ids: np.ndarray                            # (K,) int64 source frame seqs
     kf_positions: np.ndarray                      # (K, 3) float64, optical frame
     n_loops: int = 0
-    last_match: np.ndarray | None = None          # (3,) optical, flash on new loop
+    last_match: np.ndarray | None = None          # (M, 3) optical, flash on new loop
 
 
 # --------------------------------------------------------------------------- #

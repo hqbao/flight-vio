@@ -77,13 +77,18 @@ def ba_overlay(ba_map):
 def slam_overlay(slam_map):
     """SLAM map snapshot for the keyframe-dots + loop-flash overlay.
 
-    Returns ``(kf_pos, n_loops, match_pos)``:
+    Returns ``(kf_seq, kf_pos, n_loops, match_pos)``:
+    * ``kf_seq``   -- ``(N,)`` int64 source frame seq of each keyframe, in the
+      SAME order as ``kf_pos`` (``kf_seq``/``kf_pose`` are parallel arrays on the
+      map). Lets the UI match each corrected keyframe back to its dense VIO pose
+      (the rubber-sheet "corrected VIO" line).
     * ``kf_pos``   -- ``(N,3)`` current (corrected) keyframe positions.
     * ``n_loops``  -- confirmed loop count (the UI bumps its flash when it grows).
     * ``match_pos``-- ``(M,3)`` the two keyframes of the MOST RECENT loop (cur+old),
       i.e. where the pose just snapped back to (empty if no loop yet).
     """
     import numpy as np
+    kf_seq = np.asarray(slam_map.kf_seq, dtype=np.int64)
     kf_pos = (np.array([p[:3, 3] for p in slam_map.kf_pose], dtype=np.float64)
               if slam_map.kf_pose else np.zeros((0, 3)))
     n_loops = len(slam_map.loop_events)
@@ -95,4 +100,4 @@ def slam_overlay(slam_map):
         if idxs:
             match_pos = np.array([slam_map.kf_pose[i][:3, 3] for i in idxs],
                                  dtype=np.float64)
-    return (kf_pos, n_loops, match_pos)
+    return (kf_seq, kf_pos, n_loops, match_pos)

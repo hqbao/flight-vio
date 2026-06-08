@@ -4,8 +4,10 @@
 #
 # Modes:
 #   ./run.sh ...                    -- single-process viewer (default; offline-safe)
-#   ./run.sh --proc ...             -- 4-process pipeline (capture + vio + slam + ui)
+#   ./run.sh --proc ...             -- 4-process pipeline (imu_camera + vio + slam + ui)
 #                                      see docs/PROC4_ARCHITECTURE.md
+#   ./run.sh --proc-old ...         -- the PRE-split reference pipeline (ours.proc),
+#                                      kept reachable as the verification oracle
 set -e
 cd "$(dirname "$0")"
 
@@ -15,8 +17,16 @@ if [ ! -d .venv ]; then
   exit 1
 fi
 
-# --proc selects the 4-process launcher; strip the flag and forward the rest.
+# --proc selects the NEW 4-process launcher (launcher.main drives the four split
+# projects imu_camera / vio / slam / ui); strip the flag and forward the rest.
 if [ "${1:-}" = "--proc" ]; then
+  shift
+  exec .venv/bin/python -m launcher.main --auto-suffix "$@"
+fi
+
+# --proc-old keeps the PRE-split ours.proc.launcher reachable so the reference
+# oracle stays runnable for the Phase 7 verification harness.
+if [ "${1:-}" = "--proc-old" ]; then
   shift
   exec .venv/bin/python -m ours.proc.launcher --auto-suffix "$@"
 fi

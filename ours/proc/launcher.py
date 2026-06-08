@@ -39,14 +39,23 @@ import time
 from multiprocessing import shared_memory
 from pathlib import Path
 
+# Import-safe: ui.py imports PyQt6 LAZILY inside run_ui, so pulling in this one
+# constant does NOT drag Qt into the launcher (verified by the QT-FREE check).
+from ours.proc.ui import RESTART_EXIT_CODE
+
 LOG = logging.getLogger("ours.proc.launcher")
 
 
 # Endpoint roles + the ring names each role's process owns. Mirrors
 # `default_capture_specs()` (capture) and `default_vio_specs()` (vio); slam
-# attaches but owns no rings. Used by `_cleanup_orphans` to brute-force unlink
-# every stale POSIX shm segment from prior crashed runs so a fresh launch
-# doesn't trip macOS's per-process fd / shm caps with EMFILE.
+# attaches but owns no rings. Used by `_cleanup_orphans` to unlink every stale
+# POSIX shm segment from prior crashed runs so a fresh launch doesn't trip
+# macOS's per-process fd / shm caps with EMFILE.
+#
+# Each live ring is now ONE block named `{ep}.{ring}` (slots are byte offsets --
+# see SharedArrayRing). `_RING_SLOTS` is retained only for the legacy cleanup
+# pass that reclaims the OLD per-slot `{ep}.{ring}.{i}` names left by crashed
+# PRE-upgrade runs during the transition.
 _RING_NAMES_BY_ROLE = {
     "cap": ("gray_left", "gray_right", "depth_m"),
     "vio": ("kf_gray", "kf_depth"),
@@ -55,22 +64,57 @@ _RING_NAMES_BY_ROLE = {
 _RING_SLOTS = 64
 
 
+def _endpoints_history_path() -> Path:
+    """File where every launcher persists its endpoint trio. cleanup reads it
+    so a prior run whose sock files were already deleted (manual cleanup,
+    /tmp reaper, etc.) is still recoverable next launch."""
+    return Path(tempfile.gettempdir()) / "ours_ipc" / ".endpoints_seen"
+
+
+def _record_endpoints(eps: list[str]) -> None:
+    p = _endpoints_history_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        seen: set[str] = set()
+        if p.is_file():
+            seen = {ln.strip() for ln in p.read_text().splitlines() if ln.strip()}
+        seen.update(eps)
+        # Cap so the file doesn't grow forever; recent entries first.
+        capped = sorted(seen)[:1024]
+        p.write_text("\n".join(capped) + "\n")
+    except OSError:
+        pass
+
+
 def _cleanup_orphans() -> None:
     """Best-effort: unlink every stale `oak.*` SHM segment + IPC socket file.
 
-    macOS has no public listing API for POSIX shared memory, so we discover
-    candidate endpoints by listing the launcher's IPC socket directory (each
-    launch leaves `oak.{cap,vio,slm}.<suffix>.sock` there). For each endpoint
-    we then try to unlink every (ring, slot) name owned by that role. Missing
-    segments are silently skipped -- this is a guard against accumulation, not
-    a correctness operation.
+    macOS has no public listing API for POSIX shared memory, so we union
+    endpoint candidates from THREE sources, in order of recency:
+      1. The launcher's IPC socket directory (`oak.*.sock`).
+      2. A persistent endpoints-seen file (every launcher records itself,
+         so prior endpoints whose sock files were already deleted are still
+         covered).
+      3. (fallback) Brute-force the 4096 `l<hex>` PID-suffix space when both
+         of the above turn up nothing -- runs on the EMFILE recovery path
+         only, since it adds ~2.6 s on macOS.
+    Missing segments are silently skipped -- this is a guard against
+    accumulation, not a correctness operation.
     """
     sock_dir = Path(tempfile.gettempdir()) / "ours_ipc"
-    if not sock_dir.is_dir():
-        return
     endpoints: set[str] = set()
-    for p in glob.glob(str(sock_dir / "oak.*.sock")):
-        endpoints.add(Path(p).name[:-len(".sock")])
+    if sock_dir.is_dir():
+        for p in glob.glob(str(sock_dir / "oak.*.sock")):
+            endpoints.add(Path(p).name[:-len(".sock")])
+    hist = _endpoints_history_path()
+    if hist.is_file():
+        try:
+            for ln in hist.read_text().splitlines():
+                ln = ln.strip()
+                if ln.startswith("oak."):
+                    endpoints.add(ln)
+        except OSError:
+            pass
     if not endpoints:
         return
     unlinked = 0
@@ -80,8 +124,14 @@ def _cleanup_orphans() -> None:
             continue
         role = parts[1]
         for ring in _RING_NAMES_BY_ROLE.get(role, ()):
-            for i in range(_RING_SLOTS):
-                shm_name = f"{ep}.{ring}.{i}"
+            # Current layout: each ring is ONE block named exactly `{ep}.{ring}`
+            # (slots are byte offsets inside it -- see SharedArrayRing). Plus a
+            # legacy pass over the OLD per-slot names `{ep}.{ring}.{i}` so
+            # segments leaked by a PRE-upgrade crashed run are still reclaimed
+            # during the transition. Both are best-effort; missing names skipped.
+            candidates = [f"{ep}.{ring}"]
+            candidates += [f"{ep}.{ring}.{i}" for i in range(_RING_SLOTS)]
+            for shm_name in candidates:
                 try:
                     shm = shared_memory.SharedMemory(name=shm_name,
                                                      create=False)
@@ -93,12 +143,13 @@ def _cleanup_orphans() -> None:
                 except Exception:                                  # noqa: BLE001
                     pass
     sock_removed = 0
-    for p in glob.glob(str(sock_dir / "oak.*.sock")):
-        try:
-            os.unlink(p)
-            sock_removed += 1
-        except FileNotFoundError:
-            pass
+    if sock_dir.is_dir():
+        for p in glob.glob(str(sock_dir / "oak.*.sock")):
+            try:
+                os.unlink(p)
+                sock_removed += 1
+            except FileNotFoundError:
+                pass
     if unlinked or sock_removed:
         LOG.info("launcher: cleanup_orphans freed %d stale SHM segments + "
                  "%d socket files from %d prior endpoints",
@@ -155,7 +206,9 @@ def main() -> int:
     ap.add_argument("--recalibrate-bias", action="store_true",
                     help="live: re-measure gyro bias instead of using the cached one")
     ap.add_argument("--worker", action="store_true",
-                    help="run BA / SLAM solves in their own child processes")
+                    help="run the heavy BA/SLAM solves in worker subprocesses "
+                         "(GIL-free). Off by default -- SLAM already stays "
+                         "responsive via its latest-only in-process inbox.")
     ap.add_argument("--endpoint-suffix", default="",
                     help="append SUFFIX to canonical endpoint names so two "
                          "launchers can co-exist (e.g. 'dev', 'ci')")
@@ -165,18 +218,22 @@ def main() -> int:
                     help="don't open the UI -- useful for capture-only headless runs")
     args = ap.parse_args()
 
-    # ---- Best-effort cleanup of stale SHM + sockets from prior crashed runs.
-    # macOS POSIX shm persists past process death (SIGKILL skips unlink); after
-    # enough crashed launches the kernel namespace fills up and the next
-    # capture's shm_open() fails with EMFILE. We run this BEFORE spawning so
-    # the children start in a clean namespace.
-    _cleanup_orphans()
+    # SLAM keeps its live map current via a LATEST-ONLY in-process inbox (set in
+    # ours.proc.slam) -- it drops a backlog instead of lagging, with NO worker
+    # subprocess (so no resource_tracker semaphore noise on every shutdown /
+    # Restart). `--worker` is an opt-in for running the heavy solves GIL-free in
+    # child processes; off by default.
+    use_worker = bool(args.worker)
 
-    # ---- Endpoint names --------------------------------------------------
+    # ---- Endpoint names (computed ONCE, identical across restarts) --------
+    # The auto-suffix is derived from THIS launcher's PID, so re-spawning the
+    # pipeline (Restart button) re-creates the same-named endpoints + rings.
+    # _cleanup_orphans + SharedArrayRing.create's cleanup_stale reclaim any
+    # leftovers from the prior generation each iteration.
     if args.auto_suffix:
-        # `oak.cap.l<pidhex>` -- short enough that the per-slot suffix still
-        # fits inside macOS's 30-char POSIX shm name limit. See
-        # `SharedArrayRing.create` for the assertion.
+        # `oak.cap.l<pidhex>` -- the ring shm name is `{ep}.{ring}` and must fit
+        # inside macOS's 30-char POSIX shm name limit. See `SharedArrayRing.create`
+        # for the gate.
         suffix = f".l{os.getpid() & 0xFFF:x}"
     elif args.endpoint_suffix:
         suffix = "." + args.endpoint_suffix
@@ -187,6 +244,9 @@ def main() -> int:
     slam_ep = f"oak.slm{suffix}" if suffix else "oak.slam"
     LOG.info("launcher: endpoints cap=%r vio=%r slam=%r",
              cap_ep, vio_ep, slam_ep)
+    # Persist our endpoints so the NEXT launcher's `_cleanup_orphans` can
+    # recover them even if our sock files are deleted between runs.
+    _record_endpoints([cap_ep, vio_ep, slam_ep])
 
     py = sys.executable
     env = dict(os.environ)
@@ -211,24 +271,65 @@ def main() -> int:
                 "--kf-every", str(args.kf_every)]
     if args.no_gyro:
         vio_args += ["--no-gyro"]
-    if args.worker:
+    if use_worker:
         vio_args += ["--worker"]
 
     slam_args = ["--capture-endpoint", cap_ep,
                  "--vio-endpoint", vio_ep,
                  "--endpoint", slam_ep]
-    if args.worker:
+    if use_worker:
         slam_args += ["--worker"]
 
-    ui_args = ["--vio-endpoint", vio_ep, "--slam-endpoint", slam_ep]
+    # The UI's calib + visualise windows subscribe capture directly (IMU /
+    # imucam.sample / frame.depth), so it must know the suffixed live endpoint
+    # under an --auto-suffix run.
+    ui_args = ["--capture-endpoint", cap_ep,
+               "--vio-endpoint", vio_ep, "--slam-endpoint", slam_ep]
+
+    # ---- SIGTERM handler (registered ONCE) -------------------------------
+    # `kill <launcher_pid>` from outside must clean up the whole tree, not just
+    # the launcher itself. The handler reads a STABLE mutable `procs` holder
+    # that the restart loop clear()s + repopulates each generation, so it always
+    # signals the CURRENT generation's children regardless of how many restarts
+    # have happened.
+    #
+    # CRITICAL: do NOT call `_terminate(procs)` here -- `_terminate` polls each
+    # `Popen.poll()`, which calls `os.waitpid(pid, WNOHANG)` on the same pid the
+    # main thread is blocked in `ui_proc.wait()` on. The two waitpid callers race
+    # for the single reap event, leaving Popen's `returncode` stuck at None on
+    # the loser, so the handler's `_terminate` loop spins the full 10 s deadline
+    # and SIGKILLs the UI even though it already exited cleanly. Instead just
+    # forward SIGTERM to each child (they likely already got it from the
+    # process-group signal anyway) and `os._exit` immediately; children either
+    # finish their own shutdown or get reaped by init when launcher dies.
+    procs: list[subprocess.Popen] = []
+
+    def _on_sigterm(_signo, _frame):
+        LOG.info("launcher: SIGTERM -> forwarding to children + exiting")
+        for p in procs:
+            try:
+                p.terminate()
+            except Exception:                                      # noqa: BLE001
+                pass
+        os._exit(143)                                             # 128 + SIGTERM
+    signal.signal(signal.SIGTERM, _on_sigterm)
 
     # ---- Boot order ------------------------------------------------------
     # capture FIRST so the retained `calib.bundle` is published as soon as it
     # builds the frontend. vio + slam connect with retried `IpcClientBus.start`
     # so booting them after capture is fine; this just minimises the connect
     # retry noise in the log.
-    procs: list[subprocess.Popen] = []
-    try:
+    def _spawn_pipeline() -> None:
+        """Clear `procs` in place and spawn a fresh capture+vio+slam generation.
+
+        Mutates the SHARED `procs` holder (clear + append) so the once-registered
+        SIGTERM handler always sees the live generation. Best-effort SHM cleanup
+        runs FIRST so the prior generation's segments are reclaimed before the
+        same-named rings are re-created (macOS POSIX shm persists past SIGKILL;
+        a stale namespace eventually trips capture's shm_open() with EMFILE).
+        """
+        _cleanup_orphans()
+        procs.clear()
         cap_proc = _spawn(py, "ours.proc.capture", capture_args, env=env,
                           name="capture")
         procs.append(cap_proc)
@@ -236,35 +337,17 @@ def main() -> int:
         # try their first connect (vio retries so this is cosmetic, but it
         # gives a clean first-attempt success in the log).
         time.sleep(0.2)
-        vio_proc = _spawn(py, "ours.proc.vio", vio_args, env=env, name="vio")
-        procs.append(vio_proc)
-        slam_proc = _spawn(py, "ours.proc.slam", slam_args, env=env, name="slam")
-        procs.append(slam_proc)
+        procs.append(_spawn(py, "ours.proc.vio", vio_args, env=env, name="vio"))
+        procs.append(_spawn(py, "ours.proc.slam", slam_args, env=env,
+                            name="slam"))
 
-        # SIGTERM handler so a `kill <launcher_pid>` from outside cleans up
-        # the whole tree (not just the launcher process itself).
-        #
-        # CRITICAL: do NOT call `_terminate(procs)` here -- `_terminate` polls
-        # each `Popen.poll()`, which calls `os.waitpid(pid, WNOHANG)` on the
-        # same pid the main thread is blocked in `ui_proc.wait()` on. The two
-        # waitpid callers race for the single reap event, leaving Popen's
-        # `returncode` stuck at None on the loser, so the handler's
-        # `_terminate` loop spins the full 10 s deadline and SIGKILLs the UI
-        # even though it already exited cleanly. Instead just forward SIGTERM
-        # to each child (they likely already got it from the process-group
-        # signal anyway) and `os._exit` immediately; children either finish
-        # their own shutdown or get reaped by init when launcher dies.
-        def _on_sigterm(_signo, _frame):
-            LOG.info("launcher: SIGTERM -> forwarding to children + exiting")
-            for p in procs:
-                try:
-                    p.terminate()
-                except Exception:                                  # noqa: BLE001
-                    pass
-            os._exit(143)                                         # 128 + SIGTERM
-        signal.signal(signal.SIGTERM, _on_sigterm)
-
-        if args.no_ui:
+    if args.no_ui:
+        # No restart button without a UI -- the --no-ui path runs exactly ONCE,
+        # independent of the restart loop below.
+        try:
+            _spawn_pipeline()
+            cap_proc = procs[0]
+            vio_proc, slam_proc = procs[1], procs[2]
             LOG.info("launcher: --no-ui set; waiting for capture to exit "
                      "(Ctrl-C to stop)")
             try:
@@ -285,7 +368,21 @@ def main() -> int:
                     LOG.warning("launcher: %s pid=%d still running after 30 s; "
                                 "_terminate will SIGTERM/SIGKILL",
                                 child.args, child.pid)
-        else:
+        finally:
+            LOG.info("launcher: shutting down background procs ...")
+            _terminate(procs)
+            LOG.info("launcher: bye")
+        return int(rc)
+
+    # ---- Restart loop ----------------------------------------------------
+    # Each iteration spawns a FRESH capture+vio+slam+ui generation, blocks on the
+    # UI, then tears that generation down. The IPC bus is one-way (server->client)
+    # so the UI cannot reset vio/slam in place; the robust "chay lai tu dau" is a
+    # full respawn, which the UI requests via the RESTART_EXIT_CODE return code.
+    rc = 0
+    try:
+        while True:
+            _spawn_pipeline()
             # UI in foreground -- inherits stdout / stderr / stdin so the user
             # sees Qt warnings and can Ctrl-C cleanly.
             ui_proc = subprocess.Popen([py, "-m", "ours.proc.ui", *ui_args],
@@ -300,9 +397,15 @@ def main() -> int:
                 except Exception:                                  # noqa: BLE001
                     pass
                 rc = ui_proc.wait(timeout=5.0)
+            # Tear down THIS generation on the main thread (no waitpid race: the
+            # UI is already reaped by `ui_proc.wait()` above).
+            LOG.info("launcher: shutting down background procs ...")
+            _terminate(procs)
+            if rc == RESTART_EXIT_CODE:
+                LOG.info("launcher: restart requested -> respawning pipeline")
+                continue
+            break
     finally:
-        LOG.info("launcher: shutting down background procs ...")
-        _terminate(procs)
         LOG.info("launcher: bye")
 
     return int(rc)

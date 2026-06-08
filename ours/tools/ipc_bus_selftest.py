@@ -209,9 +209,10 @@ def _bridge_subscriber_proc(endpoint: str, n: int, h: int, w: int,
 
 def test_bridge_roundtrip() -> None:
     print("\nBridge flow round-trip (two processes)")
-    # Ring names are <endpoint>.<stream>.<slot>. Capture's longest stream is
-    # "gray_right" (10 chars) + ".N" (2 chars) + "." (1) = 13 chars budget; the
-    # rest goes to the endpoint name. Keep the test endpoint tiny.
+    # Ring names are <endpoint>.<stream> (one shared-memory segment per ring, no
+    # per-slot suffix). Capture's longest stream is "gray_right" (10 chars) + "."
+    # (1) = 11 chars budget; the rest goes to the endpoint name. macOS caps the
+    # shm name at 30 chars, so keep the test endpoint tiny.
     endpoint = f"t.{os.getpid() & 0xFFFF:x}.br"
     h, w = 32, 48
     n_msgs = 4

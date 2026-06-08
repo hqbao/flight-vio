@@ -155,6 +155,24 @@ class LoopCorrection:
 
 
 @dataclass(frozen=True)
+class SlamOverlay:
+    """Continuous SLAM keyframe-map snapshot for the live overlay (slam.map).
+
+    Positions are CAMERA-OPTICAL world frame; the UI applies the optical->NED
+    display transform. Distinct from LoopCorrection (which is the loop-event
+    pose-graph rewrite on loop.correction).
+    """
+
+    kf_positions: np.ndarray          # (N, 3) optical-world keyframe positions
+    n_loops: int
+    last_match: np.ndarray | None = None   # (M, 3) optical, the just-closed loop's kfs (flash)
+    #: ``(N,)`` int64 source frame seq of each keyframe, SAME order as
+    #: ``kf_positions``. Lets the UI match each corrected keyframe to its dense
+    #: VIO pose for the rubber-sheet "corrected VIO" line. Empty when unset.
+    kf_seqs: np.ndarray = field(default_factory=lambda: np.zeros(0, np.int64))
+
+
+@dataclass(frozen=True)
 class CamSync:
     """A stereo pair the ``cam`` flow publishes as a sync trigger.
 

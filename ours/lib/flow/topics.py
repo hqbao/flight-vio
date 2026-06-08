@@ -13,10 +13,12 @@ emits::
     imu_cam  --imucam.sample-> odometry       (frames + CALIBRATED IMU)
     imu_cam  --frame.depth---> odometry       (depth task output)
     odometry --pose.odom-----> ui-collector, ui-render
+    odometry --pose.vo-------> ui            (pure-vision VO line, LIVE-only)
     odometry --frame.tracks--> ui-tracks       (KLT tracks + depth, visualiser)
     odometry --keyframe------> backend, slam
     backend  --pose.refined--> ui-collector
     slam     --loop.correction-> ui-collector
+    slam     --slam.map-------> ui-collector   (LIVE-only continuous overlay)
 
 ``cam.sync`` carries the frames so the ``imu_cam`` flow packs them with the
 inertial samples it drains up to the frame timestamp. For each trigger the
@@ -31,14 +33,26 @@ Note: the back-end and SLAM flows both trigger off ``keyframe`` (NOT
 UI collector -- it is not yet fed back into odometry (no closed loop on the live
 pose path). Wire an odometry ``self.on(LOOP_CORRECTION, ...)`` when that
 feedback is added.
+
+``slam.map`` is the LIVE-ONLY continuous keyframe overlay published EVERY
+keyframe by the proc4 SLAM flow (``publish_map=True``); the UI's SLAM tab draws
+its keyframe dots from it instead of waiting on ``loop.correction`` (which only
+fires ON a loop closure). The offline path keeps ``publish_map=False`` so it is
+never published there and the deterministic ``loop.correction`` scoring stays
+byte-identical. See ``docs/PROC4_ARCHITECTURE.md`` §9 invariant 12.
 """
 from __future__ import annotations
 
 FRAME_DEPTH = "frame.depth"
 POSE_ODOM = "pose.odom"
+# Pure-vision frame-to-frame trajectory (no IMU / no BA), live-only -- the UI's
+# "VO" line to compare against the VIO ``pose.odom``. Carries a PoseMsg.
+POSE_VO = "pose.vo"
 KEYFRAME = "keyframe"
 POSE_REFINED = "pose.refined"
 LOOP_CORRECTION = "loop.correction"
+# Continuous SLAM keyframe-map overlay (live-only; loop.correction stays the loop-event correction).
+SLAM_MAP = "slam.map"
 
 # Per-frame KLT tracks the odometry frontend produced (ids + pixels) bundled with
 # the frame + its depth, for the keypoint-depth visualiser. The SAME tracks the

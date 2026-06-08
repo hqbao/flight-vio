@@ -1,0 +1,68 @@
+{
+  "_comment": "PRE-SPLIT baseline captured by ours/tools/vio_run.py (the reference oracle) BEFORE the 5-project split. Each entry holds the rounded display ATE block (mm) AND the full-precision f64 values in metres that the byte-parity gate compares. The new in-process oracle (verification/oracle_replay.py) drives the NEW projects' verbatim-ported math through the SAME vio_run scoring loop and MUST reproduce these numbers (verification/oracle_replay_selftest.py asserts == within 1e-6 mm; the harness also re-derives the OLD oracle live for a full-precision head-to-head). Captured: .venv/bin/python ours/tools/vio_run.py --session <session> --backend <backend> --max-frames <max_frames>.",
+  "_captured_at": "2026-06-08",
+  "_reference_tool": "ours/tools/vio_run.py",
+  "_full_precision_field": "_m holds the raw float64 in METRES (rmse_m, median_m, max_m); rmse_mm/median_mm/max_mm are the rounded display values vio_run prints.",
+  "entries": [
+    {
+      "session": "sessions/gold/lab_loop_30s",
+      "backend": "vio",
+      "max_frames": 20,
+      "rmse_mm": 75.9,
+      "median_mm": 77.0,
+      "max_mm": 113.0,
+      "sim3_scale": 2.002,
+      "_m": {
+        "rmse_m": 0.07590965758888675,
+        "median_m": 0.0770038479742631,
+        "max_m": 0.11299909905982754,
+        "sim3_scale": 2.0018687517361653
+      }
+    },
+    {
+      "session": "sessions/gold/lab_loop_30s",
+      "backend": "f2f",
+      "max_frames": 20,
+      "rmse_mm": 81.4,
+      "median_mm": 70.3,
+      "max_mm": 121.5,
+      "sim3_scale": 66.107,
+      "_m": {
+        "rmse_m": 0.08144894147984354,
+        "median_m": 0.07034766862091546,
+        "max_m": 0.12145055115829882,
+        "sim3_scale": 66.10713229337874
+      }
+    },
+    {
+      "session": "sessions/gold/lab_loop_30s",
+      "backend": "ba",
+      "max_frames": 20,
+      "rmse_mm": 80.8,
+      "median_mm": 70.1,
+      "max_mm": 120.7,
+      "sim3_scale": 22.510,
+      "_m": {
+        "rmse_m": 0.08081435676851387,
+        "median_m": 0.07005346622723993,
+        "max_m": 0.12069923429748894,
+        "sim3_scale": 22.509537470076538
+      }
+    },
+    {
+      "session": "sessions/gold/push_straight_fast_15s",
+      "backend": "vio",
+      "max_frames": 20,
+      "rmse_mm": 14.5,
+      "median_mm": 12.7,
+      "max_mm": 23.6,
+      "sim3_scale": 5.154,
+      "_m": {
+        "rmse_m": 0.014454110808339736,
+        "median_m": 0.012747593572965968,
+        "max_m": 0.023580027629675482,
+        "sim3_scale": 5.153511443962205
+      }
+    }
+  ]
+}

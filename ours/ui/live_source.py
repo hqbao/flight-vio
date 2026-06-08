@@ -147,8 +147,8 @@ class FlowPoseSource(PoseSource):
 
         Runs on the source thread (the ``_run`` loop). Reads a REAL engine output
         (ours-ba: ``{kf_id: refined world pos}``; ours-slam:
-        ``(kf_pos, n_loops, match_pos)``), transforms optical->NED with the same
-        matrix the marker uses, and updates the buffers the viewer reads.
+        ``(kf_seq, kf_pos, n_loops, match_pos)``), transforms optical->NED with
+        the same matrix the marker uses, and updates the buffers the viewer reads.
         """
         if self._engine is None:
             return
@@ -164,7 +164,10 @@ class FlowPoseSource(PoseSource):
             with self._ov_lock:
                 self._refined_ned = ned
         else:                                    # slam
-            kf_pos, n_loops, match_pos = ov
+            # kf_seq aligns each keyframe to its source frame seq; the
+            # single-process overlay draws dots by POSITION only, so it is
+            # unpacked (tuple shape must match slam_overlay) but not used here.
+            _kf_seq, kf_pos, n_loops, match_pos = ov
             kf_ned = ((np.asarray(kf_pos) @ _M_OPT_TO_NED.T).astype(np.float32)
                       if len(kf_pos) else np.zeros((0, 3), np.float32))
             with self._ov_lock:

@@ -1,20 +1,26 @@
-"""ui process: PyQt6 viewer with separate VIO + SLAM tabs (IPC subscriber).
+"""ui process: PyQt6 viewer with ONE single view of 5 trajectories (IPC subscriber).
 
-Connects (over IPC) to the ``vio`` and ``slam`` endpoints, mirrors each onto a
-**dedicated tab** of a single :class:`QMainWindow`. Per user spec
-(``docs/PROC4_ARCHITECTURE.md`` §6):
+Connects (over IPC) to the ``vio`` and ``slam`` endpoints and renders ALL of the
+pipeline's trajectory streams in a SINGLE :class:`Viewer3D` (no tabs). The live
+marker is ``pose.odom`` (VIO). The five trajectory lines, each from its own
+source, are (back-to-front / drift order):
 
-* **VIO tab** -- live marker = ``pose.odom`` from VIO; map overlay (behind the
-  marker) = ``pose.refined`` from VIO's windowed BA. This is the responsive
-  frame-to-frame view; the marker never lags because it never waits on the
-  back-end.
-* **SLAM tab** -- live marker = the SAME ``pose.odom`` from VIO; map overlay =
-  loop-corrected keyframe positions from SLAM's ``loop.correction``. So the
-  SLAM tab shows the "best-known map" the loop closer has converged on, with
-  the same live cursor.
+1. **VO** (``pose.vo``, pure vision) -- dim grey; drifts most.
+2. **VIO** (``pose.odom``) -- NVG green; the responsive frame-to-frame trail +
+   the live marker (never lags -- it never waits on a back-end).
+3. **VIO-BA** (``pose.refined``, windowed-BA keyframes) -- violet-blue; sparse.
+4. **SLAM-corrected VIO** -- warm orange; the dense VIO trail rubber-sheeted by
+   SLAM's per-keyframe loop corrections, with teleport vertices (where SLAM
+   pulled the path far) flashed red.
+5. **SLAM** (``slam.map``) -- HUD cyan keyframe line + amber keyframe dots, with
+   the just-revisited keyframes flashed on each loop closure. ``slam.map``
+   supersedes the old ``loop.correction`` overlay (which only fired ON a loop --
+   no dots along the path until the first loop closed).
 
-The two tabs are independent QWidget views inside one Qt event loop -- no
-duplicate Qt apps, no per-tab subprocess. The IPC subscribers live on
+A single :class:`SlamMapTracker` subscribes every stream across two IPC clients
+(SLAM on the slam endpoint; odom/vo/refined on the vio endpoint) and exposes one
+snapshot getter per line. A row of 5 checkable toggle buttons on the Controls
+toolbar shows/hides each line independently. The IPC subscribers live on
 background threads (one :class:`IpcClientBus` per source) and marshal pose
 samples onto the GUI thread via the existing :class:`PoseSource` callback
 contract (the viewer already handles the cross-thread hop via signal/slot).
@@ -23,8 +29,22 @@ Calibration handshake
 ---------------------
 Like VIO and SLAM, the UI waits for the retained ``calib.bundle`` on EACH
 endpoint it cares about before building views. The bundle's
-``width`` / ``height`` come from there so the future calibration / visualise
-dialogs (Phase 10) know the capture resolution without needing a CLI flag.
+``width`` / ``height`` / ``device_id`` come from there so the
+Visualize / Calibration menus know the capture resolution + device key without
+needing a CLI flag.
+
+Visualize / Calibration menus
+-----------------------------
+These menus reuse the EXISTING ``ours.ui`` windows + calib dialogs UNCHANGED,
+fed entirely over IPC by the Part-1 adapters in
+:mod:`ours.proc.ui_ipc_sources` -- the UI never opens a device (capture owns
+it). The triplet view reads capture's ``frame.depth`` + ``imucam.sample``; the
+keypoint tracker reads capture's ``frame.depth`` plus VIO's ``frame.tracks`` +
+``frame.inliers``; the gyro / accel dialogs read capture's ``imu.raw``.
+Calibration saves are keyed per device (``device_id`` from the bundle), so a
+saved bias/scale takes effect on the NEXT capture start (capture loads it via
+``load_gyro_bias`` / ``load_accel_calib``); it does not retro-fit the running
+pipeline.
 
 Run::
 
@@ -46,10 +66,11 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from ours.lib.flow import topics                                   # noqa: E402
 from ours.lib.flow.messages import END                             # noqa: E402
 from ours.lib.ipc import IpcClientBus                              # noqa: E402
 from ours.lib.ipc.messages import (                                # noqa: E402
-    WireCalibBundle, WireLoopCorrection, WirePoseMsg,
+    WireCalibBundle, WireEnd, WirePoseMsg, WireSlamMap,
 )
 from ours.lib.misc.frames import rot_to_quat                       # noqa: E402
 from ours.lib.misc.pose import Pose, PoseHistory                   # noqa: E402
@@ -59,6 +80,13 @@ LOG = logging.getLogger("ours.proc.ui")
 
 DEFAULT_VIO_ENDPOINT = "oak.vio"
 DEFAULT_SLAM_ENDPOINT = "oak.slam"
+DEFAULT_CAPTURE_ENDPOINT = "oak.capture"
+
+# Sentinel return code the UI uses to tell the launcher "respawn the whole
+# pipeline from scratch" (the Restart toolbar button). The launcher loops on it;
+# any other code is a normal exit. 42 is outside the usual 0/1/130/143 range so
+# it can't collide with a clean close, a crash, or a signal-induced exit.
+RESTART_EXIT_CODE = 42
 
 
 # Camera optical (x right, y down, z forward) -> NED, matching
@@ -124,7 +152,10 @@ class IpcPoseSource(PoseSource):
 
     # ------------------------------------------------------------------ #
     def _on_pose(self, wm: WirePoseMsg | object) -> None:
-        if wm is END:
+        # IpcClientBus delivers the wire-level END as a `WireEnd` instance, not
+        # the local `END` sentinel, so guard both (else the shutdown END is
+        # mistaken for a pose and raises on `.T_world_cam`).
+        if wm is END or isinstance(wm, WireEnd):
             return                                # source closed; viewer stays
         pose, prev_pos, prev_t = _wire_pose_to_ned(
             wm, self._prev_pos, self._prev_t)     # type: ignore[arg-type]
@@ -167,76 +198,312 @@ class IpcPoseSource(PoseSource):
 
 
 # --------------------------------------------------------------------------- #
-# Loop-correction subscriber for the SLAM tab: collects the latest corrected
-# keyframe positions so the viewer can draw the SLAM map behind the marker.
+# Single-view trajectory model: one subscriber across two IPC clients that feeds
+# the VO / VIO-BA / SLAM-corrected VIO / SLAM lines behind the live VIO marker.
 # --------------------------------------------------------------------------- #
-class SlamMapTracker(threading.Thread):
-    """Background subscriber: latch the latest ``loop.correction`` payload.
+# Hard cap on each dense pose ring (VIO odom + VO + BA) the tracker records.
+# At ~20 Hz this is ~2.8 h of trajectory -- far longer than any session -- but
+# bounds memory so a runaway pipeline can never grow a buffer without limit.
+_VIO_BUF_CAP = 200_000
 
-    The viewer reads :meth:`refined_path_snapshot` to render the SLAM map.
-    Cheap (single lock + copy on snapshot) so it can be polled at GUI rate
-    (10-30 Hz) without contention.
+# Teleport threshold (metres): a corrected-VIO vertex is flagged "teleport" when
+# the SLAM correction pulled it more than this from the raw VIO position. A loop
+# closure that snaps the path back will exceed it; ordinary drift correction
+# stays under. v1 = a simple magnitude threshold (see corrected_vio_snapshot).
+TELEPORT_M = 0.15
+
+
+class SlamMapTracker(threading.Thread):
+    """Single trajectory model for the proc4 single-view UI.
+
+    Subscribes -- across two IPC clients -- to every stream the 5 trajectory
+    lines need and exposes one snapshot getter per line:
+
+    * on ``endpoint`` (SLAM): ``slam.map`` -> the CONTINUOUS keyframe map (every
+      keyframe), driving the cyan SLAM line + amber kf dots + loop flash, and the
+      per-keyframe corrected positions used to deform VIO.
+    * on ``vio_endpoint`` (VIO): ``pose.odom`` -> the dense per-frame VIO trail
+      WITH its frame seqs (for the deform); ``pose.vo`` -> the pure-vision VO
+      trail; ``pose.refined`` -> the windowed-BA keyframe trail.
+
+    Drives the keyframe dots from the CONTINUOUS ``slam.map`` stream (every
+    keyframe), not from ``loop.correction`` (which the SLAM process emits ONLY
+    when a loop closes -- the old bug: no dots along the path until the first
+    loop). ``loop.correction`` is untouched; this is a parallel live-only overlay.
+
+    Combining the dense VIO trail with the keyframe seqs SLAM publishes lets it
+    compute the SLAM-corrected VIO line: the dense VIO trail rubber-sheeted
+    (piecewise-linearly in seq) so each keyframe anchor lands on its loop-
+    corrected SLAM position -- see :meth:`corrected_vio_snapshot`.
+
+    The viewer reads :meth:`slam_overlay_snapshot` (kf dots + loop flash),
+    :meth:`refined_path_snapshot` (the SLAM kf line), :meth:`vo_snapshot`,
+    :meth:`ba_snapshot`, and :meth:`corrected_vio_snapshot` (the deformed dense
+    line + teleport flags). All snapshots are cheap (lock + copy / vectorised
+    interp) so they can be polled at GUI rate (10-30 Hz). Mirrors the conversion
+    in :meth:`ours.ui.live_source.FlowPoseSource._poll_overlay`.
     """
 
-    def __init__(self, endpoint: str, *,
+    def __init__(self, endpoint: str, *, vio_endpoint: str,
                  connect_timeout_s: float = 30.0) -> None:
         super().__init__(name=f"slam-map-{endpoint}", daemon=True)
         self.endpoint = endpoint
+        self.vio_endpoint = vio_endpoint
         self._connect_timeout_s = float(connect_timeout_s)
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._client: IpcClientBus | None = None
+        self._vio_client: IpcClientBus | None = None
+        # SLAM keyframe overlay (corrected keyframe positions + flash state).
         self._kf_ned: np.ndarray = np.zeros((0, 3), np.float32)
+        self._match_ned: np.ndarray = np.zeros((0, 3), np.float32)
         self._n_loops = 0
+        self._flash_id = 0
+        # Corrected SLAM keyframes keyed by source frame seq (for the deform).
+        self._kf_seqs: np.ndarray = np.zeros(0, np.int64)
+        self._kf_corr_ned: np.ndarray = np.zeros((0, 3), np.float64)
+        # Dense VIO trail (parallel seq + NED-position arrays, bounded ring).
+        self._vio_seqs: np.ndarray = np.zeros(0, np.int64)
+        self._vio_ned: np.ndarray = np.zeros((0, 3), np.float64)
+        # Pure-vision VO trail + windowed-BA trail (NED, bounded rings). Plain
+        # position rings -- they are drawn as-is, with no seq-keyed deform.
+        self._vo_ned: np.ndarray = np.zeros((0, 3), np.float32)
+        self._ba_ned: np.ndarray = np.zeros((0, 3), np.float32)
 
     # ------------------------------------------------------------------ #
-    def _on_loop(self, wm: WireLoopCorrection | object) -> None:
-        if wm is END:
+    def clear(self) -> None:
+        """Wipe EVERY display buffer feeding the 4 tracker-driven lines.
+
+        Resets, under the lock, all internal buffers so vo_snapshot /
+        ba_snapshot / corrected_vio_snapshot / refined_path_snapshot /
+        slam_overlay_snapshot all return empty until new data arrives.
+
+        DISPLAY-ONLY: the vio/slam processes keep their full state, so the
+        lines rebuild from new incoming data -- the SLAM line/dots repopulate on
+        the next ``slam.map`` (which always carries the full current map), and
+        the VO / VIO-BA / SLAM-corrected trails restart from the next poses.
+        That immediate-rebuild behaviour is intended (paired with the live
+        PoseHistory.clear() for the green VIO trail).
+        """
+        with self._lock:
+            # SLAM keyframe overlay (cyan line, amber kf dots, loop flash).
+            self._kf_ned = np.zeros((0, 3), np.float32)
+            self._match_ned = np.zeros((0, 3), np.float32)
+            self._n_loops = 0
+            self._flash_id = 0
+            # Corrected-keyframe anchors used by the seq-keyed deform.
+            self._kf_seqs = np.zeros(0, np.int64)
+            self._kf_corr_ned = np.zeros((0, 3), np.float64)
+            # Dense VIO trail (seq + pos) used to build the corrected line.
+            self._vio_seqs = np.zeros(0, np.int64)
+            self._vio_ned = np.zeros((0, 3), np.float64)
+            # Pure-vision VO trail + windowed-BA trail.
+            self._vo_ned = np.zeros((0, 3), np.float32)
+            self._ba_ned = np.zeros((0, 3), np.float32)
+
+    # ------------------------------------------------------------------ #
+    def _on_slammap(self, wm: WireSlamMap | object) -> None:
+        # Guard the wire-level END (a `WireEnd` instance from IpcClientBus, not
+        # the local `END` sentinel) so the shutdown END isn't read as a map.
+        if wm is END or isinstance(wm, WireEnd):
             return
-        kf_poses = dict(wm.kf_poses)             # type: ignore[attr-defined]
-        if not kf_poses:
-            return
-        # `loop.correction` carries refined CAMERA-OPTICAL keyframe poses keyed
-        # by kf_id. Convert each to NED position for the viewer overlay.
-        ids = sorted(kf_poses)
-        pos_opt = np.asarray([kf_poses[i][:3, 3] for i in ids],
-                             dtype=np.float64)
-        kf_ned = (pos_opt @ _M_OPT_TO_NED.T).astype(np.float32)
+        # `slam.map` carries the current (corrected) CAMERA-OPTICAL keyframe
+        # positions every keyframe. Convert to NED for the viewer overlay.
+        kf_pos = np.asarray(wm.kf_positions, dtype=np.float64)  # type: ignore[attr-defined]
+        kf_ned64 = (kf_pos @ _M_OPT_TO_NED.T if len(kf_pos)
+                    else np.zeros((0, 3), np.float64))
+        kf_ned = kf_ned64.astype(np.float32)
+        # The REAL per-keyframe source seqs (carried in kf_ids) -- aligned with
+        # kf_positions -- so the deform can match each keyframe to a VIO pose.
+        kf_seqs = np.asarray(wm.kf_ids, dtype=np.int64).reshape(-1)  # type: ignore[attr-defined]
+        if len(kf_seqs) != len(kf_ned64):         # malformed -> drop the seqs
+            kf_seqs = np.zeros(0, np.int64)
+            kf_corr = np.zeros((0, 3), np.float64)
+        else:
+            kf_corr = kf_ned64
         with self._lock:
             self._kf_ned = kf_ned
-            self._n_loops = int(wm.n_loops)      # type: ignore[attr-defined]
+            self._kf_seqs = kf_seqs
+            self._kf_corr_ned = kf_corr
+            if int(wm.n_loops) > self._n_loops:   # type: ignore[attr-defined]
+                # A NEW loop just closed -> bump the flash id and latch the
+                # just-revisited keyframes so the viewer can blink them.
+                self._n_loops = int(wm.n_loops)   # type: ignore[attr-defined]
+                self._flash_id += 1
+                match = wm.last_match              # type: ignore[attr-defined]
+                self._match_ned = (
+                    (np.asarray(match, dtype=np.float64) @ _M_OPT_TO_NED.T)
+                    .astype(np.float32)
+                    if match is not None and len(match)
+                    else np.zeros((0, 3), np.float32))
+
+    def _on_pose(self, wm: WirePoseMsg | object) -> None:
+        # Record the dense VIO trail (seq + NED position) for the corrected line.
+        # Guard the wire-level END exactly like IpcPoseSource._on_pose does.
+        if wm is END or isinstance(wm, WireEnd):
+            return
+        pos_ned = _M_OPT_TO_NED @ wm.T_world_cam[:3, 3]   # type: ignore[attr-defined]
+        seq = int(wm.seq)                                 # type: ignore[attr-defined]
+        with self._lock:
+            self._vio_seqs = np.append(self._vio_seqs, seq)
+            self._vio_ned = np.vstack((self._vio_ned, pos_ned[None, :]))
+            # Bound the ring: drop the oldest samples once over the cap.
+            if len(self._vio_seqs) > _VIO_BUF_CAP:
+                self._vio_seqs = self._vio_seqs[-_VIO_BUF_CAP:]
+                self._vio_ned = self._vio_ned[-_VIO_BUF_CAP:]
+
+    def _on_vo(self, wm: WirePoseMsg | object) -> None:
+        # Pure-vision ``pose.vo`` trail: convert optical->NED, append to the ring.
+        # No seq needed (the VO line is drawn as-is, never deformed).
+        if wm is END or isinstance(wm, WireEnd):
+            return
+        pos_ned = (_M_OPT_TO_NED @ wm.T_world_cam[:3, 3]).astype(np.float32)  # type: ignore[attr-defined]
+        with self._lock:
+            self._vo_ned = np.vstack((self._vo_ned, pos_ned[None, :]))
+            if len(self._vo_ned) > _VIO_BUF_CAP:
+                self._vo_ned = self._vo_ned[-_VIO_BUF_CAP:]
+
+    def _on_refined(self, wm: WirePoseMsg | object) -> None:
+        # Windowed-BA ``pose.refined`` keyframe trail: optical->NED, append.
+        if wm is END or isinstance(wm, WireEnd):
+            return
+        pos_ned = (_M_OPT_TO_NED @ wm.T_world_cam[:3, 3]).astype(np.float32)  # type: ignore[attr-defined]
+        with self._lock:
+            self._ba_ned = np.vstack((self._ba_ned, pos_ned[None, :]))
+            if len(self._ba_ned) > _VIO_BUF_CAP:
+                self._ba_ned = self._ba_ned[-_VIO_BUF_CAP:]
 
     # ------------------------------------------------------------------ #
+    def vo_snapshot(self) -> np.ndarray:
+        """The pure-vision VO trail (NED, (N, 3) float32)."""
+        with self._lock:
+            return self._vo_ned.copy()
+
+    def ba_snapshot(self) -> np.ndarray:
+        """The windowed-BA (``pose.refined``) trail (NED, (N, 3) float32)."""
+        with self._lock:
+            return self._ba_ned.copy()
+
     def refined_path_snapshot(self) -> np.ndarray:
         with self._lock:
             return self._kf_ned.copy()
 
     def slam_overlay_snapshot(self):
+        # 4-tuple Viewer3D._refresh_overlay expects:
+        # (kf_ned, match_ned, loop_segs, flash_id). loop_segs is unused (no
+        # polyline segments in proc4) -> always empty.
         with self._lock:
-            return (self._kf_ned.copy(),
-                    np.zeros((0, 3), np.float32),
-                    [], self._n_loops)
+            return (self._kf_ned.copy(), self._match_ned.copy(),
+                    [], self._flash_id)
+
+    def corrected_vio_snapshot(self) -> tuple[np.ndarray, np.ndarray]:
+        """The dense VIO trail DEFORMED by SLAM's loop corrections (NED).
+
+        Rubber-sheet: for every keyframe whose source seq is still in the dense
+        VIO ring, the correction delta is ``kf_corrected - vio_pos_at(kf_seq)``.
+        Each dense pose's delta is then interpolated PIECEWISE-LINEARLY by seq
+        between its two bracketing keyframes (flat-clamped before the first /
+        after the last keyframe), and added to the raw VIO position. With no
+        usable keyframe the raw VIO trail is returned unchanged (delta = 0).
+
+        ``np.interp`` per axis gives exactly that behaviour: it is linear between
+        the (sorted, seq-keyed) keyframe deltas and constant outside their range.
+
+        Returns ``(positions (M, 3) float32, teleport (M,) bool)``. A vertex is
+        flagged ``teleport`` where the interpolated correction-delta magnitude
+        exceeds :data:`TELEPORT_M` -- i.e. where SLAM pulled the path far (a loop
+        closure snap), so the viewer can recolour that segment. With no usable
+        correction the flags are all ``False`` (delta = 0 everywhere).
+        """
+        # Snapshot under the lock, then compute lock-free (the GUI poll thread
+        # must not block the IPC recv threads on the interp work).
+        with self._lock:
+            vio_seqs = self._vio_seqs.copy()
+            vio_ned = self._vio_ned.copy()
+            kf_seqs = self._kf_seqs.copy()
+            kf_corr = self._kf_corr_ned.copy()
+
+        if len(vio_seqs) == 0:
+            return (np.zeros((0, 3), np.float32), np.zeros(0, bool))
+        no_corr = (vio_ned.astype(np.float32),
+                   np.zeros(len(vio_ned), bool))    # raw VIO, nothing flagged
+        if len(kf_seqs) == 0:
+            return no_corr                           # no corrections yet
+
+        # Map seq -> dense VIO position so we can look up each keyframe's anchor.
+        # (np.searchsorted on the sorted VIO seqs; VIO seqs are monotonic in
+        # arrival, but sort defensively to be robust to any out-of-order push.)
+        order = np.argsort(vio_seqs, kind="stable")
+        vs = vio_seqs[order]
+        vp = vio_ned[order]
+        # Keep only keyframes whose seq actually exists in the VIO ring (others
+        # rolled off the bounded buffer and have no anchor to deform around).
+        pos = np.searchsorted(vs, kf_seqs)
+        in_range = pos < len(vs)
+        hit = np.zeros(len(kf_seqs), dtype=bool)
+        hit[in_range] = vs[pos[in_range]] == kf_seqs[in_range]
+        if not hit.any():
+            return no_corr                           # no anchor in range
+
+        kf_seq_hit = kf_seqs[hit]
+        delta = kf_corr[hit] - vp[pos[hit]]       # (Kh, 3) correction per keyframe
+
+        # Sort the keyframe anchors by seq for np.interp (requires increasing x).
+        ks_order = np.argsort(kf_seq_hit, kind="stable")
+        ks = kf_seq_hit[ks_order].astype(np.float64)
+        kd = delta[ks_order]
+        dense_seq = vio_seqs.astype(np.float64)
+        # Build the per-vertex correction delta (the SAME values we add to the
+        # raw VIO), keep it so the teleport flag is its magnitude -- no second
+        # interp pass.
+        corr_delta = np.empty_like(vio_ned)
+        for axis in range(3):
+            # np.interp: linear between anchors, flat-clamped at the ends -- the
+            # exact piecewise-linear-with-flat-ends deform the spec describes.
+            corr_delta[:, axis] = np.interp(dense_seq, ks, kd[:, axis])
+        corrected = vio_ned + corr_delta
+        # Teleport = a large per-vertex correction magnitude (loop-closure snap).
+        teleport = np.linalg.norm(corr_delta, axis=1) > TELEPORT_M
+        return (corrected.astype(np.float32), teleport)
 
     # ------------------------------------------------------------------ #
     def run(self) -> None:
         client = IpcClientBus(self.endpoint,
                               connect_timeout_s=self._connect_timeout_s)
-        client.subscribe("loop.correction", self._on_loop)
+        client.subscribe(topics.SLAM_MAP, self._on_slammap)
+        # SECOND client: VIO's pose.odom feeds the dense trail for the deform;
+        # pose.vo + pose.refined feed the VO + VIO-BA trajectory lines.
+        vio_client = IpcClientBus(self.vio_endpoint,
+                                  connect_timeout_s=self._connect_timeout_s)
+        vio_client.subscribe(topics.POSE_ODOM, self._on_pose)
+        vio_client.subscribe(topics.POSE_VO, self._on_vo)
+        vio_client.subscribe(topics.POSE_REFINED, self._on_refined)
         try:
             client.start()
+            vio_client.start()
         except (TimeoutError, ConnectionError) as e:
-            LOG.error("slam-map-tracker: connect to %s failed: %s",
-                      self.endpoint, e)
-            return
-        self._client = client
-        try:
-            self._stop.wait()
-        finally:
+            LOG.error("slam-map-tracker: connect failed: %s", e)
             try:
                 client.stop()
             except Exception:                                      # noqa: BLE001
                 pass
+            try:
+                vio_client.stop()
+            except Exception:                                      # noqa: BLE001
+                pass
+            return
+        self._client = client
+        self._vio_client = vio_client
+        try:
+            self._stop.wait()
+        finally:
+            for c in (client, vio_client):
+                try:
+                    c.stop()
+                except Exception:                                  # noqa: BLE001
+                    pass
             self._client = None
+            self._vio_client = None
 
     def stop(self) -> None:
         self._stop.set()
@@ -269,20 +536,28 @@ def _await_calib_bundle(endpoint: str, timeout_s: float) -> WireCalibBundle:
 # --------------------------------------------------------------------------- #
 def run_ui(*, vio_endpoint: str = DEFAULT_VIO_ENDPOINT,
            slam_endpoint: str = DEFAULT_SLAM_ENDPOINT,
+           capture_endpoint: str = DEFAULT_CAPTURE_ENDPOINT,
            calib_timeout_s: float = 60.0,
-           default_view: str = "ISO") -> int:
-    """Open the 2-tab Qt UI and block on the Qt event loop."""
+           default_view: str = "TOP") -> int:
+    """Open the single-view Qt UI (5 trajectories) and block on the Qt event loop."""
     # Import Qt lazily so a headless smoke / CI run that doesn't need the GUI
     # can import this module without pulling PyQt6.
-    from PyQt6.QtCore import QSocketNotifier
+    from PyQt6.QtCore import Qt, QSocketNotifier
+    from PyQt6.QtGui import QAction
     from PyQt6.QtWidgets import (
-        QApplication, QHBoxLayout, QLabel, QMainWindow, QTabWidget, QVBoxLayout,
-        QWidget,
+        QApplication, QHBoxLayout, QMainWindow, QPushButton,
+        QToolBar, QVBoxLayout, QWidget,
     )
 
     from ours.ui import theme
-    from ours.ui.viewer3d import Viewer3D
+    from ours.ui.viewer3d import Viewer3D, VIEW_PRESETS
     from ours.ui.panels import TelemetryPanel
+    from ours.ui.synced_window import SyncedViewWindow
+    from ours.ui.keypoints_window import KeypointTrackWindow
+    from ours.ui.calib_dialogs import GyroCalibDialog, AccelCalibDialog
+    from ours.proc.ui_ipc_sources import (
+        IpcImuRawSource, ipc_triplet_factory, ipc_keypoint_factory,
+    )
 
     # 1. Wait for VIO + SLAM to be ready (and learn the capture resolution).
     LOG.info("ui: waiting for calib.bundle on %s ...", vio_endpoint)
@@ -296,70 +571,208 @@ def run_ui(*, vio_endpoint: str = DEFAULT_VIO_ENDPOINT,
     app = QApplication(sys.argv if sys.argv else ["ours-ui"])
     app.setStyleSheet(theme.QSS)
 
-    # 3. Build the two tabs. Each owns its own PoseHistory + Viewer3D +
-    #    IpcPoseSource. The VIO tab additionally polls its refined trajectory
-    #    line (a future enhancement -- not wired yet, see Phase 8 limitations
-    #    in docs/PROC4_ARCHITECTURE.md). The SLAM tab polls the loop-corrected
-    #    keyframe positions from SLAM's loop.correction stream.
-    def _build_tab(name: str, history: PoseHistory, viewer: Viewer3D,
-                   source: PoseSource,
-                   slam_tracker: SlamMapTracker | None) -> QWidget:
-        w = QWidget()
-        root = QVBoxLayout(w)
-        root.setContentsMargins(6, 6, 6, 6)
-        root.setSpacing(6)
-        # Header label so the operator can tell at a glance which tab is which
-        # (the QTabWidget tab text already says it, but a sub-header keeps the
-        # contract with the 1-window MainWindow look).
-        hdr = QLabel(f"{name} · live marker = pose.odom · "
-                     f"map = {'loop-corrected keyframes' if slam_tracker is not None else 'odom only'}")
-        hdr.setObjectName("HeaderSub")
-        root.addWidget(hdr)
-        body = QWidget()
-        bh = QHBoxLayout(body)
-        bh.setContentsMargins(0, 0, 0, 0)
-        bh.setSpacing(6)
-        bh.addWidget(viewer, 1)
-        panel = TelemetryPanel(history, source_fps_getter=lambda: source.fps)
-        bh.addWidget(panel, 0)
-        root.addWidget(body, 1)
-        if slam_tracker is not None:
-            viewer.set_overlay_source(slam_tracker.slam_overlay_snapshot)
-            viewer.set_refined_path_source(slam_tracker.refined_path_snapshot)
-        return w
+    # 3. Build the SINGLE view: one Viewer3D + one TelemetryPanel + one live
+    #    PoseHistory. The live marker = pose.odom (VIO); all 5 trajectory lines
+    #    render in this one viewer, each fed by a snapshot getter on the single
+    #    SlamMapTracker (which subscribes odom/vo/refined on the vio endpoint and
+    #    slam.map on the slam endpoint).
+    history = PoseHistory(capacity=200_000)
+    viewer = Viewer3D(history, default_view=default_view)
 
-    vio_history = PoseHistory(capacity=200_000)
-    slam_history = PoseHistory(capacity=200_000)
-
-    vio_viewer = Viewer3D(vio_history, default_view=default_view)
-    slam_viewer = Viewer3D(slam_history, default_view=default_view)
-
+    # The VIO marker source feeds the live PoseHistory (green trail + marker).
     vio_source = IpcPoseSource(vio_endpoint, label="vio",
                                connect_timeout_s=calib_timeout_s)
-    slam_pose_source = IpcPoseSource(vio_endpoint, label="slam-pose",
-                                     connect_timeout_s=calib_timeout_s)
-    slam_tracker = SlamMapTracker(slam_endpoint,
-                                  connect_timeout_s=calib_timeout_s)
-    slam_tracker.start()
+    # The single tracker owns the other 4 lines' data (VO / VIO-BA / corrected /
+    # SLAM) across its two IPC clients.
+    tracker = SlamMapTracker(slam_endpoint, vio_endpoint=vio_endpoint,
+                             connect_timeout_s=calib_timeout_s)
+    tracker.start()
 
-    # 4. Push poses from the sources -> PoseHistory. The viewer redraws on a
-    #    QTimer (~30 Hz) inside Viewer3D and reads from PoseHistory under a
+    # Wire each viewer line to its tracker snapshot getter (green VIO line + the
+    # live marker come from `history`, fed by vio_source.start below).
+    viewer.set_vo_path_source(tracker.vo_snapshot)               # 1. VO (grey)
+    viewer.set_ba_path_source(tracker.ba_snapshot)               # 3. VIO-BA (blue)
+    viewer.set_corrected_path_source(tracker.corrected_vio_snapshot)  # 4. orange
+    viewer.set_refined_path_source(tracker.refined_path_snapshot)     # 5. cyan
+    viewer.set_overlay_source(tracker.slam_overlay_snapshot)          # 5. kf dots
+
+    # 4. Push poses from the marker source -> PoseHistory. The viewer redraws on
+    #    a QTimer (~60 Hz) inside Viewer3D and reads from PoseHistory under a
     #    lock, so it's safe to append from the IPC recv thread directly.
-    vio_source.start(vio_history.push)
-    slam_pose_source.start(slam_history.push)
+    vio_source.start(history.push)
 
-    tabs = QTabWidget()
-    tabs.addTab(_build_tab("VIO", vio_history, vio_viewer, vio_source, None),
-                "VIO")
-    tabs.addTab(_build_tab("SLAM", slam_history, slam_viewer,
-                           slam_pose_source, slam_tracker),
-                "SLAM")
+    # 5. Compose the central widget: a top Controls row (toggles + Clear/Restart)
+    #    handled by the toolbar below, then the viewer beside its telemetry panel.
+    central = QWidget()
+    root = QVBoxLayout(central)
+    root.setContentsMargins(6, 6, 6, 6)
+    root.setSpacing(6)
+    body = QWidget()
+    bh = QHBoxLayout(body)
+    bh.setContentsMargins(0, 0, 0, 0)
+    bh.setSpacing(6)
+    bh.addWidget(viewer, 1)
+    panel = TelemetryPanel(history, source_fps_getter=lambda: vio_source.fps)
+    bh.addWidget(panel, 0)
+    root.addWidget(body, 1)
 
     win = QMainWindow()
-    win.setWindowTitle("OAK-D · 4-proc · VIO | SLAM")
+    win.setWindowTitle("OAK-D · 4-proc · 5-trajectory view")
     win.resize(1400, 860)
     win.setStyleSheet(theme.QSS)
-    win.setCentralWidget(tabs)
+    win.setCentralWidget(central)
+
+    # 6. Menu bar (View / Visualize / Calibration). Mirrors the single-process
+    #    ours.ui.mainwindow menus, but device-agnostic: every action drives the
+    #    UNCHANGED windows + dialogs over IPC (capture owns the device, the UI
+    #    only consumes topics). No _release_device dance -- there is nothing to
+    #    release here. There is now ONE viewer/history, so the View + Clear Trail
+    #    actions target it directly.
+    W, H = int(vio_bundle.width), int(vio_bundle.height)
+    dev_id = vio_bundle.device_id or "default"
+
+    # 6a. Always-visible Controls toolbar (top of the window). It holds the 5
+    #     per-line toggle buttons, then "Clear Trail" (per-run trajectory reset)
+    #     and "Restart". Restart is needed because the IPC bus is one-way
+    #     (server->client): the UI cannot reset vio/slam in place, so it asks the
+    #     launcher to respawn the whole pipeline by quitting with
+    #     RESTART_EXIT_CODE (the launcher loops on it).
+    restart_requested = [False]
+
+    def _do_restart() -> None:
+        restart_requested[0] = True
+        app.quit()                              # launcher sees RESTART_EXIT_CODE
+
+    tb = QToolBar("Controls")
+    tb.setMovable(False)
+    tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+    win.addToolBar(tb)                          # docks at the top by default
+
+    # 5 per-line toggles (checkable, all start CHECKED = visible). Labels are
+    # EXACTLY as spec'd; each drives its viewer visibility setter via the
+    # toggled(bool) signal. Order = the drift/back-to-front order of the lines.
+    # (label, viewer visibility setter)
+    for _label, _setter in (("VO", viewer.set_vo_visible),
+                            ("VIO", viewer.set_vio_visible),
+                            ("VIO-BA", viewer.set_ba_visible),
+                            ("SLAM-corrected VIO", viewer.set_corrected_visible),
+                            ("SLAM", viewer.set_slam_visible)):
+        _btn = QPushButton(_label)
+        _btn.setCheckable(True)
+        _btn.setChecked(True)
+        _btn.toggled.connect(_setter)
+        tb.addWidget(_btn)
+    tb.addSeparator()
+
+    # "Clear Trail" wipes the DISPLAY of ALL 5 lines: the live PoseHistory (the
+    # green VIO trail + marker) AND every tracker buffer (VO / VIO-BA /
+    # SLAM-corrected / SLAM line + kf dots). This is a display wipe only -- the
+    # vio/slam processes keep their state, so the lines rebuild from the next
+    # incoming data (see SlamMapTracker.clear / PoseHistory.clear).
+    def _clear_trail() -> None:
+        history.clear()
+        tracker.clear()
+
+    clear_trail_act = QAction("Clear Trail", win)
+    clear_trail_act.triggered.connect(lambda _c=False: _clear_trail())
+    tb.addAction(clear_trail_act)
+    restart_act = QAction("Restart", win)
+    restart_act.triggered.connect(lambda _c=False: _do_restart())
+    tb.addAction(restart_act)
+
+    mbar = win.menuBar()
+    # Render the menu bar INSIDE the window on every platform (Linux/Windows do
+    # this anyway; macOS would otherwise hoist it into the global top-of-screen
+    # bar). Forcing in-window keeps the UI identical across platforms -- the same
+    # cross-platform goal as the rest of the proc4 stack. The menu itself is
+    # plain Qt (QMenuBar/QAction), so it already runs on Linux; this only fixes
+    # WHERE it draws.
+    mbar.setNativeMenuBar(False)
+
+    # View: preset cameras + follow, on the single viewer. ("Clear Trail" moved
+    # to the always-visible Controls toolbar above.)
+    view_menu = mbar.addMenu("View")
+    for name in VIEW_PRESETS:
+        act = QAction(name.title(), win)
+        # Capture `name` (the loop var) per-iteration, else every action would
+        # bind the last value; `_c` swallows QAction.triggered's bool arg.
+        act.triggered.connect(lambda _c=False, n=name: viewer.set_view(n))
+        view_menu.addAction(act)
+    view_menu.addSeparator()
+    follow_act = QAction("Follow Camera", win)
+    follow_act.setCheckable(True)
+    follow_act.toggled.connect(lambda on: viewer.set_follow(on))
+    view_menu.addAction(follow_act)
+    # (No "Clear Keyframes": proc4's SLAM source has no clear_slam_map and there
+    #  is no UI->SLAM channel, so it would be a dead action.)
+
+    # Visualize: the EXISTING windows, fed by the Part-1 IPC adapters. Cache one
+    # instance per kind on `win` so repeated opens reuse it (and its single IPC
+    # worker) instead of stacking subscribers. `fps` is just the UI redraw
+    # cadence -- the data itself is event-driven over IPC.
+    vis_menu = mbar.addMenu("Visualize")
+
+    def _open_triplet() -> None:
+        if getattr(win, "_triplet_win", None) is None:
+            win._triplet_win = SyncedViewWindow(
+                ipc_triplet_factory(capture_endpoint, W, H),
+                fps=20, parent=win)
+        win._triplet_win.show()
+        win._triplet_win.raise_()
+        win._triplet_win.activateWindow()
+        win._triplet_win.ensure_started()   # retry on every open
+        win.statusBar().showMessage("Camera + Depth + IMU triplet opened.", 2500)
+
+    triplet_act = QAction("Camera + Depth + IMU (triplet)…", win)
+    triplet_act.triggered.connect(_open_triplet)
+    vis_menu.addAction(triplet_act)
+
+    def _open_keypoints() -> None:
+        if getattr(win, "_keypoints_win", None) is None:
+            win._keypoints_win = KeypointTrackWindow(
+                ipc_keypoint_factory(capture_endpoint, vio_endpoint, W, H),
+                fps=20, parent=win)
+        win._keypoints_win.show()
+        win._keypoints_win.raise_()
+        win._keypoints_win.activateWindow()
+        win._keypoints_win.ensure_started()
+        win.statusBar().showMessage("Keypoint depth tracker opened.", 2500)
+
+    keypoints_act = QAction("Keypoint Depth Tracker…", win)
+    keypoints_act.triggered.connect(_open_keypoints)
+    vis_menu.addAction(keypoints_act)
+
+    # Calibration: each wizard gets a FRESH IPC IMU source (capture's raw imu.raw)
+    # and a modal dialog. We inject `stream=src`, which sets the dialog's
+    # `_owns_stream=False` -- so the dialog will NOT stop the stream and WE must,
+    # in `finally`. The SAME resolved `dev_id` goes to both source and dialog so
+    # the saved calib keys match what capture loads on its next start.
+    cal_menu = mbar.addMenu("Calibration")
+
+    def _open_gyro_calib() -> None:
+        src = IpcImuRawSource(capture_endpoint, device_id=dev_id,
+                              connect_timeout_s=calib_timeout_s)
+        try:
+            GyroCalibDialog(win, device_id=dev_id, stream=src).exec()
+        finally:
+            src.stop()
+
+    gyro_act = QAction("Gyroscope Bias…", win)
+    gyro_act.triggered.connect(_open_gyro_calib)
+    cal_menu.addAction(gyro_act)
+
+    def _open_accel_calib() -> None:
+        src = IpcImuRawSource(capture_endpoint, device_id=dev_id,
+                              connect_timeout_s=calib_timeout_s)
+        try:
+            AccelCalibDialog(win, device_id=dev_id, stream=src).exec()
+        finally:
+            src.stop()
+
+    accel_act = QAction("Accelerometer (6-position)…", win)
+    accel_act.triggered.connect(_open_accel_calib)
+    cal_menu.addAction(accel_act)
+
     win.show()
 
     # SIGTERM from the launcher must exit the Qt loop within the launcher's
@@ -420,8 +833,17 @@ def run_ui(*, vio_endpoint: str = DEFAULT_VIO_ENDPOINT,
         # Stop the IPC sources FIRST -- their recv threads otherwise keep the
         # process alive after `app.exec()` returns.
         vio_source.stop()
-        slam_pose_source.stop()
-        slam_tracker.stop()
+        tracker.stop()
+        # Close any Visualize child windows so their IPC workers stop cleanly
+        # (closeEvent stops the worker). The calib dialogs are modal + scoped to
+        # their handler's `finally`, so there's nothing to clean up for them here.
+        for _attr in ("_triplet_win", "_keypoints_win"):
+            _w = getattr(win, _attr, None)
+            if _w is not None:
+                try:
+                    _w.close()
+                except Exception:                                  # noqa: BLE001
+                    pass
         # Tear down the signal plumbing in reverse order so no signal racing
         # in during teardown writes to a closed socket. `set_wakeup_fd(-1)`
         # (or the previous fd) disables wakeups before we close ours.
@@ -432,6 +854,12 @@ def run_ui(*, vio_endpoint: str = DEFAULT_VIO_ENDPOINT,
         notifier.setEnabled(False)
         wakeup_rd.close()
         wakeup_wr.close()
+    # The Restart toolbar button flips `restart_requested` then calls app.quit();
+    # surface that to the launcher as RESTART_EXIT_CODE so it respawns the whole
+    # pipeline. Any normal close (window X, SIGTERM, Ctrl-C) returns the Qt rc.
+    if restart_requested[0]:
+        LOG.info("ui: restart requested -> exit %d", RESTART_EXIT_CODE)
+        return RESTART_EXIT_CODE
     LOG.info("ui: bye (rc=%d)", int(rc))
     return int(rc)
 
@@ -443,15 +871,18 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--vio-endpoint", default=DEFAULT_VIO_ENDPOINT)
     ap.add_argument("--slam-endpoint", default=DEFAULT_SLAM_ENDPOINT)
+    ap.add_argument("--capture-endpoint", default=DEFAULT_CAPTURE_ENDPOINT,
+                    help="capture endpoint for the Visualize/Calibration menus")
     ap.add_argument("--calib-timeout", type=float, default=60.0,
                     help="seconds to wait for each retained calib.bundle")
-    ap.add_argument("--default-view", default="ISO",
+    ap.add_argument("--default-view", default="TOP",
                     choices=("ISO", "TOP", "FRONT", "SIDE"),
-                    help="initial 3D viewer preset")
+                    help="initial 3D viewer preset (default: top-down)")
     args = ap.parse_args()
     return run_ui(
         vio_endpoint=args.vio_endpoint,
         slam_endpoint=args.slam_endpoint,
+        capture_endpoint=args.capture_endpoint,
         calib_timeout_s=args.calib_timeout,
         default_view=args.default_view,
     )

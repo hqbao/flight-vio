@@ -3,8 +3,9 @@
 Subscribes (over IPC) to the ``capture`` endpoint for ``calib.bundle``,
 ``imucam.sample`` and ``frame.depth``; runs the same ``OdometryFlow`` +
 ``BackendFlow`` the in-process ``ours.app.build_graph`` builds; then mirrors
-``pose.odom``, ``keyframe``, ``frame.tracks``, ``frame.inliers`` and
-``pose.refined`` onto its own IpcBus endpoint ``"oak.vio"`` for SLAM / UI / tools.
+``pose.odom``, ``pose.vo`` (pure-vision f2f line), ``keyframe``,
+``frame.tracks``, ``frame.inliers`` and ``pose.refined`` onto its own IpcBus
+endpoint ``"oak.vio"`` for SLAM / UI / tools.
 
 Calibration handshake
 ---------------------
@@ -53,6 +54,7 @@ from ours.flows.bridge.ring_registry import (                      # noqa: E402
 )
 from ours.flows.backend import BackendFlow                         # noqa: E402
 from ours.flows.odometry import OdometryFlow                       # noqa: E402
+from ours.lib.odometry.odometry import OdometryConfig              # noqa: E402
 
 LOG = logging.getLogger("ours.proc.vio")
 
@@ -62,9 +64,12 @@ DEFAULT_VIO_ENDPOINT = "oak.vio"
 #: Topics VIO subscribes to from capture.
 _INPUT_TOPICS = [topics.IMUCAM_SAMPLE, topics.FRAME_DEPTH]
 
-#: Topics VIO republishes (downstream is SLAM + UI).
+#: Topics VIO republishes (downstream is SLAM + UI). POSE_VO is the pure-vision
+#: frame-to-frame trajectory (live "VO" line) -- pure POD pose, no ring, like
+#: POSE_ODOM / POSE_REFINED.
 _OUTPUT_TOPICS = [
     topics.POSE_ODOM,
+    topics.POSE_VO,
     topics.KEYFRAME,
     topics.POSE_REFINED,
     topics.FRAME_TRACKS,
@@ -126,11 +131,19 @@ def run_vio(*,
 
     # 4. Build the local bus + the odometry / backend graph using the bundle.
     local = Bus()
+    # proc4's launcher is the interactive LIVE viewer (capture runs --live), so
+    # VIO must self-level (level_tilt) and gyro-fuse rotation exactly like
+    # ours.app.build_graph does for the in-process live graph -- otherwise the
+    # body frame renders tilted and heading under-rotates on fast turns. The
+    # byte-identical-pose constraint only applies to the offline deterministic
+    # scoring harness (ours.tools.vio_run / run_replay), a separate entry point.
     odom = OdometryFlow(local, bundle.K,
                         R_imu_cam=bundle.R_imu_cam,
                         accel_align=bundle.accel_align,
+                        odom_cfg=OdometryConfig(gyro_fuse=use_gyro),
                         kf_every=kf_every, use_gyro=use_gyro,
-                        latest_only=False, level_tilt=False)
+                        latest_only=False, level_tilt=True,
+                        publish_vo=True)   # live viewer's pure-vision "VO" line
     backend = BackendFlow(local, bundle.K,
                           window=backend_window, iters=backend_iters,
                           latest_only=False, worker=worker)
@@ -138,8 +151,9 @@ def run_vio(*,
     # 5. Open the OUTPUT IpcServerBus + publisher bridge. KEYFRAME is the only
     #    VIO output that needs shared memory (image + depth payload), so it gets
     #    a dedicated publisher backed by VIO's own kf_* rings. Everything else
-    #    VIO republishes (POSE_ODOM, POSE_REFINED, FRAME_TRACKS, FRAME_INLIERS)
-    #    is pure POD (poses + per-frame ids / pixels) -- no ring slots needed,
+    #    VIO republishes (POSE_ODOM, POSE_VO, POSE_REFINED, FRAME_TRACKS,
+    #    FRAME_INLIERS) is pure POD (poses + per-frame ids / pixels) -- no ring
+    #    slots needed,
     #    so the second publisher's ring registry is effectively unused. The
     #    image + depth the keypoint visualiser pairs with FRAME_TRACKS arrive on
     #    capture's FRAME_DEPTH (capture is the SINGLE writer of those rings; VIO
@@ -151,7 +165,8 @@ def run_vio(*,
     pub_kf = IpcPublisherFlow(local, server, vio_rings, [topics.KEYFRAME],
                               endpoint=endpoint, ring_endpoint=endpoint)
     pub_pose = IpcPublisherFlow(local, server, vio_rings,
-                                [topics.POSE_ODOM, topics.POSE_REFINED,
+                                [topics.POSE_ODOM, topics.POSE_VO,
+                                 topics.POSE_REFINED,
                                  topics.FRAME_TRACKS, topics.FRAME_INLIERS],
                                 endpoint=endpoint,
                                 ring_endpoint=endpoint)

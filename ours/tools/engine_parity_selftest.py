@@ -147,12 +147,16 @@ def check_ba(session: str, kf_every: int, max_frames: int, tol: float) -> bool:
 
 
 def _ov_kf(ov):
-    """Keyframe-position array of a SLAM overlay snapshot (kf_pos, n_loops, ...)."""
-    return ov[0] if ov is not None else np.zeros((0, 3))
+    """Keyframe-position array of a SLAM overlay snapshot.
+
+    The overlay tuple is ``(kf_seq, kf_pos, n_loops, match_pos)`` -- kf_pos is
+    element 1.
+    """
+    return ov[1] if ov is not None else np.zeros((0, 3))
 
 
 def _ov_nloops(ov):
-    return int(ov[1]) if ov is not None else 0
+    return int(ov[2]) if ov is not None else 0
 
 
 def check_slam(session: str, kf_every: int, max_frames: int, tol: float) -> bool:

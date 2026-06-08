@@ -1,9 +1,17 @@
 """3D scene built with pyqtgraph's OpenGL viewport.
 
-Renders, in ENU display coordinates (positions converted from internal NED):
+Renders, in ENU display coordinates (positions converted from internal NED),
+the FIVE trajectory streams of the proc4 single-view UI plus the live marker:
   * ground grid + axis triad at world origin
   * live drone position as a triad (forward=red, right=green, down=cyan reversed to up)
-  * trajectory polyline (NVG green)
+  * VO polyline (dim grey): the pure-vision ``pose.vo`` trail (drifts most)
+  * VIO trajectory polyline (NVG green): the live VIO ``pose.odom`` trail + marker
+  * VIO-BA polyline (violet-blue): the windowed-BA ``pose.refined`` keyframe path
+  * SLAM-corrected-VIO polyline (warm orange, with teleport vertices flashed in
+    red): the dense VIO trail rubber-sheeted by SLAM's loop corrections
+  * SLAM keyframe polyline (HUD cyan) + amber keyframe dots: the SLAM map
+Each line has a visibility setter so the single-view's 5 toggle buttons can
+show/hide it independently.
 """
 from __future__ import annotations
 
@@ -137,6 +145,22 @@ class Viewer3D(gl.GLViewWidget):
         for ax in _make_world_axes(length=1.5):
             self.addItem(ax)
 
+        # ---- VO polyline (optional) --------------------------------------
+        # The PURE-VISION ``pose.vo`` trail (dim desaturated grey), drawn FIRST so
+        # it sits BEHIND every brighter line — it is the rawest, most-drifting
+        # stream, so it reads as the noisy baseline. Populated only when the
+        # source exposes a VO snapshot (set via ``set_vo_path_source``); a
+        # harmless empty line otherwise.
+        self._vo_getter: Callable[[], np.ndarray] | None = None
+        self._vo = gl.GLLinePlotItem(
+            pos=np.zeros((1, 3), dtype=np.float32),
+            color=_qcolor(theme.VO_PATH, 0.80),
+            width=2.0,
+            antialias=True,
+            mode="line_strip",
+        )
+        self.addItem(self._vo)
+
         # ---- trajectory polyline -----------------------------------------
         self._traj = gl.GLLinePlotItem(
             pos=np.zeros((1, 3), dtype=np.float32),
@@ -146,6 +170,22 @@ class Viewer3D(gl.GLViewWidget):
             mode="line_strip",
         )
         self.addItem(self._traj)
+
+        # ---- VIO-BA polyline (optional) ----------------------------------
+        # The windowed-BA ``pose.refined`` keyframe trail (violet-blue): the
+        # sparse BA-optimised poses VIO emits per keyframe, distinct from the
+        # dense green f2f trail. Populated only when the source exposes a BA
+        # snapshot (set via ``set_ba_path_source``); a harmless empty line
+        # otherwise.
+        self._ba_getter: Callable[[], np.ndarray] | None = None
+        self._ba = gl.GLLinePlotItem(
+            pos=np.zeros((1, 3), dtype=np.float32),
+            color=_qcolor(theme.BA_PATH, 0.85),
+            width=2.0,
+            antialias=True,
+            mode="line_strip",
+        )
+        self.addItem(self._ba)
 
         # ---- refined-map polyline (optional) -----------------------------
         # The BA/SLAM-refined keyframe trajectory, drawn in HUD cyan BEHIND the
@@ -163,6 +203,27 @@ class Viewer3D(gl.GLViewWidget):
             mode="line_strip",
         )
         self.addItem(self._refined)
+
+        # ---- SLAM-corrected-VIO polyline (optional) ----------------------
+        # The DENSE VIO trail rubber-sheeted by SLAM's loop corrections (warm
+        # orange), drawn BEHIND the marker like the refined line. Populated only
+        # when the source exposes the corrected snapshot (set via
+        # ``set_corrected_path_source``); a harmless empty line otherwise. This
+        # is the per-frame VIO path DEFORMED so its keyframe anchors land on the
+        # loop-corrected SLAM keyframe positions -- not the sparse keyframe line.
+        # The getter returns ``(positions, teleport_flags)``; vertices SLAM
+        # pulled far (|delta| > TELEPORT_M) are recoloured red per-vertex,
+        # MIRRORING the green ``_traj`` teleport recolour (see ``_refresh``).
+        self._corrected_getter: \
+            Callable[[], tuple[np.ndarray, np.ndarray]] | None = None
+        self._corrected = gl.GLLinePlotItem(
+            pos=np.zeros((1, 3), dtype=np.float32),
+            color=_qcolor(theme.CORRECTED_PATH, 0.85),
+            width=2.0,
+            antialias=True,
+            mode="line_strip",
+        )
+        self.addItem(self._corrected)
 
         # ---- drone triad --------------------------------------------------
         self._drone = _DroneTriad(length=0.6)
@@ -203,6 +264,36 @@ class Viewer3D(gl.GLViewWidget):
         self._flash_t0 = 0.0
         self._flash_match = np.zeros((0, 3), dtype=np.float32)
 
+        # ---- per-line "head" dots ----------------------------------------
+        # One GLScatterPlotItem per line marking that line's NEWEST vertex, in
+        # the SAME colour as the line, so it's obvious which lines are live and
+        # where each one's leading data is. Added LAST so they draw ON TOP of
+        # every line. Each head follows its line's visibility toggle (see the
+        # set_*_visible setters) and is set to the last vertex of its line on
+        # each refresh (empty -> nothing drawn). The cyan SLAM head marks the
+        # LEADING keyframe -- distinct from the amber all-keyframe dots above.
+        _HEAD_SIZE = 11.0
+        self._vo_head = gl.GLScatterPlotItem(
+            pos=np.zeros((0, 3), dtype=np.float32),
+            color=_qcolor(theme.VO_PATH, 0.95), size=_HEAD_SIZE, pxMode=True)
+        self._vio_head = gl.GLScatterPlotItem(
+            pos=np.zeros((0, 3), dtype=np.float32),
+            color=_qcolor(theme.TRACE_PATH, 0.95), size=_HEAD_SIZE, pxMode=True)
+        self._ba_head = gl.GLScatterPlotItem(
+            pos=np.zeros((0, 3), dtype=np.float32),
+            color=_qcolor(theme.BA_PATH, 0.95), size=_HEAD_SIZE, pxMode=True)
+        self._corrected_head = gl.GLScatterPlotItem(
+            pos=np.zeros((0, 3), dtype=np.float32),
+            color=_qcolor(theme.CORRECTED_PATH, 0.95), size=_HEAD_SIZE,
+            pxMode=True)
+        self._slam_head = gl.GLScatterPlotItem(
+            pos=np.zeros((0, 3), dtype=np.float32),
+            color=_qcolor(theme.REFINED_PATH, 0.95), size=_HEAD_SIZE,
+            pxMode=True)
+        for _head in (self._vo_head, self._vio_head, self._ba_head,
+                      self._corrected_head, self._slam_head):
+            self.addItem(_head)
+
         # ---- follow-cam state --------------------------------------------
         self._follow = False
         self.set_view(default_view if default_view in VIEW_PRESETS else "ISO")
@@ -235,14 +326,86 @@ class Viewer3D(gl.GLViewWidget):
         """
         self._overlay_getter = getter
 
-    def set_refined_path_source(self, getter: Callable[[], np.ndarray]) -> None:
-        """Register a callable returning the BA/SLAM-refined trajectory.
+    def set_vo_path_source(self, getter: Callable[[], np.ndarray]) -> None:
+        """Register a callable returning the pure-vision VO trajectory.
 
-        ``getter()`` returns an ``(N, 3)`` array of refined positions in NED
-        (the corrected keyframe path). Polled each refresh and drawn as the cyan
-        refined-map line behind the live green path; pass ``None`` to disable.
+        ``getter()`` returns an ``(N, 3)`` array of ``pose.vo`` positions in NED
+        (the rawest, most-drifting stream). Polled each refresh and drawn as the
+        dim-grey VO line behind every other line; pass ``None`` to disable.
+        """
+        self._vo_getter = getter
+
+    def set_ba_path_source(self, getter: Callable[[], np.ndarray]) -> None:
+        """Register a callable returning the windowed-BA (``pose.refined``) path.
+
+        ``getter()`` returns an ``(N, 3)`` array of BA-keyframe positions in NED.
+        Polled each refresh and drawn as the violet-blue VIO-BA line; pass
+        ``None`` to disable.
+        """
+        self._ba_getter = getter
+
+    def set_refined_path_source(self, getter: Callable[[], np.ndarray]) -> None:
+        """Register a callable returning the SLAM keyframe trajectory.
+
+        ``getter()`` returns an ``(N, 3)`` array of SLAM keyframe positions in
+        NED (the corrected keyframe path). Polled each refresh and drawn as the
+        cyan SLAM-map line behind the live green path; pass ``None`` to disable.
         """
         self._refined_getter = getter
+
+    def set_corrected_path_source(
+            self, getter: Callable[[], tuple[np.ndarray, np.ndarray]]) -> None:
+        """Register a callable returning the corrected (deformed) VIO trajectory.
+
+        ``getter()`` returns ``(positions, teleport_flags)``: an ``(M, 3)`` array
+        of dense VIO positions in NED AFTER SLAM's loop corrections have been
+        rubber-sheeted onto them, plus an ``(M,)`` bool array flagging the
+        vertices SLAM pulled far (``|correction_delta| > TELEPORT_M``). Polled
+        each refresh and drawn as the warm-orange corrected-VIO line (teleport
+        vertices recoloured red) behind the live green path; pass ``None`` to
+        disable.
+        """
+        self._corrected_getter = getter
+
+    # ---- per-line visibility (the single-view's 5 toggle buttons) --------
+
+    def set_vo_visible(self, on: bool) -> None:
+        """Show/hide the dim-grey VO (pure-vision ``pose.vo``) line + head dot."""
+        on = bool(on)
+        self._vo.setVisible(on)
+        self._vo_head.setVisible(on)
+
+    def set_vio_visible(self, on: bool) -> None:
+        """Show/hide the live green VIO (``pose.odom``) line + head dot."""
+        on = bool(on)
+        self._traj.setVisible(on)
+        self._vio_head.setVisible(on)
+
+    def set_ba_visible(self, on: bool) -> None:
+        """Show/hide the violet-blue VIO-BA (``pose.refined``) line + head dot."""
+        on = bool(on)
+        self._ba.setVisible(on)
+        self._ba_head.setVisible(on)
+
+    def set_corrected_visible(self, on: bool) -> None:
+        """Show/hide the warm-orange SLAM-corrected-VIO line + head dot."""
+        on = bool(on)
+        self._corrected.setVisible(on)
+        self._corrected_head.setVisible(on)
+
+    def set_slam_visible(self, on: bool) -> None:
+        """Show/hide the cyan SLAM keyframe line, head dot AND its keyframe dots.
+
+        The SLAM toggle owns the whole SLAM overlay -- the corrected keyframe
+        trajectory line, its cyan leading-keyframe head dot, and the amber/red
+        keyframe + revisit dots -- so hiding it clears the entire SLAM map from
+        the view, not just the line.
+        """
+        on = bool(on)
+        self._refined.setVisible(on)
+        self._slam_head.setVisible(on)
+        self._slam_kf.setVisible(on)
+        self._slam_kf_match.setVisible(on)
 
     # ---- internal --------------------------------------------------------
 
@@ -264,22 +427,92 @@ class Viewer3D(gl.GLViewWidget):
             self._traj.setData(pos=traj_enu, color=col)
         if latest is not None:
             self._drone.update(latest)
+            # Green VIO head dot at the newest VIO vertex (in ADDITION to the
+            # orientation triad). `latest.pos_ned` is the leading pose.
+            self._set_head(self._vio_head,
+                           np.asarray(latest.pos_ned, np.float64).reshape(1, 3))
             if self._follow:
                 p_enu = frames.ned_to_enu(latest.pos_ned)
                 self.opts["center"] = QtGui.QVector3D(*p_enu.astype(float))
                 self.update()
+        else:
+            self._set_head(self._vio_head, None)
+        self._refresh_vo()
+        self._refresh_ba()
         self._refresh_refined()
+        self._refresh_corrected()
         self._refresh_overlay()
 
-    def _refresh_refined(self) -> None:
-        if self._refined_getter is None:
+    def _set_head(self, head, pos_ned) -> None:
+        """Point a head scatter item at one NED vertex (or hide it).
+
+        ``pos_ned`` is a ``(1, 3)`` NED row (the line's newest vertex) which we
+        convert NED->ENU exactly like the lines; ``None`` -> an empty ``(0, 3)``
+        so nothing draws (used when the line has no points yet).
+        """
+        if pos_ned is None:
+            head.setData(pos=np.zeros((0, 3), dtype=np.float32))
             return
-        pts = self._refined_getter()
+        enu = frames.ned_to_enu(np.asarray(pos_ned, np.float64)).astype(
+            np.float32).reshape(1, 3)
+        head.setData(pos=enu)
+
+    def _refresh_line(self, getter, item, head) -> None:
+        """Poll a plain ``(N, 3)`` NED getter and push it to a line + head item.
+
+        Shared by the VO / VIO-BA / SLAM lines (all single-colour line strips):
+        an empty/short result collapses the line to a harmless single point and
+        hides the head dot; otherwise the head dot is placed on the LAST (newest)
+        vertex in the same NED->ENU frame as the line.
+        """
+        if getter is None:
+            return
+        pts = getter()
         if pts is None or len(pts) < 2:
-            self._refined.setData(pos=np.zeros((1, 3), dtype=np.float32))
+            item.setData(pos=np.zeros((1, 3), dtype=np.float32))
+            self._set_head(head, None)
             return
-        enu = frames.ned_to_enu(np.asarray(pts, np.float64)).astype(np.float32)
-        self._refined.setData(pos=enu)
+        arr = np.asarray(pts, np.float64)
+        enu = frames.ned_to_enu(arr).astype(np.float32)
+        item.setData(pos=enu)
+        self._set_head(head, arr[-1:])           # head on the newest vertex
+
+    def _refresh_vo(self) -> None:
+        self._refresh_line(self._vo_getter, self._vo, self._vo_head)
+
+    def _refresh_ba(self) -> None:
+        self._refresh_line(self._ba_getter, self._ba, self._ba_head)
+
+    def _refresh_refined(self) -> None:
+        self._refresh_line(self._refined_getter, self._refined, self._slam_head)
+
+    def _refresh_corrected(self) -> None:
+        if self._corrected_getter is None:
+            return
+        result = self._corrected_getter()
+        # The corrected getter returns (positions, teleport_flags). An empty /
+        # short path collapses to a single point (same as the other lines) and
+        # hides the head dot.
+        pts, tp_flags = result
+        if pts is None or len(pts) < 2:
+            self._corrected.setData(pos=np.zeros((1, 3), dtype=np.float32))
+            self._set_head(self._corrected_head, None)
+            return
+        arr = np.asarray(pts, np.float64)
+        enu = frames.ned_to_enu(arr).astype(np.float32)
+        # Per-vertex colour: normal corrected orange, with teleport vertices
+        # recoloured red so a segment SLAM pulled far on a loop closure reads as
+        # a flagged "swoosh". MIRRORS the green ``_traj`` recolour exactly: a
+        # line-strip segment is teleport if EITHER endpoint is a teleport sample
+        # (so the vertex leading INTO a teleport is recoloured too).
+        col = np.tile(np.array(_qcolor(theme.CORRECTED_PATH, 0.85),
+                               dtype=np.float32), (enu.shape[0], 1))
+        tp = np.asarray(tp_flags, dtype=bool)
+        seg = tp.copy()
+        seg[:-1] |= tp[1:]
+        col[seg] = np.array(_qcolor(theme.TELEPORT, 0.95), dtype=np.float32)
+        self._corrected.setData(pos=enu, color=col)
+        self._set_head(self._corrected_head, arr[-1:])  # head on newest vertex
 
     def _refresh_overlay(self) -> None:
         if self._overlay_getter is None:

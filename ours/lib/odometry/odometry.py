@@ -310,6 +310,16 @@ class RGBDVisualOdometry:
         self.cfg = cfg or OdometryConfig()
         self.frontend = frontend or KLTFrontend(FrontendConfig())
         self.pose = np.eye(4)  # T_world_cur
+        # Pure-vision (no-IMU, no-BA) accumulated pose for the UI's "VO" line.
+        # ``self.pose`` is the live VIO output (gyro complementary fusion + tilt
+        # leveling + freeze/coast); ``self.pose_vo`` is a SEPARATE accumulator
+        # fed ONLY the raw frame-to-frame PnP rotation+translation -- no gyro, no
+        # CorrectTilt, no freeze/coast -- so the UI can compare a pure-vision
+        # frame-to-frame trajectory against VIO. It seeds identically to
+        # ``self.pose`` and only ever advances on a successful PnP (a vision
+        # dropout leaves it put: VO has no IMU to coast on). It NEVER influences
+        # ``self.pose`` -- pose_vo is a pure additive read-only output.
+        self.pose_vo = np.eye(4)  # T_world_cur (pure-vision only)
         self._prev_obs: dict[int, np.ndarray] = {}
         self._prev_depth: np.ndarray | None = None
         self.last_info: dict = {}
@@ -333,6 +343,11 @@ class RGBDVisualOdometry:
         from ..imu.imu import gravity_aligned_R0
         self.pose = np.eye(4)
         self.pose[:3, :3] = gravity_aligned_R0(accel_cam)
+        # Seed the pure-vision accumulator from the SAME gravity-aligned origin so
+        # the VO line and the VIO line start from an identical frame (the gravity
+        # align is a one-shot world-frame seed, not an IMU correction, so the VO
+        # trajectory is still pure-vision thereafter).
+        self.pose_vo = self.pose.copy()
         self._g_ref = float(np.linalg.norm(accel_cam))
 
     def correct_tilt(self, accel_cam: np.ndarray,
@@ -482,6 +497,20 @@ class RGBDVisualOdometry:
                     inl_idx = np.asarray(inliers, dtype=np.int64).reshape(-1)
                     info["inlier_ids"] = np.asarray(id_list, dtype=np.int64)[inl_idx]
                     t_use = t_own if self.cfg.use_own_pnp else tvec.reshape(3)
+                    # --- pure-vision VO accumulator (UI "VO" line) -------------
+                    # PnP succeeded, so ``R`` (cur<-prev rotation) and ``t_use``
+                    # (cur<-prev translation) are the RAW vision motion BEFORE any
+                    # gyro fusion / tilt / freeze / coast touches them below.
+                    # Advance the pure-vision pose with EXACTLY the composition the
+                    # main VIO pose uses (``self.pose = self.pose @ inv(T_prev<-cur)``
+                    # where ``T_pc`` is built cur<-prev from R / t_use). This is a
+                    # pure ADD: it never reads or writes ``self.pose``. On PnP
+                    # failure / too-few-points we never reach here, so pose_vo is
+                    # simply left unchanged (VO has no IMU to coast on).
+                    T_pc_vo = np.eye(4)
+                    T_pc_vo[:3, :3] = R
+                    T_pc_vo[:3, 3] = t_use
+                    self.pose_vo = self.pose_vo @ np.linalg.inv(T_pc_vo)
                     # Freeze translation when vision is untrustworthy (too few
                     # inliers -> textureless / white wall). Advance rotation by
                     # the gyro but hold the position put; do NOT coast (no real

@@ -21,10 +21,12 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+import numpy as np
+
 from ...lib.flow import topics
 from ...lib.flow.messages import (
     CamSync, DepthFrame, FrameInliers, FrameTracks, ImuCamPacket, ImuRaw,
-    Keyframe, LoopCorrection, PoseMsg, END,
+    Keyframe, LoopCorrection, PoseMsg, SlamOverlay, END,
 )
 from ...lib.ipc.messages import (
     WireCamSync, WireDepthFrame, WireEnd, WireFrameInliers, WireFrameTracks,
@@ -176,6 +178,30 @@ def _loop_corr_to_local(wm: WireLoopCorrection, rings: RingRegistry) -> LoopCorr
                           n_loops=int(wm.n_loops))
 
 
+def _slam_overlay_to_wire(msg: SlamOverlay, rings: RingRegistry, endpoint: str):
+    # Pure POD: the keyframe positions are small (a handful of (3,) vectors), so
+    # they ride the message itself, no shared-memory ring. kf_ids carry the REAL
+    # source frame seqs so the UI can match each corrected keyframe to its dense
+    # VIO pose (the rubber-sheet "corrected VIO" line). Fall back to arange when
+    # the seqs are missing/mismatched so a malformed overlay can never crash the
+    # bridge (the dots still render by POSITION).
+    pos = np.asarray(msg.kf_positions, dtype=np.float64).reshape(-1, 3)
+    seqs = (None if msg.kf_seqs is None
+            else np.asarray(msg.kf_seqs, dtype=np.int64).reshape(-1))
+    kf_ids = (seqs if seqs is not None and len(seqs) == len(pos)
+              else np.arange(len(pos), dtype=np.int64))
+    return WireSlamMap(kf_ids=kf_ids,
+                       kf_positions=pos, n_loops=int(msg.n_loops),
+                       last_match=(None if msg.last_match is None
+                                   else np.asarray(msg.last_match, dtype=np.float64)))
+
+
+def _slam_map_to_local(wm: WireSlamMap, rings: RingRegistry) -> SlamOverlay:
+    return SlamOverlay(kf_positions=np.asarray(wm.kf_positions, dtype=np.float64),
+                       n_loops=int(wm.n_loops), last_match=wm.last_match,
+                       kf_seqs=np.asarray(wm.kf_ids, dtype=np.int64))
+
+
 # --------------------------------------------------------------------------- #
 # Registry: topic -> (to_wire, to_local). Bridges pick converters by topic.
 # Map-overlay + calib-bundle topics travel WITHOUT a local-side reconstruction
@@ -195,9 +221,11 @@ CONVERTERS: dict[str, tuple[ToWire, ToLocal]] = {
     topics.FRAME_TRACKS:    (_tracks_to_wire,   _tracks_to_local),
     topics.FRAME_INLIERS:   (_inliers_to_wire,  _inliers_to_local),
     topics.POSE_ODOM:       (_pose_to_wire,     _pose_to_local),
+    topics.POSE_VO:         (_pose_to_wire,     _pose_to_local),
     topics.POSE_REFINED:    (_pose_to_wire,     _pose_to_local),
     topics.KEYFRAME:        (_keyframe_to_wire, _keyframe_to_local),
     topics.LOOP_CORRECTION: (_loop_corr_to_wire, _loop_corr_to_local),
+    topics.SLAM_MAP:        (_slam_overlay_to_wire, _slam_map_to_local),
 }
 
 

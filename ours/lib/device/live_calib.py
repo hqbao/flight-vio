@@ -52,6 +52,11 @@ class LiveFrontEndCalib:
     res: ResolutionProfile
     accel_align: np.ndarray | None
     imu_calibration: ImuCalibration | None
+    # Per-device key for the IMU calib store -- the SAME id used by
+    # load_gyro_bias / load_accel_calib below, so a UI-saved calibration keys
+    # identically and takes effect on the next capture start. ``None`` if the
+    # device exposes no id.
+    device_id: str | None = None
 
 
 def _read_stereo_calib(ch, width: int, height: int):
@@ -166,10 +171,13 @@ def read_live_calibration(device: SharedLiveDevice, *, width: int, height: int,
     res = ResolutionProfile.for_resolution(width, height)
     sgm_cfg = res.sgm(fast=depth_fast)
 
+    # Read the per-device id up front so the calib bundle carries it regardless
+    # of whether the gyro/IMU branch runs (the UI keys saved IMU calib by it).
+    dev_id = device.device_id
+
     accel_align = None
     imu_calibration = None
     if use_gyro:
-        dev_id = device.device_id
         cached = None if recalibrate_bias else load_gyro_bias(dev_id)
         accel_cal: AccelCalibration | None = load_accel_calib(dev_id)
         # Hold-still ONLY when the gyro bias must be measured (first run /
@@ -194,4 +202,4 @@ def read_live_calibration(device: SharedLiveDevice, *, width: int, height: int,
 
     return LiveFrontEndCalib(K=K, calib=calib, R_imu_cam=R_imu_cam,
                              sgm_cfg=sgm_cfg, res=res, accel_align=accel_align,
-                             imu_calibration=imu_calibration)
+                             imu_calibration=imu_calibration, device_id=dev_id)

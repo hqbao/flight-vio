@@ -101,7 +101,7 @@ The **baseline** (DepthAI/Basalt) viewer is a separate entry point:
 ```bash
 # 4-process live pipeline (capture + vio + slam + ui in separate processes;
 # UI fault never kills capture; VIO and SLAM each own their own map).
-./run.sh --proc                      # full 4-proc with UI (two tabs: VIO / SLAM)
+./run.sh --proc                      # full 4-proc with UI (single 5-trajectory view)
 ./run.sh --proc --no-ui              # headless capture + vio + slam
 ./run.sh --proc --session sessions/gold/lab_loop_30s   # replay through 4 procs
 ```
@@ -114,6 +114,65 @@ control, `multiprocessing.shared_memory` rings for image payloads; no extra
 deps). Design + invariants are in [docs/PROC4_ARCHITECTURE.md](docs/PROC4_ARCHITECTURE.md);
 the dual codepath (single-proc oracle vs 4-proc live) is summarised in
 [ours/ARCHITECTURE.md](ours/ARCHITECTURE.md) §9.
+
+The proc4 UI is a **single view** (the former VIO / SLAM tabs were collapsed into
+one `Viewer3D`) drawing **five trajectory lines**, each with its own enable/disable
+toggle button on the Controls toolbar. The lines form a progression — pure vision
+→ +IMU → +windowed BA → +loop closure on the dense path → the corrected keyframe
+map:
+
+1. **VO** (grey) — `pose.vo`, the PURE-VISION frame-to-frame path (no IMU, no BA);
+   drifts most.
+2. **VIO** (green) — `pose.odom`, frame-to-frame RGB-D PnP + gyro fusion; the
+   responsive live marker + trail.
+3. **VIO-BA** (blue/violet) — `pose.refined`, the windowed **Bundle Adjustment**
+   keyframe trajectory.
+4. **SLAM-corrected VIO** (orange) — the dense VIO trail rubber-sheeted by SLAM's
+   per-keyframe pose-graph corrections; segments where loop closure pulled the path
+   far (correction > ~0.15 m) are flagged "teleport" and drawn in red.
+5. **SLAM** (cyan) — the loop-corrected keyframe path + amber keyframe dots from
+   the continuous `slam.map` stream, with a flash on each loop closure.
+
+**Two different optimisers back the map: VIO runs windowed Bundle Adjustment (BA —
+landmarks + poses) → `pose.refined`; SLAM runs Pose-Graph Optimization (PGO —
+poses only, no landmarks) on loop closure, distributing drift over the whole
+trajectory → `slam.map`.** SLAM keyframe motion-gating is on in proc4
+(`kf_min_trans_m=0.1`, `kf_min_rot_deg=5.0`): a keyframe joins the pose graph only
+if the camera moved ≥10 cm OR rotated ≥5° since the last one.
+
+Everything is fed over IPC — the UI imports no depthai and never opens the device
+(capture owns it). The continuous `slam.map` overlay (every keyframe) supersedes
+the old `loop.correction`-driven overlay, which only fired on a loop (so the old
+view showed no keyframe dots until the first loop closed). SLAM stays responsive
+because its proc4 flow uses a **latest-only (coalescing) inbox**: it drops a
+keyframe backlog and always solves the freshest keyframe, so `slam.map` stays
+current instead of lagging as the pose graph grows. The heavy BA/SLAM solves run
+**in-process by default**; `./run.sh --proc --worker` is an opt-in that moves them
+to GIL-free child subprocesses (off by default — no `resource_tracker` noise at
+shutdown).
+
+The **Controls toolbar** carries the five per-line toggle buttons (VO / VIO /
+VIO-BA / SLAM-corrected VIO / SLAM, all checkable, default visible), then the two
+most-used actions:
+
+- **Clear Trail** — clears the live trajectory trail (moved here out of the View
+  menu).
+- **Restart** — respawns the whole pipeline fresh. The IPC bus is one-way
+  (server→client) so the UI can't reset vio/slam in place; instead it quits with
+  `RESTART_EXIT_CODE = 42` and the launcher's restart loop cleans up and respawns
+  capture + vio + slam + ui from scratch.
+
+The menu bar renders **in-window on every platform** (`setNativeMenuBar(False)`):
+
+- **View** — camera presets and Follow Camera (on the single viewer).
+- **Visualize** — *Camera + Depth + IMU (triplet)* and *Keypoint Depth Tracker*;
+  these reuse the unchanged `ours/ui` windows, subscribing capture's
+  `imucam.sample` / `frame.depth` and (for the tracker) VIO's `frame.tracks` /
+  `frame.inliers` via the adapters in `ours/proc/ui_ipc_sources.py`.
+- **Calibration** — *Gyroscope Bias* and *Accelerometer (6-position)*, fed by
+  capture's **raw** `imu.raw`. Because capture (not the UI) owns the device, a
+  saved calibration is keyed per device and **takes effect on the next capture
+  start**, not live mid-run (the dialog shows "Saved for device `<id>`").
 
 `--source ours` is the flow pipeline (cam + imu_cam → odometry → backend →
 slam → ui flows over a pub/sub bus); `--source ours-ba` / `ours-slam` add an
