@@ -44,6 +44,10 @@ works -- it triggers the lazy import on first access:
 * :class:`~ui.modules.ipc_sources.IpcSlamMapSource` -- vio ``keyframe`` (+ its kf
   rings) + slam ``slam.map`` (corrected poses) fused into the room cloud for the
   SLAM 3D-map window.
+* :class:`~ui.modules.ipc_sources.IpcVoxelMapSource` -- vio ``keyframe`` (+ its kf
+  rings) binned into a 3D occupancy grid + merged into a solid cube mesh for the
+  Room Blocks (3D voxel) window. Shares the ``_KeyframeAccumulator`` base with the
+  SLAM-map source (NO copy-paste of the SHM/recv wiring).
 """
 from .collector import UiCollectorModule
 from .render import UiRenderModule
@@ -55,8 +59,9 @@ from .triplet import UiTripletModule
 # classes live in ui.qt). Accessing any of these names triggers the import.
 _IPC_ADAPTERS = frozenset({
     "IpcImuRawSource", "IpcGyroFuseSource", "IpcTripletWorker",
-    "IpcKeypointWorker", "IpcSlamMapSource", "ipc_triplet_factory",
-    "ipc_keypoint_factory", "ipc_slam_map_factory",
+    "IpcKeypointWorker", "IpcSlamMapSource", "IpcVoxelMapSource",
+    "ipc_triplet_factory", "ipc_keypoint_factory", "ipc_slam_map_factory",
+    "ipc_voxel_map_factory",
 })
 
 __all__ = [
@@ -72,9 +77,11 @@ __all__ = [
     "IpcTripletWorker",
     "IpcKeypointWorker",
     "IpcSlamMapSource",
+    "IpcVoxelMapSource",
     "ipc_triplet_factory",
     "ipc_keypoint_factory",
     "ipc_slam_map_factory",
+    "ipc_voxel_map_factory",
 ]
 
 

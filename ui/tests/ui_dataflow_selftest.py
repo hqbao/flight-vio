@@ -367,6 +367,48 @@ def _drain_samples(work_queue: "queue.Queue", timeout_s: float,
     return out
 
 
+def test_voxel_map_source(vio_ep: str, bundle):
+    """Build a Room Blocks cube mesh from the live keyframe feed; return it.
+
+    Mirrors the SLAM-map source's seam: attach the new
+    :class:`~ui.modules.ipc_sources.IpcVoxelMapSource` to VIO's ``keyframe``
+    feed, let the (already-running) replay drain into its keyframe accumulator,
+    then run its OFF-thread ``_build`` ONCE and assert the merged cube mesh is
+    valid (non-empty, every face index in range, one RGBA per face). Returns
+    ``(verts, faces, face_colors, cams)`` so the caller can also feed it to the
+    window. Confirms the shared ``_KeyframeAccumulator`` base populates a SECOND
+    source with NO extra SHM/recv wiring.
+    """
+    from ui.modules import IpcVoxelMapSource
+
+    W, H, K = int(bundle.width), int(bundle.height), bundle.K
+    src = IpcVoxelMapSource(vio_ep, K, width=W, height=H, connect_timeout_s=20.0)
+    # Attach + subscribe but don't spin the rebuild loop, so we control the build.
+    _check(src._attach_or_fail(),
+           f"voxel source attached VIO kf rings ({src.error})")
+    client = src._make_keyframe_client()
+    client.start()
+    try:
+        # Let trailing keyframes arrive (capture has already drained by now in the
+        # caller; this just waits for the last keyframes to land).
+        deadline = time.monotonic() + 6.0
+        while time.monotonic() < deadline and len(src._kf_depth) < 3:
+            time.sleep(0.2)
+        n_kf = len(src._kf_depth)
+        _check(n_kf >= 1, f"voxel source accumulated >=1 keyframe (got {n_kf})")
+        verts, faces, fcols, cams = src._build()
+        _check(verts.shape[0] > 0 and faces.shape[0] > 0,
+               f"voxel build is non-empty (verts {verts.shape}, faces "
+               f"{faces.shape})")
+        _check(int(faces.min()) >= 0 and int(faces.max()) < len(verts),
+               "voxel mesh face indices all reference real vertices")
+        _check(fcols is not None and len(fcols) == len(faces),
+               "voxel mesh has one RGBA face colour per triangle")
+        return verts, faces, fcols, cams
+    finally:
+        src.stop()
+
+
 def test_menus(args) -> None:
     """Build the run_ui menu actions against a live capture+vio and fire them.
 
@@ -481,6 +523,36 @@ def test_menus(args) -> None:
                "keypoint window stopped its worker on close")
         print(f"    [ok] keypoint: {len(ksamples)} samples, SEQ "
               f"{k0.seq}..{ksamples[-1].seq}, max trk {max_trk}")
+
+        # ---------- (e) Visualize -> Room Blocks (3D voxel) ----------
+        # Drive the IpcVoxelMapSource directly (we control when the cube-mesh
+        # build runs) so we can assert a NON-EMPTY occupancy cube mesh builds
+        # without error from the keyframe feed, with valid face indices + matching
+        # face colours, and that RoomBlocksWindow ingests it without raising. GL
+        # rasterisation is impossible on the offscreen Qt plugin, so this proves
+        # the build + GUI-thread ingest, not pixels.
+        from ui.qt.room_blocks_window import RoomBlocksWindow
+        from ui.viz import voxel_blocks as _vb
+        vmesh = test_voxel_map_source(vio_ep, bundle)
+        verts, faces, fcols, vcams = vmesh
+        n_vox = verts.shape[0] // _vb.CUBE_VERTS
+        rwin = RoomBlocksWindow()
+        # update() touches the GL items; it must not raise on the GUI thread even
+        # offscreen (the framebuffer just stays blank).
+        rwin.update(verts, faces, fcols, vcams)
+        # Empty + a malformed (out-of-range face index) mesh exercise the guards.
+        rwin.update(np.zeros((0, 3), np.float32), np.zeros((0, 3), np.int64),
+                    None, None)
+        rwin.update(verts[:_vb.CUBE_VERTS],
+                    np.array([[0, 1, 999999]], np.int64), None, None)
+        app.processEvents()
+        rwin.close()
+        app.processEvents()
+        _check(n_vox > 0 and faces.shape[0] == n_vox * _vb.CUBE_FACES,
+               f"room-blocks mesh: {n_vox} voxels -> {faces.shape[0]} faces "
+               f"(= {n_vox}*{_vb.CUBE_FACES})")
+        print(f"    [ok] room-blocks: {n_vox} occupied voxels, "
+              f"{faces.shape[0]} triangles, {len(vcams)} cams")
     finally:
         for w in (triplet_win, keypoint_win):
             if w is not None:

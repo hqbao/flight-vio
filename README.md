@@ -356,16 +356,29 @@ The menu bar renders **in-window on every platform** (`setNativeMenuBar(False)`)
 
 - **View** — camera presets and Follow Camera.
 - **Visualize** — *Camera + Depth + IMU (triplet)*, *Keypoint Depth Tracker*,
-  *Gyro Fusion (strip chart)*, and *SLAM Map (landmarks)* (the sparse, ID-based landmark
-  map: ONE point per KLT track id that was a PnP inlier across ≥ `PERSIST_KF` (=20)
-  SUCCESSIVE keyframes + keyframe cameras, re-snapped to SLAM's loop-corrected poses, in
-  the same ENU frame as the main viewer; the gate is a UI-only longest-consecutive-run
-  filter, `ui/viz/map_cloud.py::longest_consecutive_run`, so only consistently-tracked,
-  motion-validated points show, NOT a dense reconstruction), reusing
-  the unchanged `ui/qt` windows, fed
-  over IPC by the adapters in `ui/modules/ipc_sources.py` (capture's `imucam.sample` /
-  `frame.depth`; the tracker also VIO's `frame.tracks` / `frame.inliers`; the SLAM map
-  VIO's `keyframe` + SLAM's `slam.map`).
+  *Gyro Fusion (strip chart)*, *SLAM Map (3D room)*, and *Room Blocks (3D voxel)*.
+  - *SLAM Map (3D room)* — the sparse, ID-based landmark map: ONE point per KLT track
+    id that was a PnP inlier across ≥ `PERSIST_KF` (=6) SUCCESSIVE keyframes + keyframe
+    cameras, in the same ENU frame as the main viewer; the gate is a UI-only
+    longest-consecutive-run filter, `ui/viz/map_cloud.py::longest_consecutive_run`, so
+    only consistently-tracked, motion-validated points show, NOT a dense reconstruction.
+  - *Room Blocks (3D voxel)* — a COMPLEMENT to the point-cloud map: the SAME mapped
+    space rendered as a **solid-voxel occupancy grid**. Every VIO keyframe's dense depth
+    is back-projected by its own pose, binned into a `VOXEL_M` (≈0.12 m) grid, and the
+    cells that received ≥ `MIN_HITS` (=3) points (multi-keyframe agreement → rejects thin
+    stereo noise) are merged into ONE shaded cube mesh (`pyqtgraph.opengl.GLMeshItem`,
+    `M` voxels → `M·8` verts / `M·12` triangles), coloured by height so floor/walls/ceiling
+    read distinctly — so walls become blocky shells and the enclosed room is recognisable.
+    UI-only: occupancy + cube-mesh build live in `ui/viz/voxel_blocks.py`
+    (`occupancy_voxels` / `cube_mesh`), the window in `ui/qt/room_blocks_window.py`.
+  - Both 3D windows reuse the same VIO `keyframe` feed via a shared
+    `_KeyframeAccumulator` base (`ui/modules/ipc_sources.py`) — the SHM ring attach +
+    keyframe stash + evict wiring is written ONCE; the landmark source adds SLAM's
+    `slam.map`, the voxel source adds the occupancy/cube-mesh build.
+  - All reuse the unchanged `ui/qt` windows, fed over IPC by the adapters in
+    `ui/modules/ipc_sources.py` (capture's `imucam.sample` / `frame.depth`; the tracker
+    also VIO's `frame.tracks` / `frame.inliers`; the SLAM map VIO's `keyframe` + SLAM's
+    `slam.map`; Room Blocks VIO's `keyframe` only).
 - **Calibration** — *Gyroscope Bias* and *Accelerometer (6-position)*, fed by
   capture's **raw** `imu.raw`. Because capture (not the UI) owns the device, a
   saved calibration is keyed per device (`device_id` from the calib bundle) and

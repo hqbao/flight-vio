@@ -64,6 +64,7 @@ from ui.comms import IPCPubSub, IPCSubscriber, RingRegistry
 from ui.comms.converters import to_local
 from ui.comms.ring_registry import default_capture_specs, default_vio_specs
 from ui.viz.map_cloud import longest_consecutive_run
+from ui.viz import voxel_blocks
 from ui.qt.keypoints_window import KeypointWorker
 from ui.qt.synced_window import TripletWorker
 
@@ -376,9 +377,230 @@ class IpcKeypointWorker(KeypointWorker):
 
 
 # --------------------------------------------------------------------------- #
-# (3b) SLAM 3D-map source (sparse landmark cloud) for MapWindow
+# (3b) Shared keyframe accumulator (the SHM-ring + recv plumbing both 3D-map
+#      sources build on -- so neither copy-pastes the attach / _on_keyframe /
+#      evict code).
 # --------------------------------------------------------------------------- #
-class IpcSlamMapSource(threading.Thread):
+class _KeyframeAccumulator(threading.Thread):
+    """Attach VIO's keyframe rings and stash every keyframe for a 3D-map build.
+
+    Both the sparse landmark map (:class:`IpcSlamMapSource`) and the dense
+    occupancy/voxel map (:class:`IpcVoxelMapSource`) need the EXACT same VIO
+    keyframe feed -- the gray/depth grids (read_copy-ed out of VIO's ``kf_gray`` /
+    ``kf_depth`` rings by the converter) and each keyframe's FULL pose
+    ``[R_keyframe | t_keyframe]`` (split from ``T_world_cam``), plus the KLT track
+    snapshot (``track_ids`` / ``track_px`` / ``inlier_ids``) the landmark map
+    reads. Rather than duplicate the ring attach + ``_on_keyframe`` stash + evict
+    wiring in two sources, that machinery lives ONCE here; each concrete source
+    subclasses this and only supplies its own build (``_build`` -> a payload) +
+    its rebuild rate.
+
+    A bounded dict of the last :data:`MAX_KEYFRAMES` keyframes (keyed by source
+    frame seq) caps memory; the subclass's build re-orders by seq, so insertion
+    order is not relied on for any index assignment.
+
+    Lifecycle (subclasses inherit it, only set ``_cb`` + spin via :meth:`start`):
+
+    * :meth:`_attach_or_fail` attaches the kf rings (a missing ring == VIO not
+      running -> a clear, device-agnostic reason on :attr:`error`).
+    * :meth:`_make_keyframe_client` builds the VIO IPC client subscribed to
+      ``keyframe`` (the concrete source adds any extra clients it needs, e.g.
+      the landmark map's ``slam.map``).
+    * a coalesced rebuild loop (:meth:`run`) re-builds at most :attr:`REBUILD_HZ`
+      times a second whenever the model goes dirty, OFF the GUI thread, and hands
+      each finished payload to the injected callback (the window marshals it onto
+      the GUI thread via its thread-safe ``submit``).
+
+    Connect-error model mirrors the other sources: a connect timeout is swallowed
+    onto :attr:`error` (the window polls it) rather than raising.
+    """
+
+    #: Cap on kept keyframes (bounds memory like the other UI buffers). At
+    #: kf_every=5 @ 20 fps a keyframe lands ~every 0.25 s, so 600 kf ~= 2.5 min of
+    #: distinct keyframes -- far more than any 3D map needs.
+    MAX_KEYFRAMES = 600
+    #: Valid-depth band (m): outside this range stereo depth is too noisy to
+    #: back-project. Both builds gate to this band (the landmark map samples per
+    #: track; the voxel map back-projects the whole grid through the SAME band).
+    MIN_DEPTH_M = 0.3
+    MAX_DEPTH_M = 6.0
+    #: Max full rebuilds per second. Subclasses override (a scatter rebuild is
+    #: light; a cube-mesh rebuild is heavier -> a lower rate).
+    REBUILD_HZ = 4.0
+
+    def __init__(self, vio_endpoint: str, *, name: str,
+                 connect_timeout_s: float = 10.0,
+                 width: int | None = None, height: int | None = None) -> None:
+        super().__init__(name=name, daemon=True)
+        self._vio_ep = vio_endpoint
+        self._connect_timeout_s = float(connect_timeout_s)
+        # kf rings are FIXED shape; use the caller's resolution when known, else
+        # the canonical default specs.
+        self._w = width
+        self._h = height
+
+        # Public attr the window polls (mirrors the other sources' contract).
+        self.error: str | None = None
+
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._dirty = threading.Event()
+        self._cb = None                       # build payload sink (set by subclass)
+
+        self._vio_client: IPCPubSub | None = None
+        self._vio_rings: RingRegistry | None = None
+
+        # Per-keyframe accumulators, keyed by source frame seq. Each keyframe keeps
+        # its gray/depth grid + rotation AND translation + its KLT track snapshot
+        # (ids + pixels) plus the PnP-inlier id subset. ``MAX_KEYFRAMES`` bounds it.
+        self._kf_gray: dict[int, np.ndarray] = {}
+        self._kf_depth: dict[int, np.ndarray] = {}
+        self._kf_R: dict[int, np.ndarray] = {}        # (3,3) keyframe rotation
+        self._kf_t: dict[int, np.ndarray] = {}        # (3,) VIO keyframe translation
+        self._kf_track_ids: dict[int, np.ndarray] = {}   # (N,) track ids
+        self._kf_track_px: dict[int, np.ndarray] = {}    # (N,2) pixels, id-aligned
+        self._kf_inlier_ids: dict[int, np.ndarray] = {}  # (M,) PnP inlier ids
+
+    # ------------------------------------------------------------------ #
+    def _attach_or_fail(self) -> bool:
+        """Attach VIO's kf rings; on failure set :attr:`error` and return False."""
+        try:
+            self._vio_rings = self._attach_vio_rings()
+            return True
+        except RuntimeError as e:
+            self.error = str(e)
+            return False
+
+    def _attach_vio_rings(self) -> RingRegistry:
+        """Attach VIO's keyframe rings; map a missing ring to a clear reason."""
+        kwargs = {}
+        if self._w is not None and self._h is not None:
+            kwargs = {"width": int(self._w), "height": int(self._h)}
+        try:
+            return RingRegistry().attach_all(
+                default_vio_specs(endpoint=self._vio_ep, **kwargs))
+        except FileNotFoundError as e:
+            raise RuntimeError(
+                f"VIO keyframe stream not available on {self._vio_ep!r} "
+                f"(is VIO running?)") from e
+
+    def _make_keyframe_client(self) -> IPCPubSub:
+        """Build the VIO IPC client subscribed to the ``keyframe`` topic."""
+        client = IPCPubSub(self._vio_ep, role="client",
+                           connect_timeout_s=self._connect_timeout_s)
+        client.subscribe(topics.KEYFRAME, self._on_keyframe)
+        self._vio_client = client
+        return client
+
+    def _on_keyframe(self, wm) -> None:
+        """VIO recv thread: stash one keyframe's gray/depth + FULL pose + tracks.
+
+        Splits the (4,4) VIO world<-cam pose into rotation + translation; every
+        observation a build derives uses ``Xw = R Xc + t`` so positions stay
+        self-consistent (one pose source per keyframe -> no seams). The track
+        snapshot is OPTIONAL on the wire; it is stored as-is and a build skips
+        keyframes lacking it.
+        """
+        if wm is END:
+            return
+        kf = to_local(topics.KEYFRAME, wm, self._vio_rings)
+        if kf is END:                                 # WireEnd -> local END
+            return
+        seq = int(kf.seq)
+        T = np.asarray(kf.T_world_cam, dtype=np.float64)
+        R = T[:3, :3].copy()
+        t = T[:3, 3].copy()
+        with self._lock:
+            self._kf_gray[seq] = kf.gray_left          # already a private copy
+            self._kf_depth[seq] = kf.depth_m
+            self._kf_R[seq] = R
+            self._kf_t[seq] = t
+            self._kf_track_ids[seq] = kf.track_ids
+            self._kf_track_px[seq] = kf.track_px
+            self._kf_inlier_ids[seq] = kf.inlier_ids
+            self._evict_locked()
+        self._dirty.set()
+
+    def _evict_locked(self) -> None:
+        """Drop the oldest keyframes once over the cap (call under the lock)."""
+        n = len(self._kf_gray)
+        if n <= self.MAX_KEYFRAMES:
+            return
+        # dict preserves insertion order -> the first keys are the oldest.
+        for seq in list(self._kf_gray.keys())[: n - self.MAX_KEYFRAMES]:
+            self._kf_gray.pop(seq, None)
+            self._kf_depth.pop(seq, None)
+            self._kf_R.pop(seq, None)
+            self._kf_t.pop(seq, None)
+            self._kf_track_ids.pop(seq, None)
+            self._kf_track_px.pop(seq, None)
+            self._kf_inlier_ids.pop(seq, None)
+            self._on_evict_locked(seq)
+
+    def _on_evict_locked(self, seq: int) -> None:
+        """Hook for a subclass to drop its OWN per-seq state (call under lock)."""
+
+    # ------------------------------------------------------------------ #
+    def _build(self):
+        """Build the source's payload from the accumulated keyframes.
+
+        Implemented by each concrete source; the return value is passed straight
+        to the injected callback. Runs OFF the GUI thread on the rebuild loop.
+        """
+        raise NotImplementedError
+
+    def run(self) -> None:
+        """Coalesced rebuild loop: re-build when dirty, capped at REBUILD_HZ."""
+        period = 1.0 / self.REBUILD_HZ
+        while not self._stop.is_set():
+            # Wait for a dirty mark (or shutdown); then throttle so a burst of
+            # updates collapses into ONE rebuild per period.
+            if not self._dirty.wait(timeout=0.25):
+                continue
+            if self._stop.is_set():
+                break
+            self._dirty.clear()
+            try:
+                payload = self._build()
+            except Exception:                          # noqa: BLE001
+                # A malformed keyframe must not kill the rebuild thread; skip it.
+                time.sleep(period)
+                continue
+            cb = self._cb
+            if cb is not None:
+                cb(*payload)
+            # Coalesce: sleep out the rest of the period before honouring the next
+            # dirty mark, so we never exceed REBUILD_HZ full rebuilds/s.
+            self._stop.wait(period)
+
+    def _stop_extra_clients(self) -> None:
+        """Hook for a subclass to stop any EXTRA clients it opened (e.g. slam)."""
+
+    def stop(self) -> None:
+        """Close the VIO client + kf rings (+ any subclass clients); idempotent."""
+        self._stop.set()
+        self._dirty.set()                              # wake the rebuild thread
+        client = self._vio_client
+        self._vio_client = None
+        if client is not None:
+            try:
+                client.stop()
+            except Exception:                          # noqa: BLE001
+                pass
+        self._stop_extra_clients()
+        rings = self._vio_rings
+        self._vio_rings = None
+        if rings is not None:
+            try:
+                rings.close()
+            except Exception:                          # noqa: BLE001
+                pass
+
+
+# --------------------------------------------------------------------------- #
+# (3c) SLAM 3D-map source (sparse landmark cloud) for MapWindow
+# --------------------------------------------------------------------------- #
+class IpcSlamMapSource(_KeyframeAccumulator):
     """Build the sparse, ID-based SLAM landmark cloud for MapWindow.
 
     Shows ONE point per LANDMARK (KLT track id) that was a PnP INLIER across a run
@@ -410,7 +632,7 @@ class IpcSlamMapSource(threading.Thread):
     (Re-anchoring to the loop-corrected ``slam.map`` translations is a deliberate
     later step; positioning from one source first is what makes the map populate.)
 
-    Cloud build (TRACK-ID persistence -- see :meth:`_build_cloud`):
+    Cloud build (TRACK-ID persistence -- see :meth:`_build`):
 
     1. Order ALL VIO keyframes (every ``--kf-every`` frames) by ``seq`` and give
        each a 0-based sequential index ``k`` -- the index the consecutive-run gate
@@ -442,15 +664,16 @@ class IpcSlamMapSource(threading.Thread):
     freshest poses. The finished ``(points, colors, cams)`` go to the injected
     ``on_cloud`` callback (the window marshals it onto the GUI thread).
 
+    The VIO keyframe feed (ring attach + ``_on_keyframe`` stash + evict + the
+    coalesced rebuild loop) is inherited UNCHANGED from
+    :class:`_KeyframeAccumulator`; this class adds ONLY the landmark-specific
+    ``slam.map`` client + the track-id-persistence build.
+
     Connect-error model mirrors :class:`IpcGyroFuseSource` /
     :class:`IpcKeypointWorker`: :meth:`start` swallows a connect timeout onto
     :attr:`error` (the window polls it) rather than raising.
     """
 
-    #: Cap on kept keyframes (bounds memory like the other UI buffers). At
-    #: kf_every=5 @ 20 fps a keyframe lands ~every 0.25 s, so 600 kf ~= 2.5 min of
-    #: distinct keyframes -- far more than any landmark map needs.
-    MAX_KEYFRAMES = 600
     #: Max full-cloud rebuilds per second. The sparse landmark rebuild is light
     #: (only the ~tens-hundreds of inlier tracks per keyframe, not every depth
     #: pixel), so we run at 4 Hz to re-snap the map promptly on new keyframes +
@@ -465,49 +688,16 @@ class IpcSlamMapSource(threading.Thread):
     #: actually populates at the live --kf-every cadence. RAISE for higher
     #: confidence (sparser), LOWER to fill the room faster (noisier).
     PERSIST_KF = 6
-    #: Valid-depth band (m) for sampling a track's depth: outside this range the
-    #: stereo depth is too noisy/unreliable to back-project, so the observation is
-    #: skipped (same band the dense geometry helper uses).
-    MIN_DEPTH_M = 0.3
-    MAX_DEPTH_M = 6.0
 
     def __init__(self, vio_endpoint: str, slam_endpoint: str, K: np.ndarray, *,
                  connect_timeout_s: float = 10.0,
                  width: int | None = None, height: int | None = None) -> None:
-        super().__init__(name=f"slam-map-src-{slam_endpoint}", daemon=True)
-        self._vio_ep = vio_endpoint
+        super().__init__(vio_endpoint, name=f"slam-map-src-{slam_endpoint}",
+                         connect_timeout_s=connect_timeout_s,
+                         width=width, height=height)
         self._slam_ep = slam_endpoint
         self._K = np.asarray(K, dtype=np.float64).reshape(3, 3)
-        self._connect_timeout_s = float(connect_timeout_s)
-        # The kf rings are FIXED shape; if the caller knows the capture
-        # resolution use it, else fall back to the canonical default specs.
-        self._w = width
-        self._h = height
-
-        # Public attrs the window polls (mirror the other sources' contract).
-        self.error: str | None = None
-
-        self._stop = threading.Event()
-        self._lock = threading.Lock()
-        self._dirty = threading.Event()
-        self._cb = None                       # on_cloud(points, colors, cams)
-
-        self._vio_client: IPCPubSub | None = None
         self._slam_client: IPCPubSub | None = None
-        self._vio_rings: RingRegistry | None = None
-
-        # Per-keyframe accumulators, keyed by source frame seq. Each keyframe keeps
-        # its gray/depth grid + rotation AND its KLT track snapshot (ids + pixels)
-        # plus the PnP-inlier id subset -- the track-id persistence build reads all
-        # of these. ``_build_cloud`` re-orders by seq, so insertion order here is
-        # not relied on for the index assignment.
-        self._kf_gray: dict[int, np.ndarray] = {}
-        self._kf_depth: dict[int, np.ndarray] = {}
-        self._kf_R: dict[int, np.ndarray] = {}        # (3,3) keyframe rotation
-        self._kf_t: dict[int, np.ndarray] = {}        # (3,) VIO keyframe translation
-        self._kf_track_ids: dict[int, np.ndarray] = {}   # (N,) track ids
-        self._kf_track_px: dict[int, np.ndarray] = {}    # (N,2) pixels, id-aligned
-        self._kf_inlier_ids: dict[int, np.ndarray] = {}  # (M,) PnP inlier ids
         # Latest loop-closure-corrected camera positions from slam.map, keyed by
         # seq. NOT used to position the cloud (the cloud builds from the VIO
         # keyframe's own pose for a seam-free odom-frame map); retained as the
@@ -527,15 +717,10 @@ class IpcSlamMapSource(threading.Thread):
         # Attach VIO's keyframe rings (consumer side) so the keyframe converter
         # can read_copy the gray/depth arrays out of them. Missing rings == VIO
         # not running -> surface a clear, device-agnostic reason.
-        try:
-            self._vio_rings = self._attach_vio_rings()
-        except RuntimeError as e:
-            self.error = str(e)
+        if not self._attach_or_fail():
             return
 
-        vio_client = IPCPubSub(self._vio_ep, role="client",
-                               connect_timeout_s=self._connect_timeout_s)
-        vio_client.subscribe(topics.KEYFRAME, self._on_keyframe)
+        vio_client = self._make_keyframe_client()
         slam_client = IPCPubSub(self._slam_ep, role="client",
                                 connect_timeout_s=self._connect_timeout_s)
         slam_client.subscribe(topics.SLAM_MAP, self._on_slammap)
@@ -549,69 +734,25 @@ class IpcSlamMapSource(threading.Thread):
                     c.stop()
                 except Exception:                                  # noqa: BLE001
                     pass
+            self._vio_client = None
             if self._vio_rings is not None:
                 self._vio_rings.close()
                 self._vio_rings = None
             return
-        self._vio_client = vio_client
         self._slam_client = slam_client
         self.start()                                  # spin the rebuild thread
 
-    def _attach_vio_rings(self) -> RingRegistry:
-        """Attach VIO's keyframe rings; map a missing ring to a clear reason."""
-        # Use the caller's resolution when known, else the canonical default.
-        kwargs = {}
-        if self._w is not None and self._h is not None:
-            kwargs = {"width": int(self._w), "height": int(self._h)}
-        try:
-            return RingRegistry().attach_all(
-                default_vio_specs(endpoint=self._vio_ep, **kwargs))
-        except FileNotFoundError as e:
-            raise RuntimeError(
-                f"VIO keyframe stream not available on {self._vio_ep!r} "
-                f"(is VIO running?)") from e
-
     # ------------------------------------------------------------------ #
-    def _on_keyframe(self, wm) -> None:
-        """VIO recv thread: stash one keyframe's gray/depth + FULL pose + tracks.
-
-        The landmark map is built from the PnP-inlier track ids of each keyframe
-        (pixels back-projected through the depth map, gray for colour), so we keep
-        the gray/depth grid, the keyframe's pose (rotation AND translation), and
-        the track snapshot (``track_ids`` / ``track_px`` / ``inlier_ids``). The
-        cloud positions from the VIO keyframe's OWN pose so every observation of a
-        landmark uses one consistent odom-frame pose source (no seams).
-        """
-        if wm is END:
-            return
-        kf = to_local(topics.KEYFRAME, wm, self._vio_rings)
-        if kf is END:                                 # WireEnd -> local END
-            return
-        seq = int(kf.seq)
-        # Split the (4,4) VIO world<-cam pose into rotation + translation; the
-        # cloud builds from BOTH (Xw = R Xc + t) so positions stay self-consistent.
-        T = np.asarray(kf.T_world_cam, dtype=np.float64)
-        R = T[:3, :3].copy()
-        t = T[:3, 3].copy()
-        # The track snapshot is OPTIONAL on the wire (a keyframe may carry None);
-        # store it as-is and let _build_cloud skip keyframes lacking it.
-        with self._lock:
-            self._kf_gray[seq] = kf.gray_left          # already a private copy
-            self._kf_depth[seq] = kf.depth_m
-            self._kf_R[seq] = R
-            self._kf_t[seq] = t
-            self._kf_track_ids[seq] = kf.track_ids
-            self._kf_track_px[seq] = kf.track_px
-            self._kf_inlier_ids[seq] = kf.inlier_ids
-            self._evict_locked()
-        self._dirty.set()
+    def _on_evict_locked(self, seq: int) -> None:
+        """Drop this source's per-seq corrected-position state too (under lock)."""
+        self._kf_corr_pos.pop(seq, None)
 
     def _on_slammap(self, wm) -> None:
         """SLAM recv thread: refresh the loop-closure-corrected positions.
 
         These are kept fresh for the future corrected-map variant + diagnostics
         only; the cloud is positioned from each keyframe's own VIO pose (see
-        :meth:`_build_cloud`), so this does NOT gate or move the rendered map.
+        :meth:`_build`), so this does NOT gate or move the rendered map.
         """
         if wm is END:
             return
@@ -628,24 +769,8 @@ class IpcSlamMapSource(threading.Thread):
             self._kf_corr_pos = {int(s): pos[i] for i, s in enumerate(seqs)}
         self._dirty.set()
 
-    def _evict_locked(self) -> None:
-        """Drop the oldest keyframes once over the cap (call under the lock)."""
-        n = len(self._kf_gray)
-        if n <= self.MAX_KEYFRAMES:
-            return
-        # dict preserves insertion order -> the first keys are the oldest.
-        for seq in list(self._kf_gray.keys())[: n - self.MAX_KEYFRAMES]:
-            self._kf_gray.pop(seq, None)
-            self._kf_depth.pop(seq, None)
-            self._kf_R.pop(seq, None)
-            self._kf_t.pop(seq, None)
-            self._kf_track_ids.pop(seq, None)
-            self._kf_track_px.pop(seq, None)
-            self._kf_inlier_ids.pop(seq, None)
-            self._kf_corr_pos.pop(seq, None)
-
     # ------------------------------------------------------------------ #
-    def _build_cloud(self):
+    def _build(self):
         """Build the sparse landmark cloud by TRACK-ID persistence (VIO poses).
 
         Returns ``(points, colors, cams)`` (points/colors empty when no landmark
@@ -777,49 +902,181 @@ class IpcSlamMapSource(threading.Thread):
         return points, colors, cams
 
     # ------------------------------------------------------------------ #
-    def run(self) -> None:
-        """Rebuild the cloud (coalesced) whenever the model goes dirty."""
-        period = 1.0 / self.REBUILD_HZ
-        while not self._stop.is_set():
-            # Wait for a dirty mark (or shutdown); then throttle so a burst of
-            # slam.map updates collapses into ONE rebuild per period.
-            if not self._dirty.wait(timeout=0.25):
-                continue
-            if self._stop.is_set():
-                break
-            self._dirty.clear()
-            try:
-                points, colors, cams = self._build_cloud()
-            except Exception:                          # noqa: BLE001
-                # A malformed keyframe must not kill the rebuild thread; skip it.
-                time.sleep(period)
-                continue
-            cb = self._cb
-            if cb is not None:
-                cb(points, colors, cams)
-            # Coalesce: sleep out the rest of the period before honouring the
-            # next dirty mark, so we never exceed REBUILD_HZ full rebuilds/s.
-            self._stop.wait(period)
-
-    def stop(self) -> None:
-        """Close both clients + the kf rings (idempotent)."""
-        self._stop.set()
-        self._dirty.set()                              # wake the rebuild thread
-        for c in (self._vio_client, self._slam_client):
-            if c is not None:
-                try:
-                    c.stop()
-                except Exception:                      # noqa: BLE001
-                    pass
-        self._vio_client = None
+    def _stop_extra_clients(self) -> None:
+        """Close the EXTRA slam.map client (the base closes the VIO one)."""
+        client = self._slam_client
         self._slam_client = None
-        rings = self._vio_rings
-        self._vio_rings = None
-        if rings is not None:
+        if client is not None:
             try:
-                rings.close()
+                client.stop()
             except Exception:                          # noqa: BLE001
                 pass
+
+
+# --------------------------------------------------------------------------- #
+# (3d) Voxel/occupancy 3D-map source (solid cube mesh) for RoomBlocksWindow
+# --------------------------------------------------------------------------- #
+class IpcVoxelMapSource(_KeyframeAccumulator):
+    """Build a solid-voxel (occupancy-grid) cube mesh of the room for RoomBlocks.
+
+    A COMPLEMENT to :class:`IpcSlamMapSource`'s sparse landmark cloud: instead of
+    one point per confirmed landmark, this back-projects the DENSE depth of every
+    VIO keyframe, bins the world points into a 3D voxel grid, and renders the
+    occupied cells as SOLID CUBES -- so walls/surfaces read as blocky shells and
+    the enclosed room is recognisable. Pure CONSUMER of the same ``keyframe`` feed
+    the landmark map uses (no SLAM endpoint, no ``slam.map`` -- the occupancy grid
+    needs only the keyframe depth + each keyframe's own VIO pose); no new field,
+    no data-path change.
+
+    Reuses the inherited :class:`_KeyframeAccumulator` machinery WHOLESALE (the kf
+    ring attach + ``_on_keyframe`` stash + evict + the coalesced rebuild loop) --
+    only ONE VIO client, NO copy-paste of the SHM/recv code. This class adds ONLY
+    the occupancy/cube-mesh build.
+
+    Build (:meth:`_build`, runs OFF the GUI thread):
+
+    1. For each VIO keyframe, back-project its full depth grid to the camera frame
+       (pinhole), gate to the valid-depth band + an edge-discontinuity reject
+       (drops "flying pixels"), sub-sample by :data:`STRIDE`, and transform to the
+       world by the keyframe's OWN pose ``[R | t]`` (one pose source per keyframe
+       -> seam-free odom-frame points, the same consistent-odom approach the
+       landmark map uses).
+    2. Bin the stacked world points into a :data:`VOXEL_M` grid; keep a cell only
+       once it has ``>= MIN_HITS`` points (multi-keyframe agreement rejects thin
+       stereo noise). Output the occupied cell CENTRES + a per-cell HEIGHT colour.
+    3. Build ONE merged cube mesh (verts/faces/face-colors) from the centres so
+       the window renders the whole grid as a single shaded ``GLMeshItem``.
+
+    The finished ``(verts, faces, face_colors, cams)`` go to the injected
+    ``on_mesh`` callback (the window marshals it onto the GUI thread via its
+    thread-safe ``submit``).
+
+    Connect-error model mirrors the other sources.
+    """
+
+    #: A cube-mesh rebuild is HEAVIER than a scatter (it (re)bins every keyframe's
+    #: dense depth + rebuilds a big triangle mesh), so rebuild more slowly than the
+    #: landmark map -- ~2.5 Hz coalesces bursts of new keyframes into one rebuild.
+    REBUILD_HZ = 2.5
+
+    def __init__(self, vio_endpoint: str, K: np.ndarray, *,
+                 connect_timeout_s: float = 10.0,
+                 width: int | None = None, height: int | None = None) -> None:
+        super().__init__(vio_endpoint, name=f"voxel-map-src-{vio_endpoint}",
+                         connect_timeout_s=connect_timeout_s,
+                         width=width, height=height)
+        self._K = np.asarray(K, dtype=np.float64).reshape(3, 3)
+
+    # ------------------------------------------------------------------ #
+    def start_mesh(self, on_mesh) -> None:
+        """Connect VIO's ``keyframe`` and stream cube meshes to ``on_mesh``.
+
+        ``on_mesh(verts (V,3) float32, faces (F,3) int64, face_colors (F,4)
+        float32, cams (M,3) float32)`` is invoked from this source's REBUILD
+        thread (the window marshals it onto the GUI thread). On connect failure
+        :attr:`error` is set and the thread is NOT started (the window polls it).
+        """
+        self._cb = on_mesh
+        if not self._attach_or_fail():
+            return
+        vio_client = self._make_keyframe_client()
+        try:
+            vio_client.start()
+        except Exception as e:                                     # noqa: BLE001
+            self.error = f"Room-blocks stream connect failed: {e}"
+            try:
+                vio_client.stop()
+            except Exception:                                      # noqa: BLE001
+                pass
+            self._vio_client = None
+            if self._vio_rings is not None:
+                self._vio_rings.close()
+                self._vio_rings = None
+            return
+        self.start()                                  # spin the rebuild thread
+
+    # ------------------------------------------------------------------ #
+    def _build(self):
+        """Back-project ALL keyframes -> occupancy grid -> ONE merged cube mesh.
+
+        Returns ``(verts, faces, face_colors, cams)``: the merged cube mesh of the
+        occupied voxels (empty arrays when nothing is occupied) plus ALL VIO
+        keyframe camera positions (so the window can show the capture trail). Each
+        keyframe's dense depth is back-projected through the SAME valid-depth band
+        + edge reject the dense geometry helper uses, sub-sampled by
+        :data:`~ui.viz.voxel_blocks.STRIDE`, and placed in the world by its OWN VIO
+        pose -- then :func:`~ui.viz.voxel_blocks.occupancy_voxels` keeps only cells
+        with ``>= MIN_HITS`` hits and :func:`~ui.viz.voxel_blocks.cube_mesh` merges
+        their centres into a single mesh.
+        """
+        with self._lock:
+            # gray/depth are always present once stashed; the occupancy build needs
+            # only depth + each keyframe's own pose (no track snapshot). Sort by
+            # source seq for deterministic order (not load-bearing for occupancy,
+            # but keeps the build reproducible).
+            seqs = sorted(self._kf_depth)
+            depths = [self._kf_depth[s] for s in seqs]
+            Rs = [self._kf_R[s] for s in seqs]
+            ts = [self._kf_t[s] for s in seqs]
+            cam_ts = [self._kf_t[s] for s in self._kf_gray]
+        cams = (np.asarray(cam_ts, np.float32).reshape(-1, 3)
+                if cam_ts else np.zeros((0, 3), np.float32))
+
+        verts0 = np.zeros((0, 3), np.float32)
+        faces0 = np.zeros((0, 3), np.int64)
+        fcols0 = np.zeros((0, 4), np.float32)
+        if not seqs:
+            return verts0, faces0, fcols0, cams
+
+        fx, fy = float(self._K[0, 0]), float(self._K[1, 1])
+        cx, cy = float(self._K[0, 2]), float(self._K[1, 2])
+        stride = max(1, int(voxel_blocks.STRIDE))
+        edge_max = float(voxel_blocks.EDGE_MAX_M)
+
+        # Back-project + world-transform every keyframe's dense depth, accumulate
+        # the world points (the occupancy grid bins the UNION of all keyframes).
+        world_all: list[np.ndarray] = []
+        for k in range(len(seqs)):
+            depth = np.asarray(depths[k], dtype=np.float32)
+            h, w = depth.shape
+            # Valid-depth band (same band the landmark map + geometry helper use).
+            m = (np.isfinite(depth) & (depth >= self.MIN_DEPTH_M)
+                 & (depth <= self.MAX_DEPTH_M))
+            if edge_max > 0.0:
+                # Edge reject: drop pixels on a depth discontinuity ("flying
+                # pixels" that interpolate between a fg/bg surface) -- the SAME
+                # 4-neighbour delta gate ``keyframe_pointcloud``'s edge_max applies.
+                dv = np.abs(np.diff(depth, axis=0, append=depth[-1:]))
+                dh = np.abs(np.diff(depth, axis=1, append=depth[:, -1:]))
+                m &= (dv <= edge_max) & (dh <= edge_max)
+            # Sub-sample to bound the per-keyframe point budget (the room shape
+            # survives; occupancy only needs enough hits per cell for MIN_HITS).
+            keep = m[::stride, ::stride]
+            if not np.any(keep):
+                continue
+            us = np.arange(0, w, stride, dtype=np.float32)
+            vs = np.arange(0, h, stride, dtype=np.float32)
+            uu, vv = np.meshgrid(us, vs)
+            z = depth[::stride, ::stride]
+            uu, vv, z = uu[keep], vv[keep], z[keep]
+            # Pinhole back-projection to the camera frame, then to world by the
+            # keyframe's own VIO pose [R | t] (Xw = R Xc + t).
+            cam = np.stack([(uu - cx) * z / fx, (vv - cy) * z / fy, z], axis=1)
+            world_all.append(cam @ Rs[k].T + ts[k])
+
+        if not world_all:
+            return verts0, faces0, fcols0, cams
+        points = np.concatenate(world_all, axis=0)
+
+        # Occupancy: bin -> keep cells with >= MIN_HITS -> centres + height colour.
+        centers, colors = voxel_blocks.occupancy_voxels(
+            points, voxel=voxel_blocks.VOXEL_M, min_hits=voxel_blocks.MIN_HITS)
+        if centers.shape[0] == 0:
+            return verts0, faces0, fcols0, cams
+        # Merge into ONE cube mesh (cubes sized to the voxel so they tile solidly).
+        verts, faces, face_colors = voxel_blocks.cube_mesh(
+            centers, voxel_blocks.VOXEL_M, colors=colors)
+        return verts, faces, face_colors, cams
 
 
 # --------------------------------------------------------------------------- #
@@ -848,3 +1105,17 @@ def ipc_slam_map_factory(vio_endpoint: str, slam_endpoint: str, K: np.ndarray,
     """
     return lambda: IpcSlamMapSource(vio_endpoint, slam_endpoint, K,
                                     width=width, height=height)
+
+
+def ipc_voxel_map_factory(vio_endpoint: str, K: np.ndarray,
+                          width: int, height: int):
+    """Return a zero-arg factory building an :class:`IpcVoxelMapSource`.
+
+    Binds the VIO endpoint (the ``keyframe`` publisher + its kf rings) and the
+    rectified-left ``K`` from the retained calib bundle -- so the caller
+    (``ui.main``) just opens RoomBlocksWindow and starts the returned source. No
+    SLAM endpoint: the occupancy grid builds from the keyframe depth + each
+    keyframe's own VIO pose only.
+    """
+    return lambda: IpcVoxelMapSource(vio_endpoint, K,
+                                     width=width, height=height)
