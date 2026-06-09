@@ -275,7 +275,7 @@ flowchart LR
 | `imu_camera` | OAK-D (or session replay), cam+IMU sync, IMU calibration, **inline SGM depth** | — | `cam.sync`, `imu.raw`, `imucam.sample`, `frame.depth`, `calib.bundle` |
 | `vio` | RGB-D visual odometry (+ gyro prior) + windowed BA | `imucam.sample`, `frame.depth`, `calib.bundle` | `pose.odom`, `pose.vo` (live-only), `pose.refined`, `keyframe`, `frame.tracks`, `frame.inliers` |
 | `slam` | ORB loop closure + SE(3) pose-graph (the SLAM map) | `keyframe`, `calib.bundle` (from VIO) | `loop.correction`, `slam.map` (live-only) |
-| `ui` | Qt `MainWindow`, one 5-line `Viewer3D`, Visualize/Calibration windows | `pose.odom`/`pose.vo`/`pose.refined`/`calib.bundle` (vio); `slam.map`/`calib.bundle` (slam); on-demand `imu.raw`/`imucam.sample`/`frame.depth` (capture) + `frame.tracks`/`frame.inliers` (vio) | — (sink) |
+| `ui` | Qt `MainWindow`, one 5-line `Viewer3D`, Visualize/Calibration windows | `pose.odom`/`pose.vo`/`pose.refined`/`calib.bundle` (vio); `slam.map`/`calib.bundle` (slam); on-demand `imu.raw`/`imucam.sample`/`frame.depth` (capture) + `frame.tracks`/`frame.inliers`/`keyframe` (vio) + `slam.map` (slam, SLAM Map window) | — (sink) |
 | `launcher` | process lifecycle (spawn / restart loop / orphan cleanup) | — | — |
 | `depth` | standalone SGM depth-as-a-process harness | `cam.sync`, `calib.bundle` (capture) | `frame.depth` |
 
@@ -355,10 +355,13 @@ loop cleans up and respawns `imu_camera + vio + slam + ui` from scratch.
 The menu bar renders **in-window on every platform** (`setNativeMenuBar(False)`):
 
 - **View** — camera presets and Follow Camera.
-- **Visualize** — *Camera + Depth + IMU (triplet)* and *Keypoint Depth Tracker*,
-  reusing the unchanged `ui/qt` windows, fed over IPC by the adapters in
-  `ui/modules/ipc_sources.py` (capture's `imucam.sample` / `frame.depth`; for the
-  tracker also VIO's `frame.tracks` / `frame.inliers`).
+- **Visualize** — *Camera + Depth + IMU (triplet)*, *Keypoint Depth Tracker*,
+  *Gyro Fusion (strip chart)*, and *SLAM Map (3D room)* (the room fused from every
+  keyframe's depth + keyframe cameras, re-snapped to SLAM's loop-corrected poses, in
+  the same ENU frame as the main viewer), reusing the unchanged `ui/qt` windows, fed
+  over IPC by the adapters in `ui/modules/ipc_sources.py` (capture's `imucam.sample` /
+  `frame.depth`; the tracker also VIO's `frame.tracks` / `frame.inliers`; the SLAM map
+  VIO's `keyframe` + SLAM's `slam.map`).
 - **Calibration** — *Gyroscope Bias* and *Accelerometer (6-position)*, fed by
   capture's **raw** `imu.raw`. Because capture (not the UI) owns the device, a
   saved calibration is keyed per device (`device_id` from the calib bundle) and

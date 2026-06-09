@@ -1082,9 +1082,10 @@ frame cue is the origin triad + drone triad in `Viewer3D`.
 ## Appendix A — Existing visualization inventory (active proc4 UI)
 
 > Active UI is `ui/main.py` (the 4-process single-view GUI). The windows it opens are
-> `Viewer3D`, `SyncedViewWindow` (triplet), `KeypointTrackWindow`, and the two calib
-> dialogs. `mainwindow.py`, `imucam_window.py`, `MapWindow`, and `viz/imucam_render.py`
-> are legacy / not reachable from `ui/main.py`.
+> `Viewer3D`, `SyncedViewWindow` (triplet), `KeypointTrackWindow`, `GyroFuseWindow`,
+> `MapWindow` (SLAM Map 3D room), and the two calib dialogs. `mainwindow.py`,
+> `imucam_window.py`, and `viz/imucam_render.py` are legacy / not reachable from
+> `ui/main.py`.
 
 | View (file) | What it draws | Stage it reveals |
 |---|---|---|
@@ -1092,12 +1093,11 @@ frame cue is the origin triad + drone triad in `Viewer3D`.
 | **TelemetryPanel** `ui/qt/panels.py` | Position NED, velocity, attitude RPY incl. accel-only roll/pitch, path length, fps | Output state + gravity-leveling cross-check |
 | **SyncedViewWindow (triplet)** `ui/qt/synced_window.py` + `viz/depth_render.py` + `imu_panels.py` | rect-left \| dense SGM depth (khaki ramp + scale bar, % valid) \| scrolling gyro chart + interactive 3D accel vector | SGM dense-stereo output quality + the IMU stream |
 | **KeypointTrackWindow** `ui/qt/keypoints_window.py` + `viz/keypoint_overlay.py` | rect-left with every KLT track: dot colour = depth, hollow grey = no stereo, amber = fresh, green ring = PnP inlier, 20-frame trail; stats | KLT frontend + RGB-D PnP together. The best existing frontend window. |
+| **MapWindow (SLAM Map 3D room)** `ui/qt/map_window.py` + `ui/comms/lib/misc/geometry.py` (`keyframe_pointcloud`), fed by `IpcSlamMapSource` (`ui/modules/ipc_sources.py`) | Grid + ENU triad; the room fused from EVERY keyframe — back-projected keyframe depth (gray-shaded points) + amber keyframe-camera dots, re-snapped to SLAM's loop-corrected poses, in the SAME ENU frame as `Viewer3D` | **Dense map output** of the keyframe/SLAM stage. Consumes vio `keyframe` (gray/depth via VIO's kf rings) + slam `slam.map` (corrected poses) — pure consumer, no data-path change. |
 | **GyroCalibDialog / AccelCalibDialog** `ui/qt/calib_dialogs.py` | Stillness progress + bias readout; 6-face capture grid + residual | Gyro bias + 6-position accel calibration |
 
-**Built but NOT wired:** `MapWindow` (SLAM dense room reconstruction from
-`keyframe_pointcloud` + `voxel_downsample`, `ui/comms/lib/misc/geometry.py`) — fully
-implemented renderer, no menu action in `ui/main.py`. `imucam_window.py` /
-`viz/imucam_render.py` (legacy cv2 triplet) — superseded by `SyncedViewWindow`.
+**Legacy / not wired:** `imucam_window.py` / `viz/imucam_render.py` (legacy cv2 triplet)
+— superseded by `SyncedViewWindow`.
 
 **Algorithms with NO visualization at all:** SGM cost-volume / path-aggregation internals;
 ORB loop-closure matches + epipolar geometry; pose-graph residuals/edges; windowed-BA

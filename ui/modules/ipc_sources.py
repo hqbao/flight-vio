@@ -53,13 +53,17 @@ into ``self.error`` for the window to display.
 """
 from __future__ import annotations
 
+import threading
+import time
+
 import numpy as np
 
 from ui.comms import topics
 from ui.comms.messages import END
 from ui.comms import IPCPubSub, IPCSubscriber, RingRegistry
 from ui.comms.converters import to_local
-from ui.comms.ring_registry import default_capture_specs
+from ui.comms.ring_registry import default_capture_specs, default_vio_specs
+from ui.comms.lib.misc import geometry
 from ui.qt.keypoints_window import KeypointWorker
 from ui.qt.synced_window import TripletWorker
 
@@ -372,6 +376,272 @@ class IpcKeypointWorker(KeypointWorker):
 
 
 # --------------------------------------------------------------------------- #
+# (3b) SLAM 3D-map source (fused keyframe cloud) for MapWindow
+# --------------------------------------------------------------------------- #
+class IpcSlamMapSource(threading.Thread):
+    """Fuse the per-keyframe depth maps into ONE room cloud for MapWindow.
+
+    Subscribes BOTH endpoints the 3D room needs (mirrors :class:`IpcKeypointWorker`'s
+    two-endpoint pattern, but the keyframe gray/depth ride VIO's dedicated
+    ``kf_gray`` / ``kf_depth`` rings, NOT capture's frame rings):
+
+    * ``keyframe`` (VIO) -> per keyframe ``seq`` we keep its gray image + metric
+      depth (``read_copy``-ed out of VIO's kf rings by the converter) and the
+      ROTATION of its ``T_world_cam``. The keyframe rate is low (kf_every), so a
+      bounded dict of the last :data:`MAX_KEYFRAMES` keyframes caps memory.
+    * ``slam.map`` (SLAM) -> the CONTINUOUS per-keyframe CORRECTED positions,
+      keyed by source frame seq (``kf_ids`` aligned with ``kf_positions``). We use
+      these corrected translations -- not the raw VIO keyframe pose -- so the room
+      re-snaps after every loop closure.
+
+    The fused pose per keyframe is therefore ``[R_keyframe | t_corrected]``:
+    SLAM's overlay carries only the corrected camera POSITION (a ``(3,)`` per
+    keyframe), so we keep each keyframe's own rotation and swap in the corrected
+    translation. That is enough to re-anchor every back-projected point to the
+    loop-corrected room (orientation drift between corrections is negligible at
+    keyframe spacing), and it keeps this a pure CONSUMER of existing topics -- no
+    new field, no data-path change.
+
+    ``K`` comes from VIO's retained ``calib.bundle`` (the rectified-left
+    intrinsic for the full-res depth grid, the same one
+    :func:`geometry.keyframe_pointcloud` expects).
+
+    Rebuild policy: a full-cloud re-fuse over every kept keyframe is heavy, so we
+    COALESCE -- a ``slam.map`` (or a new keyframe) just marks the model dirty, and
+    a background loop rebuilds at most :data:`REBUILD_HZ` times a second, always
+    from the freshest poses. The finished ``(points, colors, cams)`` go to the
+    injected ``on_cloud`` callback (the window marshals it onto the GUI thread).
+
+    Connect-error model mirrors :class:`IpcGyroFuseSource` /
+    :class:`IpcKeypointWorker`: :meth:`start` swallows a connect timeout onto
+    :attr:`error` (the window polls it) rather than raising.
+    """
+
+    #: Cap on kept keyframes (bounds memory like the other UI buffers). At
+    #: kf_every=5 @ 20 fps a keyframe lands ~every 0.25 s, so 600 kf ~= 2.5 min of
+    #: distinct keyframes -- far more than any room reconstruction needs.
+    MAX_KEYFRAMES = 600
+    #: Max full-cloud rebuilds per second (coalesce bursts of slam.map updates).
+    REBUILD_HZ = 3.0
+    #: Subsample stride into geometry.keyframe_pointcloud (4 -> 1/16 the points).
+    STRIDE = 4
+
+    def __init__(self, vio_endpoint: str, slam_endpoint: str, K: np.ndarray, *,
+                 connect_timeout_s: float = 10.0,
+                 width: int | None = None, height: int | None = None) -> None:
+        super().__init__(name=f"slam-map-src-{slam_endpoint}", daemon=True)
+        self._vio_ep = vio_endpoint
+        self._slam_ep = slam_endpoint
+        self._K = np.asarray(K, dtype=np.float64).reshape(3, 3)
+        self._connect_timeout_s = float(connect_timeout_s)
+        # The kf rings are FIXED shape; if the caller knows the capture
+        # resolution use it, else fall back to the canonical default specs.
+        self._w = width
+        self._h = height
+
+        # Public attrs the window polls (mirror the other sources' contract).
+        self.error: str | None = None
+
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._dirty = threading.Event()
+        self._cb = None                       # on_cloud(points, colors, cams)
+
+        self._vio_client: IPCPubSub | None = None
+        self._slam_client: IPCPubSub | None = None
+        self._vio_rings: RingRegistry | None = None
+
+        # Per-keyframe accumulators, keyed by source frame seq. Insertion order is
+        # the keyframe arrival order (Python dicts preserve it), which is the
+        # order we fuse in -- the cloud is order-independent anyway.
+        self._kf_gray: dict[int, np.ndarray] = {}
+        self._kf_depth: dict[int, np.ndarray] = {}
+        self._kf_R: dict[int, np.ndarray] = {}        # (3,3) keyframe rotation
+        # Latest corrected camera positions from slam.map, keyed by seq.
+        self._kf_corr_pos: dict[int, np.ndarray] = {}
+
+    # ------------------------------------------------------------------ #
+    def start_cloud(self, on_cloud) -> None:
+        """Connect both endpoints and stream fused clouds to ``on_cloud``.
+
+        ``on_cloud(points (N,3) float32, colors (N,3) float32, cams (M,3)
+        float32)`` is invoked from this source's REBUILD thread (the window
+        marshals it onto the GUI thread). On connect failure :attr:`error` is set
+        and the thread is NOT started (the window polls :attr:`error`).
+        """
+        self._cb = on_cloud
+        # Attach VIO's keyframe rings (consumer side) so the keyframe converter
+        # can read_copy the gray/depth arrays out of them. Missing rings == VIO
+        # not running -> surface a clear, device-agnostic reason.
+        try:
+            self._vio_rings = self._attach_vio_rings()
+        except RuntimeError as e:
+            self.error = str(e)
+            return
+
+        vio_client = IPCPubSub(self._vio_ep, role="client",
+                               connect_timeout_s=self._connect_timeout_s)
+        vio_client.subscribe(topics.KEYFRAME, self._on_keyframe)
+        slam_client = IPCPubSub(self._slam_ep, role="client",
+                                connect_timeout_s=self._connect_timeout_s)
+        slam_client.subscribe(topics.SLAM_MAP, self._on_slammap)
+        try:
+            vio_client.start()
+            slam_client.start()
+        except Exception as e:                                     # noqa: BLE001
+            self.error = f"SLAM-map stream connect failed: {e}"
+            for c in (vio_client, slam_client):
+                try:
+                    c.stop()
+                except Exception:                                  # noqa: BLE001
+                    pass
+            if self._vio_rings is not None:
+                self._vio_rings.close()
+                self._vio_rings = None
+            return
+        self._vio_client = vio_client
+        self._slam_client = slam_client
+        self.start()                                  # spin the rebuild thread
+
+    def _attach_vio_rings(self) -> RingRegistry:
+        """Attach VIO's keyframe rings; map a missing ring to a clear reason."""
+        # Use the caller's resolution when known, else the canonical default.
+        kwargs = {}
+        if self._w is not None and self._h is not None:
+            kwargs = {"width": int(self._w), "height": int(self._h)}
+        try:
+            return RingRegistry().attach_all(
+                default_vio_specs(endpoint=self._vio_ep, **kwargs))
+        except FileNotFoundError as e:
+            raise RuntimeError(
+                f"VIO keyframe stream not available on {self._vio_ep!r} "
+                f"(is VIO running?)") from e
+
+    # ------------------------------------------------------------------ #
+    def _on_keyframe(self, wm) -> None:
+        """VIO recv thread: stash one keyframe's gray + depth + rotation."""
+        if wm is END:
+            return
+        kf = to_local(topics.KEYFRAME, wm, self._vio_rings)
+        if kf is END:                                 # WireEnd -> local END
+            return
+        seq = int(kf.seq)
+        R = np.asarray(kf.T_world_cam, dtype=np.float64)[:3, :3].copy()
+        with self._lock:
+            self._kf_gray[seq] = kf.gray_left          # already a private copy
+            self._kf_depth[seq] = kf.depth_m
+            self._kf_R[seq] = R
+            self._evict_locked()
+        self._dirty.set()
+
+    def _on_slammap(self, wm) -> None:
+        """SLAM recv thread: refresh the corrected per-keyframe positions."""
+        if wm is END:
+            return
+        smap = to_local(topics.SLAM_MAP, wm, RingRegistry())   # POD, no rings
+        if smap is END:
+            return
+        pos = np.asarray(smap.kf_positions, dtype=np.float64).reshape(-1, 3)
+        seqs = np.asarray(smap.kf_seqs, dtype=np.int64).reshape(-1)
+        if len(seqs) != len(pos):              # malformed -> ignore (keep last)
+            return
+        with self._lock:
+            # slam.map carries the FULL current corrected map every keyframe, so
+            # rebuild the dict wholesale (drops keyframes SLAM no longer keeps).
+            self._kf_corr_pos = {int(s): pos[i] for i, s in enumerate(seqs)}
+        self._dirty.set()
+
+    def _evict_locked(self) -> None:
+        """Drop the oldest keyframes once over the cap (call under the lock)."""
+        n = len(self._kf_gray)
+        if n <= self.MAX_KEYFRAMES:
+            return
+        # dict preserves insertion order -> the first keys are the oldest.
+        for seq in list(self._kf_gray.keys())[: n - self.MAX_KEYFRAMES]:
+            self._kf_gray.pop(seq, None)
+            self._kf_depth.pop(seq, None)
+            self._kf_R.pop(seq, None)
+
+    # ------------------------------------------------------------------ #
+    def _build_cloud(self):
+        """Fuse the kept keyframes into one cloud using CORRECTED poses.
+
+        Returns ``(points, colors, cams)`` (all empty when nothing is usable).
+        Only keyframes that have BOTH a stashed gray/depth AND a corrected
+        position from slam.map are fused -- so a keyframe SLAM hasn't placed yet
+        is skipped (not drawn at a stale raw pose).
+        """
+        with self._lock:
+            corr = dict(self._kf_corr_pos)
+            seqs = [s for s in self._kf_gray if s in corr]
+            grays = [self._kf_gray[s] for s in seqs]
+            depths = [self._kf_depth[s] for s in seqs]
+            Rs = [self._kf_R[s] for s in seqs]
+            ts = [corr[s] for s in seqs]
+        if not seqs:
+            empty = np.zeros((0, 3), np.float32)
+            return empty, empty, empty
+        # Compose [R_keyframe | t_corrected] per keyframe (see class docstring).
+        poses = []
+        cams = np.empty((len(seqs), 3), np.float32)
+        for i in range(len(seqs)):
+            T = np.eye(4, dtype=np.float64)
+            T[:3, :3] = Rs[i]
+            T[:3, 3] = ts[i]
+            poses.append(T)
+            cams[i] = ts[i].astype(np.float32)
+        points, colors = geometry.keyframe_pointcloud(
+            poses=poses, depths=depths, grays=grays, K=self._K,
+            stride=self.STRIDE)
+        return points, colors, cams
+
+    # ------------------------------------------------------------------ #
+    def run(self) -> None:
+        """Rebuild the cloud (coalesced) whenever the model goes dirty."""
+        period = 1.0 / self.REBUILD_HZ
+        while not self._stop.is_set():
+            # Wait for a dirty mark (or shutdown); then throttle so a burst of
+            # slam.map updates collapses into ONE rebuild per period.
+            if not self._dirty.wait(timeout=0.25):
+                continue
+            if self._stop.is_set():
+                break
+            self._dirty.clear()
+            try:
+                points, colors, cams = self._build_cloud()
+            except Exception:                          # noqa: BLE001
+                # A malformed keyframe must not kill the rebuild thread; skip it.
+                time.sleep(period)
+                continue
+            cb = self._cb
+            if cb is not None:
+                cb(points, colors, cams)
+            # Coalesce: sleep out the rest of the period before honouring the
+            # next dirty mark, so we never exceed REBUILD_HZ full rebuilds/s.
+            self._stop.wait(period)
+
+    def stop(self) -> None:
+        """Close both clients + the kf rings (idempotent)."""
+        self._stop.set()
+        self._dirty.set()                              # wake the rebuild thread
+        for c in (self._vio_client, self._slam_client):
+            if c is not None:
+                try:
+                    c.stop()
+                except Exception:                      # noqa: BLE001
+                    pass
+        self._vio_client = None
+        self._slam_client = None
+        rings = self._vio_rings
+        self._vio_rings = None
+        if rings is not None:
+            try:
+                rings.close()
+            except Exception:                          # noqa: BLE001
+                pass
+
+
+# --------------------------------------------------------------------------- #
 # (4) Factory helpers -- the windows want a zero-arg ``worker_factory``
 # --------------------------------------------------------------------------- #
 def ipc_triplet_factory(capture_endpoint: str, width: int, height: int):
@@ -384,3 +654,16 @@ def ipc_keypoint_factory(capture_endpoint: str, vio_endpoint: str,
     """Return a zero-arg factory building an :class:`IpcKeypointWorker`."""
     return lambda: IpcKeypointWorker(capture_endpoint, vio_endpoint,
                                      width, height)
+
+
+def ipc_slam_map_factory(vio_endpoint: str, slam_endpoint: str, K: np.ndarray,
+                         width: int, height: int):
+    """Return a zero-arg factory building an :class:`IpcSlamMapSource`.
+
+    Binds the VIO endpoint (the ``keyframe`` publisher + its kf rings), the SLAM
+    endpoint (the ``slam.map`` corrected poses) and the rectified-left ``K`` from
+    the retained calib bundle -- so the caller (``ui.main``) just opens MapWindow
+    and starts the returned source.
+    """
+    return lambda: IpcSlamMapSource(vio_endpoint, slam_endpoint, K,
+                                    width=width, height=height)

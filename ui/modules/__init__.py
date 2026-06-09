@@ -41,6 +41,9 @@ works -- it triggers the lazy import on first access:
   ``imucam.sample`` + ``frame.depth`` for the triplet window.
 * :class:`~ui.modules.ipc_sources.IpcKeypointWorker` -- capture ``frame.depth`` +
   vio ``frame.tracks`` / ``frame.inliers`` for the keypoint window.
+* :class:`~ui.modules.ipc_sources.IpcSlamMapSource` -- vio ``keyframe`` (+ its kf
+  rings) + slam ``slam.map`` (corrected poses) fused into the room cloud for the
+  SLAM 3D-map window.
 """
 from .collector import UiCollectorModule
 from .render import UiRenderModule
@@ -52,7 +55,8 @@ from .triplet import UiTripletModule
 # classes live in ui.qt). Accessing any of these names triggers the import.
 _IPC_ADAPTERS = frozenset({
     "IpcImuRawSource", "IpcGyroFuseSource", "IpcTripletWorker",
-    "IpcKeypointWorker", "ipc_triplet_factory", "ipc_keypoint_factory",
+    "IpcKeypointWorker", "IpcSlamMapSource", "ipc_triplet_factory",
+    "ipc_keypoint_factory", "ipc_slam_map_factory",
 })
 
 __all__ = [
@@ -67,8 +71,10 @@ __all__ = [
     "IpcGyroFuseSource",
     "IpcTripletWorker",
     "IpcKeypointWorker",
+    "IpcSlamMapSource",
     "ipc_triplet_factory",
     "ipc_keypoint_factory",
+    "ipc_slam_map_factory",
 ]
 
 
