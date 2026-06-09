@@ -817,6 +817,69 @@ def sgm_disparity(left: np.ndarray, right: np.ndarray,
     return disp
 
 
+def sgm_disparity_capture(
+    left: np.ndarray, right: np.ndarray, cfg: SGMConfig
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """SGM disparity PLUS the internal cost volumes -- an OPT-IN teaching/debug hook.
+
+    Returns ``(disparity, C, S)`` where:
+
+    * ``disparity`` -- the same ``(H, W)`` sub-pixel map :func:`sgm_disparity`
+      produces (``NaN`` where rejected),
+    * ``C`` -- the RAW census-Hamming cost volume ``(H, W, ndisp)`` ``int32``:
+      ``C[v, u, k] = popcount(censusL[v,u] XOR censusR[v,u-(dmin+k)])`` for
+      ``d = dmin + k``. This is the per-pixel matching evidence *before* any
+      smoothness prior -- flat/multi-valley on a textureless pixel, a sharp single
+      valley on a textured one,
+    * ``S`` -- the N-path SGM-AGGREGATED cost volume ``(H, W, ndisp)`` ``int32``:
+      ``S = sum_r L_r`` over the path directions. The global smoothness prior
+      sharpens an ambiguous ``C`` into a clearer single minimum -- the whole point
+      of SGM, made inspectable.
+
+    This is the SAME math as :func:`sgm_disparity`; it merely *keeps* the
+    intermediate volumes instead of discarding them. It exists ONLY for the
+    cost-volume explorer tool, so it forces ``downscale=1`` (the volumes only make
+    sense at the computed grid, not after a box-average + upsample) and is NEVER
+    called by the production depth path -- :func:`sgm_disparity` stays bit-for-bit
+    unchanged.
+
+    Cost: holds two ``H*W*ndisp`` int32 volumes in RAM (~150 MB at 640x400x96) --
+    fine for a one-frame offline inspector, which is exactly why it is opt-in.
+    """
+    # Run the full-resolution core directly: the volumes are only meaningful on
+    # the actual computed grid (a downscale would hide each pixel's true curve
+    # behind a box-average + nearest-neighbour upsample). The caller passes a
+    # downscale=1 config; the body below mirrors the downscale=1 branch of
+    # ``sgm_disparity`` exactly, only additionally returning ``vol`` (C) and
+    # ``agg`` (S) instead of discarding them.
+    L = np.ascontiguousarray(left.astype(np.float64))
+    R = np.ascontiguousarray(right.astype(np.float64))
+    crad = cfg.census_radius
+    ndisp = cfg.num_disparities
+    max_cost = (2 * crad + 1) * (2 * crad + 1)
+    H, W = L.shape
+
+    cl = _census(L, crad)
+    cr = _census(R, crad)
+    vol = _cost_volume(cl, cr, cfg.min_disparity, ndisp, np.int32(max_cost))
+
+    agg = np.zeros_like(vol)
+    npaths = 8 if cfg.num_paths >= 8 else 4
+    for i in range(npaths):
+        sy = int(_SGM_DIRS[i, 0])
+        sx = int(_SGM_DIRS[i, 1])
+        sv, su = _path_starts(H, W, sy, sx)
+        _aggregate_dir(vol, agg, sv, su, sy, sx,
+                       np.int32(cfg.p1), np.int32(cfg.p2))
+
+    disp = _wta_lr(agg, cfg.min_disparity, float(cfg.uniqueness),
+                   cfg.subpixel, cfg.lr_consistency, float(cfg.lr_max_diff))
+    _denoise_disparity(disp, cfg)
+    # ``vol`` is C (raw Hamming), ``agg`` is S (N-path aggregated); both
+    # (H, W, ndisp) int32 on the computed grid.
+    return disp, vol, agg
+
+
 # Disparity is invalid as NaN throughout this module, but cv2's median/speckle
 # ops work on a finite array. We bridge with a sentinel that cannot collide with
 # a real disparity (always < min_disparity=0): negative one. medianBlur over a
@@ -1054,6 +1117,25 @@ class SGMStereoMatcher:
             right = self.rectifier.rectify(right)
         return sgm_disparity(left, right, self.cfg)
 
+    def dense_disparity_capture(
+        self, left: np.ndarray, right: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """OPT-IN: disparity + cost volumes + the rectified pair used to match.
+
+        Returns ``(rectified_left, rectified_right, disparity, C, S)``: the two
+        rectified grayscale frames the matcher actually compared (the right
+        re-rectified via :class:`RightRectifier`, the left optionally re-rectified
+        too), the disparity map, and the RAW (``C``) + AGGREGATED (``S``) cost
+        volumes from :func:`sgm_disparity_capture`. This drives the cost-volume
+        explorer tool and is never used by the production depth path; the normal
+        :meth:`dense_disparity` / :meth:`dense_depth` are untouched.
+        """
+        left_rect = (self.left_rectifier.rectify(left)
+                     if self.left_rectifier is not None else left)
+        right_rect = (self.rectifier.rectify(right)
+                      if self.rectifier is not None else right)
+        disp, C, S = sgm_disparity_capture(left_rect, right_rect, self.cfg)
+        return left_rect, right_rect, disp, C, S
 
     def dense_depth(self, left: np.ndarray, right: np.ndarray) -> np.ndarray:
         """Full ``(H, W)`` metric depth map (``0.0`` where invalid)."""

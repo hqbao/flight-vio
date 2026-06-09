@@ -32,6 +32,7 @@ imu_camera.main ──(oak.capture: cam.sync raw L/R + calib.bundle)──▶ de
 | `depth/modules/` | the `compute_depth` + `publish_depth` steps | re-rooted copy of `imu_camera/modules/{compute_depth,publish_depth}.py` |
 | `depth/main.py` | the standalone depth process | new (mirrors `imu_camera.modules.pipeline` wiring + `vio.main` IPC topology) |
 | `depth/tests/` | the SGM-vs-chip-depth regression self-test | re-rooted copy of `imu_camera/tests/stereo_sgm_selftest.py` |
+| `depth/tools/` | standalone learning/diagnostic tools (e.g. the SGM cost-volume explorer) | new; offline, opt-in, never on the data path |
 
 ### `depth/comms/` — byte-identical, do not hand-edit
 
@@ -59,6 +60,13 @@ identical** to the depth the capture process computes inline (proven —
 * `SGMStereoMatcher` + `SGMConfig` — semi-global block matching with built-in
   left/right rectification.
 * `StereoMatcher` + `StereoConfig` — the sparse block matcher the self-test uses.
+* `sgm_disparity_capture` + `SGMStereoMatcher.dense_disparity_capture` — an
+  **opt-in** hook that runs the SAME SGM math but *keeps* the internal cost
+  volumes (`C` = raw census-Hamming, `S` = N-path aggregated) instead of
+  discarding them, returning `(disparity, C, S)` (and, on the matcher, the
+  rectified pair too). It forces `downscale=1` and is used ONLY by the cost-volume
+  explorer tool; `sgm_disparity` / `dense_depth` are bit-for-bit unchanged
+  (verified: the captured disparity is byte-identical to the production path).
 
 #### Density-preserving disparity denoise (live preset only)
 
@@ -124,6 +132,37 @@ boots with the bundle cached.
 
 CLI: `--capture-endpoint` (default `oak.capture`), `--endpoint` (default
 `oak.depth`), `--session`, `--max-frames`, `--depth-fast`, `--calib-timeout`.
+
+## `depth.tools.sgm_cost_explorer` — the SGM cost-volume explorer (learning tool)
+
+A standalone, offline tool that makes the dense matcher's internals visible and
+explains **why textureless surfaces give noisy depth**. It loads ONE frame from a
+recorded gold session, re-rectifies the recorded raw right frame via
+`RightRectifier` + the session calibration, runs the SGM with the opt-in
+volume-capture hook, and lets you inspect a single pixel's matching-cost curves:
+
+* `C(d)` — the **raw** census-Hamming cost over disparity (the evidence *before*
+  the smoothness prior),
+* `S(d)` — the **N-path SGM-aggregated** cost (the evidence *after* it),
+
+with the winner-take-all minimum, the sub-pixel parabola offset, and the
+uniqueness second-best band marked. A **textured** corner has a sharp single
+`C(d)` valley (one clear match → reliable depth); a **textureless** flat region
+has a flat / multi-valley `C(d)` (ambiguous → wrong disparity → noise), and only
+`S(d)` after global aggregation develops a clearer minimum — the whole point of
+SGM, made visible.
+
+It is purely a consumer of the depth math; it never touches the data path or the
+production depth output, and the capture hook leaves `sgm_disparity` unchanged.
+
+```bash
+# interactive (needs a display): click the left image / depth map -> plot C,S
+.venv/bin/python -m depth.tools.sgm_cost_explorer --session sessions/gold/corridor_60s
+
+# headless: write the textured-vs-textureless 2x2 curve PNG (numpy -> cv2, no GUI)
+.venv/bin/python -m depth.tools.sgm_cost_explorer \
+    --session sessions/gold/corridor_60s --frame 40 --render /tmp/sgm_cost.png
+```
 
 ## Run
 

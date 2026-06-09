@@ -362,14 +362,24 @@ block-medians valid pixels to a 54×42 grid.
 `:794`; downscale `:746,860,868`; depth `:939`; `SGMConfig` `:288`, live preset `:309`;
 `compute_depth.py:25`; `resolution_build.py:18`.
 
-**How to see it (most illuminating internals view).** *New view needed.* A click-to-inspect
-**disparity-space cost curve**: pick a pixel; plot `C(d)` (raw Hamming cost) and `S(d)`
-(aggregated cost) over `d=0..ndisp`, mark the WTA minimum, the parabola sub-pixel offset,
-and the uniqueness second-minimum band. On a textured pixel the raw curve already has a
-sharp valley; on a textureless/repetitive pixel the *raw* curve is flat/multi-valleyed and
-the *aggregated* curve develops a clear single minimum — that is precisely the "global
-smoothness disambiguates low-parallax" story made visible. The full-frame depth *output*
-already exists and is well-handled: the triplet depth panel
+**How to see it (most illuminating internals view).** *Built — `depth/tools/sgm_cost_explorer.py`.*
+A standalone, offline **disparity-space cost-curve explorer**: it loads ONE frame from a
+gold session, re-rectifies the recorded raw right via `RightRectifier`, runs the SGM with
+the **opt-in volume-capture hook** (`sgm_disparity_capture` /
+`SGMStereoMatcher.dense_disparity_capture`, which run the SAME math but *keep* `C`/`S`
+instead of discarding them — `sgm_disparity` stays bit-for-bit unchanged, verified), shows
+the rectified-left + the depth heatmap (reusing `ui/viz/depth_render.colorize_depth`), and
+on a pixel click plots `C(d)` (raw Hamming cost) and `S(d)` (aggregated cost) over
+`d ∈ [dmin, dmin+ndisp)` — marking the WTA minimum, the parabola sub-pixel offset, and the
+uniqueness second-best band. Two preset markers (a textured corner [T] vs a flat region
+[F]) are auto-placed so the contrast is one click away. On a textured pixel the raw curve
+already has a sharp single valley (`C` and `S` agree); on a textureless/repetitive pixel
+the *raw* curve is flat/multi-valleyed (its argmin is basically noise) and only the
+*aggregated* curve develops a clear single minimum — precisely the "global smoothness
+disambiguates low-parallax" story made visible. A headless `--render PNG` mode writes the
+textured-vs-textureless 2×2 curve figure (numpy → cv2, no GUI) for verification. Inherently
+offline because the live UI publishes only left+depth, never the raw right the volume needs.
+The full-frame depth *output* already exists and is well-handled: the triplet depth panel
 (`ui/viz/depth_render.py:colorize_depth`, line 71 — fixed 0.3–8.0 m khaki ramp, black =
 invalid).
 
@@ -1099,7 +1109,12 @@ frame cue is the origin triad + drone triad in `Viewer3D`.
 **Legacy / not wired:** `imucam_window.py` / `viz/imucam_render.py` (legacy cv2 triplet)
 — superseded by `SyncedViewWindow`.
 
-**Algorithms with NO visualization at all:** SGM cost-volume / path-aggregation internals;
-ORB loop-closure matches + epipolar geometry; pose-graph residuals/edges; windowed-BA
-reprojection residuals + landmarks; stereo rectification maps; the inertial filter; the
-camera↔IMU time-sync bucketing; the gravity sphere; the frame ladder.
+**Standalone learning tools (offline, not wired into the live proc4 UI):**
+`depth/tools/sgm_cost_explorer.py` — the SGM cost-volume explorer (§1.6 "How to see it"):
+click a pixel → plot its raw `C(d)` + aggregated `S(d)` matching-cost curves; loads one
+gold frame and runs the SGM with the opt-in volume-capture hook (production path unchanged).
+
+**Algorithms with NO visualization at all:** ORB loop-closure matches + epipolar geometry;
+pose-graph residuals/edges; windowed-BA reprojection residuals + landmarks; stereo
+rectification maps; the inertial filter; the camera↔IMU time-sync bucketing; the gravity
+sphere; the frame ladder.
