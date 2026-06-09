@@ -276,7 +276,7 @@ class KeypointTrackWindow(QWidget):
         rasters.addWidget(_DepthScaleBar(), stretch=0)
         lay.addLayout(rasters, stretch=1)
         hint = QLabel("colour = depth · hollow grey = no stereo · amber = fresh "
-                      "track · green = PnP inlier · stub = reproj error "
+                      "track · cyan ring = PnP inlier · stub = reproj error "
                       "(green inlier / red outlier) · trail = last 20 frames")
         hint.setObjectName("ScaleTick")
         lay.addWidget(hint, stretch=0)

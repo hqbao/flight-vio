@@ -50,7 +50,10 @@ _INVALID_BGR = (158, 148, 139)   # #8b949e
 _FRESH_BGR = (0, 176, 255)       # #ffb000
 _INLIER_BGR = (80, 185, 63)      # #3fb950
 _HALO_BGR = (0, 0, 0)
-#: Reprojection stub colours (BGR): inliers reuse the SUCCESS green (subtle,
+#: PnP-inlier dot RING colour (BGR). Distinct from the green inlier reproj stub
+#: below (#39c5cf cyan) so the ring and the stub never blend into one green blob.
+_INLIER_RING_BGR = (207, 197, 57)   # #39c5cf cyan
+#: Reprojection stub colours (BGR): inliers use the SUCCESS green (subtle,
 #: ~0-2 px), outliers use DANGER red #f85149 (long, striking strays).
 _STUB_INLIER_BGR = _INLIER_BGR
 _STUB_OUTLIER_BGR = (73, 81, 248)   # #f85149
@@ -164,9 +167,10 @@ def draw_overlay(gray: np.ndarray, depth_m: np.ndarray,
 
     Background is the grayscale frame, dimmed so the colour dots pop. Each live
     track: a black halo + a depth-coloured dot (valid depth) or a hollow grey
-    ring (no stereo return), an amber ring if it is a fresh track, a green ring
+    ring (no stereo return), an amber ring if it is a fresh track, a cyan ring
     if the RGB-D PnP kept it as an inlier (``inlier_ids``, the clean subset the
-    motion solve actually trusted), and -- when ``draw_trails`` -- a faint
+    motion solve actually trusted; cyan so it never blends with the green inlier
+    reproj stub), and -- when ``draw_trails`` -- a faint
     depth-coloured polyline of its last positions.
 
     ``reproj`` (optional) is the per-PnP-point reprojection diagnostic, a dict
@@ -219,7 +223,7 @@ def draw_overlay(gray: np.ndarray, depth_m: np.ndarray,
         if trails.age(int(tid)) < fresh_age:
             cv2.circle(bg, (ix, iy), fresh_r, _FRESH_BGR, 1, cv2.LINE_AA)
         if int(tid) in inl:
-            cv2.circle(bg, (ix, iy), fresh_r + line_w, _INLIER_BGR,
+            cv2.circle(bg, (ix, iy), fresh_r + line_w, _INLIER_RING_BGR,
                        line_w, cv2.LINE_AA)
 
     # --- reprojection-error stubs (drawn last, on top of the markers) -------- #
