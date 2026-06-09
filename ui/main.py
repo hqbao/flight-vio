@@ -590,7 +590,13 @@ def run_ui(*, vio_endpoint: str = DEFAULT_VIO_ENDPOINT,
     slam_bundle = _await_calib_bundle(slam_endpoint, calib_timeout_s)
     LOG.info("ui: slam ready (%dx%d)", slam_bundle.width, slam_bundle.height)
 
-    # 2. Qt app.
+    # 2. Qt app. Share GL contexts across windows: the main Viewer3D and the
+    # SLAM-Map room view are each a pyqtgraph GLViewWidget = a separate GL
+    # context. Without sharing, the 2nd window's shader-program ids are not valid
+    # in the 1st context, so glUseProgram throws GLError 1281/1282 ('invalid
+    # value/operation') on every paint. AA_ShareOpenGLContexts must be set BEFORE
+    # the QApplication is constructed.
+    QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
     app = QApplication(sys.argv if sys.argv else ["ui"])
     app.setStyleSheet(theme.QSS)
 
@@ -671,19 +677,24 @@ def run_ui(*, vio_endpoint: str = DEFAULT_VIO_ENDPOINT,
     tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
     win.addToolBar(tb)                          # docks at the top by default
 
-    # 5 per-line toggles (checkable, all start CHECKED = visible). Labels are
-    # EXACTLY as spec'd; each drives its viewer visibility setter via the
-    # toggled(bool) signal. Order = the drift/back-to-front order of the lines.
-    # (label, viewer visibility setter)
-    for _label, _setter in (("VO", viewer.set_vo_visible),
-                            ("VIO", viewer.set_vio_visible),
-                            ("VIO-BA", viewer.set_ba_visible),
-                            ("SLAM-corrected VIO", viewer.set_corrected_visible),
-                            ("SLAM", viewer.set_slam_visible)):
+    # 5 per-line toggles (checkable). DEFAULT: only VIO is on -- the other lines
+    # (VO / VIO-BA / SLAM-corrected / SLAM) start OFF so the view isn't cluttered;
+    # the user enables them as needed. Each drives its viewer visibility setter
+    # via the toggled(bool) signal. Order = the drift/back-to-front order.
+    # (label, viewer visibility setter, default-on)
+    for _label, _setter, _on in (("VO", viewer.set_vo_visible, False),
+                                 ("VIO", viewer.set_vio_visible, True),
+                                 ("VIO-BA", viewer.set_ba_visible, False),
+                                 ("SLAM-corrected VIO",
+                                  viewer.set_corrected_visible, False),
+                                 ("SLAM", viewer.set_slam_visible, False)):
         _btn = QPushButton(_label)
         _btn.setCheckable(True)
-        _btn.setChecked(True)
+        _btn.setChecked(_on)
         _btn.toggled.connect(_setter)
+        # setChecked(False) on a fresh button fires no toggled, so call the
+        # setter explicitly to force each line's initial visibility to match.
+        _setter(_on)
         tb.addWidget(_btn)
     tb.addSeparator()
 
