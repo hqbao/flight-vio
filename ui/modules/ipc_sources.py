@@ -458,8 +458,11 @@ class IpcSlamMapSource(threading.Thread):
     REBUILD_HZ = 4.0
     #: Persistence gate: a landmark (track id) shows only if it was a PnP inlier
     #: across >= PERSIST_KF SUCCESSIVE keyframes -> only consistently-tracked,
-    #: motion-validated points; LOWER if too sparse on short runs.
-    PERSIST_KF = 20
+    #: motion-validated points (transient stereo noise never qualifies). 6 is a
+    #: balance: strict enough to reject one-off noise, low enough that the map
+    #: actually populates at the live --kf-every cadence. RAISE for higher
+    #: confidence (sparser), LOWER to fill the room faster (noisier).
+    PERSIST_KF = 6
     #: Valid-depth band (m) for sampling a track's depth: outside this range the
     #: stereo depth is too noisy/unreliable to back-project, so the observation is
     #: skipped (same band the dense geometry helper uses).
