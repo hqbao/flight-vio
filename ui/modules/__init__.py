@@ -55,9 +55,10 @@ from .triplet import UiTripletModule
 # bus sinks above stay importable WITHOUT PyQt6 (the adapters' worker base
 # classes live in ui.qt). Accessing any of these names triggers the import.
 _IPC_ADAPTERS = frozenset({
-    "IpcImuRawSource", "IpcGyroFuseSource", "IpcTripletWorker",
-    "IpcKeypointWorker", "IpcSlamMapSource",
+    "IpcImuRawSource", "IpcGyroFuseSource", "IpcLoopMatchSource",
+    "IpcTripletWorker", "IpcKeypointWorker", "IpcSlamMapSource",
     "ipc_triplet_factory", "ipc_keypoint_factory", "ipc_slam_map_factory",
+    "ipc_loop_factory",
 })
 
 __all__ = [
@@ -70,12 +71,14 @@ __all__ = [
     # IPC source adapters (lazy)
     "IpcImuRawSource",
     "IpcGyroFuseSource",
+    "IpcLoopMatchSource",
     "IpcTripletWorker",
     "IpcKeypointWorker",
     "IpcSlamMapSource",
     "ipc_triplet_factory",
     "ipc_keypoint_factory",
     "ipc_slam_map_factory",
+    "ipc_loop_factory",
 ]
 
 

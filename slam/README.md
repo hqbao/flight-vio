@@ -45,9 +45,14 @@ hand-edit it** — change `imu_camera/comms` and re-vendor.
 
 Public API the SLAM process uses: `LocalPubSub`, `IPCPubSub(role="server"|"client")`,
 `IPCPublisher`, `IPCSubscriber`, `Module`, `Step`, `RingRegistry`, `topics`, and
-`wire.WireCalibBundle`. The `keyframe`, `loop.correction`, `slam.map` topics and
-the `Keyframe` / `LoopCorrection` / `SlamOverlay` messages already live in the
-shared comms contract.
+`wire.WireCalibBundle`. The `keyframe`, `loop.correction`, `slam.map`, `slam.loop`
+topics and the `Keyframe` / `LoopCorrection` / `SlamOverlay` / `LoopMatch` messages
+already live in the shared comms contract. `slam.loop` (LIVE-only, additive) is the
+per-loop-CANDIDATE match funnel for the UI's "Loop Closure" window — the matched ORB
+pixel pairs + per-match verification stage (appearance/epipolar/PnP) + funnel counts +
+rotation-gate verdict, published for EVERY verified candidate (confirmed OR rejected).
+It carries NO keyframe images (SLAM keeps only descriptors); the UI joins it by seq to
+the `keyframe` grays it buffers.
 
 ### `slam/mathlib/` — the math SLAM owns + the FORCED-vendor deps
 
@@ -102,19 +107,25 @@ optimised and the rewritten keyframe poses are published as a correction.
 
 The single-purpose steps each own one responsibility: `SlamStep` (submit + poll
 the engine → `LoopCorrection` on a loop), `PublishCorrection` (emit on
-`loop.correction`), `PublishSlamMap` (poll the cheap overlay → `slam.map`).
+`loop.correction`), `PublishSlamMap` (poll the cheap overlay → `slam.map`),
+`PublishLoops` (poll the per-candidate match funnel → `slam.loop`, LIVE-only).
 
 Two key behaviours are preserved verbatim from the oracle:
 
 - **`publish_map` flag** (LIVE-only, defaults `False`). When on, SlamModule emits
   a continuous `slam.map` overlay so the UI draws keyframe dots **every** keyframe
-  instead of only after a loop closes. The offline path (flag off) is byte-identical.
+  instead of only after a loop closes, AND captures the loop-closure match funnel
+  (`make_slam_engine(capture_loops=True)`) to publish a `LoopMatch` on `slam.loop`
+  for every verified candidate (for the UI's "Loop Closure" window). The offline
+  path (flag off) is byte-identical: the engine never captures, so the deterministic
+  `loop.correction` scoring path runs the byte-frozen `verify` with no extra work.
 - **`_RunCorrectionChain`** — `Module.on` keeps **one** step list per topic, and
   `SlamStep` returns `None` on every non-loop keyframe (which short-circuits the
   chain). So the live path wraps `[SlamStep(), PublishCorrection()]` in one step
   that always returns the keyframe, letting the outer chain continue to
-  `PublishSlamMap` (which polls the overlay **after** the submit). One combined
-  chain, correct order, zero impact on the `loop.correction` semantics.
+  `PublishLoops` (passes the keyframe through) and `PublishSlamMap` (terminal, polls
+  the overlay **after** the submit). One combined chain, correct order, zero impact
+  on the `loop.correction` semantics.
 
 ### `slam/main.py` — the SLAM process
 

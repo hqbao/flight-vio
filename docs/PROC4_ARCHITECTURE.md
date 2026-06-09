@@ -40,8 +40,8 @@ Four long-lived processes, plus transient tool processes that come and go:
 |---           |---                                            |---                             |---|
 | `imu_camera` | OAK-D device + cam/IMU sync + IMU calib + **inline SGM depth** | —              | `cam.sync`, `imu.raw`, `imucam.sample`, `frame.depth`, `calib.bundle` |
 | `vio`        | RGB-D PnP odometry + windowed BA              | `imucam.sample`, `frame.depth`, `calib.bundle` | `pose.odom`, `pose.vo` (pure-vision, LIVE-only), `keyframe`, `frame.tracks`, `frame.inliers`, `pose.refined` |
-| `slam`       | ORB loop closure + SE(3) pose graph          | `keyframe`, `calib.bundle` (from VIO) | `loop.correction` (loop-event rewrite) **and** `slam.map` (continuous keyframe overlay, LIVE-only) |
-| `ui`         | Qt `MainWindow`, single 5-trajectory Viewer3D + View/Visualize/Calibration menus | `pose.odom`, `pose.vo`, `pose.refined`, `calib.bundle` (vio); `slam.map`, `calib.bundle` (slam); on-demand: `imucam.sample`, `frame.depth`, `imu.raw` (capture) + `frame.tracks`, `frame.inliers` (vio) | — (sink) |
+| `slam`       | ORB loop closure + SE(3) pose graph          | `keyframe`, `calib.bundle` (from VIO) | `loop.correction` (loop-event rewrite), `slam.map` (continuous keyframe overlay, LIVE-only) **and** `slam.loop` (per-candidate loop-match funnel for the Loop-Closure window, LIVE-only) |
+| `ui`         | Qt `MainWindow`, single 5-trajectory Viewer3D + View/Visualize/Calibration menus | `pose.odom`, `pose.vo`, `pose.refined`, `calib.bundle` (vio); `slam.map`, `slam.loop`, `calib.bundle` (slam); on-demand: `imucam.sample`, `frame.depth`, `imu.raw` (capture) + `frame.tracks`, `frame.inliers`, `keyframe` (vio) | — (sink) |
 
 > The capture process is named `imu_camera`; its endpoint is `oak.capture` and its
 > entrypoint is `imu_camera.main`. Throughout this doc "capture" = `imu_camera`.
@@ -65,9 +65,9 @@ flowchart LR
     cap -- "imucam.sample · frame.depth · calib.bundle" --> vio
     vio -- "keyframe · calib.bundle" --> slam
     vio -- "pose.odom · pose.vo · pose.refined · calib.bundle" --> ui
-    slam -- "slam.map · calib.bundle" --> ui
+    slam -- "slam.map · slam.loop · calib.bundle" --> ui
     cap -. "imu.raw · imucam.sample · frame.depth (on-demand)" .-> ui
-    vio -. "frame.tracks · frame.inliers (on-demand)" .-> ui
+    vio -. "frame.tracks · frame.inliers · keyframe (on-demand)" .-> ui
 ```
 
 The UI's Visualize / Calibration windows are **not** separate transient processes:
@@ -83,6 +83,7 @@ long-lived trajectory sources use:
 | Camera + Depth + IMU triplet  | `IpcTripletWorker`           | capture · `imucam.sample`, `frame.depth` |
 | Keypoint Depth Tracker        | `IpcKeypointWorker`          | capture · `frame.depth`  +  vio · `frame.tracks`, `frame.inliers` |
 | Gyro Fusion (strip chart)     | `IpcGyroFuseSource`          | vio · `frame.gyrofuse` |
+| Loop Closure                  | `IpcLoopMatchSource`         | slam · `slam.loop` (match funnel)  +  vio · `keyframe` (gray buffered by seq, joined to the funnel) |
 | SLAM Map (3D room, voxel occupancy) | `IpcSlamMapSource`     | vio · `keyframe` (denoised depth via VIO's kf rings) + slam · `slam.map` (corrected poses) |
 
 The crucial design rule: **nothing but `imu_camera` opens the OAK-D**. The UI never

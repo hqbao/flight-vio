@@ -33,9 +33,21 @@ def make_ba_engine(K: np.ndarray, cfg, *, worker: bool = False) -> Engine:
     return InProcessEngine(lambda: WindowedBAMap(K, cfg), ba_step, ba_overlay)
 
 
-def make_slam_engine(K: np.ndarray, cfg, *, worker: bool = False) -> Engine:
-    """Build a loop-closure SLAM engine (in-process unless ``worker``)."""
+def make_slam_engine(K: np.ndarray, cfg, *, worker: bool = False,
+                     capture_loops: bool = False) -> Engine:
+    """Build a loop-closure SLAM engine (in-process unless ``worker``).
+
+    ``capture_loops`` (LIVE-only) makes the engine capture each verified
+    candidate's match funnel so the SLAM module can publish ``slam.loop`` for the
+    UI's loop-closure view. It is wired ON only on the live publish-map path; the
+    OFFLINE / oracle path leaves it False, so the map runs the byte-frozen
+    ``verify`` (no funnel work) and the deterministic ``loop.correction`` scoring
+    stays bit-identical. The subprocess engine is LIVE-only and always captures
+    (its worker builds the map with ``capture_loops=True``), so the flag here only
+    governs the in-process engine.
+    """
     if worker:
         return SubprocessEngine(_slam_worker_main, K, cfg)
     from ..loop.slam import SlamMap
-    return InProcessEngine(lambda: SlamMap(K, cfg), slam_step, slam_overlay)
+    return InProcessEngine(lambda: SlamMap(K, cfg, capture_loops=capture_loops),
+                           slam_step, slam_overlay)

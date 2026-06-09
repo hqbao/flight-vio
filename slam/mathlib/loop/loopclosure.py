@@ -26,7 +26,7 @@ Two stages, cheap-to-expensive:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -48,6 +48,50 @@ class LoopConfig:
     fmat_thresh_px: float = 2.0   # fundamental-matrix RANSAC threshold
     min_depth_m: float = 0.2
     max_depth_m: float = 8.0
+
+
+# Per-match verification-stage labels (uint8). A match's stage is the FURTHEST
+# funnel gate it survived: every appearance match starts at APPEARANCE; one that
+# also passed the fundamental-matrix RANSAC is promoted to EPIPOLAR; one that was
+# additionally a PnP-RANSAC inlier is promoted to PNP. These are the exact colour
+# bands the UI's loop-closure viz draws (grey -> yellow -> green).
+STAGE_APPEARANCE = 0   # matched on descriptors only (dropped before/at epipolar)
+STAGE_EPIPOLAR = 1     # also a fundamental-matrix (epipolar) inlier, not a PnP one
+STAGE_PNP = 2          # also a PnP-RANSAC inlier -> confirmed-loop correspondence
+
+
+@dataclass
+class LoopMatchCapture:
+    """The full match funnel for ONE ``verify_capture`` candidate (opt-in only).
+
+    Returned ALONGSIDE the normal verify result so the UI's loop-closure window
+    can show WHY a candidate fired or was rejected. Pixel pairs are in the two
+    keyframes' OWN pixel coordinates (the rectified-left grid the ORB ran on), so
+    the UI can draw a line per match across two side-by-side keyframe images.
+
+    * ``cur_px`` / ``old_px`` -- ``(N, 2)`` float32, one row per ALL appearance
+      matches, in the SAME order; ``cur_px[i]`` <-> ``old_px[i]`` is one match.
+    * ``stage`` -- ``(N,)`` uint8 per-match label (:data:`STAGE_APPEARANCE` /
+      :data:`STAGE_EPIPOLAR` / :data:`STAGE_PNP`).
+    * ``n_appearance`` / ``n_fmat_inliers`` / ``n_pnp_inliers`` -- the funnel
+      counts (the gate inputs at each stage).
+    * ``rot_deg`` -- the loop's relative rotation magnitude vs odometry in degrees
+      (NaN when the engine did not supply an odometry pair / the gate is off).
+    * ``rot_gate_deg`` -- the rotation-gate threshold (``loop_max_odom_rot_deg``,
+      0 = gate disabled), carried so the UI never needs the config.
+    * ``accepted`` -- True iff this candidate became a confirmed loop edge (passed
+      every gate INCLUDING the engine-side rotation gate).
+    """
+
+    cur_px: np.ndarray = field(default_factory=lambda: np.empty((0, 2), np.float32))
+    old_px: np.ndarray = field(default_factory=lambda: np.empty((0, 2), np.float32))
+    stage: np.ndarray = field(default_factory=lambda: np.empty((0,), np.uint8))
+    n_appearance: int = 0
+    n_fmat_inliers: int = 0
+    n_pnp_inliers: int = 0
+    rot_deg: float = float("nan")
+    rot_gate_deg: float = 0.0
+    accepted: bool = False
 
 
 class KeyframeAppearance:
@@ -113,8 +157,61 @@ class LoopDetector:
         Returns ``(T_cur_old, n_inliers, n_matches)`` where ``T_cur_old`` maps a
         point in the OLD camera frame to the CURRENT camera frame, or ``None`` if
         the loop is not geometrically confirmed.
+
+        This is the canonical, byte-frozen entry point. It calls the shared core
+        with ``capture=None``, so the path here is identical to the original
+        (no funnel arrays built, same early returns) -- the offline / oracle path
+        stays bit-for-bit unchanged. For the live UI funnel use
+        :meth:`verify_capture`.
+        """
+        return self._verify_core(cur, old, None)
+
+    def verify_capture(self, cur: KeyframeAppearance, old: KeyframeAppearance):
+        """Opt-in funnel capture: same math as :meth:`verify`, plus the funnel.
+
+        Returns ``(result, capture)`` where ``result`` is EXACTLY what
+        :meth:`verify` returns (``(T_cur_old, n_inliers, n_matches)`` or ``None``)
+        and ``capture`` is a populated :class:`LoopMatchCapture` describing every
+        appearance match, its survived stage, and the funnel counts -- the data
+        the UI's loop-closure window draws. ``verify`` itself is unaffected (this
+        is a sibling method, LIVE-only), so the deterministic path is unchanged.
+
+        Even a candidate REJECTED at the appearance gate yields a capture with the
+        matches it had (so the UI can show "appearance 14 -> rejected"); the
+        rotation gate (``loop_max_odom_rot_deg``) is applied by the engine AFTER
+        this call, so ``capture.accepted`` / ``rot_deg`` / ``rot_gate_deg`` are
+        finalised there via :meth:`LoopMatchCapture` field updates.
+        """
+        cap = LoopMatchCapture(rot_gate_deg=0.0)
+        result = self._verify_core(cur, old, cap)
+        return result, cap
+
+    def _verify_core(self, cur: KeyframeAppearance, old: KeyframeAppearance,
+                     capture):
+        """Shared verification core for :meth:`verify` / :meth:`verify_capture`.
+
+        When ``capture`` is ``None`` the body runs the ORIGINAL verify path with
+        zero extra work (the funnel branches are all guarded by ``capture is not
+        None``), so the frozen offline result is preserved bit-for-bit. When a
+        :class:`LoopMatchCapture` is passed it is populated AS the funnel runs:
+        every appearance match is recorded at :data:`STAGE_APPEARANCE`, the ones
+        that survive the fundamental-matrix RANSAC are promoted to
+        :data:`STAGE_EPIPOLAR`, and the PnP-RANSAC inliers to :data:`STAGE_PNP`.
         """
         good = self._good_matches(cur, old)
+        # --- capture: record EVERY appearance match (the funnel's widest stage).
+        # `good_all` keeps the full appearance set (verify() prunes `good` in
+        # place at the epipolar stage; the capture needs the dropped ones too).
+        good_all = good
+        if capture is not None:
+            capture.n_appearance = len(good_all)
+            if good_all:
+                capture.cur_px = np.array(
+                    [cur.kps[ic] for ic, _ in good_all], np.float32)
+                capture.old_px = np.array(
+                    [old.kps[io] for _, io in good_all], np.float32)
+            capture.stage = np.zeros(len(good_all), np.uint8)  # all APPEARANCE
+
         if len(good) < self.cfg.min_matches:
             return None
 
@@ -131,20 +228,38 @@ class LoopDetector:
         if res_f is None:
             return None                        # degenerate / too few inliers
         _F, fmask = res_f
+        if capture is not None:
+            # Promote each epipolar inlier to STAGE_EPIPOLAR. `fmask` is aligned
+            # with `good` here, which (when capture is on) is still the full
+            # appearance set, so the mask indexes `capture.stage` 1:1.
+            keep = np.asarray(fmask, dtype=bool).reshape(-1)
+            n = min(len(keep), len(capture.stage))
+            capture.stage[:n][keep[:n]] = STAGE_EPIPOLAR
+            capture.n_fmat_inliers = int(keep.sum())
         if int(fmask.sum()) < self.cfg.min_fmat_inliers:
             return None
+        # Indices into the FULL appearance set that survived the epipolar gate, so
+        # the capture can map a PnP inlier (indexed in the pruned `good`) back to
+        # its row in `capture.stage`.
+        epi_idx = [i for i, keep in enumerate(fmask) if keep]
         good = [g for g, keep in zip(good, fmask) if keep]
 
         obj, img = [], []
+        # `pnp_rows` maps each PnP correspondence (in solve order) back to its row
+        # in the FULL appearance set (= capture.stage index), so a PnP inlier can
+        # be promoted to STAGE_PNP. Built only when capturing (else unused).
+        pnp_rows: list[int] = []
         fx, fy = self.K[0, 0], self.K[1, 1]
         cx, cy = self.K[0, 2], self.K[1, 2]
-        for ic, io in good:
+        for j, (ic, io) in enumerate(good):
             z = float(old.depth[io])
             if z <= 0.0:
                 continue
             u, v = old.kps[io]
             obj.append([(u - cx) * z / fx, (v - cy) * z / fy, z])  # 3D in old cam
             img.append(cur.kps[ic])                                # 2D in cur img
+            if capture is not None:
+                pnp_rows.append(epi_idx[j])
         if len(obj) < self.cfg.min_inliers:
             return None
         obj = np.asarray(obj, np.float64)
@@ -157,6 +272,13 @@ class LoopDetector:
             conf=self.cfg.ransac_conf,
             min_points=self.cfg.min_inliers,
         )
+        if capture is not None and ok and inliers is not None:
+            # Promote each PnP inlier (index into the PnP-correspondence list) to
+            # STAGE_PNP via its row in the full appearance set.
+            for k in np.asarray(inliers).reshape(-1):
+                if 0 <= int(k) < len(pnp_rows):
+                    capture.stage[pnp_rows[int(k)]] = STAGE_PNP
+            capture.n_pnp_inliers = int(len(inliers))
         if not ok or inliers is None or len(inliers) < self.cfg.min_inliers:
             return None
         T = np.eye(4)

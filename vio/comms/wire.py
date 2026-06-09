@@ -276,6 +276,34 @@ class WireSlamMap:
     last_match: np.ndarray | None = None          # (M, 3) optical, flash on new loop
 
 
+@dataclass(frozen=True)
+class WireLoopMatch:
+    """Wire form of :class:`comms.messages.LoopMatch` (topic ``slam.loop``).
+
+    The per-loop-candidate match funnel for the UI's loop-closure window,
+    published LIVE-only by the SLAM engine for every verified candidate
+    (confirmed OR rejected). Pure POD -- the matched ORB pixel pairs are a few
+    hundred ``(2,)`` floats, so they ride the message itself (no shared-memory
+    ring); there are NO keyframe images on the wire (SLAM does not retain the
+    gray). The codec ships every float bitwise (``struct('>d')``), so the
+    ``rot_deg`` NaN (no odometry pair) round-trips faithfully.
+
+    Field ORDER is the FROZEN codec contract (see module docstring).
+    """
+
+    cur_seq: int
+    old_seq: int
+    cur_px: np.ndarray                            # (N, 2) float32
+    old_px: np.ndarray                            # (N, 2) float32
+    stage: np.ndarray                             # (N,) uint8
+    n_appearance: int
+    n_fmat: int
+    n_pnp: int
+    rot_deg: float
+    rot_gate_deg: float
+    accepted: bool
+
+
 # --------------------------------------------------------------------------- #
 # Control sentinel: END signal across the IPC boundary
 # --------------------------------------------------------------------------- #
@@ -319,6 +347,7 @@ TOPIC_WIRE: dict[str, type] = {
     topics.KEYFRAME:        WireKeyframe,
     topics.LOOP_CORRECTION: WireLoopCorrection,
     topics.SLAM_MAP:        WireSlamMap,
+    topics.SLAM_LOOP:       WireLoopMatch,
     # Retained / read-directly topics (no converter), but the registry MUST cover
     # them so consumers can decode the wire object. See blueprint risk #5.
     topics.CALIB_BUNDLE:    WireCalibBundle,

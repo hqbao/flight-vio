@@ -42,6 +42,14 @@ class InProcessEngine(Engine):
             return None
         return self._overlay(self._map)
 
+    def poll_loops(self) -> list:
+        # LIVE-only: drain the map's loop-match captures. The offline path never
+        # sets ``capture_loops``, so the map's buffer stays empty here and the
+        # deterministic correction path is untouched. A SlamMap captures; a
+        # WindowedBAMap (no such method) yields nothing.
+        drain = getattr(self._map, "drain_loop_captures", None)
+        return drain() if drain is not None else []
+
     def reset(self) -> None:
         self._map = self._make_map()
         self._pending, self._has = None, False

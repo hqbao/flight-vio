@@ -65,7 +65,7 @@ def _drain_latest(q: "mp.Queue") -> Any:
 
 
 def _serve(make_map: Callable[[], Any], step, overlay,
-           in_q, out_q, ov_q, stop_evt, reset_evt) -> None:
+           in_q, out_q, ov_q, stop_evt, reset_evt, loops_q=None) -> None:
     """Child loop: own one map, run ``step`` per snapshot, emit results + overlay.
 
     Module-level (called from the module-level worker mains below) so the whole
@@ -73,6 +73,13 @@ def _serve(make_map: Callable[[], Any], step, overlay,
     ``step`` result goes on ``out_q`` (the correction the flow consumes); the
     cheap ``overlay`` snapshot goes on ``ov_q`` EVERY keyframe (latest-wins) so the
     live viewer always has the freshest map.
+
+    ``loops_q`` (SLAM only) carries the per-candidate loop-match CAPTURES (the
+    funnel for the UI's loop-closure view). Loops are sporadic + must NOT be
+    coalesced away (each is a distinct event explaining one candidate), so they
+    are PUSHED individually (best-effort, non-blocking) rather than latest-wins;
+    the parent drains the whole queue. A WindowedBAMap has no ``drain_loop_captures``
+    so this is a no-op there.
     """
     m = make_map()
     while not stop_evt.is_set():
@@ -90,22 +97,42 @@ def _serve(make_map: Callable[[], Any], step, overlay,
             _put_latest(out_q, res)
         if overlay is not None:
             _put_latest(ov_q, overlay(m))
+        if loops_q is not None:
+            drain = getattr(m, "drain_loop_captures", None)
+            if drain is not None:
+                for cap in drain():
+                    try:
+                        loops_q.put_nowait(cap)
+                    except queue.Full:
+                        pass               # parent fell behind; drop the oldest event
 
 
-def _ba_worker_main(K, cfg, in_q, out_q, ov_q, stop_evt, reset_evt) -> None:
-    """Child entry point for windowed BA (module-level => picklable under spawn)."""
+def _ba_worker_main(K, cfg, in_q, out_q, ov_q, stop_evt, reset_evt,
+                    loops_q=None) -> None:
+    """Child entry point for windowed BA (module-level => picklable under spawn).
+
+    ``loops_q`` is accepted for a uniform worker signature but unused (a
+    WindowedBAMap has no loop captures -- ``_serve``'s drain is a no-op there).
+    """
     from ..backend.windowed import WindowedBAMap
     from .steps import ba_step, ba_overlay
     _serve(lambda: WindowedBAMap(K, cfg), ba_step, ba_overlay,
-           in_q, out_q, ov_q, stop_evt, reset_evt)
+           in_q, out_q, ov_q, stop_evt, reset_evt, loops_q)
 
 
-def _slam_worker_main(K, cfg, in_q, out_q, ov_q, stop_evt, reset_evt) -> None:
-    """Child entry point for loop-closure SLAM (module-level => picklable)."""
+def _slam_worker_main(K, cfg, in_q, out_q, ov_q, stop_evt, reset_evt,
+                      loops_q=None) -> None:
+    """Child entry point for loop-closure SLAM (module-level => picklable).
+
+    The subprocess engine is LIVE-only, so the map is built with
+    ``capture_loops=True``: every verified candidate's match funnel is captured
+    and pushed on ``loops_q`` for the UI's loop-closure view. (The OFFLINE path
+    uses the in-process engine and never sets this, so determinism is untouched.)
+    """
     from ..loop.slam import SlamMap
     from .steps import slam_step, slam_overlay
-    _serve(lambda: SlamMap(K, cfg), slam_step, slam_overlay,
-           in_q, out_q, ov_q, stop_evt, reset_evt)
+    _serve(lambda: SlamMap(K, cfg, capture_loops=True), slam_step, slam_overlay,
+           in_q, out_q, ov_q, stop_evt, reset_evt, loops_q)
 
 
 class SubprocessEngine:
@@ -130,6 +157,12 @@ class SubprocessEngine:
         self._in_q: "mp.Queue" = self._ctx.Queue(maxsize=1)   # one pending KF; newest wins
         self._out_q: "mp.Queue" = self._ctx.Queue(maxsize=2)  # corrections (drain to newest)
         self._ov_q: "mp.Queue" = self._ctx.Queue(maxsize=2)   # map overlay (drain to newest)
+        # Loop-match captures (SLAM only): each is a distinct event (one verified
+        # candidate's funnel), so this queue ACCUMULATES (not latest-wins) and the
+        # parent drains it whole. Loops are sporadic, so a modest cap absorbs a
+        # burst (a keyframe can close up to max_loops_per_kf at once) without
+        # unbounded growth; if the parent ever falls behind the oldest is dropped.
+        self._loops_q: "mp.Queue" = self._ctx.Queue(maxsize=64)
         self._stop_evt = self._ctx.Event()
         self._reset_evt = self._ctx.Event()
         self._proc = None
@@ -149,7 +182,7 @@ class SubprocessEngine:
             self._proc = self._ctx.Process(
                 target=self._worker_main,
                 args=(self._K, self._cfg, self._in_q, self._out_q, self._ov_q,
-                      self._stop_evt, self._reset_evt),
+                      self._stop_evt, self._reset_evt, self._loops_q),
                 name="OursEngineWorker", daemon=True)
             self._proc.start()
         except Exception as e:                 # noqa: BLE001
@@ -171,6 +204,18 @@ class SubprocessEngine:
     def poll_overlay(self) -> Any:
         return None if self._proc is None else _drain_latest(self._ov_q)
 
+    def poll_loops(self) -> list:
+        """Drain ALL pending loop-match captures (events, not latest-wins)."""
+        if self._proc is None:
+            return []
+        out: list = []
+        while True:
+            try:
+                out.append(self._loops_q.get_nowait())
+            except queue.Empty:
+                break
+        return out
+
     def reset(self) -> None:
         self._reset_evt.set()
 
@@ -186,7 +231,7 @@ class SubprocessEngine:
         if self._proc.is_alive():              # wedged in a C-level solve: force it
             self._proc.terminate()
             self._proc.join(timeout=1.0)
-        for q in (self._in_q, self._out_q, self._ov_q):  # don't hang atexit feeder
+        for q in (self._in_q, self._out_q, self._ov_q, self._loops_q):  # don't hang atexit feeder
             try:
                 q.cancel_join_thread()
             except Exception:                  # noqa: BLE001

@@ -66,14 +66,25 @@ class SlamModule(Module):
                  latest_only: bool = False, worker: bool = False,
                  publish_map: bool = False) -> None:
         super().__init__("slam", bus, latest_only=latest_only)
-        self.engine = make_slam_engine(K, cfg or SlamConfig(), worker=worker)
+        # capture_loops rides the SAME LIVE-only flag as publish_map: the
+        # loop-closure funnel (slam.loop) is a live overlay, so the offline engine
+        # never captures and the deterministic correction path stays byte-identical.
+        self.engine = make_slam_engine(K, cfg or SlamConfig(), worker=worker,
+                                       capture_loops=publish_map)
         self.ctx.state["engine"] = self.engine
         if publish_map:
             # LIVE: one combined chain -- correction sub-chain first (does the
-            # engine.submit), then the overlay poll. See _RunCorrectionChain.
+            # engine.submit), then the overlay poll + the loop-match funnel poll
+            # (both read independent engine channels AFTER the submit). See
+            # _RunCorrectionChain.
             from .publish_slam_map import PublishSlamMap
-            self.on(topics.KEYFRAME, [_RunCorrectionChain(), PublishSlamMap()])
-            self.forwards_to(topics.LOOP_CORRECTION, topics.SLAM_MAP)
+            from .publish_loops import PublishLoops
+            # PublishLoops passes the keyframe through; PublishSlamMap is terminal
+            # (returns None), so loops must come BEFORE it in the chain.
+            self.on(topics.KEYFRAME,
+                    [_RunCorrectionChain(), PublishLoops(), PublishSlamMap()])
+            self.forwards_to(topics.LOOP_CORRECTION, topics.SLAM_MAP,
+                             topics.SLAM_LOOP)
         else:
             # OFFLINE: byte-identical to the old path.
             self.on(topics.KEYFRAME, [SlamStep(), PublishCorrection()])

@@ -221,6 +221,48 @@ class SlamOverlay:
 
 
 @dataclass(frozen=True)
+class LoopMatch:
+    """One verified loop CANDIDATE's match funnel for the UI's loop-closure view.
+
+    Published on ``topics.SLAM_LOOP`` by the SLAM engine for EVERY candidate it
+    geometrically verified -- confirmed OR rejected -- so the UI can show WHY a
+    loop fired or got rejected. LIVE-only (mirrors the ``slam.map`` overlay
+    pattern), so the offline / oracle path stays byte-identical (it never
+    publishes this) and pose math is unaffected.
+
+    Carries NO keyframe images (SLAM keeps only compact ORB descriptors + depth,
+    not the gray), so the pixel pairs are in the two keyframes' OWN rectified-left
+    pixel coordinates and the UI joins them to the GRAY images it buffers by seq
+    off the ``keyframe`` topic.
+
+    * ``cur_seq`` / ``old_seq`` -- source frame seq of the current + matched-old
+      keyframe (the join key into the UI's keyframe-gray buffer).
+    * ``cur_px`` / ``old_px`` -- ``(N, 2)`` float32 matched ORB keypoint pixels,
+      SAME order; ``cur_px[i]`` <-> ``old_px[i]`` is one appearance match.
+    * ``stage`` -- ``(N,)`` uint8 per-match verification stage (0 = appearance
+      only / dropped, 1 = epipolar(fundamental) inlier, 2 = PnP inlier); the
+      colour band the UI draws (grey / yellow / green).
+    * ``n_appearance`` / ``n_fmat`` / ``n_pnp`` -- the funnel counts.
+    * ``rot_deg`` -- the loop's relative rotation vs odometry (deg; NaN if the
+      engine had no odometry pair to compare).
+    * ``rot_gate_deg`` -- the rotation-gate threshold (0 = gate disabled).
+    * ``accepted`` -- True iff the candidate became a confirmed loop edge.
+    """
+
+    cur_seq: int
+    old_seq: int
+    cur_px: np.ndarray
+    old_px: np.ndarray
+    stage: np.ndarray
+    n_appearance: int
+    n_fmat: int
+    n_pnp: int
+    rot_deg: float
+    rot_gate_deg: float
+    accepted: bool
+
+
+@dataclass(frozen=True)
 class CamSync:
     """A stereo pair the ``cam`` module publishes as a sync trigger.
 

@@ -15,6 +15,8 @@
   "keyframe_optional_none": "b192d2a61a48fc952839601dd027cb79c4df96786900a831570ec8ef68c19139",
   "loop_correction": "b5ae83ca28050392816f813c64c34bfdb3e005a7cefc25ff3e2e05e614dc6e23",
   "loop_correction_empty": "89e47ac5138225435c7d516445a2e72f71a302185b7f186f9b5b41d7524f91c8",
+  "loop_match_accepted": "c2d2398a10bc164b7fbe864c8cff296bc2e886c9660afe64e66fbfdb7f067386",
+  "loop_match_rejected_nan_rot": "15b14a14cc319bd183c28175ed9186f3d9555de50fda1a8a27aa148f26602aca",
   "pose_odom": "f9f539c6fb858e14a8f6c909d006ee42e4633b6d79d98c2be2d6561302bca1c3",
   "pose_refined": "64c2e92ee649f48cbf6ffaf98ebdfec4d6bb6ebcae33708b901b95150e1cfe99",
   "pose_vo_empty_info": "f19d331929440ffb7c69d9af4221e17442770742af8b73431f276cdbe95e6ac7",

@@ -53,6 +53,17 @@ LOOP_CORRECTION = "loop.correction"
 # Continuous SLAM keyframe-map overlay (live-only; loop.correction stays the loop-event correction).
 SLAM_MAP = "slam.map"
 
+# Per-loop-CANDIDATE match funnel (live-only) for the UI's "Loop Closure" window.
+# Published by the SLAM engine for every verified candidate -- CONFIRMED or
+# REJECTED -- so the UI can show WHY a loop fired or was rejected: the matched ORB
+# keypoint pixel pairs in the two keyframes, a per-match verification-stage label
+# (appearance / epipolar / PnP), the funnel counts, and the rotation-gate verdict.
+# Additive + LIVE-only (the offline/oracle path never publishes it), so pose math
+# + the byte-parity oracle are UNAFFECTED. Carries NO keyframe images (SLAM does
+# not retain the gray); the UI joins these by seq to grays it buffers off
+# ``keyframe``. Consumed only by the UI.
+SLAM_LOOP = "slam.loop"
+
 # Per-frame KLT tracks the odometry frontend produced (ids + pixels) bundled with
 # the frame + its depth, for the keypoint-depth visualiser. The SAME tracks the
 # motion estimate consumes -- no parallel detector. Consumed only by the UI.

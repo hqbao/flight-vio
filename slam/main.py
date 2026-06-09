@@ -56,10 +56,11 @@ DEFAULT_SLAM_ENDPOINT = "oak.slam"
 
 #: Topic SLAM subscribes to from VIO.
 _INPUT_TOPICS = [topics.KEYFRAME]
-#: Topics SLAM republishes. SLAM_MAP is the continuous keyframe-map overlay (pure
-#: POD, no shared-memory ring); the publisher forwards it alongside the loop-event
-#: loop.correction.
-_OUTPUT_TOPICS = [topics.LOOP_CORRECTION, topics.SLAM_MAP]
+#: Topics SLAM republishes. SLAM_MAP is the continuous keyframe-map overlay and
+#: SLAM_LOOP the per-candidate loop-match funnel for the UI's loop-closure view
+#: (both pure POD, no shared-memory ring, LIVE-only); the publisher forwards them
+#: alongside the loop-event loop.correction.
+_OUTPUT_TOPICS = [topics.LOOP_CORRECTION, topics.SLAM_MAP, topics.SLAM_LOOP]
 
 
 # --------------------------------------------------------------------------- #

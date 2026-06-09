@@ -72,6 +72,18 @@ class Engine(ABC):
         without stealing the correction the flow task consumes. Offline never
         calls this (no live viewer)."""
 
+    def poll_loops(self) -> list:
+        """Return the loop-match captures recorded since the last call (LIVE only).
+
+        Each entry is ``(cur_seq, old_seq, LoopMatchCapture)`` for one verified
+        loop candidate (confirmed OR rejected), so the live SLAM module can publish
+        a ``slam.loop`` LoopMatch for the UI's loop-closure view. Distinct from
+        :meth:`poll` (the correction the flow consumes) and :meth:`poll_overlay`
+        (the map). Default is empty -- only the capture-enabled live engines
+        override it; the offline engine never captures, so the deterministic path
+        is untouched."""
+        return []
+
     @abstractmethod
     def reset(self) -> None:
         """Forget the whole map and start fresh (UI "clear keyframes")."""

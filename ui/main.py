@@ -575,11 +575,12 @@ def run_ui(*, vio_endpoint: str = DEFAULT_VIO_ENDPOINT,
     from ui.qt.synced_window import SyncedViewWindow
     from ui.qt.keypoints_window import KeypointTrackWindow
     from ui.qt.gyrofuse_window import GyroFuseWindow
+    from ui.qt.loop_window import LoopClosureWindow
     from ui.qt.map_window import MapWindow
     from ui.qt.calib_dialogs import GyroCalibDialog, AccelCalibDialog
     from ui.modules import (
         IpcImuRawSource, IpcGyroFuseSource, ipc_triplet_factory,
-        ipc_keypoint_factory, ipc_slam_map_factory,
+        ipc_keypoint_factory, ipc_slam_map_factory, ipc_loop_factory,
     )
 
     # 1. Wait for VIO + SLAM to be ready (and learn the capture resolution).
@@ -794,6 +795,24 @@ def run_ui(*, vio_endpoint: str = DEFAULT_VIO_ENDPOINT,
     gyrofuse_act.triggered.connect(_open_gyrofuse)
     vis_menu.addAction(gyrofuse_act)
 
+    def _open_loop() -> None:
+        if getattr(win, "_loop_win", None) is None:
+            # Source binds SLAM's endpoint (slam.loop match funnel) + VIO's
+            # endpoint (keyframe gray + its kf rings); device-agnostic, like the
+            # other Visualize windows.
+            win._loop_win = LoopClosureWindow(
+                ipc_loop_factory(slam_endpoint, vio_endpoint, W, H),
+                parent=win)
+        win._loop_win.show()
+        win._loop_win.raise_()
+        win._loop_win.activateWindow()
+        win._loop_win.ensure_started()
+        win.statusBar().showMessage("Loop Closure window opened.", 2500)
+
+    loop_act = QAction("Loop Closure…", win)
+    loop_act.triggered.connect(_open_loop)
+    vis_menu.addAction(loop_act)
+
     # SLAM Map (3D room): a ModalAI/VOXL-style VOXEL OCCUPANCY map of the room
     # (clean green voxel cubes -- floor grid + walls + furniture), in the same ENU
     # frame as the main Viewer3D. The IpcSlamMapSource consumes VIO's ``keyframe``
@@ -937,7 +956,7 @@ def run_ui(*, vio_endpoint: str = DEFAULT_VIO_ENDPOINT,
         # (closeEvent stops the worker). The calib dialogs are modal + scoped to
         # their handler's `finally`, so there's nothing to clean up for them here.
         for _attr in ("_triplet_win", "_keypoints_win", "_gyrofuse_win",
-                      "_slam_map_win"):
+                      "_loop_win", "_slam_map_win"):
             _w = getattr(win, _attr, None)
             if _w is not None:
                 try:

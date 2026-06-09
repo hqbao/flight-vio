@@ -25,12 +25,12 @@ import numpy as np
 from . import topics
 from .messages import (
     CamSync, DepthFrame, FrameGyroFuse, FrameInliers, FrameTracks, ImuCamPacket,
-    ImuRaw, Keyframe, LoopCorrection, PoseMsg, SlamOverlay, END,
+    ImuRaw, Keyframe, LoopCorrection, LoopMatch, PoseMsg, SlamOverlay, END,
 )
 from .wire import (
     WireCamSync, WireDepthFrame, WireEnd, WireFrameInliers, WireFrameTracks,
     WireGyroFuse, WireImuCamPacket, WireImuRaw, WireKeyframe, WireLoopCorrection,
-    WirePoseMsg, WireSlamMap,
+    WireLoopMatch, WirePoseMsg, WireSlamMap,
 )
 from .ring_registry import RingRegistry
 
@@ -225,6 +225,33 @@ def _slam_map_to_local(wm: WireSlamMap, rings: RingRegistry) -> SlamOverlay:
                        kf_seqs=np.asarray(wm.kf_ids, dtype=np.int64))
 
 
+def _loop_match_to_wire(msg: LoopMatch, rings: RingRegistry, endpoint: str):
+    # Pure POD: the matched ORB pixel pairs are a few hundred (2,) floats, so they
+    # ride the message itself (no shared-memory ring) -- and there are NO keyframe
+    # images on the wire (SLAM does not retain the gray; the UI joins by seq to its
+    # own keyframe-gray buffer). Force the canonical dtypes so the bytes are stable
+    # across hosts (the codec keys off dtype.name).
+    return WireLoopMatch(
+        cur_seq=int(msg.cur_seq), old_seq=int(msg.old_seq),
+        cur_px=np.asarray(msg.cur_px, dtype=np.float32).reshape(-1, 2),
+        old_px=np.asarray(msg.old_px, dtype=np.float32).reshape(-1, 2),
+        stage=np.asarray(msg.stage, dtype=np.uint8).reshape(-1),
+        n_appearance=int(msg.n_appearance), n_fmat=int(msg.n_fmat),
+        n_pnp=int(msg.n_pnp), rot_deg=float(msg.rot_deg),
+        rot_gate_deg=float(msg.rot_gate_deg), accepted=bool(msg.accepted))
+
+
+def _loop_match_to_local(wm: WireLoopMatch, rings: RingRegistry) -> LoopMatch:
+    return LoopMatch(
+        cur_seq=int(wm.cur_seq), old_seq=int(wm.old_seq),
+        cur_px=np.asarray(wm.cur_px, dtype=np.float32).reshape(-1, 2),
+        old_px=np.asarray(wm.old_px, dtype=np.float32).reshape(-1, 2),
+        stage=np.asarray(wm.stage, dtype=np.uint8).reshape(-1),
+        n_appearance=int(wm.n_appearance), n_fmat=int(wm.n_fmat),
+        n_pnp=int(wm.n_pnp), rot_deg=float(wm.rot_deg),
+        rot_gate_deg=float(wm.rot_gate_deg), accepted=bool(wm.accepted))
+
+
 # --------------------------------------------------------------------------- #
 # Registry: topic -> (to_wire, to_local). Bridges pick converters by topic.
 # Map-overlay + calib-bundle topics travel WITHOUT a local-side reconstruction
@@ -250,6 +277,7 @@ CONVERTERS: dict[str, tuple[ToWire, ToLocal]] = {
     topics.KEYFRAME:        (_keyframe_to_wire, _keyframe_to_local),
     topics.LOOP_CORRECTION: (_loop_corr_to_wire, _loop_corr_to_local),
     topics.SLAM_MAP:        (_slam_overlay_to_wire, _slam_map_to_local),
+    topics.SLAM_LOOP:       (_loop_match_to_wire, _loop_match_to_local),
 }
 
 

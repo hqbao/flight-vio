@@ -241,6 +241,160 @@ class IpcGyroFuseSource:
 
 
 # --------------------------------------------------------------------------- #
+# (1c) Loop-closure match source for the "Loop Closure" window
+# --------------------------------------------------------------------------- #
+class IpcLoopMatchSource:
+    """Duck-typed loop-closure stream: SLAM ``slam.loop`` + VIO ``keyframe`` grays.
+
+    The "Loop Closure" window (:mod:`ui.qt.loop_window`) drives a stream object
+    with three touch-points -- ``start(callback)`` / ``stop()`` / ``.error`` --
+    and renders the LAST loop event (loops are sporadic). This adapter subscribes
+    TWO endpoints (mirrors :class:`IpcKeypointWorker`'s two-endpoint pattern):
+
+    * ``slam.loop`` (SLAM, pure POD) -> the per-loop-CANDIDATE match funnel (the
+      matched ORB pixel pairs + per-match verification stage + funnel counts +
+      rotation-gate verdict). There are NO keyframe images on this topic (SLAM
+      keeps only descriptors), so we join by seq to the grays below.
+    * ``keyframe`` (VIO, kf rings) -> every keyframe's GRAY image, buffered by
+      source frame seq (like :class:`_KeyframeAccumulator`, bounded) so a loop
+      event can look up its current + matched-old keyframe gray.
+
+    On each ``slam.loop`` message the callback gets a finished
+    :class:`~ui.viz.loop_render.LoopEvent` (the two looked-up grays -- ``None``
+    when evicted -- plus the funnel). The window keeps the last one shown.
+
+    Connect-error model mirrors :class:`IpcGyroFuseSource`: a connect timeout is
+    swallowed onto :attr:`error` (the window polls it) rather than raising.
+    """
+
+    #: Cap on buffered keyframe grays (bounds memory). A loop can reach far back,
+    #: so this is generous; an evicted keyframe simply renders as a placeholder
+    #: pane (the funnel counts + verdict still show).
+    MAX_GRAYS = 800
+
+    def __init__(self, slam_endpoint: str, vio_endpoint: str, *,
+                 width: int | None = None, height: int | None = None,
+                 connect_timeout_s: float = 10.0) -> None:
+        self._slam_ep = slam_endpoint
+        self._vio_ep = vio_endpoint
+        self._w = width
+        self._h = height
+        self._connect_timeout_s = float(connect_timeout_s)
+        self.error: str | None = None
+
+        self._slam_client: IPCPubSub | None = None
+        self._vio_client: IPCPubSub | None = None
+        self._vio_rings: RingRegistry | None = None
+        self._lock = threading.Lock()
+        self._grays: dict[int, np.ndarray] = {}       # seq -> (H, W) gray
+        self._cb = None
+
+    # ------------------------------------------------------------------ #
+    def start(self, callback) -> None:
+        """Connect both endpoints; stream a LoopEvent per slam.loop message."""
+        self._cb = callback
+        # Attach VIO's keyframe rings (consumer side) so the keyframe converter
+        # can read_copy the gray array out of them. Missing rings == VIO not
+        # running -> a clear, device-agnostic reason.
+        try:
+            kwargs = {}
+            if self._w is not None and self._h is not None:
+                kwargs = {"width": int(self._w), "height": int(self._h)}
+            self._vio_rings = RingRegistry().attach_all(
+                default_vio_specs(endpoint=self._vio_ep, **kwargs))
+        except FileNotFoundError as e:
+            self.error = (f"VIO keyframe stream not available on "
+                          f"{self._vio_ep!r} (is VIO running?): {e}")
+            return
+
+        vio_client = IPCPubSub(self._vio_ep, role="client",
+                               connect_timeout_s=self._connect_timeout_s)
+        vio_client.subscribe(topics.KEYFRAME, self._on_keyframe)
+        slam_client = IPCPubSub(self._slam_ep, role="client",
+                                connect_timeout_s=self._connect_timeout_s)
+        slam_client.subscribe(topics.SLAM_LOOP, self._on_loop)
+        try:
+            vio_client.start()
+            slam_client.start()
+        except Exception as e:                                     # noqa: BLE001
+            self.error = f"loop-closure stream connect failed: {e}"
+            for c in (vio_client, slam_client):
+                try:
+                    c.stop()
+                except Exception:                                  # noqa: BLE001
+                    pass
+            if self._vio_rings is not None:
+                self._vio_rings.close()
+                self._vio_rings = None
+            return
+        self._vio_client = vio_client
+        self._slam_client = slam_client
+
+    # ------------------------------------------------------------------ #
+    def _on_keyframe(self, wm) -> None:
+        """VIO recv thread: buffer one keyframe's GRAY image, keyed by seq."""
+        if wm is END:
+            return
+        kf = to_local(topics.KEYFRAME, wm, self._vio_rings)
+        if kf is END:
+            return
+        seq = int(kf.seq)
+        gray = np.asarray(kf.gray_left).copy()        # own the slot copy
+        with self._lock:
+            self._grays[seq] = gray
+            # dict preserves insertion order -> drop the oldest over the cap.
+            n = len(self._grays)
+            if n > self.MAX_GRAYS:
+                for old in list(self._grays.keys())[: n - self.MAX_GRAYS]:
+                    self._grays.pop(old, None)
+
+    def _on_loop(self, wm) -> None:
+        """SLAM recv thread: build a LoopEvent (join the two grays by seq)."""
+        if wm is END:
+            return
+        msg = to_local(topics.SLAM_LOOP, wm, RingRegistry())   # POD, no rings
+        if msg is END:
+            return
+        from ui.viz.loop_render import LoopEvent
+
+        cur_seq, old_seq = int(msg.cur_seq), int(msg.old_seq)
+        with self._lock:
+            cur_gray = self._grays.get(cur_seq)
+            old_gray = self._grays.get(old_seq)
+        ev = LoopEvent(
+            cur_seq=cur_seq, old_seq=old_seq,
+            cur_gray=cur_gray, old_gray=old_gray,
+            cur_px=np.asarray(msg.cur_px, np.float32).reshape(-1, 2),
+            old_px=np.asarray(msg.old_px, np.float32).reshape(-1, 2),
+            stage=np.asarray(msg.stage, np.uint8).reshape(-1),
+            n_appearance=int(msg.n_appearance), n_fmat=int(msg.n_fmat),
+            n_pnp=int(msg.n_pnp), rot_deg=float(msg.rot_deg),
+            rot_gate_deg=float(msg.rot_gate_deg), accepted=bool(msg.accepted))
+        cb = self._cb
+        if cb is not None:
+            cb(ev)
+
+    # ------------------------------------------------------------------ #
+    def stop(self) -> None:
+        """Close both IPC clients + the kf rings (idempotent)."""
+        for attr in ("_slam_client", "_vio_client"):
+            client = getattr(self, attr)
+            setattr(self, attr, None)
+            if client is not None:
+                try:
+                    client.stop()
+                except Exception:                                  # noqa: BLE001
+                    pass
+        rings = self._vio_rings
+        self._vio_rings = None
+        if rings is not None:
+            try:
+                rings.close()
+            except Exception:                                      # noqa: BLE001
+                pass
+
+
+# --------------------------------------------------------------------------- #
 # (2) Triplet worker (image | depth | IMU) for SyncedViewWindow
 # --------------------------------------------------------------------------- #
 class IpcTripletWorker(TripletWorker):
@@ -1426,3 +1580,15 @@ def ipc_slam_map_factory(vio_endpoint: str, slam_endpoint: str, K: np.ndarray,
     """
     return lambda: IpcSlamMapSource(vio_endpoint, slam_endpoint, K,
                                     width=width, height=height)
+
+
+def ipc_loop_factory(slam_endpoint: str, vio_endpoint: str,
+                     width: int, height: int):
+    """Return a zero-arg factory building an :class:`IpcLoopMatchSource`.
+
+    Binds the SLAM endpoint (the ``slam.loop`` match-funnel publisher) and the
+    VIO endpoint (the ``keyframe`` gray publisher + its kf rings), so the caller
+    (``ui.main``) just opens the Loop-Closure window with the returned source.
+    """
+    return lambda: IpcLoopMatchSource(slam_endpoint, vio_endpoint,
+                                      width=width, height=height)

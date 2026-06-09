@@ -43,6 +43,7 @@ flowchart LR
     U1[Viewer3D<br/>5 trajectory lines]
     U2[Triplet<br/>rect-L | depth | IMU]
     U3[Keypoint tracker]
+    U4[Loop Closure<br/>2 keyframes + match funnel]
   end
 
   A5 -- imucam.sample --> B1
@@ -52,7 +53,9 @@ flowchart LR
   B2 -- pose.odom / pose.vo / frame.inliers --> U1
   B4 -- pose.refined --> U1
   B4 -- keyframe(gray+depth+pose) --> C1
+  B4 -- keyframe(gray, buffered by seq) --> U4
   C3 -- slam.map / loop.correction --> U1
+  C2 -- slam.loop (match funnel, LIVE) --> U4
 ```
 
 **The single most important thing the UI already shows:** `Viewer3D` draws *five*
@@ -863,6 +866,7 @@ flowchart TD
   EDGE0 --> PGO[SE3 pose-graph optimize]
   LEDGE --> PGO
   PGO --> CORR[loop.correction / slam.map -> UI rubber-sheet]
+  PNP -. "LIVE capture: every candidate" .-> LOOPVIZ[slam.loop LoopMatch<br/>funnel + per-match stage<br/>-> UI Loop Closure window]
 ```
 
 ## 4.1 ORB feature extraction (oriented FAST + steered BRIEF)
@@ -958,17 +962,33 @@ loop, a **loop edge** `(old→cur, Z=inv(T_cur_old), Ω∝inliers, loop=True)` (
 **Code.** loopclosure.py:110 (`verify`); matcher orb.py:334; fundamental RANSAC orb.py:407;
 gating + edge creation slam.py:159-233.
 
-**How to see it (the highest-value gap in the whole UI).** *New view needed.* The
-**match-and-verify panel**: two keyframe thumbnails side by side (current | old), lines
-between matched keypoints **color-coded by survival stage** — gray = appearance match
-dropped by Lowe/mutual, yellow = passed appearance but rejected by fundamental RANSAC,
-green = PnP inlier (survived everything). Annotate with the funnel counts
-(`50 matched → 34 F-inliers → 31 PnP-inliers`) and the rotation-gate verdict
-(`Δrot 4.2° < 30° ✓`). Makes "cheap-to-expensive funnel + why a loop was accepted/rejected"
-click instantly. Nothing draws cross-keyframe match lines today (the existing inlier
-renderer is frame-to-frame VO). Loop *events* are already published (slam.py:96,
-`slam_overlay` at steps.py:77), so the data is available — only the two-thumbnail drawing
-is missing.
+**How to see it (the highest-value gap in the whole UI).** *Built — the "Loop Closure"
+Visualize window.* The **match-and-verify panel**: two keyframe GRAY images side by side
+(CURRENT | MATCHED-OLD), one line per matched ORB keypoint **colour-coded by the
+verification stage it survived** — GREY = appearance match dropped at/before the epipolar
+gate, YELLOW = fundamental(epipolar)-RANSAC inlier but rejected by PnP, GREEN = PnP inlier
+(survived everything). It overlays the funnel counts (`appearance 201 → epipolar 195 →
+PnP 124`), the rotation-gate verdict (`rot 13.28 deg <= gate 30 deg`), and a big
+ACCEPTED / REJECTED banner. The LAST event is kept on screen (loops are sporadic); an
+evicted keyframe gray renders as a placeholder pane (the counts/verdict still show).
+
+The funnel is REAL: an OPT-IN capture (`LoopDetector.verify_capture`, loopclosure.py —
+sibling to the byte-frozen `verify`, so the offline/oracle path is bit-unchanged) labels
+each match (`STAGE_APPEARANCE/EPIPOLAR/PNP`) and returns the pixel pairs + counts +
+rotation verdict. The SLAM engine captures it LIVE-only (`SlamMap(capture_loops=True)`,
+mirroring `publish_map`) for EVERY verified candidate — confirmed OR rejected — and the
+`publish_loops` step publishes a `LoopMatch` on the new additive `slam.loop` topic
+(no keyframe images on the wire — SLAM keeps only descriptors). The UI's
+`IpcLoopMatchSource` subscribes `slam.loop` AND buffers the `keyframe` grays by seq, joins
+them, and `ui/viz/loop_render.render_loop` draws the 2D image (no GL → light + PNG-verifiable).
+Because the topic is additive + LIVE-only, the 640-pose byte-parity oracle stays gap = 0.
+**Code.** capture loopclosure.py (`verify_capture` / `LoopMatchCapture`); engine channel
+`SlamMap.drain_loop_captures` → `Engine.poll_loops` (base/inprocess/subprocess) →
+`slam/modules/publish_loops.py`; topic+message `comms.topics.SLAM_LOOP` /
+`comms.messages.LoopMatch` / `comms.wire.WireLoopMatch`; UI `ui/qt/loop_window.py` +
+`ui/viz/loop_render.py` + `ui/modules/ipc_sources.IpcLoopMatchSource`. Verified end-to-end
+on `lab_loop_30s` (`ui/tests/_loop_window_png.py` renders the real event to PNG;
+`slam/tests/loop_capture_selftest.py` proves the stage labelling).
 
 ## 4.3 SE(3) pose-graph optimization (Gauss-Newton on the manifold)
 

@@ -39,7 +39,7 @@ from imu_camera.comms.shared_array import SharedArrayRef, SharedArrayRing
 from imu_camera.comms.wire import (
     WireCalibBundle, WireCamSync, WireDepthFrame, WireEnd, WireFrameInliers,
     WireFrameTracks, WireGyroFuse, WireImuCamPacket, WireImuRaw, WireKeyframe,
-    WireLoopCorrection, WirePoseMsg, WireSlamMap, WireVioMap,
+    WireLoopCorrection, WireLoopMatch, WirePoseMsg, WireSlamMap, WireVioMap,
 )
 
 #: Where the frozen sha256 digests live (the cross-copy byte-parity oracle).
@@ -153,6 +153,14 @@ def build_vectors() -> list[tuple[str, str, object]]:
     slam_ids = np.array([0, 7], dtype=np.int64)
     last_match = np.array([[1.0, 0.5, -0.5]], dtype=np.float64)
 
+    # LoopMatch funnel: 3 appearance matches, one per stage (0/1/2). Pixel pairs
+    # are float32 keyframe coords; the rot_deg is finite (accepted candidate).
+    loop_cur_px = np.array([[100.5, 50.0], [120.0, 60.5], [140.25, 70.0]],
+                           dtype=np.float32)
+    loop_old_px = np.array([[101.0, 49.5], [119.0, 61.0], [141.0, 69.5]],
+                           dtype=np.float32)
+    loop_stage = np.array([0, 1, 2], dtype=np.uint8)   # dropped / epipolar / PnP
+
     return [
         # --- SharedArrayRef-bearing (stereo + depth + keyframe) -------------- #
         ("cam_sync", topics.CAM_SYNC,
@@ -210,6 +218,20 @@ def build_vectors() -> list[tuple[str, str, object]]:
         ("slam_map_no_match", topics.SLAM_MAP,
          WireSlamMap(kf_ids=slam_ids, kf_positions=slam_pos, n_loops=0,
                      last_match=None)),
+
+        # --- loop-match funnel (slam.loop): accepted + NaN-rot rejected edge --- #
+        ("loop_match_accepted", topics.SLAM_LOOP,
+         WireLoopMatch(cur_seq=120, old_seq=15, cur_px=loop_cur_px,
+                       old_px=loop_old_px, stage=loop_stage, n_appearance=3,
+                       n_fmat=2, n_pnp=1, rot_deg=4.2, rot_gate_deg=30.0,
+                       accepted=True)),
+        ("loop_match_rejected_nan_rot", topics.SLAM_LOOP,
+         WireLoopMatch(cur_seq=88, old_seq=20,
+                       cur_px=np.empty((0, 2), np.float32),
+                       old_px=np.empty((0, 2), np.float32),
+                       stage=np.empty((0,), np.uint8), n_appearance=12,
+                       n_fmat=0, n_pnp=0, rot_deg=float("nan"),
+                       rot_gate_deg=0.0, accepted=False)),
 
         # --- retained / read-directly (calib + vio map), all-optional + set -- #
         ("calib_bundle_minimal", topics.CALIB_BUNDLE,

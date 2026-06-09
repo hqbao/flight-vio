@@ -82,7 +82,8 @@ class SlamConfig:
 class SlamMap:
     """Persistent keyframe graph with loop closure + pose-graph optimisation."""
 
-    def __init__(self, K: np.ndarray, cfg: SlamConfig | None = None):
+    def __init__(self, K: np.ndarray, cfg: SlamConfig | None = None,
+                 capture_loops: bool = False):
         self.K = np.asarray(K, dtype=np.float64)
         self.cfg = cfg or SlamConfig()
         self.detector = LoopDetector(self.K, self.cfg.loop)
@@ -93,6 +94,15 @@ class SlamMap:
         self.kf_app: list = []                   # KeyframeAppearance
         self.kf_seq: list[int] = []
         self.loop_events: list[dict] = []        # {"cur","old","inliers","matches"}
+        # LIVE-only opt-in: capture the match funnel for EVERY verified candidate
+        # (confirmed OR rejected) so the UI can show WHY a loop fired / rejected.
+        # When False (the OFFLINE / oracle default) add_keyframe runs the
+        # byte-frozen ``verify`` path with zero extra work; when True it runs
+        # ``verify_capture`` and appends one :class:`LoopMatchCapture` (+ its seqs +
+        # rotation verdict) per candidate to :attr:`loop_captures` for the engine to
+        # poll. Never affects the pose graph / loop edges (capture is read-only).
+        self.capture_loops = bool(capture_loops)
+        self.loop_captures: list = []            # LoopMatchCapture per candidate
 
     # ------------------------------------------------------------------ #
     def reset(self) -> None:
@@ -111,6 +121,7 @@ class SlamMap:
         self.kf_app.clear()
         self.kf_seq.clear()
         self.loop_events.clear()
+        self.loop_captures.clear()
 
     # ------------------------------------------------------------------ #
     def _needs_keyframe(self, T_wc: np.ndarray) -> bool:
@@ -188,30 +199,49 @@ class SlamMap:
         if idx >= gap:
             radius = self.cfg.loop_search_radius_m
             cur_pos = T_wc[:3, 3]
+            rmax = self.cfg.loop_max_odom_rot_deg
             cands = []
+            # LIVE-only: stash one capture per verified candidate (the funnel), so
+            # the engine can publish a LoopMatch for the UI. Keyed by `old` index
+            # so the accepted flag can be finalised after the top-k selection.
+            captures_by_old: dict = {}
             for old in range(0, idx - gap + 1):
                 # Spatial gate (when enabled): skip far keyframes before paying
                 # for ORB+PnP. Uses the current (corrected) pose of the old KF.
                 if radius > 0.0:
                     if np.linalg.norm(self.kf_pose[old][:3, 3] - cur_pos) > radius:
                         continue
-                res = self.detector.verify(app, self.kf_app[old])
+                # OFFLINE (capture off): the byte-frozen ``verify`` path, zero extra
+                # work. LIVE (capture on): ``verify_capture`` gives the same result
+                # PLUS the funnel; recorded per candidate below.
+                if self.capture_loops:
+                    res, cap = self.detector.verify_capture(app, self.kf_app[old])
+                    cap.rot_gate_deg = float(rmax)
+                else:
+                    res, cap = self.detector.verify(app, self.kf_app[old]), None
                 if res is not None:
                     T_cur_old, ninl, nmatch = res
                     # Rotation-consistency gate: reject loops whose relative
                     # rotation disagrees with odometry by more than the band
                     # (odometry rotation drifts slowly, so a real revisit agrees;
                     # an aliasing false match usually does not).
-                    rmax = self.cfg.loop_max_odom_rot_deg
+                    rot_ang = float("nan")
                     if rmax > 0.0:
                         T_odom = se3_inv(self.kf_orig[idx]) @ self.kf_orig[old]
                         dR = T_cur_old[:3, :3] @ T_odom[:3, :3].T
                         c = (np.trace(dR) - 1.0) * 0.5
-                        ang = float(np.degrees(np.arccos(np.clip(c, -1.0, 1.0))))
-                        if ang > rmax:
-                            continue
+                        rot_ang = float(np.degrees(np.arccos(np.clip(c, -1.0, 1.0))))
+                    if cap is not None:
+                        # A geometrically-confirmed candidate: record its rotation
+                        # vs odometry (NaN when the gate is off). `accepted` is
+                        # provisionally False; finalised after the top-k selection.
+                        cap.rot_deg = rot_ang
+                        captures_by_old[old] = (cap, idx, old)
+                    if rmax > 0.0 and rot_ang > rmax:
+                        continue
                     cands.append((ninl, old, T_cur_old, nmatch))
             cands.sort(reverse=True)             # strongest (most inliers) first
+            accepted_olds: set = set()
             for ninl, old, T_cur_old, nmatch in cands[:self.cfg.max_loops_per_kf]:
                 # Edge old(i) -> cur(j): Z = T_ci_cj = pose of cur in old frame =
                 # inv(T_cur_old).
@@ -222,15 +252,37 @@ class SlamMap:
                       "cur_seq": self.kf_seq[idx], "old_seq": self.kf_seq[old]}
                 events.append(ev)
                 self.loop_events.append(ev)
+                accepted_olds.add(old)
+            # Finalise the captures (LIVE-only): a candidate is `accepted` iff it
+            # became a loop edge (passed every gate AND made the top-k cut). Record
+            # its real source seqs so the UI can join to its buffered keyframe grays.
+            if self.capture_loops:
+                for old, (cap, cur_i, old_i) in captures_by_old.items():
+                    cap.accepted = old in accepted_olds
+                    self.loop_captures.append(
+                        (int(self.kf_seq[cur_i]), int(self.kf_seq[old_i]), cap))
 
         # Hard ceiling: drop the oldest keyframe(s) once over budget. Done last
         # so the new keyframe and any loop edges it just formed are kept; the
         # cost is forgetting the very oldest place.
-        cap = self.cfg.max_keyframes
-        if cap > 0:
-            while len(self.kf_orig) > cap:
+        max_kf = self.cfg.max_keyframes
+        if max_kf > 0:
+            while len(self.kf_orig) > max_kf:
                 self._drop_oldest()
         return events
+
+    # ------------------------------------------------------------------ #
+    def drain_loop_captures(self) -> list:
+        """Pop + return the loop-match captures recorded since the last drain.
+
+        LIVE-only (empty unless ``capture_loops`` is set). Each entry is
+        ``(cur_seq, old_seq, LoopMatchCapture)`` for one verified candidate; the
+        engine turns them into ``slam.loop`` ``LoopMatch`` messages for the UI.
+        Draining (not just reading) keeps the buffer bounded on a long run.
+        """
+        out = self.loop_captures
+        self.loop_captures = []
+        return out
 
     # ------------------------------------------------------------------ #
     def has_loops(self) -> bool:

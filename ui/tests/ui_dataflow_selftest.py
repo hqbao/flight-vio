@@ -324,6 +324,71 @@ def test_imu_raw_source() -> None:
           f"{src.device_id!r}")
 
 
+def test_loop_window_offscreen(app) -> None:
+    """Construct the Loop Closure window with a stub source + assert it renders.
+
+    Proves the Qt window <-> renderer wiring (construct -> start -> tick ->
+    render -> close) under offscreen Qt, WITHOUT needing a loop to actually close
+    over IPC (a 20-frame replay never revisits). The stub source mimics
+    :class:`~ui.modules.ipc_sources.IpcLoopMatchSource`'s duck type
+    (``start(cb)`` / ``stop()`` / ``.error``) and pushes ONE synthetic
+    :class:`~ui.viz.loop_render.LoopEvent` with all three match stages so the
+    rendered image carries the colour-coded lines + funnel + verdict. The full
+    IPC firing on a real session is covered by ``ui.tests._loop_window_png``.
+    """
+    print("\n  [menus] Loop Closure window (Qt + renderer wiring)")
+    from ui.qt.loop_window import LoopClosureWindow
+    from ui.viz.loop_render import (
+        LoopEvent, STAGE_APPEARANCE, STAGE_EPIPOLAR, STAGE_PNP, _C_PNP,
+    )
+
+    rng = np.random.default_rng(5)
+    H, W, N = 200, 320, 30
+    cur_gray = (rng.random((H, W)) * 255).astype(np.uint8)
+    old_gray = (rng.random((H, W)) * 255).astype(np.uint8)
+    cur_px = rng.uniform([20, 20], [W - 20, H - 20], (N, 2)).astype(np.float32)
+    old_px = (cur_px + rng.normal(0, 4, (N, 2))).astype(np.float32)
+    stage = np.zeros(N, np.uint8)
+    stage[:18] = STAGE_PNP
+    stage[18:25] = STAGE_EPIPOLAR
+    stage[25:] = STAGE_APPEARANCE
+    ev = LoopEvent(cur_seq=499, old_seq=79, cur_gray=cur_gray, old_gray=old_gray,
+                   cur_px=cur_px, old_px=old_px, stage=stage, n_appearance=N,
+                   n_fmat=25, n_pnp=18, rot_deg=12.98, rot_gate_deg=30.0,
+                   accepted=True)
+
+    class _StubLoopSource:
+        error = None
+
+        def start(self, cb):
+            cb(ev)                                    # push one event synchronously
+
+        def stop(self):
+            pass
+
+    win = LoopClosureWindow(lambda: _StubLoopSource())
+    try:
+        win.start()                                   # renders the waiting frame
+        app.processEvents()
+        win._on_tick()                                # consume the synthetic event
+        app.processEvents()
+        img = win._buf
+        _check(img is not None and img.shape == (560, 1100, 3)
+               and img.dtype == np.uint8,
+               f"loop window rendered (560,1100,3) uint8 (got "
+               f"{None if img is None else (img.shape, img.dtype)})")
+        flat = img.reshape(-1, 3)
+        green = int((np.abs(flat.astype(int) - np.array(_C_PNP)).sum(1) < 40).sum())
+        _check(green > 50,
+               f"loop window drew the GREEN PnP-inlier match lines ({green} px)")
+        _check(win._first_seen, "loop window registered the synthetic loop event")
+    finally:
+        win.close()
+        app.processEvents()
+    print(f"    [ok] loop window: rendered an event with colour-coded match lines "
+          f"({green} green px)")
+
+
 def _spawn_cap_vio(session: str, max_frames: int, kf_every: int):
     """Boot imu_camera(replay) + vio over IPC; return (procs, cap_ep, vio_ep).
 
@@ -588,6 +653,15 @@ def test_menus(args) -> None:
         app.processEvents()
         print(f"    [ok] slam-map: {len(mpts)} occupied voxels, "
               f"{len(mcams)} cams on the path")
+
+        # ---------- (f) Visualize -> Loop Closure ----------
+        # The loop window is fed by a duck-typed source (slam.loop + keyframe
+        # grays over IPC). A 20-frame replay won't CLOSE a loop, so the IPC firing
+        # is proven on the FULL session in ui.tests._loop_window_png; HERE we prove
+        # the Qt window + the renderer wiring: construct it with a STUB source that
+        # pushes one synthetic LoopEvent, start it offscreen, and assert it renders
+        # a non-trivial (560,1100,3) image with the colour-coded match lines.
+        test_loop_window_offscreen(app)
     finally:
         for w in (triplet_win, keypoint_win):
             if w is not None:
