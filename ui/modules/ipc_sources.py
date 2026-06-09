@@ -53,10 +53,15 @@ into ``self.error`` for the window to display.
 """
 from __future__ import annotations
 
+import logging
 import threading
 import time
 
 import numpy as np
+
+#: Module logger (the surface-map build logs when it coarsens the mesh to stay
+#: under the GL triangle cap).
+LOG = logging.getLogger(__name__)
 
 from ui.comms import topics
 from ui.comms.messages import END
@@ -64,7 +69,7 @@ from ui.comms import IPCPubSub, IPCSubscriber, RingRegistry
 from ui.comms.converters import to_local
 from ui.comms.ring_registry import default_capture_specs, default_vio_specs
 from ui.viz.map_cloud import longest_consecutive_run
-from ui.viz import voxel_blocks
+from ui.viz import surface_mesh
 from ui.qt.keypoints_window import KeypointWorker
 from ui.qt.synced_window import TripletWorker
 
@@ -385,7 +390,7 @@ class _KeyframeAccumulator(threading.Thread):
     """Attach VIO's keyframe rings and stash every keyframe for a 3D-map build.
 
     Both the sparse landmark map (:class:`IpcSlamMapSource`) and the dense
-    occupancy/voxel map (:class:`IpcVoxelMapSource`) need the EXACT same VIO
+    surface-mesh map (:class:`IpcSurfaceMapSource`) need the EXACT same VIO
     keyframe feed -- the gray/depth grids (read_copy-ed out of VIO's ``kf_gray`` /
     ``kf_depth`` rings by the converter) and each keyframe's FULL pose
     ``[R_keyframe | t_keyframe]`` (split from ``T_world_cam``), plus the KLT track
@@ -421,11 +426,11 @@ class _KeyframeAccumulator(threading.Thread):
     MAX_KEYFRAMES = 600
     #: Valid-depth band (m): outside this range stereo depth is too noisy to
     #: back-project. Both builds gate to this band (the landmark map samples per
-    #: track; the voxel map back-projects the whole grid through the SAME band).
+    #: track; the surface map meshes the whole grid through the SAME band).
     MIN_DEPTH_M = 0.3
     MAX_DEPTH_M = 6.0
     #: Max full rebuilds per second. Subclasses override (a scatter rebuild is
-    #: light; a cube-mesh rebuild is heavier -> a lower rate).
+    #: light; a surface-mesh rebuild is heavier -> a lower rate).
     REBUILD_HZ = 4.0
 
     def __init__(self, vio_endpoint: str, *, name: str,
@@ -914,64 +919,77 @@ class IpcSlamMapSource(_KeyframeAccumulator):
 
 
 # --------------------------------------------------------------------------- #
-# (3d) Voxel/occupancy 3D-map source (solid cube mesh) for RoomBlocksWindow
+# (3d) Surface-mesh 3D-map source (continuous shaded surfaces) for the Room
+#      Surface window.
 # --------------------------------------------------------------------------- #
-class IpcVoxelMapSource(_KeyframeAccumulator):
-    """Build a solid-voxel (occupancy-grid) cube mesh of the room for RoomBlocks.
+class IpcSurfaceMapSource(_KeyframeAccumulator):
+    """Build a continuous-surface depth mesh of the room for the Room Surface view.
 
     A COMPLEMENT to :class:`IpcSlamMapSource`'s sparse landmark cloud: instead of
-    one point per confirmed landmark, this back-projects the DENSE depth of every
-    VIO keyframe, bins the world points into a 3D voxel grid, and renders the
-    occupied cells as SOLID CUBES -- so walls/surfaces read as blocky shells and
-    the enclosed room is recognisable. Pure CONSUMER of the same ``keyframe`` feed
-    the landmark map uses (no SLAM endpoint, no ``slam.map`` -- the occupancy grid
-    needs only the keyframe depth + each keyframe's own VIO pose); no new field,
-    no data-path change.
+    one point per confirmed landmark, this meshes the DENSE depth of a few
+    spatially-spread VIO keyframes into CONTINUOUS shaded triangle surfaces -- so
+    walls/floor/ceiling read as smooth connected sheets and the enclosed room is
+    recognisable. Pure CONSUMER of the same ``keyframe`` feed the landmark map
+    uses (no SLAM endpoint, no ``slam.map`` -- the surface mesh needs only the
+    keyframe depth/gray + each keyframe's own VIO pose); no new field, no
+    data-path change.
 
     Reuses the inherited :class:`_KeyframeAccumulator` machinery WHOLESALE (the kf
     ring attach + ``_on_keyframe`` stash + evict + the coalesced rebuild loop) --
     only ONE VIO client, NO copy-paste of the SHM/recv code. This class adds ONLY
-    the occupancy/cube-mesh build.
+    the depth-surface-mesh build.
 
     Build (:meth:`_build`, runs OFF the GUI thread):
 
-    1. For each VIO keyframe, back-project its full depth grid to the camera frame
-       (pinhole), gate to the valid-depth band + an edge-discontinuity reject
-       (drops "flying pixels"), sub-sample by :data:`STRIDE`, and transform to the
-       world by the keyframe's OWN pose ``[R | t]`` (one pose source per keyframe
-       -> seam-free odom-frame points, the same consistent-odom approach the
-       landmark map uses).
-    2. Bin the stacked world points into a :data:`VOXEL_M` grid; keep a cell only
-       once it has ``>= MIN_HITS`` points (multi-keyframe agreement rejects thin
-       stereo noise). Output the occupied cell CENTRES + a per-cell HEIGHT colour.
-    3. Build ONE merged cube mesh (verts/faces/face-colors) from the centres so
-       the window renders the whole grid as a single shaded ``GLMeshItem``.
+    1. SELECT a spatially-spread subset of keyframes by camera position
+       (:func:`~ui.viz.surface_mesh.select_spread_keyframes`, greedy
+       ``> KF_SPACING_M`` thinning) so the room is covered from a few viewpoints
+       and overlap/triangle count are bounded.
+    2. Per selected keyframe, mesh its depth map into a connected world-frame
+       surface (:func:`~ui.viz.surface_mesh.depth_surface_mesh`): back-project the
+       subsampled (``MESH_STRIDE``) depth grid by the keyframe's OWN pose
+       ``[R | t]`` and triangulate adjacent cells, KEEPING a triangle only when
+       all corners are valid AND their depth spread is within ``EDGE_MAX_M`` (drops
+       the fg/bg "curtain" triangles). One pose source per keyframe -> seam-free
+       odom-frame surfaces (the same consistent-odom approach the landmark map
+       uses). Vertices are coloured by HEIGHT (shared room gradient) modulated by
+       gray intensity.
+    3. STACK every selected keyframe's ``(verts, faces, vertex_colors)`` into ONE
+       merged buffer (offsetting each keyframe's face indices by the running
+       vertex count) so the window renders the whole room as a single shaded
+       ``GLMeshItem``.
 
-    The finished ``(verts, faces, face_colors, cams)`` go to the injected
+    Triangle cap: if the merged mesh would exceed
+    :data:`~ui.viz.surface_mesh.MAX_TRIANGLES`, the build COARSENS the mesh stride
+    (and, if still over, the keyframe spacing) and logs it, so a dense room never
+    overruns the GL budget.
+
+    The finished ``(verts, faces, vertex_colors, cams)`` go to the injected
     ``on_mesh`` callback (the window marshals it onto the GUI thread via its
     thread-safe ``submit``).
 
     Connect-error model mirrors the other sources.
     """
 
-    #: A cube-mesh rebuild is HEAVIER than a scatter (it (re)bins every keyframe's
-    #: dense depth + rebuilds a big triangle mesh), so rebuild more slowly than the
-    #: landmark map -- ~2.5 Hz coalesces bursts of new keyframes into one rebuild.
+    #: A surface-mesh rebuild is HEAVIER than a scatter (it meshes every selected
+    #: keyframe's dense depth + stacks a big triangle buffer), so rebuild more
+    #: slowly than the landmark map -- ~2.5 Hz coalesces bursts of new keyframes
+    #: into one rebuild.
     REBUILD_HZ = 2.5
 
     def __init__(self, vio_endpoint: str, K: np.ndarray, *,
                  connect_timeout_s: float = 10.0,
                  width: int | None = None, height: int | None = None) -> None:
-        super().__init__(vio_endpoint, name=f"voxel-map-src-{vio_endpoint}",
+        super().__init__(vio_endpoint, name=f"surface-map-src-{vio_endpoint}",
                          connect_timeout_s=connect_timeout_s,
                          width=width, height=height)
         self._K = np.asarray(K, dtype=np.float64).reshape(3, 3)
 
     # ------------------------------------------------------------------ #
     def start_mesh(self, on_mesh) -> None:
-        """Connect VIO's ``keyframe`` and stream cube meshes to ``on_mesh``.
+        """Connect VIO's ``keyframe`` and stream surface meshes to ``on_mesh``.
 
-        ``on_mesh(verts (V,3) float32, faces (F,3) int64, face_colors (F,4)
+        ``on_mesh(verts (V,3) float32, faces (F,3) int64, vertex_colors (V,3)
         float32, cams (M,3) float32)`` is invoked from this source's REBUILD
         thread (the window marshals it onto the GUI thread). On connect failure
         :attr:`error` is set and the thread is NOT started (the window polls it).
@@ -983,7 +1001,7 @@ class IpcVoxelMapSource(_KeyframeAccumulator):
         try:
             vio_client.start()
         except Exception as e:                                     # noqa: BLE001
-            self.error = f"Room-blocks stream connect failed: {e}"
+            self.error = f"Room-surface stream connect failed: {e}"
             try:
                 vio_client.stop()
             except Exception:                                      # noqa: BLE001
@@ -997,25 +1015,27 @@ class IpcVoxelMapSource(_KeyframeAccumulator):
 
     # ------------------------------------------------------------------ #
     def _build(self):
-        """Back-project ALL keyframes -> occupancy grid -> ONE merged cube mesh.
+        """Select spread keyframes -> mesh each -> STACK into ONE surface mesh.
 
-        Returns ``(verts, faces, face_colors, cams)``: the merged cube mesh of the
-        occupied voxels (empty arrays when nothing is occupied) plus ALL VIO
-        keyframe camera positions (so the window can show the capture trail). Each
-        keyframe's dense depth is back-projected through the SAME valid-depth band
-        + edge reject the dense geometry helper uses, sub-sampled by
-        :data:`~ui.viz.voxel_blocks.STRIDE`, and placed in the world by its OWN VIO
-        pose -- then :func:`~ui.viz.voxel_blocks.occupancy_voxels` keeps only cells
-        with ``>= MIN_HITS`` hits and :func:`~ui.viz.voxel_blocks.cube_mesh` merges
-        their centres into a single mesh.
+        Returns ``(verts, faces, vertex_colors, cams)``: the merged depth-surface
+        mesh (empty arrays when no keyframe meshes) plus ALL VIO keyframe camera
+        positions (so the window can show the capture trail). Each selected
+        keyframe's depth is meshed by
+        :func:`~ui.viz.surface_mesh.depth_surface_mesh` (valid-depth band + the
+        ``EDGE_MAX_M`` curtain reject, sub-sampled by ``MESH_STRIDE``) and placed
+        in the world by its OWN VIO pose; the per-keyframe meshes are concatenated
+        with running vertex-index offsets into one buffer. The total triangle count
+        is capped at :data:`~ui.viz.surface_mesh.MAX_TRIANGLES` by coarsening the
+        stride / spacing (logged).
         """
         with self._lock:
-            # gray/depth are always present once stashed; the occupancy build needs
-            # only depth + each keyframe's own pose (no track snapshot). Sort by
-            # source seq for deterministic order (not load-bearing for occupancy,
-            # but keeps the build reproducible).
+            # gray/depth are always present once stashed; the surface build needs
+            # only depth/gray + each keyframe's own pose (no track snapshot). Sort
+            # by source seq so the greedy spread-selection walks keyframes in true
+            # capture order (so the kept viewpoints follow the trajectory).
             seqs = sorted(self._kf_depth)
             depths = [self._kf_depth[s] for s in seqs]
+            grays = [self._kf_gray[s] for s in seqs]
             Rs = [self._kf_R[s] for s in seqs]
             ts = [self._kf_t[s] for s in seqs]
             cam_ts = [self._kf_t[s] for s in self._kf_gray]
@@ -1024,59 +1044,84 @@ class IpcVoxelMapSource(_KeyframeAccumulator):
 
         verts0 = np.zeros((0, 3), np.float32)
         faces0 = np.zeros((0, 3), np.int64)
-        fcols0 = np.zeros((0, 4), np.float32)
+        vcols0 = np.zeros((0, 3), np.float32)
         if not seqs:
-            return verts0, faces0, fcols0, cams
+            return verts0, faces0, vcols0, cams
 
-        fx, fy = float(self._K[0, 0]), float(self._K[1, 1])
-        cx, cy = float(self._K[0, 2]), float(self._K[1, 2])
-        stride = max(1, int(voxel_blocks.STRIDE))
-        edge_max = float(voxel_blocks.EDGE_MAX_M)
+        # (1) Spatially-spread keyframe selection: a few well-separated viewpoints.
+        positions = np.asarray(ts, dtype=np.float64).reshape(-1, 3)
+        sel = surface_mesh.select_spread_keyframes(
+            positions, spacing=surface_mesh.KF_SPACING_M)
+        if sel.size == 0:
+            return verts0, faces0, vcols0, cams
 
-        # Back-project + world-transform every keyframe's dense depth, accumulate
-        # the world points (the occupancy grid bins the UNION of all keyframes).
-        world_all: list[np.ndarray] = []
-        for k in range(len(seqs)):
-            depth = np.asarray(depths[k], dtype=np.float32)
-            h, w = depth.shape
-            # Valid-depth band (same band the landmark map + geometry helper use).
-            m = (np.isfinite(depth) & (depth >= self.MIN_DEPTH_M)
-                 & (depth <= self.MAX_DEPTH_M))
-            if edge_max > 0.0:
-                # Edge reject: drop pixels on a depth discontinuity ("flying
-                # pixels" that interpolate between a fg/bg surface) -- the SAME
-                # 4-neighbour delta gate ``keyframe_pointcloud``'s edge_max applies.
-                dv = np.abs(np.diff(depth, axis=0, append=depth[-1:]))
-                dh = np.abs(np.diff(depth, axis=1, append=depth[:, -1:]))
-                m &= (dv <= edge_max) & (dh <= edge_max)
-            # Sub-sample to bound the per-keyframe point budget (the room shape
-            # survives; occupancy only needs enough hits per cell for MIN_HITS).
-            keep = m[::stride, ::stride]
-            if not np.any(keep):
-                continue
-            us = np.arange(0, w, stride, dtype=np.float32)
-            vs = np.arange(0, h, stride, dtype=np.float32)
-            uu, vv = np.meshgrid(us, vs)
-            z = depth[::stride, ::stride]
-            uu, vv, z = uu[keep], vv[keep], z[keep]
-            # Pinhole back-projection to the camera frame, then to world by the
-            # keyframe's own VIO pose [R | t] (Xw = R Xc + t).
-            cam = np.stack([(uu - cx) * z / fx, (vv - cy) * z / fy, z], axis=1)
-            world_all.append(cam @ Rs[k].T + ts[k])
+        # Shared height gradient across ALL selected keyframes: the room's world-y
+        # (DOWN) span over the selected camera positions is a robust proxy for the
+        # floor->ceiling extent, so every keyframe's mesh shares one colour ramp
+        # (no per-keyframe rescale -> the floor/walls/ceiling bands stay aligned).
+        sel_y = positions[sel, 1]
+        # Pad the camera-y span by a margin: surfaces extend below the floor / above
+        # the ceiling relative to the camera height, so widen so they don't clip to
+        # the ramp's ends.
+        y_lo = float(sel_y.min()) - 1.0
+        y_hi = float(sel_y.max()) + 1.0
 
-        if not world_all:
-            return verts0, faces0, fcols0, cams
-        points = np.concatenate(world_all, axis=0)
+        # (2+3) Mesh each selected keyframe and STACK. The stride is coarsened (and,
+        # if still over budget, fewer keyframes are kept) so the merged triangle
+        # count stays within MAX_TRIANGLES.
+        stride = max(1, int(surface_mesh.MESH_STRIDE))
+        return self._mesh_and_stack(
+            depths, grays, Rs, ts, sel, stride, y_lo, y_hi, cams,
+            verts0, faces0, vcols0)
 
-        # Occupancy: bin -> keep cells with >= MIN_HITS -> centres + height colour.
-        centers, colors = voxel_blocks.occupancy_voxels(
-            points, voxel=voxel_blocks.VOXEL_M, min_hits=voxel_blocks.MIN_HITS)
-        if centers.shape[0] == 0:
-            return verts0, faces0, fcols0, cams
-        # Merge into ONE cube mesh (cubes sized to the voxel so they tile solidly).
-        verts, faces, face_colors = voxel_blocks.cube_mesh(
-            centers, voxel_blocks.VOXEL_M, colors=colors)
-        return verts, faces, face_colors, cams
+    def _mesh_and_stack(self, depths, grays, Rs, ts, sel, stride,
+                        y_lo, y_hi, cams, verts0, faces0, vcols0):
+        """Mesh the selected keyframes at ``stride`` and stack; cap triangles.
+
+        Builds each selected keyframe's depth-surface mesh and concatenates them
+        into one buffer (offsetting face indices by the running vertex count). If
+        the merged triangle count exceeds
+        :data:`~ui.viz.surface_mesh.MAX_TRIANGLES` the stride is DOUBLED (a coarser
+        grid quarters the triangles) and the build retried, up to a few times; the
+        coarsening is logged. Returns the same
+        ``(verts, faces, vertex_colors, cams)`` tuple shape as :meth:`_build`.
+        """
+        sel_list = [int(i) for i in sel]
+        # Retry with a progressively coarser stride until under the triangle cap
+        # (each doubling ~quarters the count). 4 attempts -> stride x{1,2,4,8}.
+        for attempt in range(4):
+            verts_parts: list[np.ndarray] = []
+            faces_parts: list[np.ndarray] = []
+            cols_parts: list[np.ndarray] = []
+            v_offset = 0
+            n_tri = 0
+            for i in sel_list:
+                v, f, c = surface_mesh.depth_surface_mesh(
+                    depths[i], Rs[i], ts[i], self._K,
+                    stride=stride, edge_max=surface_mesh.EDGE_MAX_M,
+                    min_depth=self.MIN_DEPTH_M, max_depth=self.MAX_DEPTH_M,
+                    gray=grays[i], y_lo=y_lo, y_hi=y_hi)
+                if f.shape[0] == 0:
+                    continue
+                verts_parts.append(v)
+                faces_parts.append(f + v_offset)       # offset into the merged buf
+                cols_parts.append(c)
+                v_offset += v.shape[0]
+                n_tri += f.shape[0]
+            if not faces_parts:
+                return verts0, faces0, vcols0, cams
+            if n_tri <= surface_mesh.MAX_TRIANGLES:
+                break
+            # Over the GL budget: coarsen the stride and rebuild (logged).
+            new_stride = stride * 2
+            LOG.info("ui: room-surface mesh %d tris > cap %d -> coarsen "
+                     "MESH_STRIDE %d -> %d", n_tri,
+                     surface_mesh.MAX_TRIANGLES, stride, new_stride)
+            stride = new_stride
+        verts = np.concatenate(verts_parts, axis=0).astype(np.float32)
+        faces = np.concatenate(faces_parts, axis=0).astype(np.int64)
+        vcols = np.concatenate(cols_parts, axis=0).astype(np.float32)
+        return verts, faces, vcols, cams
 
 
 # --------------------------------------------------------------------------- #
@@ -1107,15 +1152,15 @@ def ipc_slam_map_factory(vio_endpoint: str, slam_endpoint: str, K: np.ndarray,
                                     width=width, height=height)
 
 
-def ipc_voxel_map_factory(vio_endpoint: str, K: np.ndarray,
-                          width: int, height: int):
-    """Return a zero-arg factory building an :class:`IpcVoxelMapSource`.
+def ipc_surface_map_factory(vio_endpoint: str, K: np.ndarray,
+                            width: int, height: int):
+    """Return a zero-arg factory building an :class:`IpcSurfaceMapSource`.
 
     Binds the VIO endpoint (the ``keyframe`` publisher + its kf rings) and the
     rectified-left ``K`` from the retained calib bundle -- so the caller
-    (``ui.main``) just opens RoomBlocksWindow and starts the returned source. No
-    SLAM endpoint: the occupancy grid builds from the keyframe depth + each
+    (``ui.main``) just opens RoomSurfaceWindow and starts the returned source. No
+    SLAM endpoint: the surface mesh builds from the keyframe depth/gray + each
     keyframe's own VIO pose only.
     """
-    return lambda: IpcVoxelMapSource(vio_endpoint, K,
-                                     width=width, height=height)
+    return lambda: IpcSurfaceMapSource(vio_endpoint, K,
+                                       width=width, height=height)
