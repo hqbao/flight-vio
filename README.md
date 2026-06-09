@@ -382,24 +382,32 @@ The menu bar renders **in-window on every platform** (`setNativeMenuBar(False)`)
     `depth_surface_mesh`), the window in `ui/qt/room_surface_window.py`.
   - *Floor Plan (top-down)* — a **LIGHT, no-OpenGL** alternative to the two 3D maps
     (heavy GL on a Mac, noisy depth hard to read in perspective): a **2D top-down
-    occupancy raster**. Each keyframe's depth is back-projected by its own VIO pose
+    wall-outline raster**. Each keyframe's depth is back-projected by its own VIO pose
     (strided, same depth gate + edge reject as the 3D builds, but a **tighter
     `MAX_DEPTH_M`≈2.5 m** because far stereo sprays radial fans top-down), the
     world-vertical **optical-`+y` (down)** axis is dropped to bin the points onto the
-    optical `(x,z)` **ground plane**, and each cell is scored by **point count boosted
-    by vertical extent** with a min-count noise gate — so a **wall** (a tall column of
-    points) reads as a bright top-down **outline** while the **floor** stays faint.
-    The raster is colour-mapped (dark→bright) and the **camera path** + latest-pose
-    marker drawn over it. It renders on a 2D `pyqtgraph.PlotWidget` (`ImageItem` +
+    optical `(x,z)` **ground plane**. A cell joins the room's **occupied region** only
+    if it is hit by enough rays (`MIN_CELL_COUNT`, drops thin radial noise) **and** its
+    points span a real **vertical column** (`FLOOR_EXTENT_M` — the explicit *wall =
+    vertical extent* gate that drops the flat floor). That binary region is then
+    cleaned + reduced to a **crisp wall line** with cheap 2D `cv2` ops — `MORPH_OPEN`
+    scrubs the radial *star-burst* streaks, `MORPH_CLOSE` bridges depth-dropout gaps,
+    `connectedComponentsWithStats` drops the isolated noise islands, and `MORPH_GRADIENT`
+    takes the region's **boundary** (a wall reads top-down as the *boundary* between
+    occupied and free space, not an interior blob). The crisp outline is drawn bright
+    over a faint raw-occupancy context wash, with the **camera path** + latest-pose
+    marker on top. It renders on a 2D `pyqtgraph.PlotWidget` (`ImageItem` +
     `PlotDataItem`) — **no `GLViewWidget`** — so it never stutters the UI, and (being a
     plain raster) it can be written to a PNG with pure numpy/cv2 for **offscreen visual
-    verification**. UI-only: the pure-numpy projection + histogram live in
-    `ui/viz/floor_plan.py`, the window in `ui/qt/floor_plan_window.py`.
+    verification**. Every cleanup knob (extent gate, morphology kernels, min-component
+    area, outline-vs-filled) is exposed + commented. UI-only: the pure-numpy+cv2
+    projection + cleanup live in `ui/viz/floor_plan.py`, the window in
+    `ui/qt/floor_plan_window.py`.
   - All three map windows reuse the same VIO `keyframe` feed via a shared
     `_KeyframeAccumulator` base (`ui/modules/ipc_sources.py`) — the SHM ring attach +
     keyframe stash + evict wiring is written ONCE; the landmark source adds SLAM's
     `slam.map`, the surface source adds the depth-surface-mesh build, the floor-plan
-    source adds the 2D ground-plane occupancy build.
+    source adds the 2D ground-plane wall-outline build.
   - All reuse the unchanged `ui/qt` windows, fed over IPC by the adapters in
     `ui/modules/ipc_sources.py` (capture's `imucam.sample` / `frame.depth`; the tracker
     also VIO's `frame.tracks` / `frame.inliers`; the SLAM map VIO's `keyframe` + SLAM's

@@ -1,7 +1,8 @@
-"""Unit selftests for the pure-numpy floor-plan builder (ui.viz.floor_plan).
+"""Unit selftests for the pure-numpy+cv2 floor-plan builder (ui.viz.floor_plan).
 
 No Qt, no GL, no IPC -- just the projection (back-project keyframe depth by pose)
-+ the ground-plane occupancy histogram on SYNTHETIC inputs with a known answer:
++ the ground-plane occupancy / wall-outline cleanup on SYNTHETIC inputs with a
+known answer:
 
 * ``test_backproject_single_pixel`` -- one depth pixel back-projects to the
   pinhole-predicted world point under identity AND a translated/rotated pose.
@@ -9,11 +10,15 @@ No Qt, no GL, no IPC -- just the projection (back-project keyframe depth by pose
   axis: two points differing only in y land in the SAME ground cell.
 * ``test_extent_and_cell_index`` -- a known point lands in the expected raster
   cell and the world<->pixel extent round-trips.
-* ``test_wall_outscores_floor`` -- a tall column of points (a wall) scores higher
-  (brighter) than a flat slab (floor) at the same point count, so walls read as
-  the outline.
-* ``test_min_cell_count_gate`` -- a cell under the count gate is dropped (the
-  radial stereo-noise floor) while a dense cell survives.
+* ``test_floor_extent_gate`` -- a FLAT slab (small vertical extent = floor) is
+  dropped from the occupied region while a TALL column (a wall) survives, so the
+  outline tracks vertical structure, not the swept floor.
+* ``test_noise_island_dropped`` -- a small isolated noise island is removed by the
+  morphology + connected-component filter while a large solid region survives.
+* ``test_outline_is_boundary`` -- the rendered wall is the OUTLINE (boundary) of a
+  solid region: its border cells are lit, its interior stays dark.
+* ``test_clean_wall_mask_helper`` -- the cv2 cleanup helper directly: open drops a
+  thin streak, the component filter drops a small blob, the gradient is a boundary.
 * ``test_camera_path_projection`` -- the camera path projects onto the same grid
   pixels the raster uses.
 * ``test_empty_inputs`` -- no points -> a harmless 1x1 raster + degenerate extent.
@@ -76,22 +81,23 @@ def test_backproject_single_pixel() -> None:
 def test_ground_plane_projection() -> None:
     """The builder drops optical-y (DOWN): same (x,z), different y -> same cell."""
     # Two points at the SAME (x,z)=(0.5, 0.5) but very different y (height): they
-    # must accumulate in ONE ground cell (the vertical axis is dropped).
-    # min_cell_count=1 so the 2-point cell isn't dropped by the noise gate (the
-    # gate is tested separately) -- here we verify the PROJECTION only.
+    # must accumulate in ONE ground cell (the vertical axis is dropped). Relax the
+    # cleanup knobs (count=1, no component-area floor, FILLED not outline) so the
+    # single occupied cell isn't scrubbed -- here we verify the PROJECTION only.
     pts = np.array([[0.5, -1.0, 0.5],
                     [0.5, 2.0, 0.5]], dtype=np.float64)
-    rgb, extent = floor_plan.build_floor_plan(pts, cell_m=0.1, min_cell_count=1)
+    rgb, extent = floor_plan.build_floor_plan(
+        pts, cell_m=0.1, min_cell_count=1, min_component_cells=1, outline=False)
     # The two points span x in [0.5,0.5], z in [0.5,0.5] -> a 1x1 grid, both in it.
     _check(extent.width == 1 and extent.height == 1,
            f"co-located (x,z) points -> a 1x1 ground grid ({extent.width}x"
            f"{extent.height})")
     _check(rgb.shape == (1, 1, 3),
            f"raster is 1x1x3 for one occupied cell ({rgb.shape})")
-    # That single cell saw 2 points spanning 3 m of height -> a strong score ->
-    # a bright (non-background) colour.
+    # That single cell saw 2 points spanning 3 m of height (a tall column, well
+    # over the floor-extent gate) -> it survives as occupied -> a bright colour.
     _check(int(rgb[0, 0].max()) > 60,
-           f"the occupied cell is lit, not background ({rgb[0,0]})")
+           f"the occupied (tall) cell is lit, not background ({rgb[0,0]})")
 
 
 def test_extent_and_cell_index() -> None:
@@ -100,7 +106,12 @@ def test_extent_and_cell_index() -> None:
     # height=5 (0,..,2). A point at (1.0, *, 2.0) is the top-right corner cell.
     pts = np.array([[0.0, 0.0, 0.0],
                     [1.0, 0.0, 2.0]], dtype=np.float64)
-    rgb, extent = floor_plan.build_floor_plan(pts, cell_m=0.5, min_cell_count=1)
+    # Relax the cleanup (count=1, no floor-extent gate, component floor=1, FILLED)
+    # so the two lone single-height corner cells survive -- here we verify the
+    # EXTENT / cell indexing only (the gate + cleanup are tested separately).
+    rgb, extent = floor_plan.build_floor_plan(
+        pts, cell_m=0.5, min_cell_count=1, floor_extent_m=0.0,
+        min_component_cells=1, outline=False)
     _check(extent.width == 3 and extent.height == 5,
            f"grid is 3x5 cells for the (1m x 2m)/0.5 extent ({extent.width}x"
            f"{extent.height})")
@@ -118,66 +129,155 @@ def test_extent_and_cell_index() -> None:
            "an empty interior cell is darker than an occupied corner")
 
 
-def test_wall_outscores_floor() -> None:
-    """A tall column (wall) scores brighter than a flat slab (floor) at = count."""
-    n = 200
+def test_floor_extent_gate() -> None:
+    """A flat slab (floor) is gated out by vertical extent; a tall block survives.
+
+    The explicit "wall = vertical extent" gate: a cell whose points span less than
+    ``floor_extent_m`` in height is flat floor and dropped from the occupied region,
+    so the rendered outline tracks vertical structure (walls), not the swept floor.
+    """
     rng = np.random.default_rng(0)
-    # FLOOR slab: many points spread in (x,z) over a 1x1 m patch at ~one height
-    # (tiny y jitter). Placed around x~0 so it sits in its own grid region.
-    floor_x = rng.uniform(-0.5, 0.5, n)
-    floor_z = rng.uniform(-0.5, 0.5, n)
-    floor_y = rng.normal(1.0, 0.01, n)                 # ~flat in height
-    floor_pts = np.stack([floor_x, floor_z * 0 + 0.0, floor_z], axis=1)
-    floor_pts[:, 1] = floor_y
-
-    # WALL column: the SAME number of points but concentrated in ONE (x,z) cell,
-    # spanning a 2 m vertical extent (floor->ceiling). Same count per cell as the
-    # floor's busiest cell would be far lower, so to compare fairly we put BOTH in
-    # a 1x1 cell each and check the wall cell is brighter.
-    wall_x = rng.normal(5.0, 0.005, n)                 # all in one cell, far away
-    wall_z = rng.normal(5.0, 0.005, n)
-    wall_y = rng.uniform(0.0, 2.0, n)                  # tall column
-    wall_pts = np.stack([wall_x, wall_y, wall_z], axis=1)
-
-    pts = np.concatenate([floor_pts, wall_pts], axis=0)
+    # A solid FLOOR slab: a 1x1 m patch of many points at ~one height (extent ~0).
+    n_floor = 4000
+    fx = rng.uniform(0.0, 1.0, n_floor)
+    fz = rng.uniform(0.0, 1.0, n_floor)
+    fy = rng.normal(1.0, 0.01, n_floor)                # ~flat -> extent << gate
+    floor = np.stack([fx, fy, fz], axis=1)
+    # A solid TALL block at a far (x,z) region: a 1x1 m footprint of points each
+    # spanning a 2 m vertical column (a wall/structure) -> extent >> gate.
+    n_wall = 4000
+    wx = rng.uniform(5.0, 6.0, n_wall)
+    wz = rng.uniform(5.0, 6.0, n_wall)
+    wy = rng.uniform(0.0, 2.0, n_wall)                 # tall column -> big extent
+    wall = np.stack([wx, wy, wz], axis=1)
+    pts = np.concatenate([floor, wall], axis=0)
+    # FILLED region (not the outline) so we can probe interior cells; default gate.
     rgb, extent = floor_plan.build_floor_plan(
-        pts, cell_m=0.1, height_weight=floor_plan.HEIGHT_WEIGHT)
-    # Find the wall cell (near x=5,z=5) and the brightest floor cell.
-    wcol, wrow = extent.world_xz_to_px(np.array([5.0]), np.array([5.0]))
-    wcol = int(np.clip(round(float(wcol[0])), 0, extent.width - 1))
-    wrow = int(np.clip(round(float(wrow[0])), 0, extent.height - 1))
-    wall_bright = int(rgb[wrow, wcol].sum())
-    # The floor occupies the region around x,z in [-0.5,0.5]; sample its cells.
-    fcol0, frow0 = extent.world_xz_to_px(np.array([-0.5]), np.array([-0.5]))
-    fcol1, frow1 = extent.world_xz_to_px(np.array([0.5]), np.array([0.5]))
-    fr = slice(int(max(0, frow0[0])), int(min(extent.height, frow1[0] + 1)))
-    fc = slice(int(max(0, fcol0[0])), int(min(extent.width, fcol1[0] + 1)))
-    floor_region = rgb[fr, fc].reshape(-1, 3).sum(axis=1)
-    floor_bright = int(floor_region.max()) if floor_region.size else 0
-    _check(wall_bright > floor_bright,
-           f"wall column ({wall_bright}) outscores the brightest floor cell "
-           f"({floor_bright}) -> walls read as the outline")
+        pts, cell_m=0.1, floor_extent_m=floor_plan.FLOOR_EXTENT_M, outline=False)
+
+    def region_lit(x0, z0, x1, z1):
+        c0, r0 = extent.world_xz_to_px(np.array([x0]), np.array([z0]))
+        c1, r1 = extent.world_xz_to_px(np.array([x1]), np.array([z1]))
+        rs = slice(int(max(0, r0[0])), int(min(extent.height, r1[0] + 1)))
+        cs = slice(int(max(0, c0[0])), int(min(extent.width, c1[0] + 1)))
+        sub = rgb[rs, cs].reshape(-1, 3)
+        return int(sub.max()) if sub.size else 0
+
+    floor_lit = region_lit(0.0, 0.0, 1.0, 1.0)
+    wall_lit = region_lit(5.0, 5.0, 6.0, 6.0)
+    # The wall block reads as a bright (near-white) outline; the gated-out floor is
+    # at most the faint raw-occupancy context wash (well below the bright outline).
+    _check(floor_lit < 120,
+           f"the flat floor slab is gated out (only faint context, {floor_lit})")
+    _check(wall_lit > 200,
+           f"the tall block survives the extent gate (bright outline, {wall_lit})")
 
 
-def test_min_cell_count_gate() -> None:
-    """Cells under ``min_cell_count`` points are dropped (the radial noise floor)."""
-    # A dense cluster (5 pts in one cell) far from a sparse pair (2 pts in another):
-    # at min_cell_count=3 the sparse cell must read as background, the dense as lit.
-    dense = np.array([[5.0, 0.0, 5.0]] * 5, dtype=np.float64)
-    dense[:, 1] = np.linspace(0.0, 1.0, 5)          # give it some vertical extent
-    sparse = np.array([[0.0, 0.0, 0.0]] * 2, dtype=np.float64)
-    pts = np.concatenate([dense, sparse], axis=0)
-    rgb, extent = floor_plan.build_floor_plan(pts, cell_m=0.1, min_cell_count=3)
-    dcol, drow = extent.world_xz_to_px(np.array([5.0]), np.array([5.0]))
-    scol, srow = extent.world_xz_to_px(np.array([0.0]), np.array([0.0]))
-    dcol = int(np.clip(round(float(dcol[0])), 0, extent.width - 1))
-    drow = int(np.clip(round(float(drow[0])), 0, extent.height - 1))
-    scol = int(np.clip(round(float(scol[0])), 0, extent.width - 1))
-    srow = int(np.clip(round(float(srow[0])), 0, extent.height - 1))
-    _check(int(rgb[drow, dcol].max()) > 60,
-           f"the dense (5-pt) cell is lit ({rgb[drow,dcol]})")
-    _check(int(rgb[srow, scol].max()) < 60,
-           f"the sparse (2-pt) cell is dropped as noise ({rgb[srow,scol]})")
+def test_noise_island_dropped() -> None:
+    """A small isolated noise island is dropped; a large solid region survives.
+
+    The morphology OPEN + connected-component area filter remove the small isolated
+    star-burst blobs while keeping the large connected room region.
+    """
+    rng = np.random.default_rng(1)
+    # A LARGE solid tall region (a wall sheet) -> a big connected component.
+    n_big = 8000
+    bx = rng.uniform(0.0, 2.0, n_big)
+    bz = rng.uniform(0.0, 0.4, n_big)                  # a 2.0 x 0.4 m wall footprint
+    by = rng.uniform(0.0, 2.0, n_big)                  # tall
+    big = np.stack([bx, by, bz], axis=1)
+    # A TINY isolated tall island far away (a single ~1-cell speck of noise).
+    n_isle = 8
+    isx = rng.normal(8.0, 0.01, n_isle)
+    isz = rng.normal(8.0, 0.01, n_isle)
+    isy = rng.uniform(0.0, 2.0, n_isle)                # tall, so the gate keeps it
+    isle = np.stack([isx, isy, isz], axis=1)
+    pts = np.concatenate([big, isle], axis=0)
+    rgb, extent = floor_plan.build_floor_plan(
+        pts, cell_m=0.1, min_component_cells=floor_plan.MIN_COMPONENT_CELLS,
+        outline=False)
+    # The big region's centre must be lit; the isolated island must be dropped.
+    bc, br = extent.world_xz_to_px(np.array([1.0]), np.array([0.2]))
+    ic, ir = extent.world_xz_to_px(np.array([8.0]), np.array([8.0]))
+    bc = int(np.clip(round(float(bc[0])), 0, extent.width - 1))
+    br = int(np.clip(round(float(br[0])), 0, extent.height - 1))
+    ic = int(np.clip(round(float(ic[0])), 0, extent.width - 1))
+    ir = int(np.clip(round(float(ir[0])), 0, extent.height - 1))
+    # The big region reads as a bright (near-white) filled mask; the dropped island
+    # is at most the faint raw-occupancy context wash (no bright mask cell).
+    _check(int(rgb[br, bc].max()) > 200,
+           f"the large solid region survives (bright, {rgb[br,bc]})")
+    _check(int(rgb[ir, ic].max()) < 120,
+           f"the small isolated noise island is dropped (faint, {rgb[ir,ic]})")
+
+
+def test_outline_is_boundary() -> None:
+    """The wall mask is the OUTLINE of a region: border lit, interior dark.
+
+    With ``outline=True`` (the default) the wall is the morphological-gradient
+    boundary of the cleaned occupied region, so an interior cell deep inside a
+    solid block stays dark while the block's border is lit -- a thin wall LINE, not
+    a filled footprint.
+    """
+    rng = np.random.default_rng(2)
+    # A big solid tall block (3 x 3 m footprint), all points spanning a 2 m column.
+    n = 30000
+    bx = rng.uniform(0.0, 3.0, n)
+    bz = rng.uniform(0.0, 3.0, n)
+    by = rng.uniform(0.0, 2.0, n)
+    block = np.stack([bx, by, bz], axis=1)
+    # A few FLAT corner points well outside the block: they are gated out as floor
+    # (so they don't occupy), but they enlarge the raster so the block has FREE
+    # SPACE around it to form a boundary against (a block filling the whole raster
+    # has no boundary -- a degenerate synthetic case, never a real room).
+    corners = np.array([[-1.0, 0.0, -1.0], [4.0, 0.0, -1.0],
+                        [-1.0, 0.0, 4.0], [4.0, 0.0, 4.0]], dtype=np.float64)
+    pts = np.concatenate([block, corners], axis=0)
+    rgb, extent = floor_plan.build_floor_plan(pts, cell_m=0.1, outline=True)
+    # The block's centre (1.5, 1.5) is deep interior -> on the outline it is dark.
+    cc, cr = extent.world_xz_to_px(np.array([1.5]), np.array([1.5]))
+    cc = int(np.clip(round(float(cc[0])), 0, extent.width - 1))
+    cr = int(np.clip(round(float(cr[0])), 0, extent.height - 1))
+    # The interior is NOT on the outline -> at most the faint context wash, never
+    # the bright (near-white) wall line.
+    _check(int(rgb[cr, cc].max()) < 120,
+           f"the block's deep interior is NOT lit on the outline ({rgb[cr,cc]})")
+    # The outline DOES exist (some bright wall-line cells) and is THIN: far fewer
+    # bright cells than the ~30x30-cell filled footprint would have (a boundary
+    # ring is O(perimeter), not O(area)).
+    bright = (rgb.max(axis=2) > 200)
+    n_bright = int(bright.sum())
+    _check(n_bright > 0, f"the region boundary is lit as the wall outline "
+           f"({n_bright} bright cells)")
+    _check(n_bright < 0.5 * (extent.width * extent.height),
+           f"the outline is THIN (a boundary, not a filled block): {n_bright} of "
+           f"{extent.width * extent.height} cells")
+
+
+def test_clean_wall_mask_helper() -> None:
+    """The cv2 cleanup helper directly: open drops streaks, components drop blobs."""
+    h, w = 40, 40
+    occ = np.zeros((h, w), np.uint8)
+    occ[10:30, 10:30] = 1                  # a large solid 20x20 block (a real region)
+    occ[5, 0:25] = 1                       # a 1-cell-thick horizontal streak (noise)
+    occ[35:38, 36:39] = 1                  # a tiny isolated 3x3 blob (noise island)
+    # FILLED first: the open must erase the thin streak, the component filter the
+    # tiny blob, leaving only the big block.
+    filled = floor_plan._clean_wall_mask(
+        occ, open_px=3, close_px=3, min_component_cells=40, outline=False)
+    _check(not filled[5, 0:25].any(),
+           "MORPH_OPEN erased the 1-cell-thick streak")
+    _check(not filled[35:38, 36:39].any(),
+           "the connected-component filter dropped the tiny isolated blob")
+    _check(filled[20, 20],
+           "the large solid block survived the cleanup")
+    # OUTLINE: the block's interior is now dark, its border lit (a boundary line).
+    line = floor_plan._clean_wall_mask(
+        occ, open_px=3, close_px=3, min_component_cells=40, outline=True)
+    _check(not line[20, 20],
+           "the block's deep interior is dark on the outline")
+    _check(line[10, 10] or line[10, 20] or line[20, 10],
+           "the block's border is lit as the outline")
 
 
 def test_camera_path_projection() -> None:
@@ -215,8 +315,10 @@ def main() -> int:
     print("test_backproject_single_pixel"); test_backproject_single_pixel()
     print("test_ground_plane_projection"); test_ground_plane_projection()
     print("test_extent_and_cell_index"); test_extent_and_cell_index()
-    print("test_wall_outscores_floor"); test_wall_outscores_floor()
-    print("test_min_cell_count_gate"); test_min_cell_count_gate()
+    print("test_floor_extent_gate"); test_floor_extent_gate()
+    print("test_noise_island_dropped"); test_noise_island_dropped()
+    print("test_outline_is_boundary"); test_outline_is_boundary()
+    print("test_clean_wall_mask_helper"); test_clean_wall_mask_helper()
     print("test_camera_path_projection"); test_camera_path_projection()
     print("test_empty_inputs"); test_empty_inputs()
     print("\nALL FLOOR_PLAN SELFTESTS PASSED")
