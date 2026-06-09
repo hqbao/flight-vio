@@ -50,9 +50,6 @@ _INVALID_BGR = (158, 148, 139)   # #8b949e
 _FRESH_BGR = (0, 176, 255)       # #ffb000
 _INLIER_BGR = (80, 185, 63)      # #3fb950
 _HALO_BGR = (0, 0, 0)
-#: PnP-inlier dot RING colour (BGR). Distinct from the green inlier reproj stub
-#: below (#39c5cf cyan) so the ring and the stub never blend into one green blob.
-_INLIER_RING_BGR = (207, 197, 57)   # #39c5cf cyan
 #: Reprojection stub colours (BGR): inliers use the SUCCESS green (subtle,
 #: ~0-2 px), outliers use DANGER red #f85149 (long, striking strays).
 _STUB_INLIER_BGR = _INLIER_BGR
@@ -161,17 +158,15 @@ def draw_overlay(gray: np.ndarray, depth_m: np.ndarray,
                  ids: np.ndarray, points: np.ndarray,
                  trails: TrackTrails, *, fresh_age: int = 3,
                  draw_trails: bool = True,
-                 inlier_ids: set[int] | None = None,
                  reproj: dict | None = None) -> np.ndarray:
     """Render the keypoint/depth/trail overlay; returns an ``(H, W, 3)`` RGB image.
 
     Background is the grayscale frame, dimmed so the colour dots pop. Each live
     track: a black halo + a depth-coloured dot (valid depth) or a hollow grey
-    ring (no stereo return), an amber ring if it is a fresh track, a cyan ring
-    if the RGB-D PnP kept it as an inlier (``inlier_ids``, the clean subset the
-    motion solve actually trusted; cyan so it never blends with the green inlier
-    reproj stub), and -- when ``draw_trails`` -- a faint
-    depth-coloured polyline of its last positions.
+    ring (no stereo return), an amber ring if it is a fresh track, and -- when
+    ``draw_trails`` -- a faint depth-coloured polyline of its last positions.
+    Which points the RGB-D PnP kept as inliers is shown by the reprojection stubs
+    below (green = inlier, red = outlier) -- there is no separate inlier ring.
 
     ``reproj`` (optional) is the per-PnP-point reprojection diagnostic, a dict
     ``{"ids": (M,) int, "reproj": (M, 2) float, "inlier": (M,) bool}`` (the
@@ -180,8 +175,7 @@ def draw_overlay(gray: np.ndarray, depth_m: np.ndarray,
     the measured pixel to its reprojected pixel: subtle GREEN for inliers
     (near-zero length), striking RED for outliers (long strays). It makes
     "minimise reprojection error" -- the heart of RGB-D PnP and windowed BA --
-    literally visible. ``inlier_ids`` may be passed independently (the legacy
-    green dots) or derived by the caller as ``reproj["ids"][reproj["inlier"]]``.
+    literally visible.
     """
     import cv2
 
@@ -198,8 +192,6 @@ def draw_overlay(gray: np.ndarray, depth_m: np.ndarray,
     valid = z > 1e-6
     colors = depth_colors(z)                          # (M, 3) uint8 BGR
     dot_r, halo_r, fresh_r, line_w = marker_sizes(bg.shape[:2])
-    inl = ({int(i) for i in inlier_ids}               # clean PnP subset (real)
-           if inlier_ids is not None else set())
 
     if draw_trails:
         layer = bg.copy()
@@ -222,9 +214,6 @@ def draw_overlay(gray: np.ndarray, depth_m: np.ndarray,
             cv2.circle(bg, (ix, iy), dot_r, _INVALID_BGR, 1, cv2.LINE_AA)
         if trails.age(int(tid)) < fresh_age:
             cv2.circle(bg, (ix, iy), fresh_r, _FRESH_BGR, 1, cv2.LINE_AA)
-        if int(tid) in inl:
-            cv2.circle(bg, (ix, iy), fresh_r + line_w, _INLIER_RING_BGR,
-                       line_w, cv2.LINE_AA)
 
     # --- reprojection-error stubs (drawn last, on top of the markers) -------- #
     # Join the per-PnP-point reproj diagnostic to THIS frame's measured pixels by
@@ -253,8 +242,15 @@ def draw_overlay(gray: np.ndarray, depth_m: np.ndarray,
                         continue
                     if not (np.isfinite(rx) and np.isfinite(ry)):
                         continue
+                    rxi, ryi = int(round(rx)), int(round(ry))
                     cv2.line(bg, (int(round(m[0])), int(round(m[1]))),
-                             (int(round(rx)), int(round(ry))),
-                             col, line_w, cv2.LINE_AA)
+                             (rxi, ryi), col, line_w, cv2.LINE_AA)
+                    # A small dot at the reprojected point so an inlier -- whose
+                    # stub is ~0 px and would otherwise be invisible -- is still
+                    # marked (a subtle green dot ON the keypoint); for an outlier
+                    # it marks the far end of the red stray where the bad match
+                    # "wanted" the point to land.
+                    cv2.circle(bg, (rxi, ryi), max(1, line_w), col, -1,
+                               cv2.LINE_AA)
 
     return np.ascontiguousarray(bg[:, :, ::-1])

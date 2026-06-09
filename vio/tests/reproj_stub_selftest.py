@@ -241,7 +241,7 @@ def test_overlay() -> bool:
     trails = TrackTrails()
     trails.update(ids, pts)
     rgb = draw_overlay(gray, depth, ids, pts, trails, draw_trails=False,
-                       inlier_ids={1}, reproj=reproj)
+                       reproj=reproj)
     # draw_overlay returns RGB; the stub colours are BGR constants, so flip them.
     inl_rgb = _STUB_INLIER_BGR[::-1]
     out_rgb = _STUB_OUTLIER_BGR[::-1]

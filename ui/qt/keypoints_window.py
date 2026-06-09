@@ -149,7 +149,6 @@ class KeypointWorker(threading.Thread):
                 return
             depths = sample_depths(msg.depth_m, pts)
             rgb = draw_overlay(msg.gray_left, msg.depth_m, ids, pts, trails,
-                               inlier_ids=latest_inl["ids"],
                                reproj=latest_inl["reproj"])
             sample = KeypointSample(
                 rgb=rgb, ids=ids, points=pts, depths=depths,
@@ -276,8 +275,8 @@ class KeypointTrackWindow(QWidget):
         rasters.addWidget(_DepthScaleBar(), stretch=0)
         lay.addLayout(rasters, stretch=1)
         hint = QLabel("colour = depth · hollow grey = no stereo · amber = fresh "
-                      "track · cyan ring = PnP inlier · stub = reproj error "
-                      "(green inlier / red outlier) · trail = last 20 frames")
+                      "track · reproj stub = green inlier / red outlier · "
+                      "trail = last 20 frames")
         hint.setObjectName("ScaleTick")
         lay.addWidget(hint, stretch=0)
         root.addWidget(panel, stretch=1)
