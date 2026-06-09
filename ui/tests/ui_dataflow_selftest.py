@@ -409,6 +409,53 @@ def test_surface_map_source(vio_ep: str, bundle):
         src.stop()
 
 
+def attach_floor_plan_source(vio_ep: str, bundle):
+    """Attach an :class:`IpcFloorPlanSource` to VIO's ``keyframe`` feed (no build).
+
+    Returns the attached, subscribed source so the caller can let it accumulate
+    keyframes in the BACKGROUND (alongside the room-surface source) WHILE the
+    replay/VIO is still alive, then build the plan + ``stop()`` it afterwards. VIO
+    shuts down once the replay sends END, so the floor-plan client must be up
+    before that happens -- attaching it up front (rather than after the
+    room-surface test's wait) is what makes the build see live kf rings.
+    """
+    from ui.modules import IpcFloorPlanSource
+
+    W, H, K = int(bundle.width), int(bundle.height), bundle.K
+    src = IpcFloorPlanSource(vio_ep, K, width=W, height=H, connect_timeout_s=20.0)
+    _check(src._attach_or_fail(),
+           f"floor-plan source attached VIO kf rings ({src.error})")
+    client = src._make_keyframe_client()
+    client.start()
+    return src
+
+
+def build_floor_plan_from(src):
+    """Run the floor-plan source's OFF-thread ``_build`` ONCE and assert it.
+
+    Asserts the occupancy raster is valid (a real ``(H,W,3)`` uint8 image, a sane
+    world<->pixel extent, one camera path point per keyframe, some lit cell), then
+    returns ``(rgb, path_px, cams, extent)`` for the caller to feed the window.
+    Confirms the shared ``_KeyframeAccumulator`` base populates a THIRD source with
+    NO extra SHM/recv wiring. The caller ``stop()``s the source.
+    """
+    n_kf = len(src._kf_depth)
+    _check(n_kf >= 1, f"floor-plan source accumulated >=1 keyframe (got {n_kf})")
+    rgb, path_px, cams, extent = src._build()
+    _check(rgb.ndim == 3 and rgb.shape[2] == 3 and rgb.dtype == np.uint8,
+           f"floor-plan raster is (H,W,3) uint8 ({rgb.shape}, {rgb.dtype})")
+    _check(extent.width == rgb.shape[1] and extent.height == rgb.shape[0],
+           "floor-plan extent matches the raster dimensions")
+    _check(extent.cell_m > 0.0, f"floor-plan cell size is positive ({extent.cell_m})")
+    _check(len(path_px) == len(cams),
+           f"one camera-path pixel per keyframe ({len(path_px)} vs {len(cams)})")
+    # Some cell must be lit above the colormap's background floor (the room
+    # actually built, not an all-empty raster).
+    _check(int(rgb.max()) > 60,
+           f"floor-plan raster has lit (occupied) cells (max={int(rgb.max())})")
+    return rgb, path_px, cams, extent
+
+
 def test_menus(args) -> None:
     """Build the run_ui menu actions against a live capture+vio and fire them.
 
@@ -524,6 +571,12 @@ def test_menus(args) -> None:
         print(f"    [ok] keypoint: {len(ksamples)} samples, SEQ "
               f"{k0.seq}..{ksamples[-1].seq}, max trk {max_trk}")
 
+        # Attach the Floor-Plan source's keyframe client NOW (before the
+        # room-surface test's wait), so it accumulates keyframes in the background
+        # while VIO is still alive -- VIO shuts down once the replay ENDs, so its
+        # kf rings must be attached before then. We build + assert it in (f).
+        floor_src = attach_floor_plan_source(vio_ep, bundle)
+
         # ---------- (e) Visualize -> Room Surface (3D mesh) ----------
         # Drive the IpcSurfaceMapSource directly (we control when the surface-mesh
         # build runs) so we can assert a NON-EMPTY depth-surface mesh builds
@@ -551,6 +604,29 @@ def test_menus(args) -> None:
                f"(face indices in range)")
         print(f"    [ok] room-surface: {len(verts)} verts, "
               f"{n_tri} triangles, {len(vcams)} cams")
+
+        # ---------- (f) Visualize -> Floor Plan (top-down) ----------
+        # Build the 2D occupancy raster from the keyframes the floor-plan source
+        # accumulated above (in parallel with the room-surface source), and assert
+        # FloorPlanWindow ingests it without raising. This window is a 2D
+        # PlotWidget (NO GLViewWidget) so it renders fine offscreen.
+        from ui.qt.floor_plan_window import FloorPlanWindow
+        try:
+            frgb, fpath, fcams, fext = build_floor_plan_from(floor_src)
+        finally:
+            floor_src.stop()
+        fwin = FloorPlanWindow()
+        # update() touches the plot items; it must not raise on the GUI thread.
+        fwin.update(frgb, fpath, fcams, fext)
+        # Empty inputs exercise the early-return guard (no crash on a blank plan).
+        fwin.update(np.zeros((1, 1, 3), np.uint8), np.zeros((0, 2), np.float32),
+                    np.zeros((0, 3), np.float32), fext)
+        fwin.update(None, None, None, None)
+        app.processEvents()
+        fwin.close()
+        app.processEvents()
+        print(f"    [ok] floor-plan: {fext.width}x{fext.height} cells, "
+              f"{len(fcams)} cams on the path")
     finally:
         for w in (triplet_win, keypoint_win):
             if w is not None:

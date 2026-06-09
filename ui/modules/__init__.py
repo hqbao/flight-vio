@@ -49,6 +49,10 @@ works -- it triggers the lazy import on first access:
   connected triangle surface) into ONE shaded surface mesh for the Room Surface
   (3D mesh) window. Shares the ``_KeyframeAccumulator`` base with the SLAM-map
   source (NO copy-paste of the SHM/recv wiring).
+* :class:`~ui.modules.ipc_sources.IpcFloorPlanSource` -- vio ``keyframe`` (+ its
+  kf rings) back-projected + binned onto the ground plane into a 2D top-down
+  OCCUPANCY raster for the Floor Plan (top-down) window -- a LIGHT, no-GL
+  alternative to the 3D maps. Shares the SAME ``_KeyframeAccumulator`` base.
 """
 from .collector import UiCollectorModule
 from .render import UiRenderModule
@@ -61,8 +65,9 @@ from .triplet import UiTripletModule
 _IPC_ADAPTERS = frozenset({
     "IpcImuRawSource", "IpcGyroFuseSource", "IpcTripletWorker",
     "IpcKeypointWorker", "IpcSlamMapSource", "IpcSurfaceMapSource",
+    "IpcFloorPlanSource",
     "ipc_triplet_factory", "ipc_keypoint_factory", "ipc_slam_map_factory",
-    "ipc_surface_map_factory",
+    "ipc_surface_map_factory", "ipc_floor_plan_factory",
 })
 
 __all__ = [
@@ -79,10 +84,12 @@ __all__ = [
     "IpcKeypointWorker",
     "IpcSlamMapSource",
     "IpcSurfaceMapSource",
+    "IpcFloorPlanSource",
     "ipc_triplet_factory",
     "ipc_keypoint_factory",
     "ipc_slam_map_factory",
     "ipc_surface_map_factory",
+    "ipc_floor_plan_factory",
 ]
 
 

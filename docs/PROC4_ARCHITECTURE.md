@@ -84,6 +84,8 @@ long-lived trajectory sources use:
 | Keypoint Depth Tracker        | `IpcKeypointWorker`          | capture · `frame.depth`  +  vio · `frame.tracks`, `frame.inliers` |
 | Gyro Fusion (strip chart)     | `IpcGyroFuseSource`          | vio · `frame.gyrofuse` |
 | SLAM Map (landmarks)          | `IpcSlamMapSource`           | vio · `keyframe` (gray/depth/`track_ids`/`track_px`/`inlier_ids` via VIO's kf rings) + slam · `slam.map` (corrected poses) |
+| Room Surface (3D mesh)        | `IpcSurfaceMapSource`        | vio · `keyframe` (gray/depth via VIO's kf rings) |
+| Floor Plan (top-down)         | `IpcFloorPlanSource`         | vio · `keyframe` (depth via VIO's kf rings) |
 
 The crucial design rule: **nothing but `imu_camera` opens the OAK-D**. The UI never
 fights capture for the device, and the UI process imports no depthai — it is
@@ -428,7 +430,21 @@ The menu is plain Qt (`QMenuBar` / `QAction`); `ui.main` calls
   SLAM's loop-corrected poses, in the same ENU frame as `Viewer3D`; the gate is a
   **longest-consecutive-keyframe-run** filter — `ui/viz/map_cloud.py::longest_consecutive_run`,
   UI-only — so only consistently-tracked, motion-validated points show, NOT a dense
-  reconstruction). Each window is cached so repeated opens reuse the one IPC source.
+  reconstruction), **"Room Surface (3D mesh)…"** (`RoomSurfaceWindow`, driven by
+  `IpcSurfaceMapSource` — a continuous **depth-surface mesh** of a spatially-spread
+  keyframe subset, `ui/viz/surface_mesh.py`, UI-only), and **"Floor Plan (top-down)…"**
+  (`FloorPlanWindow`, driven by `IpcFloorPlanSource` — a **LIGHT 2D top-down
+  occupancy raster**, NOT OpenGL). The floor plan is a cheap, readable alternative
+  to the 3D maps (heavy GL on a Mac, noisy in perspective): it back-projects each
+  keyframe's depth by its own VIO pose, drops the world-vertical optical-`+y` axis
+  to bin the points onto the optical `(x,z)` GROUND plane, scores each cell by point
+  count boosted by vertical extent (so **walls** read as a top-down **outline** and
+  the floor stays faint) with a min-count noise gate, colour-maps it, and overlays
+  the **camera path** + latest-pose marker. It uses a 2D pyqtgraph `PlotWidget`
+  (`ImageItem` + `PlotDataItem`) — **no `GLViewWidget`** — so it never stutters the
+  UI, and the raster can be written to a PNG with pure numpy/cv2 for offscreen
+  visual verification. The builder math is the pure-numpy `ui/viz/floor_plan.py`
+  (no Qt/GL). Each window is cached so repeated opens reuse the one IPC source.
 - **Calibration** — **"Gyroscope Bias…"** (`GyroCalibDialog`) and **"Accelerometer
   (6-position)…"** (`AccelCalibDialog`). Each opens with a fresh `IpcImuRawSource`
   injected as its `stream`; the menu handler owns the stream and closes it in its
@@ -449,6 +465,15 @@ consumes only the abstract IPC topics + wire POD types and never imports depthai
 Each adapter opens its own read-only `IPCPubSub(role="client")` on demand, attaches
 only the capture rings it needs, and surfaces a connect failure (capture down) as a
 clear reason rather than a raw shared-memory path error.
+
+Beside these three duck-typed adapters, the same module hosts the **keyframe-map
+builder** sources — `IpcSlamMapSource` (sparse landmark cloud), `IpcSurfaceMapSource`
+(continuous surface mesh) and `IpcFloorPlanSource` (2D top-down occupancy raster).
+All three subclass a shared `_KeyframeAccumulator` base (VIO `keyframe` ring attach +
+stash + evict + a coalesced off-GUI rebuild loop), so each adds **only** its own
+build (`_build`) with **no copy-paste** of the SHM/recv wiring; the floor-plan build
+delegates to the pure-numpy `ui/viz/floor_plan.py` so its projection + histogram are
+testable headless.
 
 ### 6.4 Calibration semantic — "saves for the NEXT capture start"
 

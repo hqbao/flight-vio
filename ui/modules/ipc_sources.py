@@ -70,6 +70,7 @@ from ui.comms.converters import to_local
 from ui.comms.ring_registry import default_capture_specs, default_vio_specs
 from ui.viz.map_cloud import longest_consecutive_run
 from ui.viz import surface_mesh
+from ui.viz import floor_plan
 from ui.qt.keypoints_window import KeypointWorker
 from ui.qt.synced_window import TripletWorker
 
@@ -1125,6 +1126,116 @@ class IpcSurfaceMapSource(_KeyframeAccumulator):
 
 
 # --------------------------------------------------------------------------- #
+# (3e) Floor-plan source (2D top-down occupancy raster) for FloorPlanWindow.
+# --------------------------------------------------------------------------- #
+class IpcFloorPlanSource(_KeyframeAccumulator):
+    """Build a 2D TOP-DOWN floor-plan raster of the room for FloorPlanWindow.
+
+    A LIGHT complement to the 3D map sources (:class:`IpcSlamMapSource` /
+    :class:`IpcSurfaceMapSource`): instead of a 3D cloud / mesh (heavy GL, hard to
+    read in perspective on this Mac), this back-projects the SAME VIO keyframe
+    feed to world points and bins them onto the horizontal GROUND plane into a 2D
+    OCCUPANCY raster -- so the walls read as a top-down outline + the camera path,
+    rendered as a cheap 2D ``ImageItem`` (no ``GLViewWidget``). Pure CONSUMER of
+    the ``keyframe`` feed (no SLAM endpoint, no ``slam.map``); no new field, no
+    data-path change.
+
+    Reuses the inherited :class:`_KeyframeAccumulator` machinery WHOLESALE (the kf
+    ring attach + ``_on_keyframe`` stash + evict + the coalesced rebuild loop) --
+    only ONE VIO client, NO copy-paste of the SHM/recv code. This class adds ONLY
+    the 2D ground-plane occupancy build (delegated to :mod:`ui.viz.floor_plan`).
+
+    Build (:meth:`_build`, runs OFF the GUI thread):
+
+    1. Back-project EVERY stashed keyframe's (denoised) depth to world points by
+       its OWN VIO pose ``[R | t]`` (strided + the SAME depth gate + edge reject as
+       the 3D builders) -- :func:`~ui.viz.floor_plan.keyframes_to_ground_points`.
+    2. Bin the points onto the optical ``(x, z)`` GROUND plane (drop the vertical
+       optical ``+y``/DOWN axis) into a 2D occupancy raster, scoring each cell by
+       point count BOOSTED by the vertical extent (so walls outscore floor) and
+       colour-mapping it -- :func:`~ui.viz.floor_plan.build_floor_plan`.
+    3. Project ALL keyframe camera positions onto the SAME plane for the path
+       overlay.
+
+    The finished ``(rgb, path_px, cams, extent)`` go to the injected ``on_plan``
+    callback (the window marshals it onto the GUI thread via its thread-safe
+    ``submit``).
+
+    Connect-error model mirrors the other sources.
+    """
+
+    #: The 2D histogram build is CHEAP (a single ``np.add.at`` scatter, no triangle
+    #: stacking), so it can rebuild faster than the surface mesh (2.5 Hz) -- 5 Hz
+    #: keeps the plan snappy as keyframes accumulate without burning CPU.
+    REBUILD_HZ = 5.0
+
+    def __init__(self, vio_endpoint: str, K: np.ndarray, *,
+                 connect_timeout_s: float = 10.0,
+                 width: int | None = None, height: int | None = None) -> None:
+        super().__init__(vio_endpoint, name=f"floor-plan-src-{vio_endpoint}",
+                         connect_timeout_s=connect_timeout_s,
+                         width=width, height=height)
+        self._K = np.asarray(K, dtype=np.float64).reshape(3, 3)
+
+    # ------------------------------------------------------------------ #
+    def start_plan(self, on_plan) -> None:
+        """Connect VIO's ``keyframe`` and stream floor plans to ``on_plan``.
+
+        ``on_plan(rgb (H,W,3) uint8, path_px (M,2) float32, cams (M,3) float32,
+        extent FloorPlanExtent)`` is invoked from this source's REBUILD thread (the
+        window marshals it onto the GUI thread). On connect failure :attr:`error`
+        is set and the thread is NOT started (the window polls it).
+        """
+        self._cb = on_plan
+        if not self._attach_or_fail():
+            return
+        vio_client = self._make_keyframe_client()
+        try:
+            vio_client.start()
+        except Exception as e:                                     # noqa: BLE001
+            self.error = f"Floor-plan stream connect failed: {e}"
+            try:
+                vio_client.stop()
+            except Exception:                                      # noqa: BLE001
+                pass
+            self._vio_client = None
+            if self._vio_rings is not None:
+                self._vio_rings.close()
+                self._vio_rings = None
+            return
+        self.start()                                  # spin the rebuild thread
+
+    # ------------------------------------------------------------------ #
+    def _build(self):
+        """Back-project the keyframes -> bin onto the ground plane -> raster.
+
+        Returns ``(rgb, path_px, cams, extent)``: the 2D occupancy raster, the
+        camera path projected to raster pixels, ALL VIO keyframe camera positions
+        (optical world) and the world<->pixel extent. Every stashed keyframe's
+        depth is used, back-projected by its OWN VIO pose; the floor-plan math is
+        the pure-numpy :mod:`ui.viz.floor_plan` (no GL, no Qt).
+        """
+        with self._lock:
+            # gray is unused for the plan (occupancy, not colour); the build needs
+            # only depth + each keyframe's own pose. Sort by source seq for a stable
+            # build order (the order doesn't affect the histogram, but keeps the
+            # camera path in capture order).
+            seqs = sorted(self._kf_depth)
+            depths = [self._kf_depth[s] for s in seqs]
+            Rs = [self._kf_R[s] for s in seqs]
+            ts = [self._kf_t[s] for s in seqs]
+            cam_ts = [self._kf_t[s] for s in self._kf_gray]
+        cams = (np.asarray(cam_ts, np.float32).reshape(-1, 3)
+                if cam_ts else np.zeros((0, 3), np.float32))
+
+        # Back-project every keyframe's gated, strided depth to world points, then
+        # bin onto the ground plane into the occupancy raster + camera path.
+        points = floor_plan.keyframes_to_ground_points(depths, Rs, ts, self._K)
+        rgb, path_px, extent = floor_plan.floor_plan_with_path(points, cams)
+        return rgb, path_px, cams, extent
+
+
+# --------------------------------------------------------------------------- #
 # (4) Factory helpers -- the windows want a zero-arg ``worker_factory``
 # --------------------------------------------------------------------------- #
 def ipc_triplet_factory(capture_endpoint: str, width: int, height: int):
@@ -1164,3 +1275,17 @@ def ipc_surface_map_factory(vio_endpoint: str, K: np.ndarray,
     """
     return lambda: IpcSurfaceMapSource(vio_endpoint, K,
                                        width=width, height=height)
+
+
+def ipc_floor_plan_factory(vio_endpoint: str, K: np.ndarray,
+                           width: int, height: int):
+    """Return a zero-arg factory building an :class:`IpcFloorPlanSource`.
+
+    Binds the VIO endpoint (the ``keyframe`` publisher + its kf rings) and the
+    rectified-left ``K`` from the retained calib bundle -- so the caller
+    (``ui.main``) just opens FloorPlanWindow and starts the returned source. No
+    SLAM endpoint: the floor plan builds from the keyframe depth + each keyframe's
+    own VIO pose only (same feed as the Room Surface source).
+    """
+    return lambda: IpcFloorPlanSource(vio_endpoint, K,
+                                      width=width, height=height)

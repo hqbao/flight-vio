@@ -577,10 +577,12 @@ def run_ui(*, vio_endpoint: str = DEFAULT_VIO_ENDPOINT,
     from ui.qt.gyrofuse_window import GyroFuseWindow
     from ui.qt.map_window import MapWindow
     from ui.qt.room_surface_window import RoomSurfaceWindow
+    from ui.qt.floor_plan_window import FloorPlanWindow
     from ui.qt.calib_dialogs import GyroCalibDialog, AccelCalibDialog
     from ui.modules import (
         IpcImuRawSource, IpcGyroFuseSource, ipc_triplet_factory,
         ipc_keypoint_factory, ipc_slam_map_factory, ipc_surface_map_factory,
+        ipc_floor_plan_factory,
     )
 
     # 1. Wait for VIO + SLAM to be ready (and learn the capture resolution).
@@ -867,6 +869,42 @@ def run_ui(*, vio_endpoint: str = DEFAULT_VIO_ENDPOINT,
     room_surface_act.triggered.connect(_open_room_surface)
     vis_menu.addAction(room_surface_act)
 
+    # Floor Plan (top-down): the SAME mapped space, but rendered as a LIGHT 2D
+    # top-down OCCUPANCY raster (NO OpenGL) -- the walls read as a top-down outline
+    # + the camera path -- so the room layout is clear AND the view never stutters
+    # (the 3D maps are heavy GL on this Mac and noisy in perspective). The
+    # IpcFloorPlanSource consumes VIO's ``keyframe`` (depth via VIO's kf rings)
+    # only, back-projects each keyframe's depth by its own VIO pose, drops the
+    # world-vertical axis to bin the points onto the ground plane, and colour-maps
+    # the occupancy; its callback hands each rebuilt raster to the window via the
+    # thread-safe `submit` (a queued signal onto the GUI thread). Cached on `win`;
+    # the source is stopped in run_ui's teardown (mirrors the SLAM-Map entry).
+    def _open_floor_plan() -> None:
+        if getattr(win, "_floor_plan_win", None) is None:
+            win._floor_plan_win = FloorPlanWindow(title="Floor Plan (top-down)")
+        fwin = win._floor_plan_win
+        # (Re)start the source on every open (one-shot per run, like the 3D maps):
+        # stop a prior one before spawning a fresh one.
+        old = getattr(win, "_floor_plan_src", None)
+        if old is not None:
+            try:
+                old.stop()
+            except Exception:                                      # noqa: BLE001
+                pass
+        src = ipc_floor_plan_factory(vio_endpoint, vio_bundle.K, W, H)()
+        win._floor_plan_src = src
+        src.start_plan(fwin.submit)
+        if src.error:
+            win.statusBar().showMessage(f"Floor plan: {src.error}", 4000)
+        fwin.show()
+        fwin.raise_()
+        fwin.activateWindow()
+        win.statusBar().showMessage("Floor Plan (top-down) opened.", 2500)
+
+    floor_plan_act = QAction("Floor Plan (top-down)…", win)
+    floor_plan_act.triggered.connect(_open_floor_plan)
+    vis_menu.addAction(floor_plan_act)
+
     # Calibration: each wizard gets a FRESH IPC IMU source (capture's raw imu.raw)
     # and a modal dialog. We inject `stream=src`, which sets the dialog's
     # `_owns_stream=False` -- so the dialog will NOT stop the stream and WE must,
@@ -959,10 +997,11 @@ def run_ui(*, vio_endpoint: str = DEFAULT_VIO_ENDPOINT,
         # process alive after `app.exec()` returns.
         vio_source.stop()
         tracker.stop()
-        # The SLAM-map + Room-surface sources are standalone threads (their windows
-        # are plain QMainWindows with no closeEvent worker-stop), so stop them
-        # explicitly here.
-        for _src_attr in ("_slam_map_src", "_room_surface_src"):
+        # The SLAM-map + Room-surface + Floor-plan sources are standalone threads
+        # (their windows are plain QMainWindows with no closeEvent worker-stop), so
+        # stop them explicitly here.
+        for _src_attr in ("_slam_map_src", "_room_surface_src",
+                          "_floor_plan_src"):
             _src = getattr(win, _src_attr, None)
             if _src is not None:
                 try:
@@ -973,7 +1012,7 @@ def run_ui(*, vio_endpoint: str = DEFAULT_VIO_ENDPOINT,
         # (closeEvent stops the worker). The calib dialogs are modal + scoped to
         # their handler's `finally`, so there's nothing to clean up for them here.
         for _attr in ("_triplet_win", "_keypoints_win", "_gyrofuse_win",
-                      "_slam_map_win", "_room_surface_win"):
+                      "_slam_map_win", "_room_surface_win", "_floor_plan_win"):
             _w = getattr(win, _attr, None)
             if _w is not None:
                 try:
