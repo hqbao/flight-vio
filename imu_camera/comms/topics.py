@@ -64,6 +64,13 @@ FRAME_TRACKS = "frame.tracks"
 # only by the UI; published after EstimateMotion runs.
 FRAME_INLIERS = "frame.inliers"
 
+# Per-frame gyro-fusion diagnostic -- the vision-vs-gyro inter-frame rotation, their
+# disagreement, the resulting correction gain + translation-trust, and the config
+# gate thresholds (ALGORITHMS.md #5). A REAL odometry output read from last_info,
+# published only on gyro-fused frames. Drives the UI "Gyro fusion" strip chart that
+# explains why the fused VIO stays straight where pure-vision drifts. UI-only.
+FRAME_GYROFUSE = "frame.gyrofuse"
+
 # Acquisition front-end (``cam`` <-> ``imu_cam``).
 CAM_SYNC = "cam.sync"
 IMUCAM_SAMPLE = "imucam.sample"

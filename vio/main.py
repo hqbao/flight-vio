@@ -77,6 +77,7 @@ _OUTPUT_TOPICS = [
     topics.POSE_REFINED,
     topics.FRAME_TRACKS,
     topics.FRAME_INLIERS,
+    topics.FRAME_GYROFUSE,
 ]
 
 
@@ -183,7 +184,8 @@ def run_vio(*,
     pub_pose = IPCPublisher(local, server, vio_rings,
                             [topics.POSE_ODOM, topics.POSE_VO,
                              topics.POSE_REFINED,
-                             topics.FRAME_TRACKS, topics.FRAME_INLIERS],
+                             topics.FRAME_TRACKS, topics.FRAME_INLIERS,
+                             topics.FRAME_GYROFUSE],
                             endpoint=endpoint,
                             ring_endpoint=endpoint)
     pub_kf.start()

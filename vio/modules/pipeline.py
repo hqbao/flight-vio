@@ -19,6 +19,7 @@ two edges of the unified acquisition front-end:
   :class:`~vio.modules.estimate_motion.EstimateMotion`,
   :class:`~vio.modules.correct_tilt.CorrectTilt`,
   :class:`~vio.modules.publish_inliers.PublishInliers`,
+  :class:`~vio.modules.publish_gyrofuse.PublishGyroFuse`,
   :class:`~vio.modules.publish_pose.PublishPose`,
   (:class:`~vio.modules.publish_vo.PublishVo`),
   :class:`~vio.modules.emit_keyframe.EmitKeyframe`]
@@ -37,7 +38,10 @@ the IMU<->vision join that pops the preintegrated prior for the frame's ``seq``;
 ``EstimateMotion`` is then just the RGB-D PnP (+ gyro fusion) solve.
 ``PublishInliers`` then emits that solve's PnP inlier track ids on
 ``frame.inliers`` so the visualiser can mark the clean subset the motion estimate
-actually trusted. The :class:`~vio.modules.tracked.Tracked` carrier threads the
+actually trusted. ``PublishGyroFuse`` then emits that solve's gyro-fusion
+diagnostic on ``frame.gyrofuse`` (vision-vs-gyro rotation, disagreement, gain,
+translation-trust) for the "Gyro fusion" strip chart -- only on gyro-fused frames
+(it self-skips when gyro is off / PnP failed). The :class:`~vio.modules.tracked.Tracked` carrier threads the
 frame + tracks down to ``PullPrior``, which swaps it for the
 :class:`~vio.modules.primed.Primed` carrier (tracks + joined prior); the
 :class:`~vio.modules.step.Step` carrier then threads the result through the rest
@@ -86,6 +90,7 @@ from .pull_prior import PullPrior
 from .estimate_motion import EstimateMotion
 from .correct_tilt import CorrectTilt
 from .publish_inliers import PublishInliers
+from .publish_gyrofuse import PublishGyroFuse
 from .publish_pose import PublishPose
 from .publish_vo import PublishVo
 from .emit_keyframe import EmitKeyframe
@@ -129,15 +134,19 @@ class OdometryModule(Module):
         # pose.odom byte-parity holds (mirrors the level_tilt opt-in). It runs
         # right after PublishPose; CorrectTilt only touches self.pose (never
         # pose_vo), so placing it after CorrectTilt does not affect the VO line.
+        # ``PublishGyroFuse`` runs right after ``PublishInliers`` (both are
+        # post-EstimateMotion diagnostic publishers). It self-skips on frames
+        # where the gyro fusion did not run (gyro off / PnP failed / bootstrap),
+        # so it is safe to always wire in -- it never emits a garbage frame.
         frame_chain = [TrackFeatures(), PublishTracks(), AlignGravity(),
                        PullPrior(), EstimateMotion(), CorrectTilt(),
-                       PublishInliers(), PublishPose()]
+                       PublishInliers(), PublishGyroFuse(), PublishPose()]
         if publish_vo:
             frame_chain.append(PublishVo())
         frame_chain.append(EmitKeyframe())
         self.on(topics.FRAME_DEPTH, frame_chain)
         fwd = [topics.POSE_ODOM, topics.KEYFRAME, topics.FRAME_TRACKS,
-               topics.FRAME_INLIERS]
+               topics.FRAME_INLIERS, topics.FRAME_GYROFUSE]
         if publish_vo:
             fwd.append(topics.POSE_VO)
         self.forwards_to(*fwd)

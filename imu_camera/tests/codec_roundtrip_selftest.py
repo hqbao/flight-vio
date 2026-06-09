@@ -38,7 +38,7 @@ from imu_camera.comms.codec import decode, encode
 from imu_camera.comms.shared_array import SharedArrayRef, SharedArrayRing
 from imu_camera.comms.wire import (
     WireCalibBundle, WireCamSync, WireDepthFrame, WireEnd, WireFrameInliers,
-    WireFrameTracks, WireImuCamPacket, WireImuRaw, WireKeyframe,
+    WireFrameTracks, WireGyroFuse, WireImuCamPacket, WireImuRaw, WireKeyframe,
     WireLoopCorrection, WirePoseMsg, WireSlamMap, WireVioMap,
 )
 
@@ -186,6 +186,10 @@ def build_vectors() -> list[tuple[str, str, object]]:
         ("frame_inliers", topics.FRAME_INLIERS,
          WireFrameInliers(seq=3, ts_ns=123_456_789, ids=track_ids,
                           reproj=pnp_reproj, inlier=pnp_inlier)),
+        ("frame_gyrofuse", topics.FRAME_GYROFUSE,
+         WireGyroFuse(seq=3, ts_ns=123_456_789, vision_rot_deg=6.2,
+                      gyro_rot_deg=4.8, disagree_deg=2.1, gain=0.8,
+                      t_trust=1.0, gate_deg=1.5, span_deg=3.0)),
         ("pose_odom", topics.POSE_ODOM,
          WirePoseMsg(seq=3, ts_ns=123_456_789, T_world_cam=T, info=info)),
         ("pose_vo_empty_info", topics.POSE_VO,

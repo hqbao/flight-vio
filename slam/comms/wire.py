@@ -183,6 +183,27 @@ class WireFrameInliers:
 
 
 @dataclass(frozen=True)
+class WireGyroFuse:
+    """Wire form of :class:`comms.messages.FrameGyroFuse`.
+
+    Pure POD: nine scalars per frame (seq + ts + the seven fusion diagnostic
+    floats). See :class:`comms.messages.FrameGyroFuse` for the field semantics.
+    The codec ships every float bitwise (``struct('>d')``), so NaN / Inf would
+    round-trip faithfully -- but the publisher only emits real, finite values.
+    """
+
+    seq: int
+    ts_ns: int
+    vision_rot_deg: float
+    gyro_rot_deg: float
+    disagree_deg: float
+    gain: float
+    t_trust: float
+    gate_deg: float
+    span_deg: float
+
+
+@dataclass(frozen=True)
 class WireKeyframe:
     """Wire form of :class:`comms.messages.Keyframe`.
 
@@ -291,6 +312,7 @@ TOPIC_WIRE: dict[str, type] = {
     topics.FRAME_DEPTH:     WireDepthFrame,
     topics.FRAME_TRACKS:    WireFrameTracks,
     topics.FRAME_INLIERS:   WireFrameInliers,
+    topics.FRAME_GYROFUSE:  WireGyroFuse,
     topics.POSE_ODOM:       WirePoseMsg,
     topics.POSE_VO:         WirePoseMsg,
     topics.POSE_REFINED:    WirePoseMsg,

@@ -602,6 +602,31 @@ class RGBDVisualOdometry:
                             damp = 1.0 - (disagree_deg
                                           - self.cfg.gyro_disagree_deg) / span
                             gain *= max(0.0, damp)
+                        # --- gyro-fusion strip-chart diagnostic (additive, DO ---
+                        # NOT use below) -----------------------------------------
+                        # Record the full per-frame fusion observation so the UI
+                        # can draw the "why the gyro-fused VIO stays straight"
+                        # strip chart (ALGORITHMS.md #5): the RAW vision rotation
+                        # magnitude vs the gyro rotation magnitude (deg/frame),
+                        # their disagreement, the final vision-correction gain
+                        # (0..1, after the disagreement-gate damp above), and the
+                        # translation-trust. ``R`` here is still the RAW PnP
+                        # rotation (it is reassigned to ``R_fused`` only below), so
+                        # ``vision_rot_deg`` is the pre-fusion vision rotation the
+                        # disagreement was measured against -- exactly the grey
+                        # trace that drifts where the gyro corrects it. These are
+                        # PURE observations of values already computed for the
+                        # fusion math; nothing reads them back, so the 640-pose
+                        # byte-parity oracle stays gap=0. ``t_trust`` defaults to
+                        # 1.0 (full vision translation) here and is overwritten
+                        # below only on the legacy damp path that actually scales
+                        # the translation (``lock_translation_to_rotation`` off).
+                        info["vision_rot_deg"] = float(np.degrees(
+                            np.linalg.norm(so3_log(R))))
+                        info["gyro_rot_deg"] = rot_deg
+                        info["disagree_deg"] = disagree_deg
+                        info["gain"] = float(gain)
+                        info["t_trust"] = 1.0
                         R_fused = _scale_rotation(R_corr, gain) @ R_gyro
                         # Translation solve. With ``lock_translation_to_rotation``
                         # we ALWAYS re-estimate the translation with the fused

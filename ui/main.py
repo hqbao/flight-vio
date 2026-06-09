@@ -574,9 +574,11 @@ def run_ui(*, vio_endpoint: str = DEFAULT_VIO_ENDPOINT,
     from ui.qt.panels import TelemetryPanel
     from ui.qt.synced_window import SyncedViewWindow
     from ui.qt.keypoints_window import KeypointTrackWindow
+    from ui.qt.gyrofuse_window import GyroFuseWindow
     from ui.qt.calib_dialogs import GyroCalibDialog, AccelCalibDialog
     from ui.modules import (
-        IpcImuRawSource, ipc_triplet_factory, ipc_keypoint_factory,
+        IpcImuRawSource, IpcGyroFuseSource, ipc_triplet_factory,
+        ipc_keypoint_factory,
     )
 
     # 1. Wait for VIO + SLAM to be ready (and learn the capture resolution).
@@ -762,6 +764,24 @@ def run_ui(*, vio_endpoint: str = DEFAULT_VIO_ENDPOINT,
     keypoints_act.triggered.connect(_open_keypoints)
     vis_menu.addAction(keypoints_act)
 
+    def _open_gyrofuse() -> None:
+        if getattr(win, "_gyrofuse_win", None) is None:
+            # Source factory binds to VIO's endpoint (frame.gyrofuse publisher);
+            # device-agnostic, like the other Visualize windows.
+            win._gyrofuse_win = GyroFuseWindow(
+                lambda: IpcGyroFuseSource(
+                    vio_endpoint, connect_timeout_s=calib_timeout_s),
+                parent=win)
+        win._gyrofuse_win.show()
+        win._gyrofuse_win.raise_()
+        win._gyrofuse_win.activateWindow()
+        win._gyrofuse_win.ensure_started()
+        win.statusBar().showMessage("Gyro fusion strip chart opened.", 2500)
+
+    gyrofuse_act = QAction("Gyro Fusion (strip chart)…", win)
+    gyrofuse_act.triggered.connect(_open_gyrofuse)
+    vis_menu.addAction(gyrofuse_act)
+
     # Calibration: each wizard gets a FRESH IPC IMU source (capture's raw imu.raw)
     # and a modal dialog. We inject `stream=src`, which sets the dialog's
     # `_owns_stream=False` -- so the dialog will NOT stop the stream and WE must,
@@ -857,7 +877,7 @@ def run_ui(*, vio_endpoint: str = DEFAULT_VIO_ENDPOINT,
         # Close any Visualize child windows so their IPC workers stop cleanly
         # (closeEvent stops the worker). The calib dialogs are modal + scoped to
         # their handler's `finally`, so there's nothing to clean up for them here.
-        for _attr in ("_triplet_win", "_keypoints_win"):
+        for _attr in ("_triplet_win", "_keypoints_win", "_gyrofuse_win"):
             _w = getattr(win, _attr, None)
             if _w is not None:
                 try:

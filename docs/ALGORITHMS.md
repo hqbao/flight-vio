@@ -727,14 +727,30 @@ etc. (`OdometryConfig:100-270`).
 **Code.** `odometry.py:543-648` (fusion), `:279-303` (rotation-locked translation),
 `:716-764` (`_gyro_propagate`). Rationale: `OdometryConfig:108-262`.
 
-**How to see it.** *New chart, data partly exists.* A **two-trace strip chart**: vision
-rotation magnitude vs gyro rotation magnitude (deg/frame), disagreement shaded, the `1.5°`
-gate + `4.5°` full-gyro line marked, plus a lane for the resulting `gain` (vision weight
-1→0) and `t_trust`. The one view that explains why the fused trajectory stays straight
-where pure-vision (`pose_vo`) drifts. The fields (`rot_deg`, `gyro_corr_deg`) are already
-computed in `last_info` but nothing publishes them; the **outcome** (VO-vs-VIO trajectory)
-already exists in 3D (`ui/qt/viewer3d.py:148-164`: dim-grey `pose_vo` line vs green VIO
-line). The *mechanism* strip chart is the new build (alongside `ui/qt/imu_panels.py`).
+**How to see it.** *Exists (built).* A **two-trace strip chart** — the "Gyro fusion"
+Visualize-menu window (`ui/qt/gyrofuse_window.py`, renderer
+`ui/viz/gyrofuse_render.py:GyroFuseChart`) — now draws, per frame over time:
+vision rotation magnitude (grey, drifts) vs gyro rotation magnitude (cyan, trusted)
+in deg/frame, the disagreement between them **shaded**, two horizontal reference
+lines at the `gate_deg` (1.5°, "gyro starts taking over") and `gate_deg + span_deg`
+(4.5°, "full gyro"), plus a second lane plotting the resulting `gain` (vision weight
+1→0) and `t_trust` (0..1). It is the one view that explains why the fused trajectory
+stays straight where pure-vision (`pose_vo`, the dim-grey line in
+`ui/qt/viewer3d.py:148-164`) drifts during fast yaw. Data path mirrors viz #4: the
+odometry records the per-frame fusion observation additively into `last_info`
+(`odometry.py:estimate` ~line 624 — `vision_rot_deg` = RAW PnP rotation magnitude
+*before* fusion, `gyro_rot_deg` = `rot_deg`, `disagree_deg` = `gyro_corr_deg`,
+`gain` after the disagreement-gate damp, `t_trust`); a new `PublishGyroFuse` step
+(`vio/modules/publish_gyrofuse.py`) emits a `FrameGyroFuse` on the new
+`frame.gyrofuse` topic — but **only on gyro-fused frames** (it self-skips when gyro
+is off / PnP failed, so the chart never gets a garbage record), bundling the config
+`gate_deg`/`span_deg` so the UI draws matching reference lines; the UI subscribes it
+via `IpcGyroFuseSource` (`ui/modules/ipc_sources.py`). The diagnostic is purely
+additive — the 640-pose byte-parity oracle stays gap = 0 (proven in
+`vio/tests/gyrofuse_selftest.py` + the end-to-end `oracle_replay_selftest`).
+Convention: `vision_rot_deg = degrees(‖so3_log(R_pnp)‖)`,
+`gyro_rot_deg = degrees(‖so3_log(R_gyro)‖)`,
+`disagree_deg = degrees(‖so3_log(R_pnp · R_gyroᵀ)‖)`.
 
 ## 3.3 Windowed Bundle Adjustment (`vio/mathlib/backend/`)
 

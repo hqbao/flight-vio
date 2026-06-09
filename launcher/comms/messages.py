@@ -119,6 +119,48 @@ class FrameInliers:
 
 
 @dataclass(frozen=True)
+class FrameGyroFuse:
+    """One frame's gyro-fusion strip-chart diagnostic (ALGORITHMS.md #5).
+
+    Published on ``topics.FRAME_GYROFUSE`` by the odometry module's
+    ``PublishGyroFuse`` step, AFTER ``EstimateMotion`` runs the gyro fusion. It
+    carries the per-frame fusion observation the UI strip chart needs to explain
+    WHY the gyro-fused VIO stays straight where pure-vision (``pose.vo``) drifts
+    during fast yaw -- all values are REAL odometry outputs read from
+    ``last_info``, never a re-derivation.
+
+    Only emitted on frames where the gyro fusion actually ran (gyro on AND a PnP
+    solve with a rotation prior); the publisher skips frames where the fields are
+    absent, so the topic never carries garbage.
+
+    * ``vision_rot_deg`` -- RAW PnP inter-frame rotation magnitude (deg/frame),
+      BEFORE fusion: the grey "vision" trace that drifts during fast yaw.
+    * ``gyro_rot_deg`` -- gyro inter-frame rotation magnitude (deg/frame): the
+      near-ground-truth trace the fusion hands rotation to.
+    * ``disagree_deg`` -- ``‖so3_log(R_vision · R_gyroᵀ)‖`` (deg): how far the
+      vision rotation disagrees with the gyro (the shaded area between traces).
+    * ``gain`` -- the resulting vision-correction gain (0..1): 1 = pure vision,
+      0 = pure gyro (ramped down by the disagreement gate).
+    * ``t_trust`` -- translation-trust this frame (0..1); 1.0 when the damp path
+      did not run.
+    * ``gate_deg`` / ``span_deg`` -- the config thresholds
+      (``gyro_disagree_deg`` / ``gyro_disagree_span_deg``) so the UI draws the
+      matching reference lines (gate = "gyro starts taking over", gate+span =
+      "full gyro"). Carried per-frame so the UI never has to know the config.
+    """
+
+    seq: int
+    ts_ns: int
+    vision_rot_deg: float
+    gyro_rot_deg: float
+    disagree_deg: float
+    gain: float
+    t_trust: float
+    gate_deg: float
+    span_deg: float
+
+
+@dataclass(frozen=True)
 class PoseMsg:
     """An estimated camera pose (4x4 ``T_world_cam``) for one frame."""
 

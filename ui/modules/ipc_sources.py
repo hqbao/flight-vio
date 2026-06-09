@@ -174,6 +174,70 @@ class IpcImuRawSource:
 
 
 # --------------------------------------------------------------------------- #
+# (1b) Gyro-fusion source for the strip-chart window
+# --------------------------------------------------------------------------- #
+class IpcGyroFuseSource:
+    """Duck-typed gyro-fusion stream over VIO's ``frame.gyrofuse`` IPC topic.
+
+    The "Gyro fusion" strip-chart window (:mod:`ui.qt.gyrofuse_window`) drives a
+    stream object with exactly three touch-points -- ``start(callback)``,
+    ``stop()`` and ``.error`` -- and feeds each per-frame
+    :class:`~ui.comms.messages.FrameGyroFuse` to its chart. This adapter offers
+    the same surface but sources the records from VIO's ``frame.gyrofuse`` topic
+    (pure POD, no shared-memory ring), so the window needs no device handle.
+
+    ``frame.gyrofuse`` is published ONLY on gyro-fused frames (the VIO publisher
+    self-skips when gyro is off / PnP failed), so every record the callback sees
+    is a genuine fusion observation -- the chart never gets a garbage frame.
+    Mirrors :class:`IpcImuRawSource`'s connect-error model: ``start`` swallows a
+    connect timeout onto :attr:`error` (the window polls it) rather than raising.
+    """
+
+    def __init__(self, vio_endpoint: str, *,
+                 connect_timeout_s: float = 30.0) -> None:
+        self._endpoint = vio_endpoint
+        self._connect_timeout_s = float(connect_timeout_s)
+        self.error: str | None = None
+        self._client: IPCPubSub | None = None
+        # frame.gyrofuse is pure POD (no ring), so a bare registry suffices for
+        # the converter -- the ``rings`` arg is unused for this topic.
+        self._rings = RingRegistry()
+        self._cb = None
+
+    def start(self, callback) -> None:
+        """Connect to VIO and stream each FrameGyroFuse record to ``callback``."""
+        self._cb = callback
+        client = IPCPubSub(self._endpoint, role="client",
+                           connect_timeout_s=self._connect_timeout_s)
+        client.subscribe(topics.FRAME_GYROFUSE, self._on_msg)
+        try:
+            client.start()
+        except Exception as e:                                     # noqa: BLE001
+            self.error = f"VIO gyro-fusion stream connect failed: {e}"
+            return
+        self._client = client
+
+    def _on_msg(self, wm) -> None:
+        if wm is END:
+            return
+        msg = to_local(topics.FRAME_GYROFUSE, wm, self._rings)
+        if msg is END:                                # WireEnd -> local END
+            return
+        cb = self._cb
+        if cb is not None:
+            cb(msg)
+
+    def stop(self) -> None:
+        client = self._client
+        self._client = None
+        if client is not None:
+            try:
+                client.stop()
+            except Exception:                                      # noqa: BLE001
+                pass
+
+
+# --------------------------------------------------------------------------- #
 # (2) Triplet worker (image | depth | IMU) for SyncedViewWindow
 # --------------------------------------------------------------------------- #
 class IpcTripletWorker(TripletWorker):

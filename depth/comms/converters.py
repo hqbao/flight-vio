@@ -24,13 +24,13 @@ import numpy as np
 
 from . import topics
 from .messages import (
-    CamSync, DepthFrame, FrameInliers, FrameTracks, ImuCamPacket, ImuRaw,
-    Keyframe, LoopCorrection, PoseMsg, SlamOverlay, END,
+    CamSync, DepthFrame, FrameGyroFuse, FrameInliers, FrameTracks, ImuCamPacket,
+    ImuRaw, Keyframe, LoopCorrection, PoseMsg, SlamOverlay, END,
 )
 from .wire import (
     WireCamSync, WireDepthFrame, WireEnd, WireFrameInliers, WireFrameTracks,
-    WireImuCamPacket, WireImuRaw, WireKeyframe, WireLoopCorrection, WirePoseMsg,
-    WireSlamMap,
+    WireGyroFuse, WireImuCamPacket, WireImuRaw, WireKeyframe, WireLoopCorrection,
+    WirePoseMsg, WireSlamMap,
 )
 from .ring_registry import RingRegistry
 
@@ -140,6 +140,26 @@ def _inliers_to_local(wm: WireFrameInliers, rings: RingRegistry) -> FrameInliers
                         ids=wm.ids, reproj=wm.reproj, inlier=wm.inlier)
 
 
+def _gyrofuse_to_wire(msg: FrameGyroFuse, rings: RingRegistry, endpoint: str):
+    del rings, endpoint                                # pure POD, no ring slot
+    return WireGyroFuse(seq=int(msg.seq), ts_ns=int(msg.ts_ns),
+                        vision_rot_deg=float(msg.vision_rot_deg),
+                        gyro_rot_deg=float(msg.gyro_rot_deg),
+                        disagree_deg=float(msg.disagree_deg),
+                        gain=float(msg.gain), t_trust=float(msg.t_trust),
+                        gate_deg=float(msg.gate_deg), span_deg=float(msg.span_deg))
+
+
+def _gyrofuse_to_local(wm: WireGyroFuse, rings: RingRegistry) -> FrameGyroFuse:
+    del rings                                          # pure POD, no ring slot
+    return FrameGyroFuse(seq=int(wm.seq), ts_ns=int(wm.ts_ns),
+                         vision_rot_deg=float(wm.vision_rot_deg),
+                         gyro_rot_deg=float(wm.gyro_rot_deg),
+                         disagree_deg=float(wm.disagree_deg),
+                         gain=float(wm.gain), t_trust=float(wm.t_trust),
+                         gate_deg=float(wm.gate_deg), span_deg=float(wm.span_deg))
+
+
 def _pose_to_wire(msg: PoseMsg, rings: RingRegistry, endpoint: str):
     return WirePoseMsg(seq=int(msg.seq), ts_ns=int(msg.ts_ns),
                        T_world_cam=msg.T_world_cam, info=dict(msg.info))
@@ -223,6 +243,7 @@ CONVERTERS: dict[str, tuple[ToWire, ToLocal]] = {
     topics.FRAME_DEPTH:     (_depth_to_wire,    _depth_to_local),
     topics.FRAME_TRACKS:    (_tracks_to_wire,   _tracks_to_local),
     topics.FRAME_INLIERS:   (_inliers_to_wire,  _inliers_to_local),
+    topics.FRAME_GYROFUSE:  (_gyrofuse_to_wire, _gyrofuse_to_local),
     topics.POSE_ODOM:       (_pose_to_wire,     _pose_to_local),
     topics.POSE_VO:         (_pose_to_wire,     _pose_to_local),
     topics.POSE_REFINED:    (_pose_to_wire,     _pose_to_local),
