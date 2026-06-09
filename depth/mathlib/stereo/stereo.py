@@ -305,6 +305,20 @@ class SGMConfig:
     speckle_window: int = 0      # remove connected disparity blobs <= this many
                                  # px (0 = off); kills salt-pepper noise
     speckle_range: float = 1.0   # px; neighbours join a blob if |disp| diff <=
+    # ----- Density-preserving post-filters (default OFF = legacy behaviour) ----
+    # These clean the DISPARITY map AFTER the WTA/uniqueness/LR gates, so they
+    # remove noise WITHOUT rejecting more matches (density at tracked keypoints is
+    # preserved). They run at the COMPUTED resolution (before upsample when
+    # downscaled), where the map is small and the C-optimised cv2 ops cost well
+    # under a millisecond. NONE of the rejection thresholds (uniqueness / lr /
+    # census) are touched.
+    median_disp: int = 0         # cv2.medianBlur aperture on the disparity (px;
+                                 # 0/1 = off, else odd >=3, e.g. 3). Kills
+                                 # salt-pepper without shifting edges or dropping
+                                 # density (a median over valid neighbours).
+    speckle_cv2: bool = False    # use cv2.filterSpeckles (fast C) instead of the
+                                 # numpy ``_speckle_filter`` for the
+                                 # ``speckle_window`` blob removal when available
 
     @classmethod
     def live(cls) -> "SGMConfig":
@@ -316,9 +330,17 @@ class SGMConfig:
         keep the depth quality close to the full preset while fitting the live
         per-frame budget. The full default config stays the offline/accuracy
         reference.
+
+        Density-preserving denoise is ON here (and ONLY here): a 3x3 disparity
+        median + a small-blob speckle removal (``cv2.filterSpeckles``), both run
+        at the half-res computed grid. They strip the salt-pepper + isolated
+        "flying" fragments that made the live 3D map explode, WITHOUT tightening
+        any rejection threshold (so keypoint depth density is preserved) and at a
+        measured cost of only a fraction of a millisecond per frame.
         """
         return cls(census_radius=2, num_disparities=96, num_paths=4,
-                   downscale=2)
+                   downscale=2, median_disp=3, speckle_window=20,
+                   speckle_range=1.0, speckle_cv2=True)
 
 
 # 8 SGM path directions (dv, du): 4 cardinal + 4 diagonal. ``num_paths`` selects
@@ -752,6 +774,9 @@ def sgm_disparity(left: np.ndarray, right: np.ndarray,
         h2, w2 = Hf // ds, Wf // ds
         Ld = _box_downsample(np.ascontiguousarray(left.astype(np.float64)), ds)
         Rd = _box_downsample(np.ascontiguousarray(right.astype(np.float64)), ds)
+        # Carry the denoise fields into the inner (downscale=1) solve so the
+        # median + speckle run on the SMALL computed grid -- cheap and exactly
+        # where the prompt wants them (before the nearest-neighbour upsample).
         sub = SGMConfig(census_radius=cfg.census_radius,
                         min_disparity=cfg.min_disparity // ds,
                         num_disparities=max(8, cfg.num_disparities // ds),
@@ -760,7 +785,9 @@ def sgm_disparity(left: np.ndarray, right: np.ndarray,
                         lr_consistency=cfg.lr_consistency,
                         lr_max_diff=cfg.lr_max_diff, downscale=1,
                         speckle_window=cfg.speckle_window,
-                        speckle_range=cfg.speckle_range)
+                        speckle_range=cfg.speckle_range,
+                        median_disp=cfg.median_disp,
+                        speckle_cv2=cfg.speckle_cv2)
         disp_small = sgm_disparity(Ld[:h2, :w2], Rd[:h2, :w2], sub)
         return _upsample_disp(disp_small, Hf, Wf, ds)
 
@@ -786,9 +813,101 @@ def sgm_disparity(left: np.ndarray, right: np.ndarray,
 
     disp = _wta_lr(agg, cfg.min_disparity, float(cfg.uniqueness),
                    cfg.subpixel, cfg.lr_consistency, float(cfg.lr_max_diff))
-    if cfg.speckle_window > 0:
-        _speckle_filter(disp, int(cfg.speckle_window), float(cfg.speckle_range))
+    _denoise_disparity(disp, cfg)
     return disp
+
+
+# Disparity is invalid as NaN throughout this module, but cv2's median/speckle
+# ops work on a finite array. We bridge with a sentinel that cannot collide with
+# a real disparity (always < min_disparity=0): negative one. medianBlur over a
+# neighbourhood of mostly-valid pixels then returns a real median (density
+# preserved), and filterSpeckles treats the sentinel like any other label.
+_INVALID = -1.0
+
+
+def _try_cv2():
+    """Lazy, cached cv2 import. ``None`` when cv2 is absent.
+
+    The SGM library stays cv2-free at import time (the io/comms layers vendor a
+    pure-Python PNG reader for portability); cv2 is only pulled in when a config
+    actually opts into the C-optimised median/speckle ops, and the speckle pass
+    has a numba fallback when it is missing.
+    """
+    if not hasattr(_try_cv2, "_mod"):
+        try:
+            import cv2 as _cv2  # noqa: PLC0415 (lazy on purpose)
+            _try_cv2._mod = _cv2
+        except Exception:       # pragma: no cover - portability fallback
+            _try_cv2._mod = None
+    return _try_cv2._mod
+
+
+def _denoise_disparity(disp: np.ndarray, cfg: SGMConfig) -> None:
+    """Density-preserving disparity cleanup, IN PLACE (no thresholds touched).
+
+    Order matters: the 3x3 median strips lone salt-pepper mismatches first, then
+    the speckle pass removes the remaining small isolated blobs (the "flying"
+    fragments). Both run on the disparity grid handed in (the computed grid when
+    downscaled). All ops are no-ops at their default-off settings, so a config
+    that does not opt in is byte-identical to before.
+    """
+    median_ap = int(cfg.median_disp)
+    use_median = median_ap >= 3 and (median_ap % 2 == 1)
+    if not use_median and cfg.speckle_window <= 0:
+        return  # nothing enabled -> byte-identical to the legacy path
+    cv2 = _try_cv2()
+    if use_median and cv2 is not None:
+        # cv2.medianBlur needs a finite float32 image; map NaN -> sentinel.
+        finite = np.where(np.isfinite(disp), disp, _INVALID).astype(np.float32)
+        # 3x3 median is the cheap, edge-preserving case (cv2 special-cases small
+        # apertures for float32). The median of a window that is mostly valid
+        # returns a valid disparity, so density is preserved -- a pixel only
+        # becomes invalid if the MAJORITY of its 3x3 neighbours were already
+        # invalid (genuinely isolated), which is the noise we want gone.
+        med = cv2.medianBlur(finite, median_ap)
+        # Map the sentinel back to NaN; everything else is the cleaned disparity.
+        disp[:, :] = np.where(med <= _INVALID + 0.5, np.nan, med)
+
+    if cfg.speckle_window > 0:
+        if cfg.speckle_cv2 and cv2 is not None and hasattr(cv2, "filterSpeckles"):
+            _speckle_filter_cv2(disp, cv2, int(cfg.speckle_window),
+                                float(cfg.speckle_range))
+        else:
+            # Fallback: the numba flood fill (used when cv2 lacks filterSpeckles
+            # or the config opted out of cv2 for the speckle pass).
+            _speckle_filter(disp, int(cfg.speckle_window),
+                            float(cfg.speckle_range))
+
+
+# cv2.filterSpeckles only accepts CV_8UC1 / CV_16SC1 (it is the SGBM fixed-point
+# disparity primitive). Disparity here is float; this scale converts the L/R
+# max-diff threshold (px) into the integer grid filterSpeckles compares on. 16 ->
+# 1/16 px quantisation (OpenCV's own StereoSGBM_DISP_SCALE), fine for grouping
+# blobs while leaving the survivors' float sub-pixel values untouched.
+_SPECKLE_INT_SCALE = 16
+_SPECKLE_INVALID_I16 = np.int16(-32768)   # < any valid scaled disparity (>=0)
+
+
+def _speckle_filter_cv2(disp: np.ndarray, cv2, max_size: int,
+                        max_diff: float) -> None:
+    """Small-blob speckle removal via ``cv2.filterSpeckles`` (fast C), IN PLACE.
+
+    cv2.filterSpeckles is the SGBM fixed-point primitive: it 4-connect flood
+    fills, joining neighbours whose value differs by <= ``maxDiff``, and sets any
+    blob with area <= ``maxSpeckleSize`` to ``newVal``. It demands an int disparity
+    image, so we quantise to int16 (1/16 px) purely to GROUP the blobs, run the
+    filter, then use the result only as a KEEP/DROP MASK -- the surviving pixels
+    retain their original float sub-pixel disparity (density preserved; no values
+    shifted). Invalid (NaN) pixels map to a sentinel below any valid value so a
+    real-disparity speckle sitting next to invalid stays its own blob.
+    """
+    q = np.where(np.isfinite(disp),
+                 np.rint(disp * _SPECKLE_INT_SCALE), float(_SPECKLE_INVALID_I16))
+    buf = q.astype(np.int16)
+    # newVal = the invalid sentinel -> removed speckles read back as "dropped".
+    cv2.filterSpeckles(buf, int(_SPECKLE_INVALID_I16), max_size,
+                       max(1.0, max_diff * _SPECKLE_INT_SCALE))
+    disp[buf == _SPECKLE_INVALID_I16] = np.nan
 
 
 @njit(cache=True)

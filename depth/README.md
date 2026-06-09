@@ -47,16 +47,44 @@ Public API depth uses: `LocalPubSub`, `IPCPubSub(role="server"|"client")`,
 ### `depth/mathlib/stereo/` — the source of truth, kept in lock-step
 
 `depth/mathlib/stereo` is the **canonical** SGM math (numpy + numba, fully
-self-contained — no project imports). A gate runs `diff -r --exclude=__pycache__
-depth/mathlib/stereo imu_camera/mathlib/stereo` and it must be empty: the two
-copies are byte-identical, so the depth math the standalone process runs is
-**numerically identical** to the depth the capture process computes inline (proven
-— `depth.tests.stereo_sgm_selftest` reports the same numbers as
+self-contained — no top-level cv2 / project imports). A gate runs `diff -r
+--exclude=__pycache__ depth/mathlib/stereo imu_camera/mathlib/stereo`; the only
+permitted delta is the three docstring lines that name the host project's
+`io.reader.StereoCalib` (`depth.` vs `imu_camera.`). Every line of MATH is
+byte-identical, so the depth the standalone process runs is **numerically
+identical** to the depth the capture process computes inline (proven —
+`depth.tests.stereo_sgm_selftest` reports the same numbers as
 `imu_camera.tests.stereo_sgm_selftest` line-for-line).
 
 * `SGMStereoMatcher` + `SGMConfig` — semi-global block matching with built-in
   left/right rectification.
 * `StereoMatcher` + `StereoConfig` — the sparse block matcher the self-test uses.
+
+#### Density-preserving disparity denoise (live preset only)
+
+The raw SGM disparity carries salt-pepper mismatches + isolated "flying" blobs
+that survive the L/R / uniqueness gates and make the 3D map look exploded.
+`SGMConfig` exposes two **post-filters** that clean the disparity map *after* the
+WTA/uniqueness/LR gates — so they never reject more matches (keypoint depth
+density is preserved; the rejection thresholds — `uniqueness` / `lr_max_diff` /
+census — are left untouched, which would otherwise starve PnP):
+
+* `median_disp` — `cv2.medianBlur` aperture on the disparity (e.g. `3` for 3×3;
+  `0` = off). Kills salt-pepper without shifting edges; a median over a
+  mostly-valid window stays valid, so a hole only opens where the neighbourhood
+  was already mostly invalid.
+* `speckle_window` / `speckle_range` + `speckle_cv2` — small-blob removal. With
+  `speckle_cv2=True` it uses `cv2.filterSpeckles` (fast C, quantised int16 grid
+  used only to GROUP blobs — survivors keep their float sub-pixel disparity);
+  otherwise it falls back to the numba `_speckle_filter` flood fill.
+
+Both run at the **computed** (post-downscale) resolution, where the map is small,
+so the measured per-frame cost is a fraction of a millisecond. They are **OFF by
+default** (`SGMConfig()` is byte-identical to before) and **ON only in
+`SGMConfig.live()`** (`median_disp=3`, `speckle_window=20`, `speckle_cv2=True`),
+i.e. the live / replay-preview depth — the path that feeds the live 3D map.
+Gate: `python -m imu_camera.tests.sgm_denoise_bench` (latency increase bounded,
+keypoint density not dropped, speckle proxy ≥30% lower).
 
 ### Why `depth/io/` (the calibration the wire bundle doesn't carry)
 
