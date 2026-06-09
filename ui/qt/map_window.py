@@ -1,17 +1,18 @@
-"""MapWindow: a standalone 3D viewer for the SLAM keyframe point cloud.
+"""MapWindow: a standalone 3D viewer for the SLAM landmark point cloud.
 
-Shows the room reconstructed from every keyframe at once (the caller passes the
-already-built ``points``/``colors``/``cams`` arrays; this just renders them): a
-coloured point cloud plus the keyframe camera positions, on the same grid/axes
-the pose viewer uses. Points come in the camera-optical world frame and are
-rotated to the viewer's ENU display frame with the SAME convention as
-:class:`~ui.qt.viewer3d.Viewer3D`, so a map and a trajectory line up.
+Shows the sparse SLAM landmark map (the caller passes the already-built
+``points``/``colors``/``cams`` arrays; this just renders them): a coloured point
+cloud -- ONE point per consistently-tracked landmark -- plus the keyframe camera
+positions, on the same grid/axes the pose viewer uses. Points come in the
+camera-optical world frame and are rotated to the viewer's ENU display frame with
+the SAME convention as :class:`~ui.qt.viewer3d.Viewer3D`, so a map and a
+trajectory line up.
 
 The cloud is REBUILT live: an IPC source (see
-:class:`~ui.modules.ipc_sources.IpcSlamMapSource`) re-fuses the keyframe depth
-maps every time SLAM re-corrects the keyframe poses (after a loop closure) and
-calls :meth:`update` with the fresh ``(points, colors, cams)`` -- so the room
-re-snaps in place rather than being a one-shot snapshot.
+:class:`~ui.modules.ipc_sources.IpcSlamMapSource`) re-builds the landmark cloud
+every time SLAM re-corrects the keyframe poses (after a loop closure) and calls
+:meth:`update` with the fresh ``(points, colors, cams)`` -- so the map re-snaps in
+place rather than being a one-shot snapshot.
 """
 from __future__ import annotations
 
@@ -111,7 +112,8 @@ class MapWindow(QMainWindow):
         """Replace the rendered cloud + keyframe cameras with fresh data.
 
         ``points`` / ``cams`` are ``(N,3)`` / ``(M,3)`` in the camera-optical
-        world frame (the frame :func:`geometry.keyframe_pointcloud` returns);
+        world frame (the per-landmark world points + keyframe camera positions
+        :class:`~ui.modules.ipc_sources.IpcSlamMapSource` builds);
         ``colors`` is ``(N,3)`` per-point intensity/RGB in [0,1]. All are rotated
         to the viewer's ENU display frame here, so the map lines up with the main
         Viewer3D. Safe to call repeatedly from the GUI thread.

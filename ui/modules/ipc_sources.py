@@ -63,7 +63,7 @@ from ui.comms.messages import END
 from ui.comms import IPCPubSub, IPCSubscriber, RingRegistry
 from ui.comms.converters import to_local
 from ui.comms.ring_registry import default_capture_specs, default_vio_specs
-from ui.comms.lib.misc import geometry
+from ui.viz.map_cloud import longest_consecutive_run
 from ui.qt.keypoints_window import KeypointWorker
 from ui.qt.synced_window import TripletWorker
 
@@ -376,59 +376,69 @@ class IpcKeypointWorker(KeypointWorker):
 
 
 # --------------------------------------------------------------------------- #
-# (3b) SLAM 3D-map source (fused keyframe cloud) for MapWindow
+# (3b) SLAM 3D-map source (sparse landmark cloud) for MapWindow
 # --------------------------------------------------------------------------- #
 class IpcSlamMapSource(threading.Thread):
-    """Fuse the per-keyframe DENSE depth maps into ONE clean room cloud for MapWindow.
+    """Build the sparse, ID-based SLAM landmark cloud for MapWindow.
 
-    Subscribes BOTH endpoints the 3D room needs (mirrors :class:`IpcKeypointWorker`'s
-    two-endpoint pattern, but the keyframe gray/depth ride VIO's dedicated
-    ``kf_gray`` / ``kf_depth`` rings, NOT capture's frame rings):
+    Shows ONE point per LANDMARK (KLT track id) that was a PnP INLIER across a run
+    of ``>= PERSIST_KF`` SUCCESSIVE keyframes -- i.e. only consistently-tracked,
+    motion-validated features (like a real SLAM map), NOT a dense-depth
+    reconstruction. This is a pure CONSUMER of existing topics: no new field, no
+    data-path change.
+
+    Subscribes BOTH endpoints the landmark map needs (mirrors
+    :class:`IpcKeypointWorker`'s two-endpoint pattern, but the keyframe gray/depth
+    ride VIO's dedicated ``kf_gray`` / ``kf_depth`` rings, NOT capture's frame
+    rings):
 
     * ``keyframe`` (VIO) -> per keyframe ``seq`` we keep its gray image + metric
-      depth (``read_copy``-ed out of VIO's kf rings by the converter) and the
-      ROTATION of its ``T_world_cam``. The keyframe rate is low (kf_every), so a
-      bounded dict of the last :data:`MAX_KEYFRAMES` keyframes caps memory.
+      depth (``read_copy``-ed out of VIO's kf rings by the converter), the ids +
+      pixels of its KLT tracks (``track_ids`` / ``track_px``), the subset PnP kept
+      as INLIERS this frame (``inlier_ids``) and the ROTATION of its
+      ``T_world_cam``. The keyframe rate is low (kf_every), so a bounded dict of
+      the last :data:`MAX_KEYFRAMES` keyframes caps memory.
     * ``slam.map`` (SLAM) -> the CONTINUOUS per-keyframe CORRECTED positions,
-      keyed by source frame seq (``kf_ids`` aligned with ``kf_positions``). We use
-      these corrected translations -- not the raw VIO keyframe pose -- so the room
+      keyed by source frame seq (``kf_seqs`` aligned with ``kf_positions``). We use
+      these corrected translations -- not the raw VIO keyframe pose -- so the map
       re-snaps after every loop closure.
 
     The fused pose per keyframe is therefore ``[R_keyframe | t_corrected]``:
     SLAM's overlay carries only the corrected camera POSITION (a ``(3,)`` per
     keyframe), so we keep each keyframe's own rotation and swap in the corrected
-    translation. That is enough to re-anchor every back-projected point to the
-    loop-corrected room (orientation drift between corrections is negligible at
-    keyframe spacing), and it keeps this a pure CONSUMER of existing topics -- no
-    new field, no data-path change.
+    translation. That is enough to re-anchor every back-projected landmark to the
+    loop-corrected map (orientation drift between corrections is negligible at
+    keyframe spacing).
 
-    Cloud build (the "clean DENSE room" approach -- the middle ground between the
-    laggy raw-dense fuse and the too-sparse PnP-inlier landmark set):
+    Cloud build (TRACK-ID persistence -- see :meth:`_build_cloud`):
 
-    1. :func:`geometry.keyframe_pointcloud` back-projects the DENSE depth map of
-       every keyframe (subsampled by :data:`STRIDE`) and stacks them into one world
-       cloud -- so the room SURFACE is reconstructed from every viewpoint, giving a
-       RECOGNISABLE room (not the ~400 sparse landmarks). It is cleaned at source:
-       :data:`EDGE_MAX` drops "flying pixels" at depth discontinuities and the
-       ``[min_depth, max_depth]`` gate drops noisy far stereo depth.
-    2. :func:`geometry.voxel_downsample` voxel-grid fuses the result: the SAME
-       physical surface seen across many keyframes lands in one :data:`VOXEL_M`
-       cell and collapses to a single centroid (DEDUP -- this is what keeps the
-       overlapping dense maps from exploding the count), thin stereo noise (cells
-       with ``< :data:`VOXEL_MIN_COUNT``` points) is dropped, and the total point
-       count is BOUNDED by the number of occupied cells. The result is a dense but
-       deduped/filtered room at a smooth point count (~tens of thousands), not the
-       hundreds-of-thousands raw-dense fuse that lagged.
+    1. Order the kept keyframes by ``seq`` and give each a 0-based sequential
+       index ``k`` -- the index the consecutive-run gate counts in.
+    2. For each keyframe ``k`` and each ``track_id`` in its ``inlier_ids``: look up
+       the track's pixel (``track_ids`` -> ``track_px``), sample ``depth_m`` there,
+       back-project with the pinhole and transform to the world by
+       ``[R_keyframe | t_corrected]``; record ``(k, world_xyz, gray)`` under that
+       ``track_id``. So we accumulate, per landmark, every keyframe it was an
+       inlier in (with a world observation + colour).
+    3. For each landmark, take the SET of keyframe indices it was an inlier in and
+       compute its longest run of CONSECUTIVE integers
+       (:func:`ui.viz.map_cloud.longest_consecutive_run`). KEEP the landmark only
+       if that run reaches :data:`PERSIST_KF` -- so a track seen only in scattered
+       or too-few keyframes is dropped.
+    4. Output ONE point per kept landmark: the MEDIAN of its world observations
+       (robust to a stray) with mean colour, plus the keyframe camera markers.
 
-    ``K`` comes from VIO's retained ``calib.bundle`` (the rectified-left
-    intrinsic for the full-res depth grid, the same one
-    :func:`geometry.keyframe_pointcloud` expects).
+    This is much lighter than a dense fuse (only ~tens-hundreds of tracks per
+    keyframe), so the rebuild is fast even as keyframes accumulate.
 
-    Rebuild policy: a full-cloud re-fuse over every kept keyframe is heavy, so we
-    COALESCE -- a ``slam.map`` (or a new keyframe) just marks the model dirty, and
-    a background loop rebuilds at most :data:`REBUILD_HZ` times a second, always
-    from the freshest poses. The finished ``(points, colors, cams)`` go to the
-    injected ``on_cloud`` callback (the window marshals it onto the GUI thread).
+    ``K`` comes from VIO's retained ``calib.bundle`` (the rectified-left intrinsic
+    for the full-res depth grid the keyframe ``depth_m`` lives on).
+
+    Rebuild policy: a full re-fuse over every kept keyframe is coalesced -- a
+    ``slam.map`` (or a new keyframe) just marks the model dirty, and a background
+    loop rebuilds at most :data:`REBUILD_HZ` times a second, always from the
+    freshest poses. The finished ``(points, colors, cams)`` go to the injected
+    ``on_cloud`` callback (the window marshals it onto the GUI thread).
 
     Connect-error model mirrors :class:`IpcGyroFuseSource` /
     :class:`IpcKeypointWorker`: :meth:`start` swallows a connect timeout onto
@@ -437,35 +447,24 @@ class IpcSlamMapSource(threading.Thread):
 
     #: Cap on kept keyframes (bounds memory like the other UI buffers). At
     #: kf_every=5 @ 20 fps a keyframe lands ~every 0.25 s, so 600 kf ~= 2.5 min of
-    #: distinct keyframes -- far more than any room reconstruction needs.
+    #: distinct keyframes -- far more than any landmark map needs.
     MAX_KEYFRAMES = 600
-    #: Max full-cloud rebuilds per second. The DENSE rebuild is heavier than the
-    #: old sparse landmark one (it back-projects + voxel-fuses every keyframe's
-    #: depth), so we run at 4 Hz: bumped from 3 -> 4 to re-snap the room promptly
-    #: on new keyframes + slam.map pose updates, but kept at 4 (not 5) so the
-    #: ~0.25 s period stays safely ABOVE the measured rebuild cost as the keyframe
-    #: count grows. The build is OFF the GUI thread (this source is a worker thread
-    #: that submit()s the finished cloud), so a heavy rebuild never stutters the UI.
+    #: Max full-cloud rebuilds per second. The sparse landmark rebuild is light
+    #: (only the ~tens-hundreds of inlier tracks per keyframe, not every depth
+    #: pixel), so we run at 4 Hz to re-snap the map promptly on new keyframes +
+    #: slam.map pose updates. The build is OFF the GUI thread (this source is a
+    #: worker thread that submit()s the finished cloud), so a rebuild never stutters
+    #: the UI.
     REBUILD_HZ = 4.0
-    # --- DENSE-room build tuning (all tunable; see class docstring step 1+2) --- #
-    # Tuned on replay corridor_60s (640x400, ~30 placed keyframes): lands ~45k
-    # output points in ~0.22 s/rebuild -- a recognisable room at a SMOOTH count,
-    # between the laggy 329k raw-dense fuse and the too-sparse ~420 PnP landmarks.
-    #: Depth subsample stride per keyframe. STRIDE=3 -> 1/9 the pixels: it both
-    #: keeps the output in-band AND keeps the np.unique voxel fuse (the build's
-    #: cost driver, ~O(input pixels)) under the rebuild period. The voxel fuse
-    #: dedups the rest, so the room shape survives the subsample.
-    STRIDE = 3
-    #: Drop "flying pixels" at depth discontinuities: reject a pixel whose depth
-    #: jumps more than this (m) from a 4-neighbour (foreground/background edges
-    #: interpolate to points floating between the two real surfaces).
-    EDGE_MAX = 0.10
-    #: Voxel-grid edge (m) for the dedup/fuse pass: dense points within one 6 cm
-    #: cell (same surface across overlapping keyframes) collapse to one centroid.
-    VOXEL_M = 0.06
-    #: Min point hits a voxel cell needs to survive: cells hit by >= 2 rays are
-    #: real surface; thinner cells are stereo noise, dropped.
-    VOXEL_MIN_COUNT = 2
+    #: Persistence gate: a landmark (track id) shows only if it was a PnP inlier
+    #: across >= PERSIST_KF SUCCESSIVE keyframes -> only consistently-tracked,
+    #: motion-validated points; LOWER if too sparse on short runs.
+    PERSIST_KF = 20
+    #: Valid-depth band (m) for sampling a track's depth: outside this range the
+    #: stereo depth is too noisy/unreliable to back-project, so the observation is
+    #: skipped (same band the dense geometry helper uses).
+    MIN_DEPTH_M = 0.3
+    MAX_DEPTH_M = 6.0
 
     def __init__(self, vio_endpoint: str, slam_endpoint: str, K: np.ndarray, *,
                  connect_timeout_s: float = 10.0,
@@ -492,12 +491,17 @@ class IpcSlamMapSource(threading.Thread):
         self._slam_client: IPCPubSub | None = None
         self._vio_rings: RingRegistry | None = None
 
-        # Per-keyframe accumulators, keyed by source frame seq. Insertion order is
-        # the keyframe arrival order (Python dicts preserve it), which is the
-        # order we fuse in -- the cloud is order-independent anyway.
+        # Per-keyframe accumulators, keyed by source frame seq. Each keyframe keeps
+        # its gray/depth grid + rotation AND its KLT track snapshot (ids + pixels)
+        # plus the PnP-inlier id subset -- the track-id persistence build reads all
+        # of these. ``_build_cloud`` re-orders by seq, so insertion order here is
+        # not relied on for the index assignment.
         self._kf_gray: dict[int, np.ndarray] = {}
         self._kf_depth: dict[int, np.ndarray] = {}
         self._kf_R: dict[int, np.ndarray] = {}        # (3,3) keyframe rotation
+        self._kf_track_ids: dict[int, np.ndarray] = {}   # (N,) track ids
+        self._kf_track_px: dict[int, np.ndarray] = {}    # (N,2) pixels, id-aligned
+        self._kf_inlier_ids: dict[int, np.ndarray] = {}  # (M,) PnP inlier ids
         # Latest corrected camera positions from slam.map, keyed by seq.
         self._kf_corr_pos: dict[int, np.ndarray] = {}
 
@@ -560,11 +564,13 @@ class IpcSlamMapSource(threading.Thread):
 
     # ------------------------------------------------------------------ #
     def _on_keyframe(self, wm) -> None:
-        """VIO recv thread: stash one keyframe's gray + depth + rotation.
+        """VIO recv thread: stash one keyframe's gray/depth + rotation + tracks.
 
-        The dense room is built from each keyframe's full depth map (gray for
-        colour), so we keep only the gray/depth grid + the keyframe's rotation --
-        the corrected translation comes from ``slam.map``.
+        The landmark map is built from the PnP-inlier track ids of each keyframe
+        (pixels back-projected through the depth map, gray for colour), so we keep
+        the gray/depth grid, the keyframe's rotation, and the track snapshot
+        (``track_ids`` / ``track_px`` / ``inlier_ids``). The corrected translation
+        comes from ``slam.map``.
         """
         if wm is END:
             return
@@ -573,10 +579,15 @@ class IpcSlamMapSource(threading.Thread):
             return
         seq = int(kf.seq)
         R = np.asarray(kf.T_world_cam, dtype=np.float64)[:3, :3].copy()
+        # The track snapshot is OPTIONAL on the wire (a keyframe may carry None);
+        # store it as-is and let _build_cloud skip keyframes lacking it.
         with self._lock:
             self._kf_gray[seq] = kf.gray_left          # already a private copy
             self._kf_depth[seq] = kf.depth_m
             self._kf_R[seq] = R
+            self._kf_track_ids[seq] = kf.track_ids
+            self._kf_track_px[seq] = kf.track_px
+            self._kf_inlier_ids[seq] = kf.inlier_ids
             self._evict_locked()
         self._dirty.set()
 
@@ -607,55 +618,134 @@ class IpcSlamMapSource(threading.Thread):
             self._kf_gray.pop(seq, None)
             self._kf_depth.pop(seq, None)
             self._kf_R.pop(seq, None)
+            self._kf_track_ids.pop(seq, None)
+            self._kf_track_px.pop(seq, None)
+            self._kf_inlier_ids.pop(seq, None)
 
     # ------------------------------------------------------------------ #
     def _build_cloud(self):
-        """Fuse the kept keyframes into one DENSE room cloud (CORRECTED poses).
+        """Build the sparse landmark cloud by TRACK-ID persistence (CORRECTED poses).
 
-        Returns ``(points, colors, cams)`` (all empty when nothing is usable).
-        Only keyframes that have BOTH a stashed gray/depth AND a corrected
-        position from slam.map are fused -- so a keyframe SLAM hasn't placed yet
-        is skipped (not drawn at a stale raw pose).
+        Returns ``(points, colors, cams)`` (points/colors empty when no landmark
+        qualifies). Only keyframes that have BOTH a stashed gray/depth/track
+        snapshot AND a corrected position from slam.map are used -- a keyframe SLAM
+        hasn't placed yet is skipped (not drawn at a stale raw pose).
 
-        Two-stage clean DENSE build (see class docstring):
+        Track-id persistence (see class docstring):
 
-        1. :func:`geometry.keyframe_pointcloud` back-projects each keyframe's DENSE
-           depth map (subsampled by :data:`STRIDE`) into the world, cleaned at
-           source: :data:`EDGE_MAX` drops flying pixels at depth discontinuities
-           and ``[min_depth, max_depth]`` gates noisy far stereo depth -- so the
-           room SURFACE is recognisable from every viewpoint.
-        2. :func:`geometry.voxel_downsample` voxel-fuses the overlapping dense maps:
-           the same surface across keyframes collapses to one centroid per
-           :data:`VOXEL_M` cell (DEDUP -> bounds the count), and cells with
-           ``< :data:`VOXEL_MIN_COUNT``` points are dropped as thin stereo noise.
+        1. Order the usable keyframes by ``seq`` and give each a 0-based sequential
+           index ``k`` (the index the consecutive-run gate counts in).
+        2. Per keyframe ``k``, per ``track_id`` in its ``inlier_ids``: find the
+           track's pixel (``track_ids`` -> ``track_px``), sample ``depth_m`` there,
+           back-project with the pinhole (``X=(u-cx)/fx*z``, ``Y=(v-cy)/fy*z``,
+           ``Z=z``) and transform to the world by ``[R_keyframe | t_corrected]``.
+           Record ``(k, world_xyz, gray)`` under that ``track_id`` (skip ids with
+           no/invalid depth or off-grid pixel).
+        3. Per landmark, the SET of keyframe indices it was an inlier in -> its
+           longest run of CONSECUTIVE integers; KEEP only when the run reaches
+           :data:`PERSIST_KF`.
+        4. One output point per kept landmark = the MEDIAN of its world
+           observations (robust to a stray), with mean colour.
         """
         with self._lock:
             corr = dict(self._kf_corr_pos)
-            seqs = [s for s in self._kf_gray if s in corr]
+            # Keep only keyframes with a corrected position AND a full snapshot
+            # (gray/depth always present once stashed; track ids may be None on the
+            # wire). Sort by SOURCE FRAME SEQ so the 0-based index ``k`` reflects
+            # true keyframe order regardless of dict insertion / eviction.
+            seqs = sorted(s for s in self._kf_gray
+                          if s in corr
+                          and self._kf_inlier_ids.get(s) is not None
+                          and self._kf_track_ids.get(s) is not None
+                          and self._kf_track_px.get(s) is not None)
             grays = [self._kf_gray[s] for s in seqs]
             depths = [self._kf_depth[s] for s in seqs]
             Rs = [self._kf_R[s] for s in seqs]
             ts = [corr[s] for s in seqs]
+            track_ids = [self._kf_track_ids[s] for s in seqs]
+            track_px = [self._kf_track_px[s] for s in seqs]
+            inlier_ids = [self._kf_inlier_ids[s] for s in seqs]
+            # Cams = ALL placed keyframes (even ones without a usable track
+            # snapshot) so the camera trail stays complete.
+            cam_ts = [corr[s] for s in self._kf_gray if s in corr]
+        cams = (np.asarray(cam_ts, np.float32).reshape(-1, 3)
+                if cam_ts else np.zeros((0, 3), np.float32))
         if not seqs:
             empty = np.zeros((0, 3), np.float32)
-            return empty, empty, empty
-        # Compose [R_keyframe | t_corrected] per keyframe (see class docstring).
-        poses = []
-        cams = np.empty((len(seqs), 3), np.float32)
-        for i in range(len(seqs)):
-            T = np.eye(4, dtype=np.float64)
-            T[:3, :3] = Rs[i]
-            T[:3, 3] = ts[i]
-            poses.append(T)
-            cams[i] = ts[i].astype(np.float32)
-        # (1) DENSE per-keyframe depth -> world surface, edge-rejected + depth-gated.
-        points, colors = geometry.keyframe_pointcloud(
-            poses=poses, depths=depths, grays=grays, K=self._K,
-            stride=self.STRIDE, edge_max=self.EDGE_MAX)
-        # (2) Voxel-fuse the overlapping dense maps: one centroid per occupied cell
-        #     (dedup + count cap) and drop thin stereo noise (min_count).
-        points, colors = geometry.voxel_downsample(
-            points, colors, voxel=self.VOXEL_M, min_count=self.VOXEL_MIN_COUNT)
+            return empty, empty, cams
+
+        fx, fy = float(self._K[0, 0]), float(self._K[1, 1])
+        cx, cy = float(self._K[0, 2]), float(self._K[1, 2])
+
+        # (2) Accumulate, per landmark id, every keyframe it was an inlier in:
+        #     {track_id -> ([k, ...], [world_xyz, ...], [gray, ...])}. We process
+        #     each keyframe VECTORISED over its inlier ids (numpy gather + a single
+        #     back-projection), then scatter the rows into the per-landmark lists.
+        kf_seen: dict[int, list[int]] = {}        # track_id -> [keyframe index k]
+        kf_xyz: dict[int, list[np.ndarray]] = {}  # track_id -> [world (3,)]
+        kf_gray_v: dict[int, list[float]] = {}    # track_id -> [gray in [0,1]]
+        for k in range(len(seqs)):
+            ids = np.asarray(track_ids[k]).ravel()
+            inl = np.asarray(inlier_ids[k]).ravel()
+            if ids.size == 0 or inl.size == 0:
+                continue
+            px = np.asarray(track_px[k], dtype=np.float64).reshape(-1, 2)
+            depth = np.asarray(depths[k], dtype=np.float32)
+            h, w = depth.shape
+            # Select this keyframe's inlier tracks (id-aligned pixel lookup).
+            sel = np.isin(ids, inl)
+            sel_ids = ids[sel]
+            sel_px = px[sel]
+            if sel_ids.size == 0:
+                continue
+            # Round pixels to the depth grid and gate to on-grid + valid depth.
+            u = np.round(sel_px[:, 0]).astype(np.int64)
+            v = np.round(sel_px[:, 1]).astype(np.int64)
+            on = (u >= 0) & (u < w) & (v >= 0) & (v < h)
+            if not np.any(on):
+                continue
+            u, v, sel_ids = u[on], v[on], sel_ids[on]
+            z = depth[v, u]
+            ok = (np.isfinite(z) & (z >= self.MIN_DEPTH_M)
+                  & (z <= self.MAX_DEPTH_M))
+            if not np.any(ok):
+                continue
+            u, v, z, sel_ids = u[ok], v[ok], z[ok], sel_ids[ok]
+            # Pinhole back-projection to the camera frame, then to world by the
+            # fused pose [R_keyframe | t_corrected] (Xw = R Xc + t).
+            cam = np.stack([(u - cx) * z / fx, (v - cy) * z / fy, z], axis=1)
+            world = cam @ Rs[k].T + ts[k]                       # (m, 3)
+            gray_k = grays[k]
+            gvals = (np.asarray(gray_k, dtype=np.float32)[v, u] / 255.0
+                     if gray_k is not None
+                     else np.full(z.size, 0.85, np.float32))
+            # Scatter each landmark's observation into its accumulator.
+            for j in range(sel_ids.size):
+                tid = int(sel_ids[j])
+                kf_seen.setdefault(tid, []).append(k)
+                kf_xyz.setdefault(tid, []).append(world[j])
+                kf_gray_v.setdefault(tid, []).append(float(gvals[j]))
+
+        # (3+4) Keep a landmark only if its longest run of SUCCESSIVE keyframe
+        #       indices reaches PERSIST_KF; emit the MEDIAN world point + mean
+        #       colour. ``longest_consecutive_run`` needs a sorted UNIQUE index
+        #       sequence (a keyframe that saw a track twice must count once).
+        pts_out: list[np.ndarray] = []
+        col_out: list[float] = []
+        for tid, ks in kf_seen.items():
+            run = longest_consecutive_run(sorted(set(ks)))
+            if run < self.PERSIST_KF:
+                continue
+            obs = np.asarray(kf_xyz[tid], dtype=np.float64)     # (n_obs, 3)
+            pts_out.append(np.median(obs, axis=0))
+            col_out.append(float(np.mean(kf_gray_v[tid])))
+        if not pts_out:
+            empty = np.zeros((0, 3), np.float32)
+            return empty, empty, cams
+        points = np.asarray(pts_out, dtype=np.float32)
+        # Mean gray -> grayscale RGB (the viewer takes (N,3) colour in [0,1]).
+        g = np.asarray(col_out, dtype=np.float32)[:, None]
+        colors = np.repeat(g, 3, axis=1).astype(np.float32)
         return points, colors, cams
 
     # ------------------------------------------------------------------ #

@@ -83,7 +83,7 @@ long-lived trajectory sources use:
 | Camera + Depth + IMU triplet  | `IpcTripletWorker`           | capture · `imucam.sample`, `frame.depth` |
 | Keypoint Depth Tracker        | `IpcKeypointWorker`          | capture · `frame.depth`  +  vio · `frame.tracks`, `frame.inliers` |
 | Gyro Fusion (strip chart)     | `IpcGyroFuseSource`          | vio · `frame.gyrofuse` |
-| SLAM Map (3D room)            | `IpcSlamMapSource`           | vio · `keyframe` (gray/depth via VIO's kf rings) + slam · `slam.map` (corrected poses) |
+| SLAM Map (landmarks)          | `IpcSlamMapSource`           | vio · `keyframe` (gray/depth/`track_ids`/`track_px`/`inlier_ids` via VIO's kf rings) + slam · `slam.map` (corrected poses) |
 
 The crucial design rule: **nothing but `imu_camera` opens the OAK-D**. The UI never
 fights capture for the device, and the UI process imports no depthai — it is
@@ -422,10 +422,13 @@ The menu is plain Qt (`QMenuBar` / `QAction`); `ui.main` calls
 - **Visualize** — **"Camera + Depth + IMU (triplet)…"** (`SyncedViewWindow`, driven
   by `IpcTripletWorker`), **"Keypoint Depth Tracker…"** (`KeypointTrackWindow`, driven
   by `IpcKeypointWorker`), **"Gyro Fusion (strip chart)…"** (`GyroFuseWindow`, driven
-  by `IpcGyroFuseSource`), and **"SLAM Map (3D room)…"** (`MapWindow`, driven by
-  `IpcSlamMapSource` — the room fused from every keyframe's depth, re-snapped to SLAM's
-  loop-corrected poses, in the same ENU frame as `Viewer3D`). Each window is cached so
-  repeated opens reuse the one IPC source.
+  by `IpcGyroFuseSource`), and **"SLAM Map (landmarks)…"** (`MapWindow`, driven by
+  `IpcSlamMapSource` — the **sparse, ID-based landmark map**: ONE point per KLT track id
+  that was a PnP INLIER across ≥ `PERSIST_KF` (=20) SUCCESSIVE keyframes, re-snapped to
+  SLAM's loop-corrected poses, in the same ENU frame as `Viewer3D`; the gate is a
+  **longest-consecutive-keyframe-run** filter — `ui/viz/map_cloud.py::longest_consecutive_run`,
+  UI-only — so only consistently-tracked, motion-validated points show, NOT a dense
+  reconstruction). Each window is cached so repeated opens reuse the one IPC source.
 - **Calibration** — **"Gyroscope Bias…"** (`GyroCalibDialog`) and **"Accelerometer
   (6-position)…"** (`AccelCalibDialog`). Each opens with a fresh `IpcImuRawSource`
   injected as its `stream`; the menu handler owns the stream and closes it in its

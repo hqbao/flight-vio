@@ -356,9 +356,13 @@ The menu bar renders **in-window on every platform** (`setNativeMenuBar(False)`)
 
 - **View** — camera presets and Follow Camera.
 - **Visualize** — *Camera + Depth + IMU (triplet)*, *Keypoint Depth Tracker*,
-  *Gyro Fusion (strip chart)*, and *SLAM Map (3D room)* (the room fused from every
-  keyframe's depth + keyframe cameras, re-snapped to SLAM's loop-corrected poses, in
-  the same ENU frame as the main viewer), reusing the unchanged `ui/qt` windows, fed
+  *Gyro Fusion (strip chart)*, and *SLAM Map (landmarks)* (the sparse, ID-based landmark
+  map: ONE point per KLT track id that was a PnP inlier across ≥ `PERSIST_KF` (=20)
+  SUCCESSIVE keyframes + keyframe cameras, re-snapped to SLAM's loop-corrected poses, in
+  the same ENU frame as the main viewer; the gate is a UI-only longest-consecutive-run
+  filter, `ui/viz/map_cloud.py::longest_consecutive_run`, so only consistently-tracked,
+  motion-validated points show, NOT a dense reconstruction), reusing
+  the unchanged `ui/qt` windows, fed
   over IPC by the adapters in `ui/modules/ipc_sources.py` (capture's `imucam.sample` /
   `frame.depth`; the tracker also VIO's `frame.tracks` / `frame.inliers`; the SLAM map
   VIO's `keyframe` + SLAM's `slam.map`).
