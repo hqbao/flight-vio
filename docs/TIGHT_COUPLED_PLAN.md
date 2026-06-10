@@ -278,16 +278,17 @@ flag-free, which protects byte-parity and portability.
 
 | File | Action | Why |
 |---|---|---|
-| `vio/mathlib/imu/imu.py` | **Extend**: add `Σ_ij` to `preintegrate_imu` + `ImuPreintegration` slot; per-edge preint cache (template: `GyroPreintegrator`) | The only new math; needed for `Ω_I`. |
+| `vio/mathlib/imu/imu.py` | **Extend**: add `Σ_ij` to `preintegrate_imu` + `ImuPreintegration` slot; per-edge preint cache (template: `GyroPreintegrator`). **DONE (P2.5)** also adds `predict_state` (per-frame forward propagation / Basalt `predictState`) + `imu_at_rest` (ZUPT gate) — both purely additive. | The only new math; needed for `Ω_I` (P1) + the live per-frame propagation (P2.5). |
 | `vio/mathlib/backend/vio_window.py` | **Wire `Ω_I`** into the IMU residual weight (else reuse as-is) | Core already complete + tested. |
 | `vio/comms/messages.py` | **DONE (P2)** `Keyframe` gains `ts_ns: int = 0` + `imu_seg = None` (synced across all 6 vendored comms copies). `WireKeyframe`/converter UNCHANGED — both fields stay LOCAL-bus only (tight backend is in-process with odometry), so the IPC wire + comms diff-check are byte-identical. | Tight needs the timestamp + raw IMU between KFs; loose `accel` field unchanged. |
 | `vio/modules/preintegrate_prior.py` | **DONE (P2)** retains each frame's raw IMU rotated into the camera frame (`R_imu_cam @ v`) keyed by seq, gated on `retain_imu` (default OFF → loose no-op). | The one genuinely new bit of plumbing. |
-| `vio/modules/emit_keyframe.py` | **DONE (P2)** concatenates the per-frame segs since the last KF (strict-increasing-ts cleaned) → `imu_seg` + sets `ts_ns`, gated on `retain_imu`. | Threads IMU to the back-end. |
+| `vio/modules/emit_keyframe.py` | **DONE (P2)** concatenates the per-frame segs since the last KF (strict-increasing-ts cleaned) → `imu_seg` + sets `ts_ns`, gated on `retain_imu`. **DONE (P2.5)** on the tight path consumes `PropagateImu`'s `is_kf_frame` cadence boolean instead of owning the kf counter (loose path counter byte-identical). | Threads IMU to the back-end. |
+| `vio/modules/propagate_imu.py` | **NEW (P2.5)** `PropagateImu` step: live per-frame IMU forward-propagation of `pose.odom` + keyframe re-anchor + ZUPT, gated on `retain_imu`. Wired before `PublishPose`. LOOSE = pass-through no-op. | The live freeze fix (covered camera + move keeps moving via IMU). |
 | `vio/modules/run_ba.py` | **DONE (P2)** `submit` shapes the tuple per backend: 6-tuple `(…, ts_ns, imu_seg)` tight / historical 5-tuple loose (reads the `tight` state flag). | Carrier through the engine boundary. |
 | `vio/mathlib/engine/steps.py` | **DONE (P2)** `vio_step` / `vio_overlay` mirror `ba_step`/`ba_overlay`. | Submit a KF to `WindowedVIOMap.add_keyframe` + `run_ba`, carrying ts + IMU seg. |
 | `vio/mathlib/engine/subprocess.py` | **DONE (P2)** `_vio_worker_main` (no stored stream; live block rides `imu_seg`). | Tight can run `worker=True` (live, off the GIL). |
 | `vio/mathlib/engine/__init__.py` | **DONE (P2)** `make_vi_engine(K, cfg, *, worker=False)`. | Symmetric with `make_ba_engine`; builds `WindowedVIOMap`. |
-| `vio/modules/pipeline.py` | **DONE (P2)** `BackendModule(tight=False)` → `make_vi_engine` w/ `imu_info_weight=True`; `OdometryModule(retain_imu=tight)`. Default branch is literally today's code. | `tight` → `make_vi_engine` + IMU stream; default branch is literally today's code. |
+| `vio/modules/pipeline.py` | **DONE (P2)** `BackendModule(tight=False)` → `make_vi_engine` w/ `imu_info_weight=True`; `OdometryModule(retain_imu=tight)`. Default branch is literally today's code. **DONE (P2.5)** frame-chain inserts `PropagateImu()` before `PublishPose`; `OdometryModule` seeds `g_world` in ctx when `retain_imu`. | `tight` → `make_vi_engine` + IMU stream + live per-frame IMU propagation; default branch is literally today's code. |
 | `vio/main.py` | **DONE (P2)** `--tight` flag threaded through `run_vio` → `OdometryModule(retain_imu=)` + `BackendModule(tight=)`; `launcher/main.py` forwards `--tight`; `./run.sh --tight` via `"$@"`. | Opt-in; default unchanged. |
 | `vio/tests/tight_smoke_selftest.py` | **NEW (P2)** drives the EXACT `--tight` engine path on a gold session → asserts a finite/sane/non-exploding trajectory. | Phase-2 RUNS gate (deterministic, no IPC graph). |
 | `vio/tools/compare_backends.py` (NEW dir) | **NEW** | Loose-vs-tight ATE harness (§6), reusing `baseline/tools/compare_sessions.py`. |
@@ -310,8 +311,9 @@ flag-free, which protects byte-parity and portability.
 
 ```
 imucam.sample ─► PreintegratePrior ───────────────┐ (gyro R_prior + accel + RAW IMU seg buffer)
-frame.depth ─► TrackFeatures(KLT) ─► EstimateMotion(PnP+gyro fuse) ─► PublishPose
-                                          │
+frame.depth ─► TrackFeatures(KLT) ─► EstimateMotion(PnP+gyro fuse) ─► PropagateImu* ─► PublishPose
+                                          │           (* tight only: IMU-propagate
+                                          │            pose.odom + re-anchor@KF + ZUPT)
                                           └─► EmitKeyframe (every kf_every)
                                                    │  Keyframe{T_cw, ids, px, depth, accel, ts_ns, imu_seg}
                                                    ▼
@@ -463,6 +465,80 @@ Re-run `oracle_replay_selftest.py` after wiring to confirm `gap = 0`.
   live + in-process. (Beating loose is NOT a Phase-2 gate — that is benchmarked in
   Phase 3 and refined in Phase 4.)
 
+### Phase 2.5 — LIVE per-frame IMU propagation of `pose.odom` (the freeze fix) · DONE (2026-06-10)
+
+**The gap Phase 2 left open.** Phase 2 wired the tight BACKEND (keyframe-rate joint
+visual+IMU solve, published sparsely on `pose.refined`). But the **live displayed
+position is `pose.odom`**, published EVERY frame by `vio/modules/publish_pose.py`
+from the per-frame **vision-only** odometry (PnP). So even with `--tight`, when
+vision was absent (covered camera) or too weak to solve (white wall) WHILE MOVING,
+the per-frame `pose.odom` **froze** — and keyframes may not even form without
+features, so the tight backend never got to correct it. Basalt does not freeze: it
+forward-propagates the IMU every frame (`predictState`). We had **no per-frame IMU
+propagation of the live output** — that was the user-visible "covered camera + move
+= stays still" bug. Phase 2.5 closes it, **`--tight`-only**.
+
+- **DONE — per-frame IMU forward-propagation + re-anchor + ZUPT on the live pose.**
+  - **New math primitives (purely additive)** in `vio/mathlib/imu/imu.py`:
+    - `predict_state(R,p,v, ts,gyro,accel, bg,ba, g_world)` — Basalt-style
+      `predictState`: integrates a raw IMU block forward under gravity
+      (gyro→rotation, gravity-removed accel→velocity→position), matched to
+      `preintegrate_imu`'s increment convention (same midpoint sample, same
+      dp-before-dv ordering) so the per-frame propagation and the keyframe
+      nav-state are consistent.
+    - `imu_at_rest(gyro, accel)` — the ZUPT (zero-velocity) gate: low `|gyro|`
+      AND `|accel| ≈ g`. Band tightened to `accel_dev_thresh = 0.3` m/s² (vs the
+      keyframe-gravity 0.6) so real motion is NOT frozen; documented blind spot is
+      a <2.4 m/s² **purely lateral** creep (safe failure: freeze, not drift).
+    - Both leave every existing function bit-unchanged, so the loose path / oracle
+      are untouched.
+  - **New live step** `vio/modules/propagate_imu.py::PropagateImu`, wired into the
+    `OdometryModule` frame-chain **right before `PublishPose`** (after `CorrectTilt`),
+    **gated on `retain_imu` (the `--tight` flag)**. It owns a live body→world
+    nav-state `(R, p, v, bg, ba)` + fixed `g_world` and, per frame:
+    1. **Re-anchor on a keyframe** — the vision pose pulls the inertial drift back;
+       velocity is re-derived from the displacement over the interval so it stays
+       continuous across the re-anchor (no jump).
+    2. **ZUPT at rest** — hold velocity at 0 and freeze translation (rotation may
+       still track a residual), preserving the at-rest static-drift win.
+    3. **Forward-propagate when moving** — integrate the per-frame retained IMU
+       block (`PreintegratePrior`'s camera-frame samples) and **replace `step.pose`**
+       so `PublishPose` emits the IMU-propagated pose on `pose.odom`.
+    On the LOOSE path it is a **pure pass-through no-op** (never allocates a
+    nav-state, never touches `step.pose`).
+  - **Keyframe-cadence single source of truth:** `PropagateImu` (runs first in the
+    tail) owns the kf counter on the tight path and stamps `is_kf_frame`;
+    `EmitKeyframe` consumes that boolean on the tight path (so the re-anchor and the
+    keyframe emission are the SAME frame). The LOOSE path keeps `EmitKeyframe`'s
+    counter byte-identical.
+- **Test — PASS:**
+  - **KEY unit gate** `vio/tests/imu_propagate_selftest.py`: `predict_state`
+    integrates a known trapezoidal pulse to the analytic place (1.00 m, v→0);
+    **covered camera + real translation** → live pose **dead-reckons +0.16 m
+    (does NOT freeze)**; **stationary + accel bias** → **ZUPT drift 0.000 mm** over
+    60 frames; the empty-IMU-segment regression (caught live) is held without
+    crashing; LOOSE path is a verified pass-through.
+  - **KEY functional gate** `vio/tests/tight_live_pose_selftest.py` drives the REAL
+    `OdometryModule` over the bus on gold sessions: `pose.odom` is IMU-propagated
+    between keyframes (2.24 m of non-keyframe live motion on `lab_loop_30s`), and
+    through a 20-frame **blanked (covered-camera) window the tight live pose moves
+    8.8 cm via the IMU while the loose pose freezes (0.0 cm)**; on
+    `push_straight_fast_15s` the covered window moves 9.1 cm (loose 0.0).
+  - **Live multi-process** `launcher.main --session … --tight --no-ui` runs the full
+    599-frame `lab_loop_30s` capture → vio[TIGHT] → slam end-to-end with a clean
+    shutdown (no crash / explosion / NaN).
+  - **Byte-parity / regression:** oracle `gap = 0`; all six comms copies diff-clean;
+    `vio_ba_selftest`, `imu_preint_cov_selftest`, `odometry_selftest`,
+    `gyrofuse_selftest`, `reproj_stub_selftest`, `tight_smoke_selftest` all PASS.
+- **Gate — MET:** on `--tight` the live `pose.odom` now KEEPS MOVING via the IMU
+  when vision is absent/weak while moving (no freeze), and ZUPT holds it still at
+  rest (no drift); the LOOSE path is byte-identical.
+- **Scope:** `--tight`-only, live output only. No change to the loose path, the
+  comms wire contract, the baselines, or the tight backend solve itself
+  (`pose.refined` is unchanged). Re-anchoring uses the per-frame **vision** keyframe
+  pose (immediate, deterministic); folding the later `pose.refined` drift-correction
+  into the live anchor is a possible refinement (Phase 4).
+
 ### Phase 3 — Loose-vs-tight benchmark harness · ~1 day
 - New `vio/tools/compare_backends.py` (§6), reusing `_umeyama_se3` + `ate` from
   `baseline/tools/compare_sessions.py`.
@@ -479,10 +555,11 @@ Re-run `oracle_replay_selftest.py` after wiring to confirm `gap = 0`.
   (d) low-res profile tuning (`min_ba_views`, window, landmark cap) for 54×42.
 - **Gate per item:** no ATE regression vs MVP on gold; NEES within χ² bounds for (c).
 
-**Critical path to a usable `--tight`: Phases 0 → 1 → 2 → 3** (~3.5–4.5 days).
-**Status:** Phases 0, 1, 2 DONE (2026-06-10) — `--tight` is wired + runs end-to-end
-on gold sessions (loose stays byte-identical). Phase 3 (loose-vs-tight ATE
-benchmark) is next.
+**Critical path to a usable `--tight`: Phases 0 → 1 → 2 → 2.5 → 3** (~3.5–4.5 days).
+**Status:** Phases 0, 1, 2, 2.5 DONE (2026-06-10) — `--tight` is wired + runs
+end-to-end on gold sessions (loose stays byte-identical), AND the live `pose.odom`
+now forward-propagates the IMU every frame + ZUPTs at rest (the covered-camera
+freeze fix). Phase 3 (loose-vs-tight ATE benchmark) is next.
 
 ---
 
@@ -590,7 +667,12 @@ accuracy/compute trade is explicit (Delmerico protocol).
 - **Tight core (exists, tested, ORPHANED):**
   `/Users/bao/skydev/oak-d/vio/mathlib/backend/vio_window.py`, validated by
   `/Users/bao/skydev/oak-d/vio/tests/vio_ba_selftest.py`
-- **IMU preintegration (add `Σ_ij`):** `/Users/bao/skydev/oak-d/vio/mathlib/imu/imu.py`
+- **IMU preintegration (`Σ_ij`) + per-frame propagation (`predict_state`) + ZUPT
+  gate (`imu_at_rest`):** `/Users/bao/skydev/oak-d/vio/mathlib/imu/imu.py`
+- **Live per-frame IMU propagation step (P2.5, the freeze fix):**
+  `/Users/bao/skydev/oak-d/vio/modules/propagate_imu.py`, validated by
+  `/Users/bao/skydev/oak-d/vio/tests/imu_propagate_selftest.py` (KEY unit gate) +
+  `/Users/bao/skydev/oak-d/vio/tests/tight_live_pose_selftest.py` (KEY functional gate)
 - **Engine selection layer to extend:**
   `/Users/bao/skydev/oak-d/vio/mathlib/engine/__init__.py`,
   `/Users/bao/skydev/oak-d/vio/mathlib/engine/steps.py`,

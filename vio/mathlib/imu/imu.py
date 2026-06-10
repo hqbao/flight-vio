@@ -443,6 +443,131 @@ def integrate_gyro_camera(imu_ts: np.ndarray, gyro: np.ndarray,
     return R @ R_imu @ R.T
 
 
+def imu_at_rest(gyro: np.ndarray, accel: np.ndarray,
+                gravity: float = 9.81,
+                gyro_thresh: float = 0.15,
+                accel_dev_thresh: float = 0.3) -> bool:
+    """Zero-velocity (ZUPT) detector: True iff the IMU block reads "at rest".
+
+    Used by the live tight-coupled forward-propagation to decide when to apply a
+    Zero-Velocity Update: at rest the only honest motion estimate is "no motion",
+    so holding velocity at zero (and freezing translation) for that frame removes
+    the accel-bias / gravity-residual drift that otherwise walks the dead-reckoned
+    pose off while the device is sitting still. This is what keeps the static
+    drift better than a pure forward-integrating filter -- the per-frame IMU
+    propagation moves the pose ONLY when there is real motion.
+
+    The two-sided test is the standard MEMS at-rest gate (e.g. used by foot-mounted
+    INS ZUPT and by VINS-style stationarity checks):
+
+    * angular rate is small (mean ``|gyro|`` below ``gyro_thresh`` rad/s), AND
+    * specific force magnitude is close to gravity (mean ``|accel|`` within
+      ``accel_dev_thresh`` m/s^2 of ``gravity``) -- i.e. the only force the
+      accelerometer feels is gravity, so the linear acceleration is ~0.
+
+    Both conditions must hold: a fast pure rotation has |accel| ~ g but high gyro
+    (NOT at rest), and a free-fall / strong push has low gyro but |accel| far from
+    g (NOT at rest).
+
+    Known limitation (deliberate bias toward NOT freezing real motion)
+    -----------------------------------------------------------------
+    The accel test is on the magnitude only, so a translation whose acceleration
+    is *perpendicular* to gravity barely changes ``|accel|`` (a lateral push of
+    ``a`` reads ``sqrt(g^2 + a^2) - g ~= a^2/(2g)``: a 2 m/s^2 lateral push moves
+    the magnitude only 0.2 m/s^2). The band is therefore set TIGHT
+    (``accel_dev_thresh = 0.3``, vs PreintegratePrior's looser 0.6 keyframe-gravity
+    gate): this rejects any push of >= ~2.4 m/s^2 lateral (and ANY forward/vertical
+    push >= 0.3) as motion so the dead-reckoning is NOT frozen, while a true-rest
+    accel bias (~0.05-0.1 m/s^2 on consumer MEMS) stays comfortably inside it. The
+    residual blind spot -- a very gentle (<2.4 m/s^2) PURELY lateral creep with no
+    rotation -- is the safe failure mode here: ZUPT freezes for that frame and the
+    next clear motion / keyframe re-anchor recovers it (preferring "hold still" to
+    "drift" is exactly the static-drift win). A magnetometer-free single-frame
+    detector cannot do better without a velocity-consistency state.
+
+    Parameters
+    ----------
+    gyro  : (M,3) rad/s samples over the frame interval (any frame: IMU or camera
+            frame -- the magnitude is frame-invariant).
+    accel : (M,3) m/s^2 specific-force samples over the frame interval.
+    """
+    g = np.asarray(gyro, np.float64)
+    a = np.asarray(accel, np.float64)
+    if a.size == 0:
+        return False
+    gyro_mag = 0.0 if g.size == 0 else float(np.linalg.norm(g, axis=1).mean())
+    accel_mag = float(np.linalg.norm(a, axis=1).mean())
+    gyro_still = gyro_mag < gyro_thresh
+    accel_still = abs(accel_mag - gravity) < accel_dev_thresh
+    return bool(gyro_still and accel_still)
+
+
+def predict_state(R_wb: np.ndarray, p_wb: np.ndarray, v_w: np.ndarray,
+                  ts_ns: np.ndarray, gyro: np.ndarray, accel: np.ndarray,
+                  bg: np.ndarray, ba: np.ndarray, g_world: np.ndarray
+                  ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Forward-propagate one nav-state over a raw IMU block (Basalt predictState).
+
+    This is the per-frame inertial dead-reckoning the loosely-coupled path never
+    had: given a starting body->world nav-state ``(R_wb, p_wb, v_w)`` and the raw
+    IMU samples spanning the next frame interval, it integrates the gyro into the
+    rotation and the (gravity-removed) accelerometer into velocity then position,
+    so the live pose KEEPS MOVING from the IMU alone when vision is absent
+    (covered camera) or too weak to solve (white wall). It is the discrete
+    forward integration matched to :func:`preintegrate_imu`'s increment
+    convention -- the same midpoint sample, the same dp-before-dv ordering -- so a
+    keyframe's vision-corrected nav-state and the per-frame propagation between
+    keyframes are consistent.
+
+    The samples are assumed already expressed in the body == camera optical frame
+    (the caller rotates raw IMU by ``R_imu_cam`` before calling, exactly as
+    :class:`vio.mathlib.backend.vio_window.WindowedVIOMap` expects). Biases are
+    subtracted per sample (gyro/accel bias linearisation point).
+
+    Integration per segment ``k -> k+1`` (forward-Euler on the midpoint sample)::
+
+        w   = 0.5*(gyro[k]+gyro[k+1]) - bg            # bias-corrected rate
+        acc = 0.5*(accel[k]+accel[k+1]) - ba          # bias-corrected force (body)
+        a_w = R_wb @ acc + g_world                    # world-frame acceleration
+        p  += v*dt + 0.5*a_w*dt^2                      # position BEFORE velocity
+        v  += a_w*dt                                   # ... so p uses the pre-step v
+        R_wb = R_wb @ Exp(w*dt)                        # rotation increment
+
+    ``g_world`` is the gravity ACCELERATION vector (optical-world "down" = +y, so
+    ``[0, +9.81, 0]``); since the accelerometer measures specific force (it reads
+    ``+g`` upward at rest), the world acceleration is ``R_wb @ accel + g_world``
+    (gravity adds, removing the reaction the sensor reports). This matches the
+    ``v_j = v_i + g*dt + R_i @ dv`` convention in :func:`preintegrate_imu`.
+
+    Returns the propagated ``(R_wb, p_wb, v_w)``. With fewer than two samples (no
+    ``dt`` to integrate) the inputs are returned unchanged.
+    """
+    ts = np.asarray(ts_ns, np.int64)
+    g = np.asarray(gyro, np.float64)
+    a = np.asarray(accel, np.float64)
+    bg = np.asarray(bg, np.float64)
+    ba = np.asarray(ba, np.float64)
+    gw = np.asarray(g_world, np.float64)
+    R = np.asarray(R_wb, np.float64).copy()
+    p = np.asarray(p_wb, np.float64).copy()
+    v = np.asarray(v_w, np.float64).copy()
+    if ts.size < 2:
+        return R, p, v
+    for k in range(ts.size - 1):
+        dt = (int(ts[k + 1]) - int(ts[k])) * 1e-9
+        if dt <= 0:
+            continue
+        w = 0.5 * (g[k] + g[k + 1]) - bg          # midpoint, bias-corrected
+        acc = 0.5 * (a[k] + a[k + 1]) - ba
+        a_w = R @ acc + gw                        # world-frame linear accel
+        # Position uses the PRE-step velocity (matches preintegrate_imu's
+        # dp-before-dv ordering), then velocity is advanced, then the rotation.
+        p = p + v * dt + 0.5 * a_w * dt * dt
+        v = v + a_w * dt
+        R = R @ so3_exp(w * dt)
+    return R, p, v
+
+
 def gravity_aligned_R0(accel_cam: np.ndarray) -> np.ndarray:
     """Initial camera->world rotation that levels the optical world to gravity.
 

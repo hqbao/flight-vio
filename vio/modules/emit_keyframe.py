@@ -19,11 +19,20 @@ class EmitKeyframe(StepBase):
     name = "emit_keyframe"
 
     def run(self, ctx, step: Step):
-        n = ctx.state.get("kf_count", 0) + 1
-        if n < ctx.state["kf_every"]:
-            ctx.state["kf_count"] = n
-            return step
-        ctx.state["kf_count"] = 0
+        # Keyframe cadence. LOOSE path (default): EmitKeyframe owns the counter
+        # exactly as before -- byte-identical. TIGHT path (retain_imu): PropagateImu
+        # runs first and is the SINGLE source of truth for the cadence (so the live
+        # nav-state re-anchors on the same frame a keyframe is emitted); here we
+        # just consume the boolean it stamped.
+        if ctx.state.get("retain_imu"):
+            if not ctx.state.get("is_kf_frame"):
+                return step
+        else:
+            n = ctx.state.get("kf_count", 0) + 1
+            if n < ctx.state["kf_every"]:
+                ctx.state["kf_count"] = n
+                return step
+            ctx.state["kf_count"] = 0
         vo: RGBDVisualOdometry = ctx.state["vo"]
         tr = vo.frontend.tracks
         ids = tr.ids.copy() if tr is not None and tr.ids is not None else None

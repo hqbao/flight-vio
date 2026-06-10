@@ -92,6 +92,7 @@ from .estimate_motion import EstimateMotion
 from .correct_tilt import CorrectTilt
 from .publish_inliers import PublishInliers
 from .publish_gyrofuse import PublishGyroFuse
+from .propagate_imu import PropagateImu
 from .publish_pose import PublishPose
 from .publish_vo import PublishVo
 from .emit_keyframe import EmitKeyframe
@@ -131,6 +132,11 @@ class OdometryModule(Module):
         if retain_imu:
             self.ctx.state["imu_segs"] = {}
             self.ctx.state["last_kf_seq"] = -1
+            # Fixed world gravity ACCELERATION vector (optical-world "down" = +y),
+            # matching WindowedVIOConfig.g_world. Used by PropagateImu's per-frame
+            # forward-integration + ZUPT. Kept identical to the tight backend so the
+            # live dead-reckoning and the keyframe nav-state share one gravity model.
+            self.ctx.state["g_world"] = (0.0, 9.81, 0.0)
         self.ctx.state["R_imu_cam"] = (
             None if R_imu_cam is None else np.asarray(R_imu_cam, dtype=np.float64))
         if accel_align is not None:
@@ -147,9 +153,18 @@ class OdometryModule(Module):
         # post-EstimateMotion diagnostic publishers). It self-skips on frames
         # where the gyro fusion did not run (gyro off / PnP failed / bootstrap),
         # so it is safe to always wire in -- it never emits a garbage frame.
+        # ``PropagateImu`` (TIGHT path only, gated on retain_imu) runs right
+        # before PublishPose: it forward-propagates the live nav-state with the
+        # per-frame IMU and replaces ``step.pose`` so the live ``pose.odom`` keeps
+        # moving via the IMU when vision is absent/weak, and applies a ZUPT at
+        # rest. On the LOOSE path it is a pass-through no-op (byte-identical
+        # pose.odom). It sits after CorrectTilt (so it re-anchors to the final
+        # vision pose on keyframes) and before PublishPose / PublishVo (PublishVo
+        # reads vo.pose_vo, not step.pose, so the pure-vision line is unaffected).
         frame_chain = [TrackFeatures(), PublishTracks(), AlignGravity(),
                        PullPrior(), EstimateMotion(), CorrectTilt(),
-                       PublishInliers(), PublishGyroFuse(), PublishPose()]
+                       PublishInliers(), PublishGyroFuse(),
+                       PropagateImu(), PublishPose()]
         if publish_vo:
             frame_chain.append(PublishVo())
         frame_chain.append(EmitKeyframe())
