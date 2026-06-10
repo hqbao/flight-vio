@@ -115,15 +115,23 @@ Pass gate      : every bar < 1e-5.
 Builds         : `F/A/G` in `preintegration.py` + jacobian selftest (mirrors
                  the existing `_vt_jac_check` pattern in `bundle.py`).
 
-### A5 — Covariance & sqrt information
-How it works   : propagate `cov = F·cov·Fᵀ + A·Σa·Aᵀ + G·Σg·Gᵀ`; expose
-                 `sqrt_cov_inv` (LDLT) to whiten the residual later.
-Input          : a segment + accel/gyro noise from `calib.json`.
-Visual output  : `--stage cov` → plot the position 1σ (√ of the trace of the
-                 pos block) growing vs integration time on a still session.
-Pass gate      : monotonically increasing; magnitude sane (cm-scale over ~0.25 s).
+### A5 — Covariance & sqrt information   · DONE (2026-06-10)
+How it works   : propagate `cov = A·cov·Aᵀ + B·(Q/dt)·Bᵀ` per IMU segment, where
+                 A/B (the plan's F + the A/G noise inputs combined) use the SAME
+                 midpoint sample + dp-before-dv ordering as the delta update, so
+                 the weight matches the residual exactly; expose `sqrt_info`
+                 (Cholesky/LDLT of the information matrix) to whiten the residual.
+Input          : a segment + accel/gyro noise densities from `ImuNoise`
+                 (`calib.json` carries no IMU noise yet, so it is a config knob;
+                 defaults are BMI270-class). NOT additive to the deltas.
+Visual output  : Monte-Carlo gate (analytic Σ vs empirical covariance of 4000
+                 noisy re-integrations) instead of a single still-session plot —
+                 a stronger correctness check than the 1σ-vs-time curve.
+Pass gate      : MET — full-matrix relative Frobenius 2.6 %; Σ-trace
+                 monotonically increasing; position 1σ 0.25 cm over 0.25 s (sane).
 Ý nghĩa        : cho bộ tối ưu biết "tin IMU tới mức nào" — trọng số của factor IMU.
-Builds         : covariance accumulation + selftest.
+Builds         : covariance accumulation in `vio/mathlib/imu/imu.py` (additive,
+                 deltas bit-unchanged) + `vio/tests/imu_preint_cov_selftest.py`.
 
 ### A6 — Residual + bias correction (the IMU factor)
 How it works   : `residual(state0, g, state1, bias)` = 9-D [Δp,Δrot,Δv] error with

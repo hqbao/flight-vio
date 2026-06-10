@@ -84,6 +84,40 @@ def so3_right_jacobian(phi: np.ndarray) -> np.ndarray:
             + (theta - np.sin(theta)) / (t2 * theta) * (K @ K))
 
 
+class ImuNoise:
+    """Continuous-time IMU white-noise densities used to weight the IMU factor.
+
+    These are the per-axis spectral densities of the gyro / accel measurement
+    noise (the same numbers Basalt / VINS call ``gyro_noise_std`` and
+    ``accel_noise_std``). A continuous density ``sigma_c`` (units ``rad/s/sqrt(Hz)``
+    for the gyro, ``m/s^2/sqrt(Hz)`` for the accel) becomes a per-segment discrete
+    covariance ``sigma_c^2 / dt`` over a step of length ``dt`` -- the form used in
+    the covariance propagation below.
+
+    The bias random-walk densities are NOT used here: the bias states live on the
+    keyframes and are tied by the bias-random-walk residual in the optimizer
+    (``vio_window._bias_rw_residual``); this class only covers the additive
+    measurement noise that drives the 9-state preintegration covariance.
+
+    Defaults are reasonable order-of-magnitude values for the OAK-D's Bosch
+    BMI270 (consumer MEMS): they make the covariance physically sane (cm-scale
+    position 1-sigma over a ~0.25 s keyframe interval). They are config knobs, not
+    constants -- tune per device once a noise study is available.
+    """
+
+    __slots__ = ("sigma_g", "sigma_a")
+
+    def __init__(self, sigma_g: float = 1.5e-3, sigma_a: float = 2.0e-2):
+        self.sigma_g = float(sigma_g)   # gyro  noise density [rad/s/sqrt(Hz)]
+        self.sigma_a = float(sigma_a)   # accel noise density [m/s^2/sqrt(Hz)]
+
+
+# Default measurement-noise densities used when ``preintegrate_imu`` is called
+# without an explicit ``noise=`` (keeps the existing call sites working while
+# still producing a sane covariance).
+DEFAULT_IMU_NOISE = ImuNoise()
+
+
 class ImuPreintegration:
     """Result of preintegrating IMU between two times (body/IMU frame).
 
@@ -93,15 +127,28 @@ class ImuPreintegration:
     estimate can correct the deltas WITHOUT re-integrating the raw samples
     (Forster et al., "On-Manifold Preintegration", TRO 2017).
 
+    It ALSO carries the 9x9 preintegration covariance ``cov`` of the noise on the
+    9-state delta ``eta = [dphi(3); dvel(3); dpos(3)]`` (same ordering as the IMU
+    residual in :func:`vio.mathlib.backend.vio_window._imu_residual`), plus its
+    information square root ``sqrt_info`` such that ``sqrt_info.T @ sqrt_info ==
+    inv(cov)``. ``sqrt_info`` is the whitening matrix ``Omega_I = cov^-1``'s upper
+    Cholesky factor: whitening a raw 9-residual ``r`` with ``sqrt_info @ r`` gives
+    a residual with identity covariance, i.e. the correct IMU-factor weight. These
+    covariance fields are ADDITIVE -- ``dR/dv/dp/dt`` and the five bias Jacobians
+    are byte-unchanged from the pre-covariance version, so every existing consumer
+    (the loose path, ``corrected()``, the byte-parity oracle) is unaffected.
+
     All quantities are in the IMU/body frame; the extrinsic to the camera is
     applied by the optimizer, not here.
     """
 
     __slots__ = ("dR", "dv", "dp", "dt", "bg", "ba",
-                 "dR_dbg", "dv_dbg", "dv_dba", "dp_dbg", "dp_dba")
+                 "dR_dbg", "dv_dbg", "dv_dba", "dp_dbg", "dp_dba",
+                 "cov", "sqrt_info")
 
     def __init__(self, dR, dv, dp, dt, bg, ba,
-                 dR_dbg, dv_dbg, dv_dba, dp_dbg, dp_dba):
+                 dR_dbg, dv_dbg, dv_dba, dp_dbg, dp_dba,
+                 cov=None, sqrt_info=None):
         self.dR = dR
         self.dv = dv
         self.dp = dp
@@ -113,6 +160,10 @@ class ImuPreintegration:
         self.dv_dba = dv_dba
         self.dp_dbg = dp_dbg
         self.dp_dba = dp_dba
+        # 9x9 covariance of [dphi; dvel; dpos] and its sqrt-information. Both are
+        # ``None`` only for an empty / degenerate interval (no usable segment).
+        self.cov = cov
+        self.sqrt_info = sqrt_info
 
     def corrected(self, bg_new: np.ndarray, ba_new: np.ndarray):
         """First-order bias-corrected ``(dR, dv, dp)`` for a new bias estimate."""
@@ -124,8 +175,39 @@ class ImuPreintegration:
         return dR, dv, dp
 
 
+def _sqrt_information(cov: np.ndarray) -> np.ndarray:
+    """Upper-triangular whitening matrix ``L`` with ``L.T @ L == inv(cov)``.
+
+    Computed via an LDL^T / Cholesky factorisation of the covariance (Basalt uses
+    ``ldlt().matrixL()`` of the information matrix; here we factor the SPD
+    covariance, which is numerically the same whitening up to the transpose). A
+    tiny jitter is added on the diagonal if ``cov`` is borderline singular so the
+    factorisation never fails on a degenerate (e.g. extremely short) interval.
+
+    Given ``cov = U.T @ U`` (upper Cholesky), ``inv(cov) = inv(U) @ inv(U).T`` and
+    ``L = inv(U).T`` is upper-triangular with ``L.T @ L = inv(U) @ inv(U).T =
+    inv(cov)``, so whitening ``r -> L @ r`` yields unit covariance.
+    """
+    n = cov.shape[0]
+    eye = np.eye(n)
+    jitter = 0.0
+    for _ in range(8):
+        try:
+            U = np.linalg.cholesky(cov + jitter * eye).T   # upper factor: U.T@U=cov
+            Uinv = np.linalg.solve(U, eye)                 # inv(U)
+            return Uinv.T                                  # L = inv(U).T, upper-tri
+        except np.linalg.LinAlgError:
+            jitter = 1e-12 if jitter == 0.0 else jitter * 10.0
+    # Last-resort pseudo-inverse whitening (kept SPD by symmetrising).
+    info = np.linalg.pinv(0.5 * (cov + cov.T))
+    w, V = np.linalg.eigh(0.5 * (info + info.T))
+    w = np.clip(w, 0.0, None)
+    return (V * np.sqrt(w)) @ V.T
+
+
 def preintegrate_imu(ts_ns: np.ndarray, gyro: np.ndarray, accel: np.ndarray,
-                     bg: np.ndarray, ba: np.ndarray) -> ImuPreintegration:
+                     bg: np.ndarray, ba: np.ndarray,
+                     noise: "ImuNoise | None" = None) -> ImuPreintegration:
     """Preintegrate a contiguous block of IMU samples (body frame).
 
     Parameters
@@ -134,6 +216,10 @@ def preintegrate_imu(ts_ns: np.ndarray, gyro: np.ndarray, accel: np.ndarray,
     gyro  : (K,3) rad/s in the IMU frame.
     accel : (K,3) m/s^2 specific force in the IMU frame.
     bg, ba: (3,) gyro / accel bias to subtract (linearisation point).
+    noise : optional :class:`ImuNoise` measurement-noise densities used ONLY for
+            the (additive) 9x9 covariance propagation. Defaults to
+            :data:`DEFAULT_IMU_NOISE`. It does NOT affect ``dR/dv/dp`` or the
+            bias Jacobians, so passing it never changes the loose-path numerics.
 
     Returns an :class:`ImuPreintegration`. The increments satisfy, for body
     poses ``(R_i,p_i,v_i)`` at the first sample and ``(R_j,p_j,v_j)`` at the
@@ -144,12 +230,24 @@ def preintegrate_imu(ts_ns: np.ndarray, gyro: np.ndarray, accel: np.ndarray,
         p_j  ~= p_i + v_i*dt + 0.5*g*dt^2 + R_i @ dp
 
     (forward-Euler segment integration; error -> 0 as the sample rate rises).
+
+    Covariance
+    ----------
+    Alongside the deltas it propagates the 9x9 covariance ``cov`` of the noise on
+    ``eta = [dphi; dvel; dpos]`` (the IMU-residual ordering) via the standard
+    Forster discrete recursion ``cov <- A cov A^T + B (Q/dt) B^T`` per segment,
+    where ``A = d eta_{k+1} / d eta_k``, ``B = d eta_{k+1} / d (gyro,accel
+    noise)`` use the SAME midpoint sample and the SAME dp-before-dv ordering as
+    the delta update above (so the weight matches the residual exactly). The
+    sqrt-information ``sqrt_info`` (``sqrt_info.T @ sqrt_info == inv(cov)``) is
+    exposed for whitening the IMU factor; ``Omega_I = inv(cov)``.
     """
     ts = np.asarray(ts_ns, np.int64)
     g = np.asarray(gyro, np.float64)
     a = np.asarray(accel, np.float64)
     bg = np.asarray(bg, np.float64)
     ba = np.asarray(ba, np.float64)
+    noise = noise if noise is not None else DEFAULT_IMU_NOISE
 
     dR = np.eye(3)
     dv = np.zeros(3)
@@ -161,6 +259,14 @@ def preintegrate_imu(ts_ns: np.ndarray, gyro: np.ndarray, accel: np.ndarray,
     dp_dba = np.zeros((3, 3))
     t_acc = 0.0
 
+    # 9x9 covariance of [dphi; dvel; dpos] (residual order). Continuous
+    # densities -> per-segment discrete covariances Q/dt = sigma_c^2 / dt.
+    cov = np.zeros((9, 9))
+    sg2 = noise.sigma_g * noise.sigma_g     # gyro  density^2 [ (rad/s)^2 / Hz ]
+    sa2 = noise.sigma_a * noise.sigma_a     # accel density^2 [ (m/s^2)^2 / Hz ]
+    I3 = np.eye(3)
+    had_step = False
+
     for k in range(len(ts) - 1):
         dt = (int(ts[k + 1]) - int(ts[k])) * 1e-9
         if dt <= 0:
@@ -169,6 +275,39 @@ def preintegrate_imu(ts_ns: np.ndarray, gyro: np.ndarray, accel: np.ndarray,
         w = 0.5 * (g[k] + g[k + 1]) - bg
         acc = 0.5 * (a[k] + a[k + 1]) - ba
 
+        # --- covariance propagation (uses dR == dR_{i,k} BEFORE its update) ---
+        # State-transition A_k and noise-input B_k for eta = [dphi; dvel; dpos],
+        # consistent with the dp-before-dv delta update below:
+        #   dphi_{k+1} = dR_inc^T dphi_k                       + (Jr dt) n_g
+        #   dvel_{k+1} = -dR skew(acc) dt dphi_k + dvel_k      + (dR dt) n_a
+        #   dpos_{k+1} = -0.5 dR skew(acc) dt^2 dphi_k
+        #                + dt dvel_k + dpos_k                  + (0.5 dR dt^2) n_a
+        # (position uses the PRE-update dvel, matching ``dp += dv*dt``.)
+        phi = w * dt
+        dR_inc = so3_exp(phi)
+        Jr = so3_right_jacobian(phi)
+        Rk_sk = dR @ _skew(acc)                  # dR_k @ skew(acc)
+
+        A_k = np.zeros((9, 9))
+        A_k[0:3, 0:3] = dR_inc.T
+        A_k[3:6, 0:3] = -Rk_sk * dt
+        A_k[3:6, 3:6] = I3
+        A_k[6:9, 0:3] = -0.5 * Rk_sk * dt * dt
+        A_k[6:9, 3:6] = I3 * dt
+        A_k[6:9, 6:9] = I3
+
+        B_k = np.zeros((9, 6))                    # cols [n_g(3) | n_a(3)]
+        B_k[0:3, 0:3] = Jr * dt
+        B_k[3:6, 3:6] = dR * dt
+        B_k[6:9, 3:6] = 0.5 * dR * dt * dt
+
+        # Discrete noise covariance over this step: Q/dt with Q = diag(sg2,sa2).
+        Qd = np.zeros((6, 6))
+        Qd[0:3, 0:3] = (sg2 / dt) * I3
+        Qd[3:6, 3:6] = (sa2 / dt) * I3
+        cov = A_k @ cov @ A_k.T + B_k @ Qd @ B_k.T
+
+        # --- delta + bias-Jacobian update (BIT-UNCHANGED from before) ---------
         # Position + velocity increments use the CURRENT dR (= dR_{i,k}); update
         # position before velocity (it uses the pre-update dv). Same ordering for
         # the bias Jacobians.
@@ -176,22 +315,29 @@ def preintegrate_imu(ts_ns: np.ndarray, gyro: np.ndarray, accel: np.ndarray,
         dp = dp + dv * dt + 0.5 * aR * dt * dt
         dv = dv + aR * dt
 
-        Rk_sk = dR @ _skew(acc)
         dp_dba = dp_dba + dv_dba * dt - 0.5 * dR * dt * dt
         dp_dbg = dp_dbg + dv_dbg * dt - 0.5 * (Rk_sk @ dR_dbg) * dt * dt
         dv_dba = dv_dba - dR * dt
         dv_dbg = dv_dbg - (Rk_sk @ dR_dbg) * dt
 
         # Rotation increment + its gyro-bias Jacobian recursion.
-        phi = w * dt
-        dR_inc = so3_exp(phi)
-        Jr = so3_right_jacobian(phi)
         dR_dbg = dR_inc.T @ dR_dbg - Jr * dt
         dR = dR @ dR_inc
         t_acc += dt
+        had_step = True
+
+    # Only build the (symmetric) sqrt-information when at least one real segment
+    # was integrated; an empty interval leaves cov/sqrt_info as None so callers
+    # can detect a degenerate factor.
+    cov_out = None
+    sqrt_info = None
+    if had_step:
+        cov_out = 0.5 * (cov + cov.T)            # enforce exact symmetry
+        sqrt_info = _sqrt_information(cov_out)
 
     return ImuPreintegration(dR, dv, dp, t_acc, bg.copy(), ba.copy(),
-                             dR_dbg, dv_dbg, dv_dba, dp_dbg, dp_dba)
+                             dR_dbg, dv_dbg, dv_dba, dp_dbg, dp_dba,
+                             cov_out, sqrt_info)
 
 
 
