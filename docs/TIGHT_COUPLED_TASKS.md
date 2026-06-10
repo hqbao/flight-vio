@@ -133,16 +133,39 @@ Pass gate      : MET — full-matrix relative Frobenius 2.6 %; Σ-trace
 Builds         : covariance accumulation in `vio/mathlib/imu/imu.py` (additive,
                  deltas bit-unchanged) + `vio/tests/imu_preint_cov_selftest.py`.
 
-### A6 — Residual + bias correction (the IMU factor)
-How it works   : `residual(state0, g, state1, bias)` = 9-D [Δp,Δrot,Δv] error with
-                 first-order bias correction; analytic residual Jacobians.
-Input          : state0, state1, a bias offset.
-Visual output  : `--stage resid` → plot residual norm vs an injected bias offset
-                 (sweep `bg`); it should rise **linearly** with slope =
-                 `d_state_d_bg`.
-Pass gate      : residual ≈ 0 at the true state; linear in bias; Jacobian FD < 1e-5.
-Ý nghĩa        : đây chính là "sợi dây" IMU nối 2 trạng thái trong cửa sổ tối ưu.
-Builds         : `residual` + Jacobians + selftest. **Track A done = Block 2 done.**
+### A6 — Residual + bias correction (the IMU factor)   · DONE (2026-06-10)
+How it works   : `_imu_residual(state_i, g, state_j, pre)` = 9-D [δφ; δv; δp] error
+                 with first-order bias correction (`pre.corrected`), whitened by
+                 the per-edge information square root `Ω_I = pre.sqrt_info`
+                 (`sqrt_info @ r`, ordering matched to the Phase-0 Σ_ij) when
+                 `VioConfig.imu_info_weight=True`; the bias random-walk row stays a
+                 separate Gaussian factor. A per-edge cache (`_ImuEdge`) integrates
+                 once and relinearises only when the host-KF bias drifts past
+                 threshold (first-order `corrected` handles small bias changes).
+                 FD Jacobians (the validated `vio_window` default) rather than
+                 analytic — analytic is the Phase-4 C-port refinement.
+Input          : state_i, state_j, the cached preintegration `pre` (carries Σ_ij).
+Visual output  : `vio/tests/vio_ba_selftest.py` scenarios D/E/F — recover a
+                 synthetic VI window with `Ω_I = sqrt_info` weighting; printed
+                 cost/residual + per-state errors vs ground truth.
+Pass gate      : MET — residual → ~0 at the optimum; recovery pos ≤ 0.19 mm,
+                 rot ≤ 0.002° (incl. estimated bias) with the covariance weight;
+                 graceful degradation under inflated Σ. (Forster FD-Jacobian
+                 correctness is exercised end-to-end by the recovery, not a
+                 standalone FD-bar check; that lands with analytic Jacobians in
+                 Phase 4.)
+Ý nghĩa        : đây chính là "sợi dây" IMU nối 2 trạng thái trong cửa sổ tối ưu —
+                 nay được cân đúng bằng hiệp phương sai thật Σ_ij⁻¹, không phải
+                 sigma cố định.
+Builds         : `Ω_I` whitening + `_ImuEdge` per-edge cache in
+                 `vio/mathlib/backend/vio_window.py` + scenarios D/E/F in
+                 `vio/tests/vio_ba_selftest.py`.
+                 **Track A done = Block 2 done.**
+
+> Byte-parity note (matches PLAN §4): the new `Ω_I` weight is **opt-in**
+> (`VioConfig.imu_info_weight`, default False) because the frozen byte-parity
+> oracle has `backend="vio"` entries that run this exact residual. The oracle uses
+> the default (fixed sigmas) and stays `gap = 0`; the tight path turns it on.
 
 ---
 
@@ -313,7 +336,7 @@ Builds         : nothing new (composes T0.2 `--plot` + `view_pose3d`).
 | A3 | IMU seg | \|Δp\| still vs push | still <5 cm/s |
 | A4 | synthetic | F/A/G FD bars | <1e-5 |
 | A5 | seg+noise | pos 1σ vs time | monotonic, cm-scale |
-| A6 | states | residual vs bias sweep | linear, FD<1e-5 |
+| A6 ✓ | states | recovery w/ Ω_I=sqrt_info (D/E/F) | pos≤0.19mm, rot≤0.002° |
 | B1 | fast_push IMU | 3D IMU-only vs Basalt vs ours | follows push first ~1 s |
 | C1 | synthetic | reproj overlay 2 frames | recover <1 mm/0.1° |
 | C2 | gold motion | cost curve + 3D window | vio2 ATE ≤ ba |

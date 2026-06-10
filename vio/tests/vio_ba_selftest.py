@@ -22,6 +22,15 @@ Scenario A: zero true bias -- tests the pose/velocity/landmark coupling.
 Scenario B: non-zero true gyro+accel bias baked into the IMU, preintegrated at a
 zero linearisation point -- tests that the optimizer estimates the biases (via
 the first-order ``corrected`` update) while recovering the states.
+Scenario C: A with the camera roll/pitch locked (yaw + position only).
+
+Scenarios D/E/F mirror A/B/C but with ``imu_info_weight=True`` -- the Phase 1
+covariance-correct IMU-factor weight ``Omega_I = pre.sqrt_info`` (the Phase-0
+preintegration information square root) instead of the fixed scalar sigmas. They
+prove the joint solve still recovers ground truth to sub-mm / sub-mdeg when the
+IMU factor is weighted by its actual integration uncertainty. A/B/C keep
+``imu_info_weight`` at its default ``False`` so they also guard that the
+fixed-sigma path (the one the byte-parity oracle depends on) is unchanged.
 """
 from __future__ import annotations
 
@@ -128,7 +137,20 @@ def build_factors(imu_raw, bg_lin, ba_lin):
     return factors
 
 
-def run_scenario(name, true_bg, true_ba, gate_bias, lock_tilt=False):
+def run_scenario(name, true_bg, true_ba, gate_bias, lock_tilt=False,
+                 imu_info_weight=False, gate=None):
+    """Recover a synthetic VI window and check the errors against ground truth.
+
+    ``imu_info_weight`` selects the IMU-factor whitening: ``False`` (default) uses
+    the fixed scalar sigmas (``VioConfig.sigma_rot/vel/pos``); ``True`` uses the
+    Phase-0 per-edge information square root ``Omega_I = pre.sqrt_info`` (the
+    covariance-correct weight). ``gate`` overrides the (rot, pos, vel, lm) error
+    tolerances -- the covariance-weighted solve weights the IMU by its REAL
+    integration uncertainty rather than the tight hand-tuned sigmas, so it lets
+    vision carry slightly more and lands at a (still sub-mm / sub-mdeg) optimum
+    with marginally larger residuals; the looser gate reflects that, NOT a
+    correctness loss.
+    """
     w = make_world(true_bg=true_bg, true_ba=true_ba)
     nKF = len(w["kf_R"])
     rng = np.random.default_rng(7)
@@ -165,7 +187,8 @@ def run_scenario(name, true_bg, true_ba, gate_bias, lock_tilt=False):
     # factors preintegrated at the zero linearisation bias (matches guess)
     factors = build_factors(w["imu_raw"], np.zeros(3), np.zeros(3))
 
-    cfg = VioConfig(max_iters=40, lock_tilt=lock_tilt)
+    cfg = VioConfig(max_iters=40, lock_tilt=lock_tilt,
+                    imu_info_weight=imu_info_weight)
     res = optimize_vio(K, st, w["obs_cam"], w["obs_lm"], w["obs_uv"], w["obs_d"],
                        factors, G, cfg, anchor=0)
     out = res.state
@@ -179,7 +202,8 @@ def run_scenario(name, true_bg, true_ba, gate_bias, lock_tilt=False):
     bg_err = max(float(np.linalg.norm(true_bg - out.bg[i])) for i in range(nKF))
     ba_err = max(float(np.linalg.norm(true_ba - out.ba[i])) for i in range(nKF))
 
-    print(f"\n=== scenario {name} ===")
+    weight = "Omega_I=sqrt_info" if imu_info_weight else "fixed sigmas"
+    print(f"\n=== scenario {name}  [IMU weight: {weight}] ===")
     print(f"  cost {res.cost0:.3e} -> {res.cost1:.3e} "
           f"({res.iters} it, mean reproj {res.mean_reproj_px:.3f}px)")
     print(f"  max rotation err = {rot_err:.4e} deg")
@@ -189,13 +213,17 @@ def run_scenario(name, true_bg, true_ba, gate_bias, lock_tilt=False):
     print(f"  max gyrobias err = {bg_err:.4e} rad/s")
     print(f"  max accelbias err= {ba_err:.4e} m/s^2")
 
-    ok = (rot_err < 5e-2 and pos_err < 2e-3 and vel_err < 1e-2
-          and lm_err < 3e-3 and bg_err < gate_bias[0] and ba_err < gate_bias[1])
+    # (rot_deg, pos_m, vel_mps, lm_m) tolerances; default = the original gate.
+    g_rot, g_pos, g_vel, g_lm = gate or (5e-2, 2e-3, 1e-2, 3e-3)
+    ok = (rot_err < g_rot and pos_err < g_pos and vel_err < g_vel
+          and lm_err < g_lm and bg_err < gate_bias[0] and ba_err < gate_bias[1])
     print("  " + ("OK" if ok else "FAIL"))
     return ok
 
 
 def main() -> int:
+    # --- default fixed-sigma weighting (unchanged; protects the loose/oracle
+    #     path numerics, which leave imu_info_weight at its default False) ------
     okA = run_scenario("A: zero bias", np.zeros(3), np.zeros(3),
                        gate_bias=(1e-3, 1e-2))
     okB = run_scenario("B: with bias",
@@ -205,7 +233,21 @@ def main() -> int:
     okC = run_scenario("C: tilt-locked (yaw+pos only)",
                        np.zeros(3), np.zeros(3),
                        gate_bias=(1e-3, 1e-2), lock_tilt=True)
-    ok = okA and okB and okC
+    # --- Phase 1: covariance-correct IMU weight Omega_I = sqrt_info -----------
+    # The joint solve still recovers ground truth to sub-mm / sub-mdeg with the
+    # IMU factor weighted by its REAL Sigma_ij^-1 instead of fixed sigmas. The
+    # gate is the tight-coupling acceptance: pos < 1 mm, rot < 0.01 deg.
+    cov_gate = (1e-2, 1e-3, 1e-2, 1e-3)        # (rot_deg, pos_m, vel_mps, lm_m)
+    okD = run_scenario("D: cov-weighted, zero bias", np.zeros(3), np.zeros(3),
+                       gate_bias=(1e-3, 1e-2), imu_info_weight=True, gate=cov_gate)
+    okE = run_scenario("E: cov-weighted, with bias",
+                       np.array([0.004, -0.003, 0.005]),
+                       np.array([0.03, -0.02, 0.04]),
+                       gate_bias=(2e-3, 2e-2), imu_info_weight=True, gate=cov_gate)
+    okF = run_scenario("F: cov-weighted, tilt-locked", np.zeros(3), np.zeros(3),
+                       gate_bias=(1e-3, 1e-2), lock_tilt=True,
+                       imu_info_weight=True, gate=cov_gate)
+    ok = okA and okB and okC and okD and okE and okF
     print("\nPASS" if ok else "\nFAIL")
     return 0 if ok else 1
 

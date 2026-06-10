@@ -97,6 +97,19 @@ class VioConfig:
     sigma_pos: float = 0.05         # m, IMU position increment
     sigma_bg_rw: float = 1e-3       # gyro-bias random walk
     sigma_ba_rw: float = 1e-2       # accel-bias random walk
+    # IMU-factor weighting (Phase 1). When False (default) the IMU residual
+    # [dphi; dvel; dpos] is whitened by the FIXED scalar sigmas above -- the
+    # original, byte-parity-preserving behaviour the frozen ``vio`` oracle
+    # entries depend on. When True the residual is whitened by the per-edge
+    # information square root ``Omega_I = pre.sqrt_info`` (``sqrt_info.T @
+    # sqrt_info == Sigma_ij^-1``, the Phase-0 covariance), so the IMU factor's
+    # weight is the ACTUAL integration uncertainty + noise model rather than a
+    # hand-tuned constant. This is the covariance-correct tight-coupling weight;
+    # it is OPT-IN so enabling it never moves the loose path or the oracle (which
+    # both leave it at the default False). If a factor's ``sqrt_info`` is missing
+    # (degenerate / empty interval) the code falls back to the fixed sigmas for
+    # that edge.
+    imu_info_weight: bool = False
     huber_px: float = 2.0           # robust threshold on pixel residual
     use_depth: bool = True
     min_view_z: float = 1e-3
@@ -144,14 +157,29 @@ def _project(R, p, Xw, fx, fy, cx, cy, min_z):
 def _imu_residual(R_i, p_i, v_i, bg_i, ba_i,
                   R_j, p_j, v_j,
                   pre: ImuPreintegration, g_world, cfg) -> np.ndarray:
-    """15-vector whitened IMU + bias-random-walk residual between KF i and j.
+    """9-vector whitened IMU preintegration residual between KF i and j.
 
-    Order: [rRot(3), rVel(3), rPos(3), rBiasGyro(3), rBiasAccel(3)].
+    Order: [rRot(3), rVel(3), rPos(3)].
     Matches the increment convention validated in imu_preint_selftest:
         R_j = R_i dR ; v_j = v_i + g dt + R_i dv ;
         p_j = p_i + v_i dt + 0.5 g dt^2 + R_i dp
-    The bias rows tie i and j (random walk); note the *corrected* increments use
-    the CURRENT bias estimate at i, which is the Forster first-order relinearise.
+    The *corrected* increments use the CURRENT bias estimate at i, which is the
+    Forster first-order relinearise (cheap: re-uses the cached deltas + bias
+    Jacobians instead of re-integrating the raw samples).
+
+    Whitening (Phase 1)
+    -------------------
+    The RAW residual ``r = [rR; rv; rp]`` is whitened in one of two ways:
+
+    * ``cfg.imu_info_weight == False`` (default): each block is divided by the
+      fixed scalar sigma (``sigma_rot/sigma_vel/sigma_pos``). This is the
+      original, byte-identical behaviour the frozen ``vio`` oracle depends on.
+    * ``cfg.imu_info_weight == True``: the full 9-vector is whitened by the
+      per-edge information square root ``Omega_I = pre.sqrt_info`` (from the
+      Phase-0 covariance), i.e. ``sqrt_info @ r``. This makes the factor's weight
+      the actual integration uncertainty. If this edge has no ``sqrt_info`` (an
+      empty / degenerate interval), it falls back to the fixed sigmas so the
+      factor is still well-posed rather than dropped.
     """
     dt = pre.dt
     dR, dv, dp = pre.corrected(bg_i, ba_i)
@@ -159,8 +187,12 @@ def _imu_residual(R_i, p_i, v_i, bg_i, ba_i,
     rR = so3_log(dR.T @ Ri_T @ R_j)
     rv = Ri_T @ (v_j - v_i - g_world * dt) - dv
     rp = Ri_T @ (p_j - p_i - v_i * dt - 0.5 * g_world * dt * dt) - dp
-    # bias random walk uses bias_j - bias_i; bias_j lives on KF j's state, but
-    # the preintegration only carries i's bias, so j's bias enters only here.
+    if cfg.imu_info_weight and pre.sqrt_info is not None:
+        # Covariance-correct weight: whiten the joint [dphi; dvel; dpos] residual
+        # with Omega_I = sqrt_info (sqrt_info.T @ sqrt_info == Sigma_ij^-1). The
+        # ordering of r MATCHES the covariance ordering propagated in
+        # preintegrate_imu ([dphi; dvel; dpos]).
+        return pre.sqrt_info @ np.concatenate([rR, rv, rp])
     return np.concatenate([
         rR / cfg.sigma_rot,
         rv / cfg.sigma_vel,
@@ -612,6 +644,75 @@ def _imu_segment(ts_ns: np.ndarray, gyro: np.ndarray, accel: np.ndarray,
 
 
 # --------------------------------------------------------------------------- #
+# Per-edge IMU preintegration cache.
+#
+# One :class:`_ImuEdge` is the IMU factor linking two consecutive keyframes. It
+# OWNS the raw IMU segment for the inter-keyframe interval and the integrated
+# :class:`ImuPreintegration` (deltas + bias Jacobians + Sigma_ij/sqrt_info). The
+# cache exists so the optimiser does NOT re-integrate the raw samples every solve:
+#
+#   * The covariance Sigma_ij and the five bias Jacobians depend only on the raw
+#     samples and the *linearisation* bias, so they are computed ONCE per edge.
+#   * Inside a window solve the per-iteration bias change is absorbed by the
+#     first-order ``ImuPreintegration.corrected`` update (which re-uses the cached
+#     deltas + Jacobians -- no re-integration), exactly as Forster prescribes.
+#   * Only when the keyframe's bias estimate drifts past ``bias_reint_thresh``
+#     from the linearisation point does the edge RE-INTEGRATE (``relinearize``),
+#     refreshing the deltas, Jacobians and covariance about the new bias. This is
+#     the standard "relinearise when the first-order correction is stale" rule.
+#
+# The cache is template-similar to :class:`GyroPreintegrator` (it owns a raw IMU
+# slice and lazily produces a preintegrated increment), but carries the FULL
+# 9-state factor (rotation+velocity+position + covariance) rather than gyro-only
+# rotation.
+# --------------------------------------------------------------------------- #
+class _ImuEdge:
+    """Cached IMU preintegration factor between two consecutive keyframes.
+
+    Parameters
+    ----------
+    seg : ``(ts_ns, gyro_cam, accel_cam)`` raw IMU samples spanning the interval,
+          already rotated into the camera optical frame.
+    bg0, ba0 : the gyro/accel bias linearisation point used for the integration.
+    noise : optional :class:`ImuNoise` for the covariance; defaults to the
+            preintegrator's own default when None.
+    bias_reint_thresh : (gyro, accel) L2 distances of the live bias from the
+            linearisation point beyond which the edge re-integrates. Defaults are
+            generous -- the first-order ``corrected`` update is accurate well past
+            the bias swings a single window solve produces.
+    """
+
+    __slots__ = ("seg", "pre", "bg_lin", "ba_lin", "noise", "_thr_g", "_thr_a")
+
+    def __init__(self, seg, bg0, ba0, noise=None,
+                 bias_reint_thresh: tuple[float, float] = (5e-3, 5e-2)):
+        self.seg = seg
+        self.noise = noise
+        self.bg_lin = np.asarray(bg0, np.float64).copy()
+        self.ba_lin = np.asarray(ba0, np.float64).copy()
+        self._thr_g, self._thr_a = bias_reint_thresh
+        self.pre = preintegrate_imu(seg[0], seg[1], seg[2],
+                                    self.bg_lin, self.ba_lin, noise=self.noise)
+
+    def relinearize(self, bg, ba) -> None:
+        """Re-integrate about a new bias linearisation point (refresh Sigma/Jac)."""
+        self.bg_lin = np.asarray(bg, np.float64).copy()
+        self.ba_lin = np.asarray(ba, np.float64).copy()
+        self.pre = preintegrate_imu(self.seg[0], self.seg[1], self.seg[2],
+                                    self.bg_lin, self.ba_lin, noise=self.noise)
+
+    def maybe_relinearize(self, bg, ba) -> bool:
+        """Relinearise iff the live bias drifted past the threshold. Returns True
+        when a re-integration actually happened (the factor changed)."""
+        if (np.linalg.norm(np.asarray(bg, np.float64) - self.bg_lin) > self._thr_g
+                or np.linalg.norm(np.asarray(ba, np.float64) - self.ba_lin)
+                > self._thr_a):
+            self.relinearize(bg, ba)
+            return True
+        return False
+
+
+# --------------------------------------------------------------------------- #
 # Windowed tight-coupled VIO map (Basalt-style sliding window)
 # --------------------------------------------------------------------------- #
 @dataclass
@@ -722,7 +823,10 @@ class WindowedVIOMap:
         T_cw = np.asarray(T_cw, float).copy()
         ts_ns = int(ts_ns)
         if not self.keyframes:
-            kf = {"T_cw": T_cw, "obs": obs, "ts_ns": ts_ns, "pre": None,
+            # First KF has no inbound edge: ``edge`` is None and ``pre`` (the
+            # cached factor reference used by ``run_ba``) stays None.
+            kf = {"T_cw": T_cw, "obs": obs, "ts_ns": ts_ns,
+                  "edge": None, "pre": None,
                   "v": np.zeros(3), "bg": self.bg0.copy(), "ba": self.ba0.copy()}
         else:
             prev = self.keyframes[-1]
@@ -735,16 +839,24 @@ class WindowedVIOMap:
             else:
                 seg = _imu_segment(self.imu_ts, self.imu_gyro, self.imu_accel,
                                    prev["ts_ns"], ts_ns)
+            edge = None
             pre = None
             v_j = prev["v"].copy()
             if seg is not None:
-                pre = preintegrate_imu(seg[0], seg[1], seg[2], bg_i, ba_i)
+                # Build the per-edge cache: integrate ONCE here about the previous
+                # keyframe's bias (the same single preintegrate_imu call as before,
+                # default noise -> byte-identical deltas for the loose/oracle path).
+                # ``run_ba`` reuses ``edge.pre`` every solve and only re-integrates
+                # if the live bias drifts past threshold (tight path only).
+                edge = _ImuEdge(seg, bg_i, ba_i)
+                pre = edge.pre
                 R_i, _ = T_cw_to_body_world(prev["T_cw"])
                 dR, dv, dp = pre.corrected(bg_i, ba_i)
                 # predict velocity from the IMU increment (position/rotation are
                 # seeded from the visual pose instead, which is metric already).
                 v_j = prev["v"] + self.g_world * pre.dt + R_i @ dv
-            kf = {"T_cw": T_cw, "obs": obs, "ts_ns": ts_ns, "pre": pre,
+            kf = {"T_cw": T_cw, "obs": obs, "ts_ns": ts_ns,
+                  "edge": edge, "pre": pre,
                   "v": v_j, "bg": bg_i.copy(), "ba": ba_i.copy()}
         self.keyframes.append(kf)
         self._marginalize()
@@ -799,14 +911,30 @@ class WindowedVIOMap:
         if len(obs_cam) < 12:
             return None
 
-        # IMU factors between consecutive in-window keyframes. kf[ci]["pre"]
-        # links kf[ci-1] -> kf[ci]; the window's first keyframe's own "pre"
-        # (which linked to a now-dropped keyframe) is simply never referenced.
+        # IMU factors between consecutive in-window keyframes, read from the
+        # per-edge cache. ``kf[ci]["edge"]`` links kf[ci-1] -> kf[ci]; the
+        # window's first keyframe's own edge (which linked to a now-dropped
+        # keyframe) is simply never referenced.
+        #
+        # Cache reuse vs relinearisation: the cached ``edge.pre`` (deltas + bias
+        # Jacobians + Sigma_ij/sqrt_info) is reused every solve. The optimiser's
+        # per-iteration bias change is handled by the first-order
+        # ``pre.corrected`` update (no re-integration). Only on the covariance-
+        # weighted (tight) path do we refresh an edge whose keyframe bias has
+        # drifted materially from its linearisation point, so the covariance
+        # weight stays consistent with the current bias. The default / oracle
+        # path NEVER relinearises -> its factor is bit-identical to before.
+        relinearize = bool(self.cfg.vio.imu_info_weight)
         imu_factors = []
         for ci in range(1, len(kfs)):
-            pre = kfs[ci]["pre"]
-            if pre is not None:
-                imu_factors.append((ci - 1, ci, pre))
+            edge = kfs[ci]["edge"]
+            if edge is None:
+                continue
+            if relinearize:
+                # use the host keyframe (i = ci-1) bias as the linearisation pt
+                edge.maybe_relinearize(kfs[ci - 1]["bg"], kfs[ci - 1]["ba"])
+            kfs[ci]["pre"] = edge.pre        # keep the convenience reference fresh
+            imu_factors.append((ci - 1, ci, edge.pre))
         if not self.cfg.use_imu:
             imu_factors = []
 

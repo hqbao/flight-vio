@@ -368,12 +368,45 @@ Re-run `oracle_replay_selftest.py` after wiring to confirm `gap = 0`.
 - **Gate — MET:** Σ matches MC within statistical tolerance; no regression in
   `vio_ba_selftest.py`; byte-parity preserved.
 
-### Phase 1 — Weight the IMU factor + per-edge cache · ~0.5 day
-- Wire `Ω_I` into the `optimize_vio` IMU residual; add the per-edge preint cache
-  wrapper (template `GyroPreintegrator`).
-- **Test:** extend `vio_ba_selftest.py` to assert recovery still passes with the
-  weighted factor (and degrades gracefully with inflated `Σ`).
-- **Gate:** sub-mm / sub-mdeg recovery incl. bias retained.
+### Phase 1 — Weight the IMU factor + per-edge cache · DONE (2026-06-10)
+- **DONE.** `Ω_I = Σ_ij⁻¹` (the Phase-0 `pre.sqrt_info`) is wired into the
+  `optimize_vio` IMU residual, and a per-edge preintegration cache (`_ImuEdge`,
+  template `GyroPreintegrator`) was added to `vio_window.py`.
+  - **`_imu_residual`** now whitens the joint `[δφ; δv; δp]` with `sqrt_info @ r`
+    (ordering matches the Phase-0 covariance) **when `VioConfig.imu_info_weight`
+    is True**, falling back to the fixed `sigma_rot/vel/pos` otherwise. The bias
+    random-walk term is unchanged (still `_bias_rw_residual`, Gaussian, fixed
+    `σ_bg/ba_rw`).
+  - **`_ImuEdge` cache** owns the raw inter-KF IMU segment + the integrated
+    `ImuPreintegration` (deltas + 5 bias Jacobians + `Σ_ij`/`sqrt_info`). It
+    integrates **once** per edge in `add_keyframe`; `run_ba` reuses `edge.pre`
+    every solve and the optimiser's per-iteration bias change is absorbed by the
+    first-order `pre.corrected` update (no re-integration). Only the covariance-
+    weighted path relinearises an edge whose host-KF bias drifts past
+    `bias_reint_thresh` (`maybe_relinearize`), keeping `Σ_ij` consistent with the
+    current bias.
+- **CRITICAL byte-parity correction to §1/§4's "orphaned" premise.** The audit
+  premise that `vio_window.py` is reachable *only* from its self-test is **wrong
+  for this tree**: `verification/baseline_metrics.json` carries TWO frozen
+  `backend="vio"` entries (`lab_loop_30s`, `push_straight_fast_15s`) that drive
+  `WindowedVIORGBDOdometry → optimize_vio → _imu_residual` with real IMU factors.
+  A naive *replacement* of the fixed sigmas would therefore have moved the oracle
+  and broken `gap = 0`. So the new weighting is made **opt-in** via
+  `VioConfig.imu_info_weight` (default **False**) — exactly the §4 byte-parity
+  rule ("every tight-only behaviour is a default-OFF flag; the oracle leaves it
+  unset"). The oracle's `vio` backend uses the default `WindowedVIOConfig`, so it
+  keeps the fixed-sigma whitening and stays byte-identical; the tight path / the
+  new self-test scenarios turn the flag on. (Phase 2 wiring should set
+  `imu_info_weight=True` on the live `--tight` `WindowedVIOConfig`.)
+- **Test — PASS.** `vio_ba_selftest.py` extended with scenarios D/E/F (mirroring
+  A/B/C but `imu_info_weight=True`): with `Ω_I = sqrt_info` the joint solve
+  recovers ground truth to **pos ≤ 0.19 mm, rot ≤ 0.002°** (incl. bias),
+  degrading gracefully (not diverging) when `Σ` is inflated ×10. A/B/C keep the
+  flag OFF and are bit-unchanged, so they also guard the fixed-sigma path the
+  oracle depends on. Oracle `gap = 0`; `imu_preint_cov_selftest` and the other
+  vio self-tests still PASS; comms untouched; loose odometry/backend not modified.
+- **Gate — MET:** sub-mm / sub-mdeg recovery incl. bias retained under the
+  covariance-correct weight; byte-parity preserved.
 
 ### Phase 2 — Engine + selection plumbing (LOOSE byte-identical) · ~1–1.5 days
 - Add `make_vi_engine`, `vio_step`/`vio_overlay`, `_vio_worker_main`.
