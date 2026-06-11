@@ -5,7 +5,7 @@ verbatim from ``ours.flows.slam``; Flow -> Module, Task -> Step, Bus ->
 LocalPubSub):
 
 * :class:`~slam.modules.pipeline.SlamModule` -- subscribes ``keyframe`` and
-  publishes ``loop.correction``. Wraps :class:`~slam.mathlib.loop.slam.SlamMap`:
+  publishes ``loop.correction``. Wraps :class:`~sky.slam.slam.SlamMap`:
   every keyframe is added (the map's own motion gate may skip redundant ones);
   when a loop is confirmed the pose graph is optimised and the rewritten keyframe
   poses are published as a correction. The heavy ORB + pose-graph solve runs

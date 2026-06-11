@@ -51,7 +51,7 @@ from slam.comms.messages import END                                # noqa: E402
 from slam.comms.wire import WireCalibBundle                        # noqa: E402
 from slam.comms.ring_registry import default_vio_specs             # noqa: E402
 from slam.modules import SlamModule                                # noqa: E402
-from slam.mathlib.loop.slam import SlamConfig                      # noqa: E402
+from sky.slam.slam import SlamConfig                      # noqa: E402
 
 LOG = logging.getLogger("slam.main")
 

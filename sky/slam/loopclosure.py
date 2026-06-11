@@ -4,14 +4,14 @@ This is the *frontend* of the SLAM layer. Visual odometry tells us where the
 camera is up to accumulated drift; loop closure recognises when the camera has
 physically returned to a previously-seen place and produces a precise relative
 pose constraint between the two keyframes, which the pose graph
-(:mod:`slam.mathlib.loop.posegraph`) then uses to cancel the drift.
+(:mod:`sky.slam.posegraph`) then uses to cancel the drift.
 
 Honest pipeline note
 --------------------
 The ORB features here are *our own* real features detected on the real recorded
 image -- this is genuinely our loop-closure frontend, not a fake overlay of some
 black box's internals. Detection, description, matching, the epipolar pre-filter
-and the metric PnP are ALL our own library-free NumPy (:mod:`slam.mathlib.loop.orb` +
+and the metric PnP are ALL our own library-free NumPy (:mod:`sky.slam.orb` +
 :mod:`sky.front.pnp`); there is no cv2 anywhere on this path. The relative pose
 comes from a real RANSAC PnP on real depth-backprojected 3D points, so a
 confirmed loop is a real geometric fact.

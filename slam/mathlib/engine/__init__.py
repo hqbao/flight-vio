@@ -8,7 +8,7 @@ A flow picks how its optimiser runs with one ``worker`` flag:
   -- the solve runs in a separate process so it never holds the camera read loop's
   GIL (the fast-push undershoot fix).
 
-The engine wraps the existing loop-closure SLAM library (``slam.mathlib.loop.slam``)
+The engine wraps the existing loop-closure SLAM library (``sky.slam.slam``)
 and knows nothing about flows or the bus -- it is pure machinery (``mathlib``),
 called by the module steps.
 """
@@ -40,6 +40,6 @@ def make_slam_engine(K: np.ndarray, cfg, *, worker: bool = False,
     """
     if worker:
         return SubprocessEngine(_slam_worker_main, K, cfg)
-    from ..loop.slam import SlamMap
+    from sky.slam.slam import SlamMap
     return InProcessEngine(lambda: SlamMap(K, cfg, capture_loops=capture_loops),
                            slam_step, slam_overlay)

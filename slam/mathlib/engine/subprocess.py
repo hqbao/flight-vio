@@ -116,7 +116,7 @@ def _slam_worker_main(K, cfg, in_q, out_q, ov_q, stop_evt, reset_evt,
     and pushed on ``loops_q`` for the UI's loop-closure view. (The OFFLINE path
     uses the in-process engine and never sets this, so determinism is untouched.)
     """
-    from ..loop.slam import SlamMap
+    from sky.slam.slam import SlamMap
     from .steps import slam_step, slam_overlay
     _serve(lambda: SlamMap(K, cfg, capture_loops=True), slam_step, slam_overlay,
            in_q, out_q, ov_q, stop_evt, reset_evt, loops_q)

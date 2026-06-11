@@ -20,7 +20,7 @@ so the resolution-scaled tuning stays byte-identical to the reference oracle.
 from __future__ import annotations
 
 from slam.comms.lib.config.resolution import ResolutionProfile
-from slam.mathlib.loop.loopclosure import LoopConfig
+from sky.slam.loopclosure import LoopConfig
 
 
 def loop_config(res: ResolutionProfile) -> LoopConfig:

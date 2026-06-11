@@ -2,7 +2,7 @@
 
 Our own replacement for the subset of ``cv2.ORB`` / ``cv2.BFMatcher`` /
 ``cv2.findFundamentalMat`` that the loop-closure frontend
-(:mod:`slam.mathlib.loop.loopclosure`) needs, so the ``ours-slam`` path carries no cv2
+(:mod:`sky.slam.loopclosure`) needs, so the ``ours-slam`` path carries no cv2
 runtime dependency (matching what :mod:`sky.front.klt` /
 :mod:`sky.front.corners` did for the VO frontend).
 
@@ -336,7 +336,7 @@ def match_ratio_mutual(desc_a: np.ndarray, desc_b: np.ndarray,
     """Lowe-ratio + mutual (cross-check) matches a->b.
 
     Returns a list of ``(ia, ib)`` index pairs, mirroring the behaviour of
-    :meth:`slam.mathlib.loop.loopclosure.LoopDetector._good_matches`.
+    :meth:`sky.slam.loopclosure.LoopDetector._good_matches`.
     """
     if len(desc_a) < 2 or len(desc_b) < 2:
         return []

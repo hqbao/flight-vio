@@ -52,7 +52,7 @@ from vio.mathlib.imu.imu import GyroPreintegrator
 from sky.front.odometry import OdometryConfig, RGBDVisualOdometry
 from sky.backend.windowed import WindowedConfig, WindowedRGBDOdometry
 from vio.mathlib.backend.vio_window import WindowedVIORGBDOdometry
-from slam.mathlib.loop.slam import SlamConfig, SlamMap
+from sky.slam.slam import SlamConfig, SlamMap
 from sky.math import se3_inv
 
 

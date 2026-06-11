@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from slam.comms import LocalPubSub, Module, topics
 from slam.comms.step import Step
-from slam.mathlib.loop.slam import SlamConfig
+from sky.slam.slam import SlamConfig
 from slam.mathlib.engine import make_slam_engine
 from .slam_step import SlamStep
 from .publish_correction import PublishCorrection

@@ -51,7 +51,7 @@ from vio.comms.messages import (                                     # noqa: E40
 from vio.modules import OdometryModule                               # noqa: E402
 from sky.front.odometry import OdometryConfig            # noqa: E402
 from slam.modules import SlamModule                                  # noqa: E402
-from slam.mathlib.loop.slam import SlamConfig                        # noqa: E402
+from sky.slam.slam import SlamConfig                        # noqa: E402
 
 
 def _per_frame_imu(ts_all, gyro, accel, prev_ts, ts):

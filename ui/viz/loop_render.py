@@ -33,7 +33,7 @@ import cv2
 import numpy as np
 
 # Per-match verification-stage labels (must match
-# ``slam.mathlib.loop.loopclosure``: 0 = appearance, 1 = epipolar, 2 = PnP).
+# ``sky.slam.loopclosure``: 0 = appearance, 1 = epipolar, 2 = PnP).
 STAGE_APPEARANCE = 0
 STAGE_EPIPOLAR = 1
 STAGE_PNP = 2

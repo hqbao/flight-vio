@@ -14,7 +14,7 @@ loose sliding-window map that drives it, and its keyframe marginalization.
   builds them. That is why the core deduped cleanly: ``vio`` and ``slam`` shipped
   token-identical copies of this file (``slam``'s was in fact dead code -- nothing
   in ``slam`` imported it; ``slam`` loop closure runs its own pose-graph in
-  :mod:`slam.mathlib.loop.posegraph`), and the only behavioural divergence between
+  :mod:`sky.slam.posegraph`), and the only behavioural divergence between
   VIO BA and SLAM loop-closure BA lives in those callers, never here.
 * :mod:`sky.backend.windowed` -- :class:`~sky.backend.windowed.WindowedBAMap` /
   :class:`~sky.backend.windowed.WindowedRGBDOdometry`, the LOOSE sliding-window

@@ -2,9 +2,9 @@
 """Unit-test for the loop-closure match-funnel capture (no recorded data needed).
 
 The capture (``LoopDetector.verify_capture`` in
-:mod:`slam.mathlib.loop.loopclosure`) must (a) return EXACTLY what ``verify``
+:mod:`sky.slam.loopclosure`) must (a) return EXACTLY what ``verify``
 returns -- the offline path is byte-frozen -- and (b) ALSO populate a
-:class:`~slam.mathlib.loop.loopclosure.LoopMatchCapture` whose per-match stage
+:class:`~sky.slam.loopclosure.LoopMatchCapture` whose per-match stage
 labels and funnel counts are correct. This builds a SYNTHETIC, fully-controlled
 match set so the expected stage of every match is known a priori:
 
@@ -32,7 +32,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from slam.mathlib.loop.loopclosure import (                       # noqa: E402
+from sky.slam.loopclosure import (                       # noqa: E402
     KeyframeAppearance, LoopConfig, LoopDetector,
     STAGE_APPEARANCE, STAGE_EPIPOLAR, STAGE_PNP,
 )
