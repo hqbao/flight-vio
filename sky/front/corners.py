@@ -1,7 +1,7 @@
 """Pure-NumPy Shi-Tomasi corner detection.
 
 Our own replacement for ``cv2.goodFeaturesToTrack`` so the visual frontend
-detects corners library-free (the KLT tracker in :mod:`vio.mathlib.frontend.klt` already
+detects corners library-free (the KLT tracker in :mod:`sky.front.klt` already
 replaced ``cv2.calcOpticalFlowPyrLK``).
 
 It follows the standard Shi-Tomasi ("good features to track") recipe, the same

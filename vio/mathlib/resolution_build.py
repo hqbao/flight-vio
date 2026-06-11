@@ -21,7 +21,7 @@ so the resolution-scaled tuning stays byte-identical to the reference oracle.
 from __future__ import annotations
 
 from vio.comms.lib.config.resolution import ResolutionProfile, _round_odd
-from vio.mathlib.frontend.frontend import FrontendConfig
+from sky.front.frontend import FrontendConfig
 from vio.mathlib.odometry.odometry import OdometryConfig
 
 

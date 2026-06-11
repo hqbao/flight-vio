@@ -30,11 +30,11 @@ def warmup_klt(klt_cfg=None) -> bool:
     safe -- the real path then compiles on the first frame exactly as before).
     """
     try:
-        from vio.mathlib.frontend.klt_numba import HAVE_NUMBA
+        from sky.front.klt_numba import HAVE_NUMBA
         if not HAVE_NUMBA:
             return False
-        from vio.mathlib.frontend.frontend import FrontendConfig
-        from vio.mathlib.frontend.klt import calc_optical_flow_pyr_lk
+        from sky.front.frontend import FrontendConfig
+        from sky.front.klt import calc_optical_flow_pyr_lk
 
         klt = klt_cfg or FrontendConfig()
 

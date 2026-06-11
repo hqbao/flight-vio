@@ -78,7 +78,7 @@ import numpy as np
 
 from vio.comms import Module, LocalPubSub, topics
 from vio.comms.messages import END
-from vio.mathlib.frontend.frontend import FrontendConfig, KLTFrontend
+from sky.front.frontend import FrontendConfig, KLTFrontend
 from vio.mathlib.odometry.odometry import OdometryConfig, RGBDVisualOdometry
 from sky.backend.bundle import BAConfig
 from vio.mathlib.backend.windowed import WindowedConfig

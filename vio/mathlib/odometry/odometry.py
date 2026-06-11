@@ -1,7 +1,7 @@
 """RGB-D visual odometry: track-based 3D-2D PnP between consecutive frames.
 
 For each frame pair we already have KLT tracks (persistent ids) from
-:mod:`vio.mathlib.frontend`. The motion estimate works like a minimal feature-based
+:mod:`sky.front`. The motion estimate works like a minimal feature-based
 VO:
 
 1. Take tracks seen in *both* the previous and current frame.
@@ -30,7 +30,7 @@ from sky.math import so3_log
 
 from sky.front.pnp import solve_pnp_ransac
 
-from ..frontend.frontend import FrontendConfig, KLTFrontend
+from sky.front.frontend import FrontendConfig, KLTFrontend
 
 
 def level_attitude(R: np.ndarray, accel_cam: np.ndarray,

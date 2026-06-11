@@ -3,7 +3,7 @@
 
 This is the regression test that was missing while we kept "fixing" live lag
 blind. It pins down three independent things with hard pass/fail thresholds, so
-any future change to ``vio.mathlib.frontend.klt`` or ``vio.mathlib.frontend.corners`` is caught:
+any future change to ``sky.front.klt`` or ``sky.front.corners`` is caught:
 
 1. CORRECTNESS (synthetic, does NOT trust OpenCV) -- warp a deterministic
    textured image by a KNOWN sub-pixel translation, detect corners with our own
@@ -35,9 +35,9 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from vio.mathlib.frontend.corners import good_features_to_track            # noqa: E402
-from vio.mathlib.frontend.klt import _bilinear, calc_optical_flow_pyr_lk   # noqa: E402
-from vio.mathlib.frontend.frontend import FrontendConfig                   # noqa: E402
+from sky.front.corners import good_features_to_track            # noqa: E402
+from sky.front.klt import _bilinear, calc_optical_flow_pyr_lk   # noqa: E402
+from sky.front.frontend import FrontendConfig                   # noqa: E402
 
 try:
     import cv2
@@ -226,7 +226,7 @@ def test_backend_agreement() -> bool:
     true, which is the point -- the fallback is exercised either way.
     """
     print("== 1b. numba vs numpy backend agreement ==")
-    from vio.mathlib.frontend.klt_numba import HAVE_NUMBA
+    from sky.front.klt_numba import HAVE_NUMBA
     img0 = make_texture(seed=5)
     img1 = translate(img0, 2.1, -1.3)
     g0, g1 = img0.astype(np.uint8), img1.astype(np.uint8)

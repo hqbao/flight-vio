@@ -172,7 +172,7 @@ def run_vio(*,
     # longer flips LOST<->OK on clustered points). Numba availability only caps
     # the KLT window/pyramid/budget, never the detection geometry.
     try:
-        from vio.mathlib.frontend.klt_numba import HAVE_NUMBA
+        from sky.front.klt_numba import HAVE_NUMBA
     except Exception:
         HAVE_NUMBA = False
     res = ResolutionProfile.for_resolution(width, height)

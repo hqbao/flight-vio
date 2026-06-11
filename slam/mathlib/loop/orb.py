@@ -3,8 +3,8 @@
 Our own replacement for the subset of ``cv2.ORB`` / ``cv2.BFMatcher`` /
 ``cv2.findFundamentalMat`` that the loop-closure frontend
 (:mod:`slam.mathlib.loop.loopclosure`) needs, so the ``ours-slam`` path carries no cv2
-runtime dependency (matching what :mod:`vio.mathlib.frontend.klt` /
-:mod:`vio.mathlib.frontend.corners` did for the VO frontend).
+runtime dependency (matching what :mod:`sky.front.klt` /
+:mod:`sky.front.corners` did for the VO frontend).
 
 Pipeline (pure NumPy):
 

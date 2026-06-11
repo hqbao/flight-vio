@@ -4,7 +4,7 @@ Draws OUR KLT frontend's REAL tracks on a frame, coloured by the per-keypoint
 metric depth, with a per-id trail over the last ``TRAIL_LEN`` frames.
 
 Honest-data: the keypoints + persistent ids come straight from
-:class:`~vio.mathlib.frontend.frontend.KLTFrontend` -- the SAME frontend the
+:class:`~sky.front.frontend.KLTFrontend` -- the SAME frontend the
 odometry runs, not a parallel detector. The trail is the UI buffering each id's
 recent positions across frames (a derived-from-real signal, clearly that and
 nothing invented). Keypoints whose depth has no stereo return (``z == 0``) are

@@ -66,7 +66,7 @@ import numpy as np
 
 from sky.backend.bundle import BAConfig, optimize
 from .marginalize import MargPrior, marginalize_keyframe
-from ..frontend.frontend import FrontendConfig, KLTFrontend
+from sky.front.frontend import FrontendConfig, KLTFrontend
 from ..odometry.odometry import OdometryConfig, RGBDVisualOdometry
 
 
