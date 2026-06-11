@@ -122,7 +122,8 @@ def run_vio(*,
             backend_window: int = 6,
             backend_iters: int = 5,
             tight: bool = False,
-            stabilize_velocity: bool = False) -> int:
+            stabilize_velocity: bool = False,
+            depth_icp: bool = False) -> int:
     """Run the VIO process until END / SIGTERM / Ctrl-C.
 
     ``tight`` selects the TIGHT-coupled VIO backend (the joint visual + IMU
@@ -148,6 +149,13 @@ def run_vio(*,
     honours it inside its ``tight`` branch. When False the tight config is the
     untouched (oracle-tuned) default and the loose path is unaffected -- so the
     byte-parity oracle stays gap=0.
+
+    ``depth_icp`` enables the Phase-4 dense-ICP relative-pose factor on the tight
+    backend: an IMU-seeded point-to-plane ICP between adjacent in-window keyframe
+    depth clouds adds a measured TRANSLATION constraint, anchoring the
+    inter-keyframe Delta-p that the feature-starved 54x42 frontend cannot observe.
+    Opt-in and ``--tight`` ONLY (same contract as ``stabilize_velocity``); OFF
+    leaves the tight config + oracle byte-identical.
     """
     # Closed-loop feedback is --tight + LIVE only: a slam endpoint must be wired
     # AND the tight nav-state must exist (retain_imu, set by tight). The loose /
@@ -211,7 +219,8 @@ def run_vio(*,
     backend = BackendModule(local, bundle.K,
                             window=backend_window, iters=backend_iters,
                             latest_only=False, worker=worker, tight=tight,
-                            stabilize_velocity=stabilize_velocity)
+                            stabilize_velocity=stabilize_velocity,
+                            depth_icp=depth_icp)
 
     # 5. Open the OUTPUT IPCPubSub server + publisher bridge. KEYFRAME is the only
     #    VIO output that needs shared memory (image + depth payload), so it gets
@@ -383,6 +392,11 @@ def main() -> int:
                     help="tight only: enable Phase-4 velocity regularisation "
                          "(CV prior + gated ZUPT) to curb 54x42/shake velocity "
                          "divergence. Opt-in; ignored without --tight.")
+    ap.add_argument("--depth-icp", action="store_true",
+                    help="tight only: enable the Phase-4 dense-ICP relative-pose "
+                         "factor (IMU-seeded point-to-plane ICP between keyframe "
+                         "depth clouds) to anchor inter-keyframe translation at "
+                         "54x42. Opt-in; ignored without --tight.")
     args = ap.parse_args()
 
     return run_vio(
@@ -397,6 +411,7 @@ def main() -> int:
         backend_iters=args.backend_iters,
         tight=args.tight,
         stabilize_velocity=args.stabilize_velocity,
+        depth_icp=args.depth_icp,
     )
 
 

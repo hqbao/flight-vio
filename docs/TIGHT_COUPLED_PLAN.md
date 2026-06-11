@@ -554,6 +554,8 @@ propagation of the live output** — that was the user-visible "covered camera +
   marginalization with FEJ (replace drop-and-reanchor), gated on a NEES test;
   (d) low-res profile tuning (`min_ba_views`, window, landmark cap) for 54×42;
   (e) **velocity-divergence stabilisation at 54×42 — DONE (2026-06-11).**
+  (f) **dense-ICP relative-pose factor at 54×42 — BUILT + FALSIFIED, kept OPT-IN/
+  EXPERIMENTAL (2026-06-12): not a clear win, do NOT enable by default.**
 - **Gate per item:** no ATE regression vs MVP on gold; NEES within χ² bounds for (c).
 
 #### Phase 4(e) — velocity-divergence stabilisation (DONE 2026-06-11)
@@ -594,6 +596,69 @@ the shake runaway is *halved*, not fully flattened — the IMU dead-reckoning **
 itself ramps (`R@dv ≈ 2 m/s` per shake edge), and the CV prior caps the optimiser's
 peak but cannot undo the inflated seed. Scale stays <1 at 54×42 (still
 feature/depth-starved), so this is a real partial win, not a full fix.
+
+#### Phase 4(f) — dense-ICP relative-pose factor (BUILT, OPT-IN/EXPERIMENTAL, 2026-06-12)
+**Idea.** At 54×42 the sparse KLT frontend starves (5–10 % of frames < 6 tracks),
+so the inter-keyframe *translation* `Δp` goes unobservable. A **dense point-to-plane
+ICP** between two keyframes' depth clouds never fails (it always yields a translation
+constraint), so an ICP **relative-pose factor** between adjacent window keyframes
+should give `Δp` a real anchor, composing with the velocity prior (4e).
+
+**What was built (faithful to the math-reviewer spec, all OPT-IN, default OFF).**
+- **Leaf module `sky/depth/icp.py`** (`sky.*`-clean, numpy-only): `icp_p2plane_blend`
+  — IMU-seeded point-to-plane + small point-to-point blend, salient subset,
+  t-dist robust IRLS; returns `(T_icp_ij, Λ, n_corr, converged)` with `Λ` = the
+  point-to-plane normal-equation Hessian (the measurement information, `[trans;rot]`
+  order). Drops the factor when not-converged / under-determined.
+- **Factor in `vio_window.py`** (`VioConfig.icp_factor`, `IcpFactor`, `_icp_omega`,
+  `_icp_residual`): residual `r = Ω_icp · se3_log_robust(T_icp⁻¹ T_i⁻¹ T_j)`
+  (`[ρ;φ]`); the whitening `Ω_icp` eigendecomposes `Λ`, **projects out** eigen-
+  directions below `max(κ·λ_max, floor)` (the degeneracy remap), **overwrites the
+  rotation block** with a loose fixed `1/σ_rot_icp²` (gyro owns rotation) and **zeroes
+  the trans–rot cross-blocks**, computed once per factor. Jacobian via FD through the
+  same `_pose_perturb` as the IMU edge (tilt-lock handled automatically); the factor
+  touches ONLY the two pose blocks (no landmark-Schur coupling), ADDED to the sparse
+  reproj so it self-balances by information.
+- **Plumbing:** `WindowedVIOConfig.depth_icp` (sibling of `stabilize_velocity`);
+  `run_ba` caches each KF's cam-frame cloud + builds per-adjacent-pair factors +
+  `replace(vio_cfg, icp_factor=True)` only when on. Live flag `--depth-icp` threaded
+  launcher → vio.main → pipeline (tight-only, mirrors `--stabilize-velocity`).
+
+**Verification (all green).** Oracle `gap=0` byte-for-byte with flags OFF (incl.
+`backend="vio"`). Unit gates: ICP geometry + `Λ` info + single-plane null space
+(`icp_p2plane_selftest`); the **FD-Jacobian ordering/adjoint gate** matching analytic
+`Ω·Jr⁻¹(r)` to 1e-9 — and confirming the spec's `Ω·Ad(T_err)` oracle is the *r=0*
+form (`icp_factor_fd_selftest`); gap=0 dead-branch + pose-only assembly
+(`icp_factor_gap0_selftest`); the **flat-wall degeneracy SIL** — ICP-ON tracks the
+OFF baseline (1.01×, bounded, finite) on a single-plane lateral sweep, proving the
+eigenvalue remap (`icp_flatwall_degeneracy_selftest`). Launcher flag forwarding
+(`depth_icp_forward_selftest`). pyflakes 0; `sky.*` leaf.
+
+**HONEST falsification result (`verification/icp_factor_bench.py`, full gold clips).**
+ICP `Λ` is correct and the factor *does* carry translation info (trans-block info
+~40–75), but **it is NOT a clear win** and must stay opt-in:
+
+| clip (res)            | OFF ATE | vel ATE | icp ATE | icp+vel ATE | note |
+|-----------------------|--------:|--------:|--------:|------------:|------|
+| push_straight_fast (tof54) | 248.8 | 103.3 | **242.4** | 109.7 | icp alone ≈ OFF; +vel: phantom 19.1→6.6 cm, maxstep 152→135, scale 0.163→0.197, ATE slightly worse |
+| push_shake (tof54)    | 1554.2 | 832.9 | **1679.3** | 838.9 | icp alone WORSE than OFF; +vel ≈ vel |
+| lab_straight (tof54)  | 38.9 | 32.0 | 37.1 | **30.7** | the one positive: icp+vel beats vel (−21 % vs OFF), icp alone −4 % |
+| push_straight_fast (full) | 11.70 | 11.30 | 11.71 | 11.31 | inert (<0.1 %) — designed self-balancing |
+| push_shake (full)     | 842.8 | 813.7 | 838.0 | 809.6 | inert / marginally + |
+| lab_straight (full)   | 16.11 | 16.04 | 16.07 | 16.05 | inert (<0.5 %) |
+
+**Verdict.** ICP-*alone* does not improve the 54×42 cases beyond the velocity prior
+(≈ OFF on straight-fast, *worse* on shake); the only genuine gain is **icp+vel on the
+translation-dominant `lab_straight`** (best ATE of all configs) plus reduced phantom/
+maxstep on `push_straight_fast`. Full-res shows **NO regression** (ICP inert when
+vision is rich) and the flat-wall degeneracy stays **bounded** — so it is *safe* but
+not *worth* enabling. **Recommendation: keep `--depth-icp` OPT-IN / experimental, OFF
+by default; do NOT merge into the live default path.** Root cause of the weak 54×42
+gain: OAK-D *passive-stereo* depth at 54×42 is itself noisy/textureless, so the ICP
+constraint is barely more reliable than the sparse one it replaces — the real payoff
+needs the accurate per-pixel **VL53 ToF** depth (see `oakd-vl53-tof-pivot`), where the
+dense clouds are trustworthy. The module + factor are kept, gap=0-safe, ready to
+re-evaluate on real ToF.
 
 **Critical path to a usable `--tight`: Phases 0 → 1 → 2 → 2.5 → 3** (~3.5–4.5 days).
 **Status:** Phases 0, 1, 2, 2.5 DONE (2026-06-10) — `--tight` is wired + runs

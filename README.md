@@ -604,6 +604,12 @@ README lists its own; the headline gates:
 # math byte-parity vs the pre-split numbers
 .venv/bin/python -m vio.tests.vio_ba_selftest                   # windowed BA + tight-coupled VIO
 .venv/bin/python -m vio.tests.odometry_selftest                 # KLT + RGB-D PnP frontend
+
+# dense-ICP relative-pose factor (opt-in, Phase 4f; default OFF -> oracle gap=0)
+.venv/bin/python -m vio.tests.icp_p2plane_selftest             # ICP geometry + info + degeneracy
+.venv/bin/python -m vio.tests.icp_factor_fd_selftest          # FD Jacobian ordering/adjoint gate
+.venv/bin/python -m vio.tests.icp_factor_gap0_selftest        # gap=0 dead branch + pose-only
+.venv/bin/python -m vio.tests.icp_flatwall_degeneracy_selftest # flat-wall stays bounded
 .venv/bin/python -m slam.tests.loop_closure_selftest            # SE(3) pose graph + loop closure
 .venv/bin/python -m depth.tests.stereo_sgm_selftest             # SGM dense depth vs chip depth
 

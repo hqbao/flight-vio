@@ -238,6 +238,10 @@ def build_vio_args(args, cap_ep: str, vio_ep: str, slam_ep: str,
         # path (and the oracle) never see it.
         if args.stabilize_velocity:
             vio_args += ["--stabilize-velocity"]
+        # Phase-4 dense-ICP relative-pose factor: tight-only, opt-in. Same
+        # contract -- forwarded ONLY with BOTH --tight AND --depth-icp set.
+        if args.depth_icp:
+            vio_args += ["--depth-icp"]
     return vio_args
 
 
@@ -323,6 +327,11 @@ def main() -> int:
                          "(CV prior + gated ZUPT) to curb 54x42/shake velocity "
                          "divergence. Forwarded to vio.main --stabilize-velocity "
                          "only with --tight; ignored (warned) on the loose path.")
+    ap.add_argument("--depth-icp", action="store_true",
+                    help="tight only: enable the Phase-4 dense-ICP relative-pose "
+                         "factor (anchors inter-keyframe translation at 54x42). "
+                         "Forwarded to vio.main --depth-icp only with --tight; "
+                         "ignored (warned) on the loose path.")
     args = ap.parse_args()
 
     # SLAM keeps its live map current via a LATEST-ONLY in-process inbox (set in
@@ -372,6 +381,12 @@ def main() -> int:
         # builder already gates it behind --tight, this just tells the operator).
         LOG.warning("launcher: --stabilize-velocity has no effect without "
                     "--tight (loose path has no velocity state); ignoring it")
+    if args.depth_icp and not args.tight:
+        # --depth-icp only affects the tight backend's window solve; the loose
+        # path has no relative-pose factor, so warn + drop it (the builder gates
+        # it behind --tight, this just tells the operator).
+        LOG.warning("launcher: --depth-icp has no effect without --tight "
+                    "(loose path has no window factor graph); ignoring it")
     vio_args = build_vio_args(args, cap_ep, vio_ep, slam_ep, use_worker)
 
     # NB: the new `slam.main` is a PURE consumer of VIO's output and -- unlike the

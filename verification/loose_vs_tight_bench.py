@@ -155,7 +155,8 @@ def _tof_reduce(gray_src: np.ndarray, depth_src: np.ndarray) -> tuple[np.ndarray
 # --------------------------------------------------------------------------- #
 def run_session(session_dir: Path, *, backend: str, resolution: str,
                 imu_info_weight: bool = False, min_ba_views: int | None = None,
-                max_frames: int = 0) -> dict | None:
+                max_frames: int = 0, stabilize_velocity: bool = False,
+                depth_icp: bool = False) -> dict | None:
     """Run one backend over one session at one resolution; return metric dict.
 
     backend     : "ba" (LOOSE windowed BA) or "vio" (TIGHT preintegration VIO).
@@ -164,6 +165,8 @@ def run_session(session_dir: Path, *, backend: str, resolution: str,
                   (Phase 1), the live --tight weight. The frozen oracle uses False.
     min_ba_views: tight only -- lower it for the feature-starved 54x42 profile
                   (PLAN gate 3 allows this); None keeps the config default.
+    stabilize_velocity : tight only -- Phase-4 velocity prior (CV + gated ZUPT).
+    depth_icp   : tight only -- Phase-4 dense-ICP relative-pose factor.
 
     Returns None if the Basalt reference is missing/broken or there is too little
     overlap to score (so the caller can print "--").
@@ -219,6 +222,9 @@ def run_session(session_dir: Path, *, backend: str, resolution: str,
         wcfg.vio = replace(wcfg.vio, imu_info_weight=imu_info_weight)
         if min_ba_views is not None:
             wcfg.min_ba_views = int(min_ba_views)
+        # Phase-4 opt-in stabilisers (default OFF -> oracle-tuned tight path).
+        wcfg.stabilize_velocity = bool(stabilize_velocity)
+        wcfg.depth_icp = bool(depth_icp)
         vo = WindowedVIORGBDOdometry(
             K_solve, imu["ts_ns"], gyro_cam, accel_cam,
             bg0=bg0, ba0=np.zeros(3), cfg=wcfg, odom_cfg=odom_cfg)

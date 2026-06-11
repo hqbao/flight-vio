@@ -227,7 +227,8 @@ class BackendModule(Module):
     def __init__(self, bus: LocalPubSub, K: np.ndarray,
                  window: int = 6, iters: int = 5,
                  latest_only: bool = False, worker: bool = False,
-                 tight: bool = False, stabilize_velocity: bool = False) -> None:
+                 tight: bool = False, stabilize_velocity: bool = False,
+                 depth_icp: bool = False) -> None:
         super().__init__("backend", bus, latest_only=latest_only)
         if tight:
             # Tight backend: enable the covariance-correct IMU weight (Phase 1's
@@ -247,6 +248,16 @@ class BackendModule(Module):
                 vio_cfg.stabilize_velocity = True
                 LOG.info("vio: tight velocity-stabilize ON "
                          "(CV prior + gated ZUPT)")
+            # Phase-4 dense-ICP relative-pose factor (opt-in, LIVE --tight only):
+            # ``depth_icp`` makes ``run_ba`` add an IMU-seeded point-to-plane ICP
+            # relative-pose factor between adjacent in-window keyframes, anchoring
+            # the inter-keyframe TRANSLATION the feature-starved 54x42 frontend
+            # leaves unobservable. OFF by default so the tight-without-flag path
+            # and the oracle stay byte-identical; only --depth-icp sets it.
+            if depth_icp:
+                vio_cfg.depth_icp = True
+                LOG.info("vio: tight dense-ICP relative-pose factor ON "
+                         "(translation anchor for feature-starved frames)")
             self.engine = make_vi_engine(K, vio_cfg, worker=worker)
         else:
             cfg = WindowedConfig(window=window, ba=BAConfig(max_iters=iters))

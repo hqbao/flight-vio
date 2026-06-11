@@ -47,8 +47,10 @@ import numpy as np
 
 from sky.math import so3_exp_unit as so3_exp
 from sky.math import so3_log
+from sky.math import se3_from_Rp, se3_inv, se3_log_robust
 
 from sky.front.frontend import FrontendConfig, KLTFrontend
+from sky.depth.icp import backproject_depth, icp_p2plane_blend, imu_seed_relpose
 from ..imu.imu import ImuPreintegration, preintegrate_imu
 from sky.front.odometry import OdometryConfig, RGBDVisualOdometry
 
@@ -135,6 +137,35 @@ class VioConfig:
     sigma_vel_zupt: float = 0.5     # m/s, weak absolute anchor (>> sigma_vel_cv)
     zupt_accel_thresh: float = 0.30  # m/s^2, |dv|/dt below this == low excitation
     zupt_gyro_thresh: float = 0.20  # rad/s, |log(dR)|/dt below this == low excite
+    # --- Dense-ICP relative-pose factor (OPT-IN, default OFF -> oracle byte-safe)
+    # At 54x42 the sparse frontend FAILS on 5-10% of frames (<6 tracks), leaving
+    # the inter-keyframe TRANSLATION unobservable. A dense point-to-plane ICP
+    # between two keyframes' depth clouds never fails (it always yields a
+    # translation constraint), so an ICP relative-pose factor gives the missing
+    # Delta-p a real anchor. The factor is ADDED to (never replaces) the sparse
+    # reprojection: it self-balances by information -- full-res reproj dwarfs the
+    # ICP term (inert), 54x42 reproj collapses and the ICP carries Delta-p. The
+    # measurement information ``Lambda`` (the ICP point-to-plane Hessian) is
+    # whitened ONCE per factor into ``Omega_icp`` (see ``_icp_omega``) and held
+    # fixed during the solve, mirroring ``pre.sqrt_info``. When ``icp_factor`` is
+    # False AND no factors are supplied the build_system/total_cost loops are
+    # skipped entirely -> H/b/cost are BIT-IDENTICAL to today.
+    icp_factor: bool = False
+    sigma_rot_icp: float = 0.2      # rad: LOOSE fixed ICP rotation sigma. The gyro
+    #                                 owns rotation (ICP rotation is noisy), so the
+    #                                 rotation 3x3 block of Omega_icp is OVERWRITTEN
+    #                                 with 1/sigma_rot_icp^2 and the trans-rot cross
+    #                                 blocks are ZEROED -- ICP only pins translation.
+    icp_lambda_thresh: float = 0.02  # relative eigenvalue gate kappa: an eigen-
+    #                                 direction with lambda < kappa*lambda_max is a
+    #                                 degenerate (e.g. along-a-wall) direction and is
+    #                                 PROJECTED OUT (zero information) so the factor
+    #                                 never invents a constraint it cannot observe.
+    icp_lambda_floor: float = 1.0   # absolute eigenvalue floor (information units):
+    #                                 a direction below this is also projected out,
+    #                                 guarding the case where ALL eigenvalues are
+    #                                 small (a near-featureless cloud).
+    icp_huber: float = 3.0          # factor-level Huber threshold on ||r_icp||.
     huber_px: float = 2.0           # robust threshold on pixel residual
     use_depth: bool = True
     min_view_z: float = 1e-3
@@ -233,6 +264,93 @@ def _bias_rw_residual(bg_i, ba_i, bg_j, ba_j, cfg) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------- #
+# Dense-ICP relative-pose factor primitives.
+#
+# An ICP factor links two keyframes (i, j) by a measured relative pose
+# ``T_icp_ij`` (cam_i <- cam_j) with measurement information ``Lambda`` (6x6, the
+# ICP point-to-plane Hessian in [trans(3); rot(3)] order). The residual compares
+# the measured relative pose to the current state relative pose:
+#
+#     r_se3 = se3_log_robust( se3_inv(T_icp_ij) @ se3_inv(T_i) @ T_j )   ([rho;phi])
+#     r_icp = Omega_icp @ r_se3
+#
+# with ``T_i = se3_from_Rp(R_i, p_i)`` (cam_i->world, body == camera). At the
+# measurement (state relative pose == T_icp_ij) the residual is zero.
+#
+# The whitening ``Omega_icp`` is computed ONCE per factor from ``Lambda`` (like
+# ``pre.sqrt_info``) and held fixed through the solve.
+# --------------------------------------------------------------------------- #
+def _icp_omega(Lambda: np.ndarray, cfg) -> np.ndarray:
+    """6x6 whitening matrix ``Omega_icp`` from the ICP information ``Lambda``.
+
+    Pipeline (the crux -- faithfully implements the math-reviewer spec):
+
+    1. **Eigendecompose** ``Lambda`` (symmetric PSD, [trans;rot] order):
+       ``Lambda = V diag(lambda) V^T``.
+    2. **Degeneracy remap.** A direction with ``lambda < lambda_thr`` carries no
+       trustworthy information (e.g. translation ALONG a flat wall), so its
+       remapped eigenvalue is set to 0 (projected out). ``lambda_thr`` uses BOTH
+       a relative gate ``kappa * lambda_max`` (``cfg.icp_lambda_thresh``) AND an
+       absolute floor (``cfg.icp_lambda_floor``) so an all-small spectrum (a
+       near-featureless cloud) is projected out entirely rather than amplified.
+    3. **Overwrite the rotation 3x3 block** of the remapped information with the
+       LOOSE fixed ``1/sigma_rot_icp^2 I`` (the gyro owns rotation -- ICP rotation
+       is noisy) and **zero the trans-rot cross blocks**: the ICP factor pins only
+       translation, never fighting the IMU on rotation.
+    4. **Square-root via eigendecomposition** (NOT Cholesky, which would choke on
+       the projected-out zeros): ``Omega = diag(sqrt(mu)) @ U^T`` where
+       ``M = U diag(mu) U^T`` is the final block-structured information. Then
+       ``Omega.T @ Omega == M`` exactly, and ``Omega @ r`` whitens the residual.
+    """
+    Lambda = np.asarray(Lambda, np.float64)
+    Lambda = 0.5 * (Lambda + Lambda.T)        # symmetrise (guard FP asymmetry)
+    evals, V = np.linalg.eigh(Lambda)         # ascending; columns = eigenvectors
+    lam_max = float(evals[-1]) if evals.size else 0.0
+    lam_thr = max(cfg.icp_lambda_thresh * lam_max, cfg.icp_lambda_floor)
+    lam_remap = np.where(evals >= lam_thr, evals, 0.0)
+    # remapped full information, then impose the rotation/cross-block structure
+    M = V @ np.diag(lam_remap) @ V.T
+    inv_var_rot = 1.0 / (cfg.sigma_rot_icp * cfg.sigma_rot_icp)
+    M[0:3, 3:6] = 0.0
+    M[3:6, 0:3] = 0.0
+    M[3:6, 3:6] = np.eye(3) * inv_var_rot
+    # sqrt via eigendecomposition of the final symmetric PSD information
+    M = 0.5 * (M + M.T)
+    mu, U = np.linalg.eigh(M)
+    mu = np.clip(mu, 0.0, None)               # numerical floor at 0
+    Omega = np.diag(np.sqrt(mu)) @ U.T
+    return Omega
+
+
+def _icp_residual(R_i, p_i, R_j, p_j, T_icp_ij, Omega_icp) -> np.ndarray:
+    """Whitened ICP relative-pose residual ``Omega_icp @ r_se3`` ([rho;phi]).
+
+    ``r_se3 = se3_log_robust(se3_inv(T_icp_ij) @ se3_inv(T_i) @ T_j)`` with
+    ``T_i = (R_i, p_i)`` etc. (cam->world, body == camera). Zero at the
+    measurement.
+    """
+    T_i = se3_from_Rp(R_i, p_i)
+    T_j = se3_from_Rp(R_j, p_j)
+    T_err = se3_inv(T_icp_ij) @ se3_inv(T_i) @ T_j
+    r_se3 = se3_log_robust(T_err)
+    return Omega_icp @ r_se3
+
+
+@dataclass
+class IcpFactor:
+    """A dense-ICP relative-pose factor linking window keyframes ``i`` and ``j``.
+
+    ``T_icp_ij`` is the ICP-measured relative pose ``cam_i <- cam_j`` and
+    ``Omega_icp`` its precomputed 6x6 whitening (from :func:`_icp_omega`). Built
+    once by ``run_ba`` (or a test) and consumed unchanged by :func:`optimize_vio`.
+    """
+    i: int
+    j: int
+    T_icp_ij: np.ndarray
+    Omega_icp: np.ndarray
+
+
+# --------------------------------------------------------------------------- #
 # Pose perturbation helper.
 #   Full 6-DoF (up_axis None):  d = [dp(3), dphi(3)], R <- R Exp(dphi).
 #   Tilt-locked 4-DoF (up_axis): d = [dp(3), dyaw(1)], R <- Exp(up_axis*dyaw) R.
@@ -263,6 +381,7 @@ def optimize_vio(
     g_world: np.ndarray,
     cfg: VioConfig | None = None,
     anchor: int = 0,
+    icp_factors: list[IcpFactor] | None = None,
 ) -> VioResult:
     """Jointly refine poses, velocities, biases and landmarks.
 
@@ -272,8 +391,19 @@ def optimize_vio(
     imu_factors    : consecutive-keyframe preintegration factors (i, j, pre).
     g_world        : (3,) gravity ACCELERATION vector in the world frame
                      (e.g. optical-down [0, +9.81, 0]).
+    icp_factors    : OPT-IN dense-ICP relative-pose factors (:class:`IcpFactor`),
+                     each pinning the translation increment between two window
+                     keyframes. Default ``None``/empty -> the ICP loops are
+                     skipped and H/b/cost are bit-identical to the no-ICP build.
+                     Honoured only when ``cfg.icp_factor`` is True (the caller
+                     sets both together); an empty list with the flag on is a
+                     no-op too.
     """
     cfg = cfg or VioConfig()
+    # ICP factors are honoured only when the flag is on AND the list is non-empty;
+    # either condition false leaves ``icp_list`` empty so every ICP loop below is
+    # skipped -> the assembled H/b/cost stay bit-identical to the no-ICP build.
+    icp_list = (list(icp_factors) if (cfg.icp_factor and icp_factors) else [])
     st = state.copy()
     fx, fy, cx, cy = (float(K[0, 0]), float(K[1, 1]),
                       float(K[0, 2]), float(K[1, 2]))
@@ -435,6 +565,18 @@ def optimize_vio(
                 if zupt_on[ci]:
                     r_z = stt.v[ci] / cfg.sigma_vel_zupt
                     cost += 0.5 * float(r_z @ r_z)
+        # Dense-ICP relative-pose factors (opt-in; empty list -> no contribution).
+        # Factor-level Huber on the whitened residual norm so a single bad ICP
+        # match cannot dominate the window cost.
+        for f in icp_list:
+            r_icp = _icp_residual(stt.R[f.i], stt.p[f.i], stt.R[f.j], stt.p[f.j],
+                                  f.T_icp_ij, f.Omega_icp)
+            e = float(np.linalg.norm(r_icp))
+            thr = cfg.icp_huber
+            if e <= thr:
+                cost += 0.5 * float(r_icp @ r_icp)
+            else:
+                cost += thr * (e - 0.5 * thr)
         return cost, mean_e
 
     # --- one Gauss-Newton/LM linear system ---------------------------------
@@ -613,6 +755,53 @@ def optimize_vio(
                 vrange = slice(vc, vc + 3)
                 H[vrange, vrange] += np.eye(3) * inv_var_z
                 b[vc:vc + 3] += stt.v[ci] * inv_var_z
+
+        # Dense-ICP relative-pose factors (opt-in; empty list -> nothing added).
+        # POSE-ONLY: each factor differentiates only the two keyframe POSE blocks
+        # (i, j), so -- mirroring the IMU edge -- it scatters into H[pose,pose] and
+        # b[pose] without touching velocity / bias / landmark columns (no
+        # landmark-Schur coupling). The Jacobian is finite-differenced through the
+        # SAME ``_pose_perturb`` the IMU edge uses, so tilt-lock (pose_dof=4, yaw-
+        # about-vertical) is handled identically and automatically. Omega_icp is
+        # fixed (computed once per factor), so the residual is differentiable.
+        for f in icp_list:
+            r0i = _icp_residual(stt.R[f.i], stt.p[f.i], stt.R[f.j], stt.p[f.j],
+                                f.T_icp_ij, f.Omega_icp)
+            # IRLS Huber sqrt-weight on the whitened residual norm (held fixed
+            # across this linearisation, like the reproj/depth robust weights).
+            e = float(np.linalg.norm(r0i))
+            sw = 1.0 if e <= cfg.icp_huber else np.sqrt(cfg.icp_huber / e)
+
+            blocks = []
+            if pose_col[f.i] >= 0:
+                blocks.append((f.i, pose_col[f.i]))
+            if pose_col[f.j] >= 0:
+                blocks.append((f.j, pose_col[f.j]))
+            if not blocks:
+                continue                      # both poses anchored -> nothing free
+            idx = []
+            for _, base in blocks:
+                idx.extend(range(base, base + pose_dof))
+            idx = np.asarray(idx, np.int64)
+            Ji = np.zeros((r0i.shape[0], idx.shape[0]))
+            col = 0
+            for ci, _base in blocks:
+                R_c, p_c = stt.R[ci], stt.p[ci]
+                for d in range(pose_dof):
+                    dd = np.zeros(pose_dof); dd[d] = eps
+                    Rp, pp = _pose_perturb(R_c, p_c, dd, up_axis)
+                    if ci == f.i:
+                        rp = _icp_residual(Rp, pp, stt.R[f.j], stt.p[f.j],
+                                           f.T_icp_ij, f.Omega_icp)
+                    else:
+                        rp = _icp_residual(stt.R[f.i], stt.p[f.i], Rp, pp,
+                                           f.T_icp_ij, f.Omega_icp)
+                    Ji[:, col] = (rp - r0i) / eps
+                    col += 1
+            Ji *= sw
+            r0w = r0i * sw
+            H[np.ix_(idx, idx)] += Ji.T @ Ji
+            b[idx] += Ji.T @ r0w
 
         return H, b
 
@@ -822,6 +1011,15 @@ class WindowedVIOConfig:
     # via dataclasses.replace, so a caller need not reach into the nested VioConfig.
     # Default False -> the nested VioConfig flags stay OFF -> oracle byte-safe.
     stabilize_velocity: bool = False
+    # Phase-4 dense-ICP relative-pose factor (OPT-IN, sibling of
+    # ``stabilize_velocity``). When True, ``run_ba`` backprojects each keyframe's
+    # depth into a cached cam-frame cloud and adds a dense point-to-plane ICP
+    # relative-pose factor between every adjacent in-window keyframe pair, then
+    # flips ``self.cfg.vio.icp_factor`` on for that solve. The factor gives the
+    # inter-keyframe TRANSLATION the anchor the feature-starved 54x42 frontend
+    # cannot. Default False -> no clouds cached, no factors built, vio_cfg
+    # unchanged -> oracle byte-identical. Composes with ``stabilize_velocity``.
+    depth_icp: bool = False
     # The windowed VIO solves each pose with roll/pitch LOCKED (lock_tilt): the
     # accelerometer owns tilt absolutely (gravity is an absolute reference), so
     # the joint solve only refines what the IMU cannot observe -- yaw + position
@@ -851,6 +1049,11 @@ class WindowedVIOMap:
     carries its device-clock timestamp; the map preintegrates the IMU between
     consecutive keyframe timestamps internally.
     """
+
+    #: Soft cap on the per-keyframe ICP cloud size (points). A 54x42 ToF frame
+    #: (2268 px) is under this so it is taken whole; full-res frames are strided
+    #: down to roughly this many points before the salient subset is taken.
+    _ICP_CLOUD_CAP = 2500
 
     def __init__(self, K: np.ndarray, ts_ns: np.ndarray | None = None,
                  gyro_cam: np.ndarray | None = None,
@@ -918,11 +1121,29 @@ class WindowedVIOMap:
 
         T_cw = np.asarray(T_cw, float).copy()
         ts_ns = int(ts_ns)
+        # Dense-ICP cloud cache (opt-in): backproject this keyframe's depth into
+        # its CAMERA frame ONCE here, so ``run_ba`` reuses it every solve instead
+        # of re-backprojecting. ``None`` when the ICP factor is OFF (no cost on the
+        # default / oracle path). The cloud is in the camera optical frame -- the
+        # same body==camera frame the poses live in -- so ``T_i^-1 T_j`` maps the
+        # cam_j cloud into cam_i for the relative ICP.
+        cloud = None
+        if self.cfg.depth_icp:
+            # Cap the cloud at ~ICP_CLOUD_CAP points so the brute-force NN stays
+            # cheap: a 54x42 ToF frame (2268 px) is taken whole (stride 1), a
+            # full-res 640x400 frame is strided down. The salient subset inside
+            # ICP further shrinks what is actually matched.
+            npx = h * w
+            stride = max(1, int(np.ceil(np.sqrt(npx / self._ICP_CLOUD_CAP))))
+            cloud = backproject_depth(
+                np.asarray(depth_m, np.float64), self.K,
+                min_z=self.cfg.min_depth_m, max_z=self.cfg.max_depth_m,
+                stride=stride)
         if not self.keyframes:
             # First KF has no inbound edge: ``edge`` is None and ``pre`` (the
             # cached factor reference used by ``run_ba``) stays None.
             kf = {"T_cw": T_cw, "obs": obs, "ts_ns": ts_ns,
-                  "edge": None, "pre": None,
+                  "edge": None, "pre": None, "cloud": cloud,
                   "v": np.zeros(3), "bg": self.bg0.copy(), "ba": self.ba0.copy()}
         else:
             prev = self.keyframes[-1]
@@ -952,7 +1173,7 @@ class WindowedVIOMap:
                 # seeded from the visual pose instead, which is metric already).
                 v_j = prev["v"] + self.g_world * pre.dt + R_i @ dv
             kf = {"T_cw": T_cw, "obs": obs, "ts_ns": ts_ns,
-                  "edge": edge, "pre": pre,
+                  "edge": edge, "pre": pre, "cloud": cloud,
                   "v": v_j, "bg": bg_i.copy(), "ba": ba_i.copy()}
         self.keyframes.append(kf)
         self._marginalize()
@@ -1042,11 +1263,20 @@ class WindowedVIOMap:
         if self.cfg.stabilize_velocity:
             vio_cfg = replace(vio_cfg, vel_cv_prior=True, vel_zupt=True)
 
+        # Phase-4 dense-ICP relative-pose factors (opt-in): one per adjacent
+        # in-window KF pair whose cached clouds converge. Default OFF -> empty
+        # list, ``icp_factor`` stays False -> the optimiser's ICP loops are
+        # skipped and the solve is byte-identical to today.
+        icp_factors = []
+        if self.cfg.depth_icp:
+            vio_cfg = replace(vio_cfg, icp_factor=True)
+            icp_factors = self._build_icp_factors(kfs, st, vio_cfg)
+
         res = optimize_vio(
             self.K, st,
             np.array(obs_cam), np.array(obs_lm), np.array(obs_uv),
             np.array(obs_depth), imu_factors, self.g_world,
-            cfg=vio_cfg, anchor=0,
+            cfg=vio_cfg, anchor=0, icp_factors=icp_factors,
         )
         out = res.state
         for ci, kf in enumerate(kfs):
@@ -1060,9 +1290,51 @@ class WindowedVIOMap:
         self.last_info = {
             "vio_kfs": len(kfs), "vio_lms": len(ba_tids),
             "vio_obs": len(obs_cam), "vio_imu": len(imu_factors),
+            "vio_icp": len(icp_factors),
             "vio_iters": res.iters, "vio_reproj_px": res.mean_reproj_px,
         }
         return kfs[-1]["T_cw"].copy()
+
+    def _build_icp_factors(self, kfs, st, vio_cfg):
+        """Dense-ICP relative-pose factors for adjacent in-window KF pairs.
+
+        For each pair (ci-1, ci) with both cached clouds present, run the IMU-
+        seeded point-to-plane ICP (``cam_{ci-1} <- cam_ci``) and -- iff it
+        converges with enough correspondences -- emit an :class:`IcpFactor` whose
+        whitening ``Omega_icp`` is built once from the ICP information ``Lambda``.
+        A non-converged / under-determined ICP yields NO factor (the spec's drop
+        rule), so a degenerate frame simply contributes nothing rather than a
+        bad constraint.
+
+        Seed: the current window's STATE relative pose ``T_i^-1 T_j`` (visual +
+        prior-solve IMU, metric and frame-exact) refined towards the IMU edge's
+        rotation increment ``dR`` so a fast rotation still seeds close. This is
+        the best available baseline guess and lands ICP within a few iterations.
+        """
+        factors: list[IcpFactor] = []
+        for ci in range(1, len(kfs)):
+            cloud_i = kfs[ci - 1].get("cloud")
+            cloud_j = kfs[ci].get("cloud")
+            if cloud_i is None or cloud_j is None:
+                continue
+            i, j = ci - 1, ci
+            # state relative pose cam_i <- cam_j as the ICP seed
+            T_i = se3_from_Rp(st.R[i], st.p[i])
+            T_j = se3_from_Rp(st.R[j], st.p[j])
+            T_seed = se3_inv(T_i) @ T_j
+            edge = kfs[ci].get("edge")
+            if edge is not None and edge.pre is not None:
+                # blend in the IMU rotation increment (gyro is the trustworthy
+                # rotation source) while keeping the metric state translation seed.
+                dR, _dv, dp = edge.pre.corrected(kfs[i]["bg"], kfs[i]["ba"])
+                T_seed = imu_seed_relpose(dR, T_seed[:3, 3])
+            T_icp, Lambda, n_corr, converged = icp_p2plane_blend(
+                cloud_i, cloud_j, T_seed)
+            if not converged or n_corr < 20:
+                continue
+            Omega = _icp_omega(Lambda, vio_cfg)
+            factors.append(IcpFactor(i=i, j=j, T_icp_ij=T_icp, Omega_icp=Omega))
+        return factors
 
 
 class WindowedVIORGBDOdometry:
