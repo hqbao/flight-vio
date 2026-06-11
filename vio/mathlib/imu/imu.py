@@ -33,55 +33,15 @@ from __future__ import annotations
 
 import numpy as np
 
-
-def so3_exp(omega: np.ndarray) -> np.ndarray:
-    """Rodrigues exponential map: rotation vector (rad) -> 3x3 rotation matrix."""
-    theta = float(np.linalg.norm(omega))
-    if theta < 1e-12:
-        return np.eye(3)
-    k = omega / theta
-    K = np.array([[0.0, -k[2], k[1]],
-                  [k[2], 0.0, -k[0]],
-                  [-k[1], k[0], 0.0]])
-    return np.eye(3) + np.sin(theta) * K + (1.0 - np.cos(theta)) * (K @ K)
-
-
-def _skew(w: np.ndarray) -> np.ndarray:
-    return np.array([[0.0, -w[2], w[1]],
-                     [w[2], 0.0, -w[0]],
-                     [-w[1], w[0], 0.0]])
-
-
-def so3_log(R: np.ndarray) -> np.ndarray:
-    """Inverse of :func:`so3_exp`: rotation matrix -> rotation vector (rad)."""
-    c = (np.trace(R) - 1.0) * 0.5
-    c = max(-1.0, min(1.0, c))
-    theta = float(np.arccos(c))
-    if theta < 1e-12:
-        # near identity: vee of the skew part (first-order)
-        return np.array([R[2, 1] - R[1, 2],
-                         R[0, 2] - R[2, 0],
-                         R[1, 0] - R[0, 1]]) * 0.5
-    w = np.array([R[2, 1] - R[1, 2],
-                  R[0, 2] - R[2, 0],
-                  R[1, 0] - R[0, 1]])
-    return w * (theta / (2.0 * np.sin(theta)))
-
-
-def so3_right_jacobian(phi: np.ndarray) -> np.ndarray:
-    """Right Jacobian of SO(3): ``Exp(phi + dphi) ~= Exp(phi) Exp(Jr(phi) dphi)``.
-
-    Used by IMU preintegration to propagate the bias Jacobian of the
-    preintegrated rotation. Falls back to the small-angle form near zero.
-    """
-    theta = float(np.linalg.norm(phi))
-    K = _skew(phi)
-    if theta < 1e-8:
-        return np.eye(3) - 0.5 * K
-    t2 = theta * theta
-    return (np.eye(3)
-            - (1.0 - np.cos(theta)) / t2 * K
-            + (theta - np.sin(theta)) / (t2 * theta) * (K @ K))
+# SO(3) primitives live in the shared ``skymath`` kernel. The IMU module uses the
+# "unit" exponential (exact identity at zero) -- re-exported here under the names
+# the odometry / PnP / windowed-BA importers expect (``so3_exp`` / ``so3_log`` /
+# ``so3_right_jacobian``). Numerics are byte-identical to the former local copies.
+from skymath import se3_exp_unit as _se3_exp
+from skymath import se3_log as _se3_log
+from skymath import skew as _skew
+from skymath import so3_exp_unit as so3_exp
+from skymath import so3_log, so3_right_jacobian
 
 
 class ImuNoise:
@@ -708,78 +668,6 @@ def apply_se3_left(R_delta: np.ndarray, p_delta: np.ndarray,
     R_new = R_delta @ np.asarray(R, np.float64)
     p_new = R_delta @ np.asarray(p, np.float64) + p_delta
     return R_new, p_new
-
-
-def se3_from_Rp(R: np.ndarray, p: np.ndarray) -> np.ndarray:
-    """Pack a rotation + translation into a 4x4 homogeneous SE(3) matrix."""
-    T = np.eye(4)
-    T[:3, :3] = np.asarray(R, np.float64)
-    T[:3, 3] = np.asarray(p, np.float64)
-    return T
-
-
-def se3_inv(T: np.ndarray) -> np.ndarray:
-    """Inverse of a 4x4 SE(3): ``inv((R, t)) = (R^T, -R^T t)`` (no full solve)."""
-    T = np.asarray(T, np.float64)
-    R = T[:3, :3]
-    t = T[:3, 3]
-    out = np.eye(4)
-    out[:3, :3] = R.T
-    out[:3, 3] = -R.T @ t
-    return out
-
-
-def _skew4(w: np.ndarray) -> np.ndarray:
-    return np.array([[0.0, -w[2], w[1]],
-                     [w[2], 0.0, -w[0]],
-                     [-w[1], w[0], 0.0]])
-
-
-def _se3_exp(xi: np.ndarray) -> np.ndarray:
-    """Exponential map se3 -> SE3. ``xi = [rho(3); phi(3)]`` -> 4x4.
-
-    Local copy of the bundle-module's ``se3_exp`` so this IMU module stays free of
-    backend imports (kept movable per the VIO-library consolidation note); the
-    convention is identical (left-perturbation, ``rho`` first).
-    """
-    rho = xi[:3]
-    phi = xi[3:]
-    theta = float(np.linalg.norm(phi))
-    R = so3_exp(phi)
-    if theta < 1e-12:
-        V = np.eye(3) + 0.5 * _skew4(phi)
-    else:
-        K = _skew4(phi / theta)
-        V = (np.eye(3)
-             + (1.0 - np.cos(theta)) / theta * K
-             + (theta - np.sin(theta)) / theta * (K @ K))
-    T = np.eye(4)
-    T[:3, :3] = R
-    T[:3, 3] = V @ rho
-    return T
-
-
-def _se3_log(T: np.ndarray) -> np.ndarray:
-    """Logarithm map SE3 -> se3 (inverse of :func:`_se3_exp`).
-
-    Returns ``xi = [rho(3); phi(3)]`` with ``_se3_exp(xi) == T``.
-    """
-    R = T[:3, :3]
-    t = T[:3, 3]
-    phi = so3_log(R)
-    theta = float(np.linalg.norm(phi))
-    if theta < 1e-8:
-        V = np.eye(3) + 0.5 * _skew4(phi)
-    else:
-        K = _skew4(phi / theta)
-        V = (np.eye(3)
-             + (1.0 - np.cos(theta)) / theta * K
-             + (theta - np.sin(theta)) / theta * (K @ K))
-    rho = np.linalg.solve(V, t)
-    xi = np.empty(6)
-    xi[:3] = rho
-    xi[3:] = phi
-    return xi
 
 
 def gravity_aligned_R0(accel_cam: np.ndarray) -> np.ndarray:

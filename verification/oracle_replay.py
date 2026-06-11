@@ -53,7 +53,7 @@ from vio.mathlib.odometry.odometry import OdometryConfig, RGBDVisualOdometry
 from vio.mathlib.backend.windowed import WindowedConfig, WindowedRGBDOdometry
 from vio.mathlib.backend.vio_window import WindowedVIORGBDOdometry
 from slam.mathlib.loop.slam import SlamConfig, SlamMap
-from slam.mathlib.loop.posegraph import se3_inv
+from skymath import se3_inv
 
 
 # --------------------------------------------------------------------------- #

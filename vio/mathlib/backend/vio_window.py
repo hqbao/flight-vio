@@ -45,15 +45,12 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from skymath import so3_exp_unit as so3_exp
+from skymath import so3_log
+
 from ..frontend.frontend import FrontendConfig, KLTFrontend
-from ..imu.imu import ImuPreintegration, preintegrate_imu, so3_exp, so3_log
+from ..imu.imu import ImuPreintegration, preintegrate_imu
 from ..odometry.odometry import OdometryConfig, RGBDVisualOdometry
-
-
-def _skew(w: np.ndarray) -> np.ndarray:
-    return np.array([[0.0, -w[2], w[1]],
-                     [w[2], 0.0, -w[0]],
-                     [-w[1], w[0], 0.0]])
 
 
 # --------------------------------------------------------------------------- #

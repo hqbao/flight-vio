@@ -25,8 +25,10 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from skymath import se3_inv
+
 from .loopclosure import LoopConfig, LoopDetector
-from .posegraph import PoseGraph, se3_inv
+from .posegraph import PoseGraph
 
 
 @dataclass

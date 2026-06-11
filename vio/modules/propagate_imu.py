@@ -98,12 +98,15 @@ import logging
 
 import numpy as np
 
+from skymath import se3_from_Rp as _se3
+from skymath import se3_inv as _se3_inv
+from skymath import so3_log
+
 from vio.comms import Step as StepBase
 from vio.mathlib.backend.vio_window import T_cw_to_body_world, body_world_to_T_cw
 from vio.mathlib.imu.imu import (
     apply_se3_left, complementary_correct, imu_at_rest, loop_correction_delta,
-    predict_state, scale_se3_delta, se3_from_Rp as _se3, se3_inv as _se3_inv,
-    so3_log)
+    predict_state, scale_se3_delta)
 from .step import Step
 
 LOG = logging.getLogger("vio.propagate_imu")

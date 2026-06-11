@@ -35,75 +35,11 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from ..backend.bundle import se3_exp, skew
-
-
-# --------------------------------------------------------------------------- #
-# SE(3) log + adjoint (se3_exp / so3_exp / skew live in bundle.py)
-# --------------------------------------------------------------------------- #
-def so3_log(R: np.ndarray) -> np.ndarray:
-    """SO(3) -> so3 (rotation matrix to rotation vector)."""
-    c = (np.trace(R) - 1.0) * 0.5
-    c = float(np.clip(c, -1.0, 1.0))
-    theta = float(np.arccos(c))
-    if theta < 1e-9:
-        # Near identity: vee of the skew-symmetric part (first-order).
-        return 0.5 * np.array([R[2, 1] - R[1, 2],
-                               R[0, 2] - R[2, 0],
-                               R[1, 0] - R[0, 1]])
-    if np.pi - theta < 1e-6:
-        # Near pi: recover axis from the symmetric part (sign-robust).
-        A = (R + np.eye(3)) * 0.5
-        axis = np.sqrt(np.clip(np.diag(A), 0.0, None))
-        # fix signs from off-diagonals
-        if axis[0] > 1e-6:
-            axis[1] = np.copysign(axis[1], A[0, 1])
-            axis[2] = np.copysign(axis[2], A[0, 2])
-        elif axis[1] > 1e-6:
-            axis[2] = np.copysign(axis[2], A[1, 2])
-        axis = axis / max(np.linalg.norm(axis), 1e-12)
-        return theta * axis
-    w = theta / (2.0 * np.sin(theta))
-    return w * np.array([R[2, 1] - R[1, 2],
-                         R[0, 2] - R[2, 0],
-                         R[1, 0] - R[0, 1]])
-
-
-def se3_log(T: np.ndarray) -> np.ndarray:
-    """SE(3) -> se3. Returns xi = [rho(3); phi(3)] (translation part first)."""
-    R = T[:3, :3]
-    t = T[:3, 3]
-    phi = so3_log(R)
-    theta = float(np.linalg.norm(phi))
-    if theta < 1e-9:
-        Vinv = np.eye(3) - 0.5 * skew(phi)
-    else:
-        K = skew(phi)
-        a = 1.0 / (theta * theta)
-        b = (1.0 + np.cos(theta)) / (2.0 * theta * np.sin(theta))
-        Vinv = np.eye(3) - 0.5 * K + (a - b) * (K @ K)
-    rho = Vinv @ t
-    return np.concatenate([rho, phi])
-
-
-def se3_adjoint(T: np.ndarray) -> np.ndarray:
-    """6x6 adjoint Ad(T) for the [rho; phi] (translation-first) twist order."""
-    R = T[:3, :3]
-    t = T[:3, 3]
-    Ad = np.zeros((6, 6))
-    Ad[:3, :3] = R
-    Ad[:3, 3:] = skew(t) @ R
-    Ad[3:, 3:] = R
-    return Ad
-
-
-def se3_inv(T: np.ndarray) -> np.ndarray:
-    R = T[:3, :3]
-    t = T[:3, 3]
-    Ti = np.eye(4)
-    Ti[:3, :3] = R.T
-    Ti[:3, 3] = -R.T @ t
-    return Ti
+# The pose graph uses the near-pi-robust SO(3) log (sign-robust axis recovery
+# near a half-turn) for the scalar fallback inside :func:`_so3_log_batch`. The
+# rest of the solver is fully vectorised (the ``*_batch`` helpers below). Numerics
+# are byte-identical to the former local ``so3_log``.
+from skymath import so3_log_robust as so3_log
 
 
 # --------------------------------------------------------------------------- #
@@ -309,7 +245,6 @@ class PoseGraph:
         a = idx[anchor]
 
         ei, ej, Zinv, Om0, loop = self._edge_arrays(idx)
-        M = len(self.edges)
         ar6 = np.arange(6)
         # Block scatter indices into the 6N x 6N H (one set per block type) and b.
         ri = 6 * ei[:, None] + ar6[None, :]          # (M, 6) rows for node i

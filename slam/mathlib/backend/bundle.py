@@ -29,81 +29,11 @@ from dataclasses import dataclass
 
 import numpy as np
 
-
-# --------------------------------------------------------------------------- #
-# Lie-group helpers (SE3 / SO3)
-# --------------------------------------------------------------------------- #
-def skew(w: np.ndarray) -> np.ndarray:
-    return np.array([[0.0, -w[2], w[1]],
-                     [w[2], 0.0, -w[0]],
-                     [-w[1], w[0], 0.0]])
-
-
-def so3_exp(phi: np.ndarray) -> np.ndarray:
-    """Exponential map so3 -> SO3 (Rodrigues)."""
-    theta = float(np.linalg.norm(phi))
-    if theta < 1e-12:
-        return np.eye(3) + skew(phi)
-    k = phi / theta
-    K = skew(k)
-    return np.eye(3) + np.sin(theta) * K + (1.0 - np.cos(theta)) * (K @ K)
-
-
-def se3_exp(xi: np.ndarray) -> np.ndarray:
-    """Exponential map se3 -> SE3. xi = [rho(3); phi(3)] -> 4x4."""
-    rho = xi[:3]
-    phi = xi[3:]
-    theta = float(np.linalg.norm(phi))
-    R = so3_exp(phi)
-    if theta < 1e-12:
-        V = np.eye(3) + 0.5 * skew(phi)
-    else:
-        K = skew(phi / theta)
-        V = (np.eye(3)
-             + (1.0 - np.cos(theta)) / theta * K
-             + (theta - np.sin(theta)) / theta * (K @ K))
-    T = np.eye(4)
-    T[:3, :3] = R
-    T[:3, 3] = V @ rho
-    return T
-
-
-def so3_log(R: np.ndarray) -> np.ndarray:
-    """Logarithm map SO3 -> so3 (inverse of :func:`so3_exp`)."""
-    cos_t = (np.trace(R) - 1.0) * 0.5
-    cos_t = float(np.clip(cos_t, -1.0, 1.0))
-    theta = float(np.arccos(cos_t))
-    w = np.array([R[2, 1] - R[1, 2],
-                  R[0, 2] - R[2, 0],
-                  R[1, 0] - R[0, 1]])
-    if theta < 1e-8:
-        # near identity: R - R^T ~= 2*skew(phi)
-        return 0.5 * w
-    return (theta / (2.0 * np.sin(theta))) * w
-
-
-def se3_log(T: np.ndarray) -> np.ndarray:
-    """Logarithm map SE3 -> se3 (inverse of :func:`se3_exp`).
-
-    Returns ``xi = [rho(3); phi(3)]`` such that ``se3_exp(xi) == T`` (to the
-    SE3 left-perturbation convention used throughout this module).
-    """
-    R = T[:3, :3]
-    t = T[:3, 3]
-    phi = so3_log(R)
-    theta = float(np.linalg.norm(phi))
-    if theta < 1e-8:
-        V = np.eye(3) + 0.5 * skew(phi)
-    else:
-        K = skew(phi / theta)
-        V = (np.eye(3)
-             + (1.0 - np.cos(theta)) / theta * K
-             + (theta - np.sin(theta)) / theta * (K @ K))
-    rho = np.linalg.solve(V, t)
-    xi = np.empty(6)
-    xi[:3] = rho
-    xi[3:] = phi
-    return xi
+# Lie-group helpers (SE3 / SO3) -- sourced from the shared ``skymath`` kernel.
+# Bundle adjustment uses the BA-convention exponential (first-order ``I + skew``
+# at zero) and the ``solve``-based ``se3_log``; ``se3_exp`` is also re-exported for
+# the loop-closure selftest. Numerics are byte-identical to the former local copies.
+from skymath import se3_exp, se3_log, skew
 
 
 # --------------------------------------------------------------------------- #

@@ -239,8 +239,9 @@ python3.13 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 Each project is a standalone Python package with its own `main.py` (the process),
 `comms/` (the vendored contract), `mathlib/` (the algorithm code it owns), and
-`modules/` (its reactive pipeline). The data flow between processes is fixed by
-the topic strings on the `comms` bus:
+`modules/` (its reactive pipeline). The shared Lie-group primitives those algorithms
+call live once in the top-level [`skymath/`](#the-skymath-kernel) package. The data
+flow between processes is fixed by the topic strings on the `comms` bus:
 
 ```
 imu_camera.main ──(oak.capture)──▶ vio.main ──(oak.vio)──▶ slam.main ──(oak.slam)──▶ ui.main
@@ -296,6 +297,31 @@ independently portable.
 
 `comms/` is the merge + rename of the pre-split runtime layer. **The word "flow"
 is gone**; the topic strings are unchanged (the frozen contract).
+
+## The `skymath/` kernel
+
+The small Lie-group / linear-algebra **primitives** (`so3_exp`, `so3_log`,
+`so3_right_jacobian`, `skew`, `se3_exp`, `se3_log`, `se3_inv`, `se3_adjoint`,
+`se3_from_Rp`) used to be copy-pasted across `imu_camera/`, `vio/` and
+`slam/`'s `mathlib/`. They now live once in the top-level **`skymath/`** package
+(`skymath/so3.py`, `skymath/se3.py`) and every project imports the single canonical
+copy. This is **Step 1 of extracting `libskymath`** (Step 2 = move to its own repo).
+
+Unlike `comms/` (which is *vendored* per project because it is the wire contract),
+`skymath/` is a *shared* in-tree package: pure-`numpy`, no cv2 / numba / PyQt /
+project imports, so `import skymath` stays cheap and the package is portable as-is.
+The merge is **byte-identical** — the byte-parity oracle stays `gap = 0`. Where the
+old copies had *genuine* numerical drift in their near-singularity handling, the
+variants are kept under distinct names rather than silently unified:
+
+- `so3_exp` (BA convention, `I + skew` at zero) vs `so3_exp_unit` (IMU convention,
+  exact `I` at zero) — identical for any `‖φ‖ ≥ 1e-12`.
+- `so3_log` / `se3_log` (bundle/IMU) vs `so3_log_robust` / `se3_log_robust`
+  (pose-graph: sign-robust near a half-turn + closed-form `V⁻¹`).
+
+The algorithms that *call* these primitives (SGM, KLT, PnP, windowed BA, IMU
+preintegration, the SE(3) pose graph) stay where they live in each project's
+`mathlib/`; only the primitives moved.
 
 | New name | Was | Role |
 |---|---|---|

@@ -33,55 +33,12 @@ from __future__ import annotations
 
 import numpy as np
 
-
-def so3_exp(omega: np.ndarray) -> np.ndarray:
-    """Rodrigues exponential map: rotation vector (rad) -> 3x3 rotation matrix."""
-    theta = float(np.linalg.norm(omega))
-    if theta < 1e-12:
-        return np.eye(3)
-    k = omega / theta
-    K = np.array([[0.0, -k[2], k[1]],
-                  [k[2], 0.0, -k[0]],
-                  [-k[1], k[0], 0.0]])
-    return np.eye(3) + np.sin(theta) * K + (1.0 - np.cos(theta)) * (K @ K)
-
-
-def _skew(w: np.ndarray) -> np.ndarray:
-    return np.array([[0.0, -w[2], w[1]],
-                     [w[2], 0.0, -w[0]],
-                     [-w[1], w[0], 0.0]])
-
-
-def so3_log(R: np.ndarray) -> np.ndarray:
-    """Inverse of :func:`so3_exp`: rotation matrix -> rotation vector (rad)."""
-    c = (np.trace(R) - 1.0) * 0.5
-    c = max(-1.0, min(1.0, c))
-    theta = float(np.arccos(c))
-    if theta < 1e-12:
-        # near identity: vee of the skew part (first-order)
-        return np.array([R[2, 1] - R[1, 2],
-                         R[0, 2] - R[2, 0],
-                         R[1, 0] - R[0, 1]]) * 0.5
-    w = np.array([R[2, 1] - R[1, 2],
-                  R[0, 2] - R[2, 0],
-                  R[1, 0] - R[0, 1]])
-    return w * (theta / (2.0 * np.sin(theta)))
-
-
-def so3_right_jacobian(phi: np.ndarray) -> np.ndarray:
-    """Right Jacobian of SO(3): ``Exp(phi + dphi) ~= Exp(phi) Exp(Jr(phi) dphi)``.
-
-    Used by IMU preintegration to propagate the bias Jacobian of the
-    preintegrated rotation. Falls back to the small-angle form near zero.
-    """
-    theta = float(np.linalg.norm(phi))
-    K = _skew(phi)
-    if theta < 1e-8:
-        return np.eye(3) - 0.5 * K
-    t2 = theta * theta
-    return (np.eye(3)
-            - (1.0 - np.cos(theta)) / t2 * K
-            + (theta - np.sin(theta)) / (t2 * theta) * (K @ K))
+# SO(3) primitives live in the shared ``skymath`` kernel. The IMU module uses the
+# "unit" exponential (exact identity at zero); numerics are byte-identical to the
+# former local copies.
+from skymath import skew as _skew
+from skymath import so3_exp_unit as so3_exp
+from skymath import so3_right_jacobian
 
 
 class ImuPreintegration:

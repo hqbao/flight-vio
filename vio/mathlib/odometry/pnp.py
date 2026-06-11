@@ -21,13 +21,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from ..imu.imu import so3_exp
-
-
-def _skew(w: np.ndarray) -> np.ndarray:
-    return np.array([[0.0, -w[2], w[1]],
-                     [w[2], 0.0, -w[0]],
-                     [-w[1], w[0], 0.0]])
+from skymath import so3_exp_unit as so3_exp
 
 
 def _reproj_err(R: np.ndarray, t: np.ndarray, obj: np.ndarray,
