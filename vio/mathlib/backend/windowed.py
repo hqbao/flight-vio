@@ -64,7 +64,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .bundle import BAConfig, optimize
+from sky.backend.bundle import BAConfig, optimize
 from .marginalize import MargPrior, marginalize_keyframe
 from ..frontend.frontend import FrontendConfig, KLTFrontend
 from ..odometry.odometry import OdometryConfig, RGBDVisualOdometry

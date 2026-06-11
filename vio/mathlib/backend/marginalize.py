@@ -38,7 +38,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .bundle import BAConfig, se3_log, skew
+from sky.backend.bundle import BAConfig, se3_log, skew
 
 
 @dataclass

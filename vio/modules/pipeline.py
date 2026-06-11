@@ -80,7 +80,7 @@ from vio.comms import Module, LocalPubSub, topics
 from vio.comms.messages import END
 from vio.mathlib.frontend.frontend import FrontendConfig, KLTFrontend
 from vio.mathlib.odometry.odometry import OdometryConfig, RGBDVisualOdometry
-from vio.mathlib.backend.bundle import BAConfig
+from sky.backend.bundle import BAConfig
 from vio.mathlib.backend.windowed import WindowedConfig
 from vio.mathlib.backend.vio_window import WindowedVIOConfig
 from vio.mathlib.engine import make_ba_engine, make_vi_engine

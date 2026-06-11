@@ -15,15 +15,19 @@ proved by :mod:`slam.tests.loop_closure_selftest`).
 * :mod:`~slam.mathlib.engine` -- the swappable in-process / subprocess runners for
   the heavy keyframe optimiser (SLAM carries its OWN engine copy).
 
-FORCED-VENDOR dependencies (resolved from the loop import graph; vendored at the
-minimal surface):
+SHARED-LIBRARY dependencies (the loop import graph reaches into ``sky.*``, the
+one consolidated algorithm library):
 
-* :mod:`~slam.mathlib.backend` -- the SE(3) ``se3_exp`` / ``skew`` Lie-group
-  helpers, forced by :mod:`~slam.mathlib.loop.posegraph`.
-
-The PnP RANSAC that :mod:`~slam.mathlib.loop.loopclosure`'s metric geometric
-verification needs is the shared :func:`sky.front.pnp.solve_pnp_ransac` (one
-canonical copy, deduped out of the old per-project ``mathlib/odometry/pnp.py``).
+* The SE(3) / SO(3) Lie-group helpers :mod:`~slam.mathlib.loop.posegraph` needs
+  come from the shared :mod:`sky.math` kernel (e.g. ``so3_log_robust``), NOT from
+  any per-project ``backend`` copy.
+* The PnP RANSAC that :mod:`~slam.mathlib.loop.loopclosure`'s metric geometric
+  verification needs is the shared :func:`sky.front.pnp.solve_pnp_ransac` (one
+  canonical copy, deduped out of the old per-project ``mathlib/odometry/pnp.py``).
+* The bundle-adjustment core is the shared :mod:`sky.backend.bundle`; SLAM's old
+  vendored ``backend/bundle.py`` was DEAD (nothing in SLAM imported it -- loop
+  closure runs the standalone pose-graph in :mod:`~slam.mathlib.loop.posegraph`),
+  so it was deleted outright when the core was consolidated.
 
 The ARCHITECTURE RULE lives here too: the math-coupled config builder
 (:mod:`~slam.mathlib.resolution_build`) lives in ``mathlib`` -- NOT in the
