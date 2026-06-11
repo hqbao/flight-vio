@@ -139,9 +139,9 @@ def main() -> int:
             for name, proc in (("imu_camera", cap_proc), ("vio", vio_proc),
                                ("slam", slam_proc)):
                 try:
-                    _out, err = proc.communicate(timeout=2.0)
+                    _, err = proc.communicate(timeout=2.0)
                 except Exception:                                  # noqa: BLE001
-                    _out, err = b"", b""
+                    _, err = b"", b""
                 if err and err.strip():
                     print(f"\n  --- {name}.stderr (tail) ---\n"
                           f"{_tail(err.decode(errors='replace'), 20)}",

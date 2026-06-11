@@ -1,12 +1,10 @@
 """Top-level QMainWindow: header bar, view-preset toolbar, viewport, side panel."""
 from __future__ import annotations
 
-from collections.abc import Callable
-
 from PyQt6 import QtCore
 from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
-    QHBoxLayout, QLabel, QMainWindow, QPushButton, QStatusBar,
+    QHBoxLayout, QLabel, QMainWindow, QStatusBar,
     QToolBar, QVBoxLayout, QWidget,
 )
 
@@ -14,7 +12,7 @@ from ..pose import PoseHistory
 from ..sources.base import PoseSource
 from . import theme
 from .panels import TelemetryPanel
-from .viewer3d import VIEW_PRESETS, Viewer3D
+from .viewer3d import Viewer3D
 
 
 def _header(title: str, subtitle: str) -> QWidget:

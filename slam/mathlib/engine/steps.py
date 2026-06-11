@@ -1,36 +1,21 @@
 """The per-keyframe solve, factored out so in-process and subprocess engines run
 *exactly the same code* (the whole offline byte-parity argument depends on this).
 
-Each ``*_step`` takes a live map object + one keyframe snapshot and returns the
+``slam_step`` takes a live map object + one keyframe snapshot and returns the
 solve result (or ``None`` when there is nothing to publish for that keyframe).
-These are pure functions of (map, snapshot): no threads, no queues, no flow/bus
-knowledge -- they receive the map instance so the same function drives both the
+It is a pure function of (map, snapshot): no threads, no queues, no flow/bus
+knowledge -- it receives the map instance so the same function drives both the
 synchronous :class:`~slam.mathlib.engine.inprocess.InProcessEngine` and the child of
 :class:`~slam.mathlib.engine.subprocess.SubprocessEngine`.
 
-The logic is lifted verbatim from the old in-thread ``RunBA`` / ``SlamStep`` tasks
-so the offline path stays identical.
+The logic is lifted verbatim from the old in-thread ``SlamStep`` task so the
+offline path stays identical.
 """
 from __future__ import annotations
 
 from typing import Any
 
 from .base import SlamResult
-
-
-def ba_step(ba_map, snap: Any):
-    """One windowed-BA keyframe: add the track snapshot, run BA.
-
-    ``snap`` = ``(T_cw, ids, pts, depth_m, accel)`` in the raw f2f world frame
-    (the flow inverts ``T_world_cam`` -> ``T_cw`` before submitting). Returns the
-    refined latest ``T_cw`` (``4x4``) or ``None`` when the window has not yet
-    enough structure to optimise.
-    """
-    T_cw, ids, pts, depth_m, accel = snap
-    if ids is None or pts is None:
-        return None
-    ba_map.add_keyframe(T_cw, ids, pts, depth_m, accel_cam=accel)
-    return ba_map.run_ba()                    # refined latest T_cw, or None
 
 
 def slam_step(slam_map, snap: Any):
@@ -51,28 +36,12 @@ def slam_step(slam_map, snap: Any):
 
 
 # --------------------------------------------------------------------------- #
-# Overlay extractors: a cheap, picklable snapshot of the live MAP for the 3D
+# Overlay extractor: a cheap, picklable snapshot of the live MAP for the 3D
 # viewer (the visible "refined map behind the responsive marker"). All positions
 # are camera world-frame (optical); the UI applies the single optical->NED display
-# transform. These read REAL map outputs (refined keyframe poses / corrected
-# SLAM poses + loop events) -- never a parallel/derived pipeline.
+# transform. It reads REAL map outputs (corrected SLAM poses + loop events) --
+# never a parallel/derived pipeline.
 # --------------------------------------------------------------------------- #
-
-def ba_overlay(ba_map):
-    """BA window snapshot: ``{kf_id: refined camera-world position}``.
-
-    Keyed by the map's monotonic keyframe id so the UI can accumulate a full
-    refined trajectory across the sliding window (ids that leave the window keep
-    their last-refined position). ``inv(T_cw)`` maps each keyframe pose to its
-    camera-in-world position.
-    """
-    import numpy as np
-    out = {}
-    for kf in ba_map.keyframes:
-        T_cw = kf["T_cw"]
-        out[int(kf["id"])] = (np.linalg.inv(T_cw)[:3, 3]).copy()
-    return out
-
 
 def slam_overlay(slam_map):
     """SLAM map snapshot for the keyframe-dots + loop-flash overlay.

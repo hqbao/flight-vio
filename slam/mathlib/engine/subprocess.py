@@ -2,7 +2,7 @@
 
 Why a process and not a thread
 ------------------------------
-The windowed-BA refine and the SLAM ORB + pose-graph solve are mostly
+The SLAM ORB + pose-graph solve is mostly
 **pure-Python** (only the inner ``np.linalg.solve`` releases the GIL). Run on a
 thread they steal ~17-30 % of the GIL from the device frame-read loop (measured on
 ``fast_push_15s``); a starved read loop drains its camera queues to the latest
@@ -74,12 +74,12 @@ def _serve(make_map: Callable[[], Any], step, overlay,
     cheap ``overlay`` snapshot goes on ``ov_q`` EVERY keyframe (latest-wins) so the
     live viewer always has the freshest map.
 
-    ``loops_q`` (SLAM only) carries the per-candidate loop-match CAPTURES (the
-    funnel for the UI's loop-closure view). Loops are sporadic + must NOT be
-    coalesced away (each is a distinct event explaining one candidate), so they
-    are PUSHED individually (best-effort, non-blocking) rather than latest-wins;
-    the parent drains the whole queue. A WindowedBAMap has no ``drain_loop_captures``
-    so this is a no-op there.
+    ``loops_q`` carries the per-candidate loop-match CAPTURES (the funnel for the
+    UI's loop-closure view). Loops are sporadic + must NOT be coalesced away (each
+    is a distinct event explaining one candidate), so they are PUSHED individually
+    (best-effort, non-blocking) rather than latest-wins; the parent drains the whole
+    queue. The drain is guarded by ``getattr`` so a map without
+    ``drain_loop_captures`` simply yields nothing.
     """
     m = make_map()
     while not stop_evt.is_set():
@@ -105,19 +105,6 @@ def _serve(make_map: Callable[[], Any], step, overlay,
                         loops_q.put_nowait(cap)
                     except queue.Full:
                         pass               # parent fell behind; drop the oldest event
-
-
-def _ba_worker_main(K, cfg, in_q, out_q, ov_q, stop_evt, reset_evt,
-                    loops_q=None) -> None:
-    """Child entry point for windowed BA (module-level => picklable under spawn).
-
-    ``loops_q`` is accepted for a uniform worker signature but unused (a
-    WindowedBAMap has no loop captures -- ``_serve``'s drain is a no-op there).
-    """
-    from ..backend.windowed import WindowedBAMap
-    from .steps import ba_step, ba_overlay
-    _serve(lambda: WindowedBAMap(K, cfg), ba_step, ba_overlay,
-           in_q, out_q, ov_q, stop_evt, reset_evt, loops_q)
 
 
 def _slam_worker_main(K, cfg, in_q, out_q, ov_q, stop_evt, reset_evt,

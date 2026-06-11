@@ -78,13 +78,15 @@ vendored at the **minimal** surface, mirroring how `vio` had to vendor `imu`):
 | `slam/mathlib/imu/imu.py` | `so3_exp` (SO(3) helper); numpy-only, self-contained | `odometry/pnp.py` → `..imu.imu` (transitive) |
 | `slam/mathlib/backend/bundle.py` | `se3_exp` + `skew` (SE(3)/Lie helpers) drive the PGO | `loop/posegraph.py` → `..backend.bundle` |
 
-Nothing else is vendored. In particular the **windowed BA** is *not* vendored:
-the byte-copied engine carries a `make_ba_engine` / `_ba_worker_main` path with a
-**lazy** `..backend.windowed` import, but SLAM only ever calls `make_slam_engine`,
-so that BA path never fires — the exact mirror of how `vio`'s byte-copied engine
-carries a never-fired lazy `..loop.slam` import. The relative import layout under
-`mathlib` is preserved, so every `from ..odometry.pnp` / `..imu.imu` /
-`..backend.bundle` / `..loop.slam` resolves unchanged.
+Nothing else is vendored. In particular the **windowed BA** is *not* part of
+SLAM: SLAM only ever calls `make_slam_engine` (loop closure), so the engine
+carries **only** the loop-closure path (`make_slam_engine` / `slam_step` /
+`_slam_worker_main`). The never-fired `make_ba_engine` / `_ba_worker_main` path
+that the byte-copied engine used to carry (a lazy `..backend.windowed` import that
+SLAM never resolved) has been removed — SLAM has no `backend/windowed.py`. The
+relative import layout under `mathlib` is preserved, so every
+`from ..odometry.pnp` / `..imu.imu` / `..backend.bundle` / `..loop.slam` resolves
+unchanged.
 
 **ARCHITECTURE RULE.** The math-coupled config builder lives in `slam/mathlib/`,
 **not** in the generic, bit-identical `slam/comms/`:

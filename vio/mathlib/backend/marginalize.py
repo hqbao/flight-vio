@@ -67,7 +67,6 @@ class MargPrior:
         if not keep:
             return None
         cams = [id_to_index[self.kf_ids[a]] for a in keep]
-        sel = np.array(keep, dtype=np.int64)
         idx = np.concatenate([np.arange(6 * a, 6 * a + 6) for a in keep])
         H = self.H[np.ix_(idx, idx)]
         b0 = self.b0[idx]

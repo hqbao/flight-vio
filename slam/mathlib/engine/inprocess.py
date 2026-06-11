@@ -4,7 +4,7 @@ This is the OFFLINE / deterministic engine. ``submit`` runs the *whole* step
 (``add_keyframe`` + solve) right now and stashes its single result; ``poll`` hands
 that one result back and clears it. Because the back-end flow's FIFO inbox calls
 ``submit`` then ``poll`` inside the *same* task invocation per keyframe, the
-behaviour is identical to the old in-thread ``RunBA`` / ``SlamStep`` -- zero
+behaviour is identical to the old in-thread ``SlamStep`` -- zero
 latency, byte-identical replay output. See :mod:`slam.mathlib.engine.base` for why
 ``poll`` must be one-shot (not latest-wins).
 """
@@ -45,8 +45,8 @@ class InProcessEngine(Engine):
     def poll_loops(self) -> list:
         # LIVE-only: drain the map's loop-match captures. The offline path never
         # sets ``capture_loops``, so the map's buffer stays empty here and the
-        # deterministic correction path is untouched. A SlamMap captures; a
-        # WindowedBAMap (no such method) yields nothing.
+        # deterministic correction path is untouched. The ``getattr`` guard keeps
+        # this safe for any map that does not expose ``drain_loop_captures``.
         drain = getattr(self._map, "drain_loop_captures", None)
         return drain() if drain is not None else []
 

@@ -20,7 +20,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from baseline.tools.compare_sessions import (                # noqa: E402
-    _load_jsonl, _load_pose_stream, compare,
+    _load_pose_stream, compare,
 )
 
 
@@ -85,11 +85,11 @@ def main() -> int:
 
     summaries = [_summarize_session(s, args.delta_s) for s in sessions]
 
-    print(f"# Gold Baseline Report")
+    print("# Gold Baseline Report")
     print()
     print(f"**Generated**: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"**Source**: `{gold}`")
-    print(f"**Pipeline**: BasaltVIO + RTABMapSLAM (depthai 3.6.1)")
+    print("**Pipeline**: BasaltVIO + RTABMapSLAM (depthai 3.6.1)")
     print(f"**RPE window**: {args.delta_s}s")
     print()
     print("ATE/RPE compare **SLAM (ref) vs VIO (test)** — they measure how "

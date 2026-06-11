@@ -1,8 +1,8 @@
-"""Engine contract: a swappable runner for the heavy keyframe optimisers.
+"""Engine contract: a swappable runner for the heavy keyframe optimiser.
 
-An *engine* owns one heavy map optimiser (windowed BA or loop-closure SLAM) and
-exposes a tiny, uniform interface so the flow tasks (``RunBA`` / ``SlamStep``)
-never care *where* the solve runs:
+An *engine* owns one heavy map optimiser (loop-closure SLAM) and
+exposes a tiny, uniform interface so the flow task (``SlamStep``)
+never cares *where* the solve runs:
 
 * :class:`InProcessEngine` -- runs the solve synchronously on the calling thread.
   Used by the OFFLINE replay/scoring path, where determinism matters and there is
@@ -62,8 +62,8 @@ class Engine(ABC):
 
     @abstractmethod
     def poll(self) -> Any:
-        """Return a ready result (refined ``T_cw`` for BA, :class:`SlamResult`
-        for SLAM) or ``None`` if nothing is ready."""
+        """Return a ready result (:class:`SlamResult` on a loop closure) or
+        ``None`` if nothing is ready."""
 
     @abstractmethod
     def poll_overlay(self) -> Any:

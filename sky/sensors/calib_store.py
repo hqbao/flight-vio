@@ -18,8 +18,8 @@ by device id so several cameras never clobber each other::
                   "n_poses": 6, "ts": ...}
     }}
 
-This module supersedes the gyro-only ``bias_store`` (kept as a thin compatibility
-shim). It transparently MIGRATES the two legacy on-disk shapes on read:
+This module supersedes the old gyro-only bias store. It transparently MIGRATES
+the two legacy on-disk shapes on read:
 
 * the old gyro-only file ``.cache/imu_bias.json`` (auto-loaded if the new file is
   absent), and
