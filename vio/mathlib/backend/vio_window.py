@@ -738,7 +738,7 @@ class WindowedVIOConfig:
 class WindowedVIOMap:
     """Sliding-window tight-coupled VIO map (visual + IMU), tracker-agnostic.
 
-    Mirrors :class:`vio.mathlib.backend.windowed.WindowedBAMap` but feeds the raw visual
+    Mirrors :class:`sky.backend.windowed.WindowedBAMap` but feeds the raw visual
     measurements **and** IMU preintegration factors into the joint optimiser
     :func:`optimize_vio`, solving for each keyframe's pose, velocity and
     gyro/accel bias together with the landmarks. The accelerometer ties the
@@ -961,7 +961,7 @@ class WindowedVIOMap:
 class WindowedVIORGBDOdometry:
     """Frame-to-frame tracking with a tight-coupled sliding-window VIO backend.
 
-    Drop-in sibling of :class:`vio.mathlib.backend.windowed.WindowedRGBDOdometry`: the same
+    Drop-in sibling of :class:`sky.backend.windowed.WindowedRGBDOdometry`: the same
     KLT/PnP frontend produces a smooth per-frame pose, but every keyframe is
     refined by :class:`WindowedVIOMap` (visual + IMU joint optimisation) instead
     of vision-only bundle adjustment. The caller passes the full IMU stream in

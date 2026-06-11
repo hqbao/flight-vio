@@ -50,7 +50,7 @@ from imu_camera.io.reader import SessionReader
 from sky.depth.stereo import SGMConfig, SGMStereoMatcher
 from vio.mathlib.imu.imu import GyroPreintegrator
 from sky.front.odometry import OdometryConfig, RGBDVisualOdometry
-from vio.mathlib.backend.windowed import WindowedConfig, WindowedRGBDOdometry
+from sky.backend.windowed import WindowedConfig, WindowedRGBDOdometry
 from vio.mathlib.backend.vio_window import WindowedVIORGBDOdometry
 from slam.mathlib.loop.slam import SlamConfig, SlamMap
 from sky.math import se3_inv

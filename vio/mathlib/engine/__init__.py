@@ -31,7 +31,7 @@ def make_ba_engine(K: np.ndarray, cfg, *, worker: bool = False) -> Engine:
     """Build a windowed-BA engine (in-process unless ``worker``)."""
     if worker:
         return SubprocessEngine(_ba_worker_main, K, cfg)
-    from ..backend.windowed import WindowedBAMap
+    from sky.backend.windowed import WindowedBAMap
     return InProcessEngine(lambda: WindowedBAMap(K, cfg), ba_step, ba_overlay)
 
 

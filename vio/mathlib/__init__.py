@@ -11,8 +11,10 @@ byte-identical to the reference oracle -- proved by
   into the shared :mod:`sky` leaf library (single-copy; VIO is the only consumer).
 * :mod:`~sky.front.odometry` -- frame-to-frame RGB-D visual odometry (PnP +
   optional gyro fusion).
-* :mod:`~vio.mathlib.backend` -- the sliding-window bundle adjustment + the
-  tight-coupled visual-inertial window optimiser.
+* :mod:`~vio.mathlib.backend` -- the tight-coupled visual-inertial window
+  optimiser (``vio_window.py``, the Phase-4 research surface). The loose
+  sliding-window map + marginalization moved to :mod:`sky.backend` (R3); the BA
+  core itself lives in :mod:`sky.backend.bundle` (S5).
 * :mod:`~vio.mathlib.engine` -- the swappable in-process / subprocess runners for
   the heavy keyframe optimisers (VIO carries its OWN engine copy).
 * :mod:`~vio.mathlib.imu` -- the SO(3) helpers + IMU preintegration the

@@ -94,7 +94,7 @@ def _serve(make_map: Callable[[], Any], step, overlay,
 
 def _ba_worker_main(K, cfg, in_q, out_q, ov_q, stop_evt, reset_evt) -> None:
     """Child entry point for windowed BA (module-level => picklable under spawn)."""
-    from ..backend.windowed import WindowedBAMap
+    from sky.backend.windowed import WindowedBAMap
     from .steps import ba_step, ba_overlay
     _serve(lambda: WindowedBAMap(K, cfg), ba_step, ba_overlay,
            in_q, out_q, ov_q, stop_evt, reset_evt)

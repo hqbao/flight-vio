@@ -7,7 +7,7 @@ byte-identically in ``vio`` and -- dead -- in ``slam``; consolidated here).
 It knows nothing about cameras, KLT or sessions, nor about WHICH factors a
 caller assembles: the reprojection / depth / gravity / marginalization-prior /
 VO-relative factors are all passed in as arrays, and the factor lists are built
-by the callers (e.g. the sliding-window glue in :mod:`vio.mathlib.backend.windowed`).
+by the callers (e.g. the sliding-window glue in :mod:`sky.backend.windowed`).
 Keeping the solver standalone means we can unit-test it on a synthetic scene with
 a known answer (see ``vio/tests/vio_ba_selftest.py``) before trusting it on real data.
 
@@ -36,7 +36,7 @@ import numpy as np
 # Lie-group helpers (SE3 / SO3) -- sourced from the shared ``sky.math`` kernel.
 # Bundle adjustment uses the BA-convention exponential (first-order ``I + skew``
 # at zero) and the ``solve``-based ``se3_log``; ``se3_log`` / ``skew`` are also
-# re-exported for :mod:`~vio.mathlib.backend.marginalize` (the sole consumer of
+# re-exported for :mod:`~sky.backend.marginalize` (the sole consumer of
 # the prior path). Numerics are byte-identical to the former local copies.
 from sky.math import se3_exp, se3_log, skew
 
@@ -272,7 +272,7 @@ def optimize(
 
     # --- marginalization prior precompute ----------------------------------
     # A linear-Gaussian prior over k keyframe poses, condensed from previously
-    # marginalized keyframes/landmarks (see vio.mathlib.backend.marginalize). It is
+    # marginalized keyframes/landmarks (see sky.backend.marginalize). It is
     # camera-only (couples poses, no landmarks) and uses First-Estimate
     # Jacobians: the prior Jacobian is frozen at the linearization point, so it
     # contributes ``H_p`` to the camera Hessian and ``b0 + H_p @ delta`` to the
