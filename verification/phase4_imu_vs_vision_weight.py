@@ -101,14 +101,10 @@ from imu_camera.modules.pipeline import TOF_W, TOF_H  # noqa: E402
 
 from vio.mathlib.imu.imu import GyroPreintegrator  # noqa: E402
 from sky.front.odometry import OdometryConfig  # noqa: E402
-from sky.math import so3_exp_unit as so3_exp  # noqa: E402
 from vio.mathlib.backend.vio_window import (  # noqa: E402
     WindowedVIOConfig,
     WindowedVIORGBDOdometry,
     T_cw_to_body_world,
-    _pose_perturb,
-    _imu_residual,
-    _bias_rw_residual,
 )
 
 GOLD_DIR = Path("sessions/gold")
