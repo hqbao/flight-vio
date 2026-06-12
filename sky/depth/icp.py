@@ -16,8 +16,8 @@ This file is the geometry half: given two camera-frame point clouds and an
 IMU-preintegrated seed for the relative pose, it returns the refined relative
 pose AND the point-to-plane normal-equation Hessian at convergence -- which IS
 the measurement information ``Lambda`` the VIO factor whitens with. The factor
-assembly + whitening + Jacobian live in ``vio.mathlib.backend.vio_window`` (a
-process module); this module stays a pure ``sky.*`` leaf (numpy only).
+assembly + whitening + Jacobian live in :mod:`sky.vio.window` (the tight VIO
+optimiser); this module stays a pure ``sky.*`` leaf (numpy only).
 
 Algorithm (GenZ-ICP-style blend, deliberately conservative before fast)
 -----------------------------------------------------------------------

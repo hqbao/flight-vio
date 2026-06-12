@@ -36,7 +36,7 @@ def vio_step(vio_map, snap: Any):
     """One tight-coupled VIO keyframe: add the track snapshot + IMU block, solve.
 
     Mirrors :func:`ba_step` but for the tight backend
-    (:class:`vio.mathlib.backend.vio_window.WindowedVIOMap`): the snapshot is a
+    (:class:`sky.vio.window.WindowedVIOMap`): the snapshot is a
     SUPERSET of the loose one carrying the keyframe timestamp + the raw
     inter-keyframe IMU segment the joint optimiser preintegrates --
 

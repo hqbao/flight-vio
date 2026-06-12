@@ -34,8 +34,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from sky.math import se3_from_Rp, se3_inv, so3_exp_unit  # noqa: E402
-from vio.mathlib.imu.imu import preintegrate_imu  # noqa: E402
-from vio.mathlib.backend.vio_window import (  # noqa: E402
+from sky.vio.imu import preintegrate_imu  # noqa: E402
+from sky.vio.window import (  # noqa: E402
     IcpFactor, VioConfig, VioState, _icp_omega, _icp_residual, optimize_vio,
 )
 

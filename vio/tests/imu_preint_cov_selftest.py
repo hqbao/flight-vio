@@ -1,7 +1,7 @@
 """Monte-Carlo validation of the IMU preintegration covariance (Phase 0).
 
 This is THE correctness gate for the 9x9 preintegration covariance ``Sigma`` added
-to :func:`vio.mathlib.imu.imu.preintegrate_imu`. Without a correct ``Sigma`` the
+to :func:`sky.vio.imu.preintegrate_imu`. Without a correct ``Sigma`` the
 tight IMU factor would be silently mis-weighted (``Omega_I = Sigma^-1``), with no
 crash -- so the analytic propagation must be checked against ground truth.
 
@@ -34,7 +34,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from vio.mathlib.imu.imu import (  # noqa: E402
+from sky.vio.imu import (  # noqa: E402
     ImuNoise,
     preintegrate_imu,
     so3_log,

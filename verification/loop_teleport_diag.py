@@ -40,7 +40,7 @@ from vio.modules import OdometryModule                               # noqa: E40
 from sky.front.odometry import OdometryConfig                        # noqa: E402
 from slam.modules import SlamModule                                  # noqa: E402
 from sky.slam.slam import SlamConfig                                 # noqa: E402
-from vio.mathlib.backend.vio_window import T_cw_to_body_world        # noqa: E402
+from sky.vio.window import T_cw_to_body_world        # noqa: E402
 
 
 def _per_frame_imu(ts_all, gyro, accel, prev_ts, ts):

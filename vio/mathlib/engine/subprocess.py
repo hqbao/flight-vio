@@ -122,7 +122,7 @@ def _vio_worker_main(K, cfg, in_q, out_q, ov_q, stop_evt, reset_evt) -> None:
     the inter-keyframe block rides ``imu_seg`` instead. Same GIL-isolation
     rationale as the BA worker -- the joint solve runs off the camera read loop.
     """
-    from ..backend.vio_window import WindowedVIOMap
+    from sky.vio.window import WindowedVIOMap
     from .steps import vio_step, vio_overlay
     _serve(lambda: WindowedVIOMap(K, cfg=cfg), vio_step, vio_overlay,
            in_q, out_q, ov_q, stop_evt, reset_evt)

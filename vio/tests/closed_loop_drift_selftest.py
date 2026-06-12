@@ -234,7 +234,7 @@ def run(session_dir: Path, max_frames: int) -> int:
     else:
         last_emit, last_corr = corrections[-1]
         # SLAM's corrected camera-in-world position of the revisited keyframe.
-        from vio.mathlib.backend.vio_window import T_cw_to_body_world
+        from sky.vio.window import T_cw_to_body_world
         _, target = T_cw_to_body_world(
             np.linalg.inv(last_corr.kf_poses[last_emit]))
         eval_seq = last_emit + 3 * 5         # ~3 keyframes after the blend starts

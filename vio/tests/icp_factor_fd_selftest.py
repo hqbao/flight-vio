@@ -38,7 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from sky.math import (  # noqa: E402
     se3_adjoint, se3_exp, se3_from_Rp, se3_inv, se3_log_robust, so3_exp_unit,
 )
-from vio.mathlib.backend.vio_window import (  # noqa: E402
+from sky.vio.window import (  # noqa: E402
     VioConfig, _icp_omega, _icp_residual, _pose_perturb,
 )
 

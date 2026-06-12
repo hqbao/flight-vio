@@ -37,12 +37,12 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from imu_camera.io.reader import SessionReader                       # noqa: E402
-from vio.mathlib.imu.imu import GyroPreintegrator                    # noqa: E402
+from sky.vio.imu import GyroPreintegrator                    # noqa: E402
 from sky.front.odometry import (                          # noqa: E402
     OdometryConfig, RGBDVisualOdometry)
 from sky.backend.windowed import (                           # noqa: E402
     WindowedConfig, WindowedRGBDOdometry)
-from vio.mathlib.backend.vio_window import WindowedVIOConfig         # noqa: E402
+from sky.vio.window import WindowedVIOConfig         # noqa: E402
 from vio.mathlib.engine import make_vi_engine                        # noqa: E402
 
 

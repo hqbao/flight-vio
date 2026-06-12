@@ -21,7 +21,7 @@ import numpy as np
 
 from vio.comms.messages import ImuCamPacket, ImuPrior
 from vio.comms import Step
-from vio.mathlib.imu.imu import integrate_gyro_camera
+from sky.vio.imu import integrate_gyro_camera
 
 # Stillness gate for the keyframe gravity prior: low angular rate and accel close
 # to 1 g. Mirrors the live capture flow's at-rest thresholds.

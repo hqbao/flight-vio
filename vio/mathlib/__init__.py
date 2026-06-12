@@ -6,19 +6,27 @@ cross-package import roots + the doc cross-references were re-rooted at
 byte-identical to the reference oracle -- proved by
 :mod:`vio.tests.vio_ba_selftest`).
 
+After the consolidation (``docs/CONSOLIDATION_PLAN.md``) almost all the VIO
+algorithm code has been relocated into the shared :mod:`sky` leaf library; what
+remains here is the per-project glue that the C IPC port discards (the engine) plus
+the math-coupled config builders. The relocated algorithm lives in:
+
 * :mod:`sky.front` -- the from-scratch KLT optical-flow tracker + Shi-Tomasi
-  corner detector (numba-accelerated; the ONLY numba kernel VIO warms). Relocated
-  into the shared :mod:`sky` leaf library (single-copy; VIO is the only consumer).
-* :mod:`~sky.front.odometry` -- frame-to-frame RGB-D visual odometry (PnP +
-  optional gyro fusion).
-* :mod:`~vio.mathlib.backend` -- the tight-coupled visual-inertial window
-  optimiser (``vio_window.py``, the Phase-4 research surface). The loose
-  sliding-window map + marginalization moved to :mod:`sky.backend` (R3); the BA
-  core itself lives in :mod:`sky.backend.bundle` (S5).
+  corner detector + RGB-D PnP visual odometry (R1/R2).
+* :mod:`sky.backend` -- the LOOSE sliding-window map + marginalization + the
+  factor-agnostic BA core (R3 / S5).
+* :mod:`sky.vio` -- the TIGHT-coupled visual-inertial window optimiser
+  (``sky.vio.window``, formerly ``vio_window.py``) + the tight IMU SUPERSET
+  (``sky.vio.imu``, the covariance + forward-propagation + loop machinery),
+  relocated in S7 once Phase 4 reached its OAK-D ceiling.
+* :mod:`sky.imu` -- the LOOSE IMU preintegration + gyro prior the oracle path uses
+  (S4).
+
+What still lives under ``vio.mathlib``:
+
 * :mod:`~vio.mathlib.engine` -- the swappable in-process / subprocess runners for
-  the heavy keyframe optimisers (VIO carries its OWN engine copy).
-* :mod:`~vio.mathlib.imu` -- the SO(3) helpers + IMU preintegration the
-  odometry / backend / pnp math depends on (numpy-only, self-contained).
+  the heavy keyframe optimisers (VIO carries its OWN engine copy; S6 left
+  per-project as a Python-GIL artifact the C port replaces wholesale).
 
 The ARCHITECTURE RULE lives here too: the math-coupled config builders
 (:mod:`~vio.mathlib.resolution_build`) and the JIT warmup

@@ -25,9 +25,15 @@ the standard library (``threading`` / ``time`` / ``collections`` for the buffer)
 -- no process / comms / io module -- so it stays a leaf and movable (maps onto the
 C ``libskyimu`` layer in ``docs/C_PORT_PLAN.md``).
 
-NOTE -- variant deferral: ``vio/mathlib/imu/imu.py`` is a SUPERSET of this loose
-copy (it adds preintegration-covariance + bias-Jacobian machinery for the
-tight-coupled VIO window optimiser, and is the live Phase-4 research surface).
-That divergent variant is deliberately NOT consolidated here yet; ``vio`` keeps
-its own ``imu.py`` until Phase 4 freezes (see ``docs/CONSOLIDATION_PLAN.md``).
+NOTE -- the tight variant: :mod:`sky.vio.imu` is a SUPERSET of this loose copy (it
+adds the preintegration COVARIANCE + the tight-only forward-propagation / loop /
+complementary-correction machinery for the tight-coupled VIO window optimiser).
+Because that superset's ``preintegrate_imu`` interleaves the covariance recursion
+INSIDE the same per-segment loop as the delta update, the loose core could not be
+extracted cleanly without re-ordering the float arithmetic, so the superset was
+moved WHOLE into :mod:`sky.vio.imu` as a documented tight VARIANT (S7) -- this
+loose copy stays the byte-untouched oracle-feeding base. The two share the
+byte-identical loose members (``GyroPreintegrator`` / ``integrate_gyro_camera`` /
+``gravity_aligned_R0`` / the loose ``ImuPreintegration`` core) by design (see
+``docs/CONSOLIDATION_PLAN.md``).
 """

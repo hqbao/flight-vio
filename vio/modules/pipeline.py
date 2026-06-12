@@ -84,7 +84,7 @@ from sky.front.frontend import FrontendConfig, KLTFrontend
 from sky.front.odometry import OdometryConfig, RGBDVisualOdometry
 from sky.backend.bundle import BAConfig
 from sky.backend.windowed import WindowedConfig
-from vio.mathlib.backend.vio_window import WindowedVIOConfig
+from sky.vio.window import WindowedVIOConfig
 from vio.mathlib.engine import make_ba_engine, make_vi_engine
 from .preintegrate_prior import PreintegratePrior
 from .track_features import TrackFeatures
@@ -215,7 +215,7 @@ class BackendModule(Module):
       the offline oracle relies on this.
     * ``tight=True`` (``--tight``, opt-in) -- :func:`make_vi_engine` builds the
       tight-coupled ``WindowedVIOMap`` (the joint visual + IMU window optimiser
-      from :mod:`vio.mathlib.backend.vio_window`). The IMU factor is weighted by
+      from :mod:`sky.vio.window`). The IMU factor is weighted by
       the per-edge information square root (``imu_info_weight=True``, the
       covariance-correct Phase-1 weight) -- the live tight path the PLAN
       prescribes. ``RunBA`` then submits the SUPERSET snapshot (keyframe ts + raw

@@ -32,8 +32,10 @@ It imports only :mod:`sky.math` (SE(3) ``se3_exp`` / ``se3_log`` / ``skew``),
 comms / io module -- so it stays a leaf and movable (maps onto the C ``libskyba``
 / backend layer in ``docs/C_PORT_PLAN.md``).
 
-NOTE -- variant deferral: ``vio.mathlib.backend.vio_window`` (the tight-coupled
-Phase-4 VIO window optimiser) is NOT consolidated here yet; it is the live
-research surface and stays per-project until Phase 4 freezes (see
-``docs/CONSOLIDATION_PLAN.md``).
+NOTE -- the tight variant: the tight-coupled VIO window optimiser (formerly
+``vio.mathlib.backend.vio_window``) is the SEPARATE :mod:`sky.vio.window` package,
+NOT part of this loose backend. It was consolidated into :mod:`sky.vio` in S7 once
+Phase 4 reached its OAK-D ceiling; the loose sliding-window map here and the tight
+window solver there share the factor-agnostic :func:`sky.backend.bundle.optimize`
+core but build different factors (see ``docs/CONSOLIDATION_PLAN.md``).
 """

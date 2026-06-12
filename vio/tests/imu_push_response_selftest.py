@@ -42,8 +42,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from vio.comms.module import ModuleContext                       # noqa: E402
 from vio.comms import LocalPubSub                                # noqa: E402
 from vio.modules.propagate_imu import PropagateImu               # noqa: E402
-from vio.mathlib.imu.imu import imu_at_rest, predict_state       # noqa: E402
-from vio.mathlib.backend.vio_window import body_world_to_T_cw    # noqa: E402
+from sky.vio.imu import imu_at_rest, predict_state       # noqa: E402
+from sky.vio.window import body_world_to_T_cw    # noqa: E402
 
 G = 9.81
 G_WORLD = np.array([0.0, G, 0.0])     # optical-world "down" = +y

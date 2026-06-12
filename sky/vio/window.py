@@ -14,7 +14,7 @@ vision-only / loosely-coupled paths leave behind.
 Design choices (deliberate, to be correct and verifiable before fast):
   * **Body frame == camera frame** in this core. The IMU<->camera extrinsic is
     handled by the caller, which rotates the raw IMU samples into the camera
-    optical frame before preintegrating (see :mod:`vio.mathlib.imu.imu`). The small
+    optical frame before preintegrating (see :mod:`sky.vio.imu`). The small
     IMU/camera lever arm is treated as modelling noise (the OAK-D IMU sits ~cm
     from the left camera); a future refinement can add it explicitly.
   * Poses are parametrised as **body->world** ``(R, p)`` with the perturbation
@@ -51,7 +51,7 @@ from sky.math import se3_from_Rp, se3_inv, se3_log_robust
 
 from sky.front.frontend import FrontendConfig, KLTFrontend
 from sky.depth.icp import backproject_depth, icp_p2plane_blend, imu_seed_relpose
-from ..imu.imu import ImuPreintegration, preintegrate_imu
+from .imu import ImuPreintegration, preintegrate_imu
 from sky.front.odometry import OdometryConfig, RGBDVisualOdometry
 
 

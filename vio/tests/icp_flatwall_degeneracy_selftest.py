@@ -32,7 +32,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from vio.mathlib.backend.vio_window import (  # noqa: E402
+from sky.vio.window import (  # noqa: E402
     WindowedVIOConfig, WindowedVIORGBDOdometry,
 )
 

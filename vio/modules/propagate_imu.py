@@ -19,7 +19,7 @@ applied only as a SMOOTH partial correction. The three pieces:
 
 1. **Gap-free forward-propagation (instant, full-magnitude response).** The
    retained raw IMU block for this frame is integrated forward under gravity
-   (:func:`vio.mathlib.imu.imu.predict_state`). To avoid dropping the segment
+   (:func:`sky.vio.imu.predict_state`). To avoid dropping the segment
    BETWEEN this block's first sample and the previous block's last sample (the
    per-frame packet cut ``(prev_ts, ts]`` shares no boundary sample, so a naive
    per-block integration silently loses ~1-of-N inter-sample segments -> the live
@@ -30,7 +30,7 @@ applied only as a SMOOTH partial correction. The three pieces:
 
 2. **Velocity-gated ZUPT (no mid-motion pause).** A Zero-Velocity Update freezes
    translation ONLY when the IMU is GENUINELY at rest: accel ~ g AND gyro ~ 0
-   (:func:`vio.mathlib.imu.imu.imu_at_rest`) AND the live velocity estimate is
+   (:func:`sky.vio.imu.imu_at_rest`) AND the live velocity estimate is
    small (``|v| < _ZUPT_VEL``), sustained for a few frames (hysteresis via
    ``zupt_run``). Accel+gyro ALONE cannot tell "at rest" from "cruising at
    constant velocity" -- both read ``|accel| ~ g``, ``|gyro| ~ 0`` -- so the old
@@ -43,7 +43,7 @@ applied only as a SMOOTH partial correction. The three pieces:
 3. **Smooth complementary vision correction (no snap / overshoot).** When a fresh
    vision fix is available (every keyframe), the live nav-state is nudged a
    BOUNDED FRACTION of the way toward it
-   (:func:`vio.mathlib.imu.imu.complementary_correct`) -- position, velocity, and
+   (:func:`sky.vio.imu.complementary_correct`) -- position, velocity, and
    attitude each get a small error-state feedback term -- instead of the old hard
    ``p = p_vis`` jump + ``v = displacement/dt`` velocity injection. The live pose
    dead-reckons continuously; vision pulls the accumulated drift back gradually
@@ -67,10 +67,10 @@ nav-state so the accumulated drift is BOUNDED on revisits ("closed loop"):
    a thread-safe inbox by ``vio.main``, LIVE-only), it picks a CONVERGED corrected
    keyframe it still has a pre-correction pose for, computes the world-frame SE(3)
    delta ``T_delta = T_corrected @ inv(T_pre)``
-   (:func:`vio.mathlib.imu.imu.loop_correction_delta`), and queues it as a PENDING
+   (:func:`sky.vio.imu.loop_correction_delta`), and queues it as a PENDING
    correction. On each subsequent frame a BOUNDED FRACTION of the REMAINING delta
    is applied to the live pose (geodesic SE(3) interpolation,
-   :func:`vio.mathlib.imu.imu.scale_se3_delta` + :func:`apply_se3_left`), so the
+   :func:`sky.vio.imu.scale_se3_delta` + :func:`apply_se3_left`), so the
    live trajectory is pulled smoothly back onto the loop-corrected one over a few
    frames -- NOT a one-shot teleport (we just removed a hard jump; do not
    reintroduce one). Between corrections the live pose dead-reckons as before.
@@ -118,8 +118,8 @@ from sky.math import se3_inv as _se3_inv
 from sky.math import so3_log
 
 from vio.comms import Step as StepBase
-from vio.mathlib.backend.vio_window import T_cw_to_body_world, body_world_to_T_cw
-from vio.mathlib.imu.imu import (
+from sky.vio.window import T_cw_to_body_world, body_world_to_T_cw
+from sky.vio.imu import (
     apply_se3_left, complementary_correct, imu_at_rest, loop_correction_delta,
     predict_state, scale_se3_delta)
 from .step import Step

@@ -27,7 +27,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import vio.mathlib.backend.vio_window as vw  # noqa: E402
+import sky.vio.window as vw  # noqa: E402
 from verification.loose_vs_tight_bench import (  # noqa: E402
     GOLD_DIR,
     run_session,

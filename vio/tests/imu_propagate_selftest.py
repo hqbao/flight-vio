@@ -12,8 +12,8 @@ It drives :class:`vio.modules.propagate_imu.PropagateImu` exactly as the live
 ``retain_imu`` on, per-frame retained IMU segments keyed by seq, a frozen vision
 pose to simulate vision dropout), and asserts the published live pose with hard
 numeric thresholds. It also unit-checks the underlying primitives
-:func:`vio.mathlib.imu.imu.predict_state` (against a hand-integrated trajectory)
-and :func:`vio.mathlib.imu.imu.imu_at_rest`.
+:func:`sky.vio.imu.predict_state` (against a hand-integrated trajectory)
+and :func:`sky.vio.imu.imu_at_rest`.
 
 Run::
 
@@ -32,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from vio.comms.module import ModuleContext                       # noqa: E402
 from vio.comms import LocalPubSub                                # noqa: E402
 from vio.modules.propagate_imu import PropagateImu               # noqa: E402
-from vio.mathlib.imu.imu import imu_at_rest, predict_state      # noqa: E402
+from sky.vio.imu import imu_at_rest, predict_state      # noqa: E402
 
 G = 9.81
 G_WORLD = np.array([0.0, G, 0.0])     # optical-world "down" = +y

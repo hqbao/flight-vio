@@ -1,4 +1,4 @@
-"""Self-test for the tight-coupled VIO window optimizer (vio.mathlib.backend.vio_window).
+"""Self-test for the tight-coupled VIO window optimizer (sky.vio.window).
 
 Phase 2 gate for the Basalt-style build. It manufactures a synthetic world with
 a KNOWN answer, so a convention/sign error in the joint visual+inertial solve
@@ -41,8 +41,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from vio.mathlib.imu.imu import preintegrate_imu, so3_exp, so3_log  # noqa: E402
-from vio.mathlib.backend.vio_window import (  # noqa: E402
+from sky.vio.imu import preintegrate_imu, so3_exp, so3_log  # noqa: E402
+from sky.vio.window import (  # noqa: E402
     VioConfig,
     VioState,
     optimize_vio,

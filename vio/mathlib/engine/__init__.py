@@ -9,7 +9,7 @@ A flow picks how its optimiser runs with one ``worker`` flag:
   GIL (the fast-push undershoot fix).
 
 The engines wrap the existing algorithm libraries (``vio.mathlib.backend.windowed``
-/ ``vio.mathlib.backend.vio_window``) and know nothing about flows or the bus --
+/ ``sky.vio.window``) and know nothing about flows or the bus --
 they are pure machinery (``lib``), called by the flow tasks.
 """
 from __future__ import annotations
@@ -51,13 +51,13 @@ def make_vi_engine(K: np.ndarray, cfg, *, worker: bool = False) -> Engine:
     """Build a tight-coupled VIO engine (in-process unless ``worker``).
 
     Symmetric with :func:`make_ba_engine` but wraps
-    :class:`vio.mathlib.backend.vio_window.WindowedVIOMap` (the joint visual +
+    :class:`sky.vio.window.WindowedVIOMap` (the joint visual +
     IMU window optimiser) instead of the visual-only ``WindowedBAMap``. The live
     path feeds each keyframe's raw IMU segment via the snapshot, so the map is
     built with no stored IMU stream (``cfg=cfg`` only).
     """
     if worker:
         return SubprocessEngine(_vio_worker_main, K, cfg)
-    from ..backend.vio_window import WindowedVIOMap
+    from sky.vio.window import WindowedVIOMap
     return InProcessEngine(lambda: WindowedVIOMap(K, cfg=cfg),
                            vio_step, vio_overlay)

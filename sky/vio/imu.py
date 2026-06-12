@@ -56,7 +56,7 @@ class ImuNoise:
 
     The bias random-walk densities are NOT used here: the bias states live on the
     keyframes and are tied by the bias-random-walk residual in the optimizer
-    (``vio_window._bias_rw_residual``); this class only covers the additive
+    (:func:`sky.vio.window._bias_rw_residual`); this class only covers the additive
     measurement noise that drives the 9-state preintegration covariance.
 
     Defaults are reasonable order-of-magnitude values for the OAK-D's Bosch
@@ -89,7 +89,7 @@ class ImuPreintegration:
 
     It ALSO carries the 9x9 preintegration covariance ``cov`` of the noise on the
     9-state delta ``eta = [dphi(3); dvel(3); dpos(3)]`` (same ordering as the IMU
-    residual in :func:`vio.mathlib.backend.vio_window._imu_residual`), plus its
+    residual in :func:`sky.vio.window._imu_residual`), plus its
     information square root ``sqrt_info`` such that ``sqrt_info.T @ sqrt_info ==
     inv(cov)``. ``sqrt_info`` is the whitening matrix ``Omega_I = cov^-1``'s upper
     Cholesky factor: whitening a raw 9-residual ``r`` with ``sqrt_info @ r`` gives
@@ -481,7 +481,7 @@ def predict_state(R_wb: np.ndarray, p_wb: np.ndarray, v_w: np.ndarray,
 
     The samples are assumed already expressed in the body == camera optical frame
     (the caller rotates raw IMU by ``R_imu_cam`` before calling, exactly as
-    :class:`vio.mathlib.backend.vio_window.WindowedVIOMap` expects). Biases are
+    :class:`sky.vio.window.WindowedVIOMap` expects). Biases are
     subtracted per sample (gyro/accel bias linearisation point).
 
     Integration per segment ``k -> k+1`` (forward-Euler on the midpoint sample)::
