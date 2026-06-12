@@ -226,12 +226,26 @@ persisted per device; applied via `AccelCalibration.apply` → `a_cal = (a − b
 gravity-align `sky/imu/imu.py:257` + seed `imu_camera/mathlib/device/live_calib.py:123`,
 `modules/pipeline.py:172`.
 
-**How to see it (the most illuminating one for this stage).** *New view needed.* The
-**gravity sphere** 3D scatter: plot the 6 captured *raw* mean vectors as dots and the
-unit sphere of radius g. **Before** calibration the dots form a tilted, off-center
-*ellipsoid* (bias = center offset, scale = axis lengths, misalignment = tilt);
-**after** applying `T(a−b)` they snap onto the g-sphere. One picture makes
-bias/scale/misalignment literally visible and shows `residual_g` as leftover scatter.
+**How to see it (the most illuminating one for this stage).** *Built —
+`imu_camera/tools/gravity_sphere.py`* (offline; `--render` PNG, matplotlib Agg, no
+GUI). The **gravity sphere** 3D scatter: the translucent g-sphere (radius g), the 6
+*raw* face means as RED dots forming a tilted, off-center *ellipsoid* (bias = center
+offset, per-axis scale = half-axis lengths, misalignment = tilt), and the
+calibrated vectors `T(a−b)` as GREEN dots snapping onto the g-sphere — grey
+connectors draw each raw→calibrated "snap". `bias`, per-axis scale, max
+off-diagonal misalignment and `residual_g` are annotated, so all three error
+sources are literally visible and the residual shows as leftover scatter. HONEST
+about the data: the calib store (`sky.sensors.calib_store`) persists only the
+*solved* `AccelCalibration` (T, bias, residual_g), **not** the six raw face vectors
+(`SixFaceCollector` solves and discards them) and no raw accel stream is recorded —
+so the default loads the REAL stored calib and *reconstructs* the six raw faces by
+inverting the stored model exactly (`a_raw_k = b + T⁻¹(g·dir_k)`), the genuine
+"before" dots for that device's own calibration; `--demo` synthesizes from a known
+injected model and shows `solve_accel_calibration` recovering it. The figure title
+states the source. Run::
+
+    .venv/bin/python -m imu_camera.tools.gravity_sphere --render /tmp/gravity_sphere.png
+
 For the cheap gravity-align, the existing `ui/viz/imucam_render.py:render_accel3d`
 (line 126) already draws the live accel vector against the optical axes — that's the
 right *live* view; the sphere is the right *calibration* view.
