@@ -42,10 +42,13 @@ up with the left; rectified-right rows do.
 
 WHY OFFLINE / STANDALONE
 ------------------------
-The live UI publishes only left+depth, never the right frame, so the before/after
-right pair only exists from a recorded session. This tool touches NOTHING in the
-live path / comms / oracle: it only IMPORTS ``sky.depth.stereo`` rectifiers and
-reads a gold session. gap=0 is trivially unaffected.
+This tool reads a recorded session; the LIVE equivalent is the in-app
+``ui.qt.epipolar_window`` (raw left+right off ``imucam.sample`` + the retained
+``calib.stereo``). Both share ONE renderer + compute core
+(:mod:`ui.viz.epipolar_render`) so they can never drift -- this tool is the
+session caller, the window the live caller. This tool touches NOTHING in the
+live path / comms / oracle: it only reads a gold session and rectifies the right.
+gap=0 is trivially unaffected.
 
 USAGE
 -----
@@ -71,36 +74,18 @@ import numpy as np
 # Run as a module (-m) or as a script: make the repo root importable either way.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-import cv2  # noqa: E402  (approved dep; only used as an array/PNG backend here)
-
 from depth.io.reader import SessionReader                            # noqa: E402
-from sky.depth.stereo import RightRectifier                # noqa: E402
-from sky.front.corners import good_features_to_track       # noqa: E402
+from sky.depth.stereo import RightRectifier                         # noqa: E402
+from ui.viz.epipolar_render import (                                # noqa: E402
+    CornerMatch, detect_left_corners, match_corners, median_abs_mismatch,
+)
 
 
 # --------------------------------------------------------------------------- #
-# Compute core -- shared by the headless render (and any future interactive UI).
+# Session compute -- load one gold frame, rectify the right, match corners both
+# ways. The block-match + corner detection live in ``ui.viz.epipolar_render`` so
+# this tool and the live window measure "row mismatch" IDENTICALLY (DRY).
 # --------------------------------------------------------------------------- #
-@dataclass
-class CornerMatch:
-    """One left corner located in the right image (before OR after rectification).
-
-    ``row_mismatch`` = ``yr - yl`` (signed vertical disparity in pixels): the
-    whole point of rectification is to drive |row_mismatch| -> 0. ``score`` is the
-    normalized block-match cost at the chosen right pixel (lower = better) and
-    ``valid`` says whether the match cleared the acceptance gates.
-    """
-
-    xl: float            # left corner x (column)
-    yl: float            # left corner y (row)
-    xr: float            # matched right x (column)
-    yr: float            # matched right y (row)
-    row_mismatch: float  # yr - yl (signed, pixels)
-    disparity: float     # xl - xr (horizontal disparity, for sanity only)
-    score: float         # block-match cost (lower better)
-    valid: bool          # cleared the score / disparity gates
-
-
 @dataclass
 class EpipolarFrame:
     """Everything the figure needs for one gold frame, before and after rectify.
@@ -117,58 +102,6 @@ class EpipolarFrame:
     corners: np.ndarray       # (N, 2) float32 left corner (x, y) used for matching
     matches_before: list[CornerMatch]  # corners located in the RAW right
     matches_after: list[CornerMatch]   # corners located in the RECTIFIED right
-
-
-def _block_match_same_band(left: np.ndarray, right: np.ndarray,
-                           xl: int, yl: int, *, half: int = 5,
-                           row_band: int = 12, max_disp: int = 96,
-                           min_disp: int = 0) -> CornerMatch:
-    """Locate the left patch at ``(xl, yl)`` in ``right`` over a small (row, disp) box.
-
-    A brute-force normalized-SAD search: for every candidate right row in
-    ``yl +/- row_band`` and every horizontal disparity ``d`` in
-    ``[min_disp, max_disp]`` (the right match lies at ``xl - d``, left-ward, since
-    the right camera sees the scene shifted left), score the
-    ``(2*half+1)x(2*half+1)`` patch and keep the cheapest. The row search band is
-    what lets us *see* a vertical mis-rectification: on a raw right image the best
-    match is found several rows off; on the rectified right it collapses onto the
-    same row. Returns a :class:`CornerMatch` with the signed row mismatch.
-    """
-    H, W = right.shape
-    # Patch must be fully inside the left image, else the corner is unusable.
-    if not (half <= xl < W - half and half <= yl < H - half):
-        return CornerMatch(xl, yl, xl, yl, 0.0, 0.0, np.inf, False)
-
-    lpatch = left[yl - half:yl + half + 1, xl - half:xl + half + 1].astype(np.float32)
-    # Zero-mean the patch so a global brightness offset between the two cameras
-    # does not bias the SAD (a poor man's normalization -- enough for a viz).
-    lpatch = lpatch - lpatch.mean()
-
-    best_cost = np.inf
-    best_xr = xl
-    best_yr = yl
-    y_lo = max(half, yl - row_band)
-    y_hi = min(H - half - 1, yl + row_band)
-    for yr in range(y_lo, y_hi + 1):
-        for d in range(min_disp, max_disp + 1):
-            xr = xl - d
-            if xr < half or xr >= W - half:
-                continue
-            rpatch = right[yr - half:yr + half + 1,
-                           xr - half:xr + half + 1].astype(np.float32)
-            rpatch = rpatch - rpatch.mean()
-            cost = float(np.abs(lpatch - rpatch).mean())
-            if cost < best_cost:
-                best_cost = cost
-                best_xr = xr
-                best_yr = yr
-
-    npix = lpatch.size
-    valid = np.isfinite(best_cost) and (best_cost / 255.0) < 0.18 and npix > 0
-    return CornerMatch(
-        xl=float(xl), yl=float(yl), xr=float(best_xr), yr=float(best_yr),
-        row_mismatch=float(best_yr - yl), disparity=float(xl - best_xr),
-        score=float(best_cost), valid=bool(valid))
 
 
 def compute_epipolar_frame(session: str | Path, index: int,
@@ -191,17 +124,11 @@ def compute_epipolar_frame(session: str | Path, index: int,
     right_rect = RightRectifier.from_calib(sr.calib).rectify(right_raw)
     right_rect_u8 = np.clip(right_rect, 0, 255).astype(np.uint8)
 
-    # Strong corners on the (rectified) left -- the features whose rows we track.
-    # Detected on the left we already have; matched into both right images below.
-    corners = good_features_to_track(
-        left, max_corners=max_corners, quality_level=0.02, min_distance=24.0)
-
-    matches_before: list[CornerMatch] = []
-    matches_after: list[CornerMatch] = []
-    for (cx, cy) in corners:
-        xl, yl = int(round(cx)), int(round(cy))
-        matches_before.append(_block_match_same_band(left, right_raw, xl, yl))
-        matches_after.append(_block_match_same_band(left, right_rect_u8, xl, yl))
+    # Strong corners on the (rectified) left -- the features whose rows we track;
+    # then locate each in BOTH right images (shared compute, same as the window).
+    corners = detect_left_corners(left, max_corners=max_corners)
+    matches_before = match_corners(left, right_raw, corners)
+    matches_after = match_corners(left, right_rect_u8, corners)
 
     return EpipolarFrame(
         left_before=left, right_before=right_raw,
@@ -210,137 +137,25 @@ def compute_epipolar_frame(session: str | Path, index: int,
         matches_before=matches_before, matches_after=matches_after)
 
 
-# --------------------------------------------------------------------------- #
-# Headless render -- numpy -> cv2 PNG of the before/after scanline pair.
-# Theme mirrors ui/qt/theme.py / sgm_cost_explorer so the tool looks part of the
-# suite. Colours are BGR for cv2.
-# --------------------------------------------------------------------------- #
-_BG = (23, 27, 13)         # #0d1117 dark page
-_TEXT = (243, 237, 230)    # #e6edf3 light text
-_SCAN = (180, 150, 90)     # muted steel-blue scanline (subtle, BGR)
-_GOOD = (92, 255, 124)     # NVG green: a corner on/near its scanline (good)
-_BAD = (48, 59, 255)       # warning red: a corner off its scanline (bad)
-_LINK = (0, 176, 255)      # amber: the left->right correspondence link
-
-
-def _to_bgr(gray: np.ndarray) -> np.ndarray:
-    """Grayscale uint8 -> 3-channel BGR canvas we can draw coloured overlays on."""
-    g = np.clip(gray, 0, 255).astype(np.uint8)
-    return cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
-
-
-def _draw_scanlines(img: np.ndarray, n: int = 13) -> None:
-    """Draw ``n`` evenly-spaced horizontal scanlines across ``img`` (in place).
-
-    These are the SAME rows on the left and right panels of a stereo row: after a
-    correct rectification a left feature and its right match straddle the same one.
-    """
-    h = img.shape[0]
-    for y in np.linspace(0.08 * h, 0.92 * h, n):
-        cv2.line(img, (0, int(y)), (img.shape[1] - 1, int(y)), _SCAN, 1, cv2.LINE_AA)
-
-
-def _annotate_matches(left_bgr: np.ndarray, right_bgr: np.ndarray,
-                      matches: list[CornerMatch], tol_rows: float = 1.5) -> None:
-    """Mark each corner on the left, its match on the right, and the row mismatch.
-
-    Green = the match sits within ``tol_rows`` of the left corner's row (correctly
-    row-aligned); red = it is off by more (a vertical mis-rectification). A short
-    horizontal tick on the right marks the LEFT corner's row, so the gap to the
-    actual match (the dot) is the visible row mismatch.
-    """
-    for m in matches:
-        if not m.valid:
-            continue
-        ok = abs(m.row_mismatch) <= tol_rows
-        col = _GOOD if ok else _BAD
-        xl, yl = int(round(m.xl)), int(round(m.yl))
-        xr, yr = int(round(m.xr)), int(round(m.yr))
-        cv2.circle(left_bgr, (xl, yl), 4, col, 1, cv2.LINE_AA)
-        cv2.circle(right_bgr, (xr, yr), 4, col, -1, cv2.LINE_AA)
-        # The left corner's row, drawn on the right as a reference tick: the
-        # vertical gap from this tick to the filled dot IS the row mismatch.
-        cv2.line(right_bgr, (xr - 9, yl), (xr + 9, yl), col, 1, cv2.LINE_AA)
-        if not ok:
-            cv2.putText(right_bgr, f"{m.row_mismatch:+.0f}px", (xr + 8, yr - 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, col, 1, cv2.LINE_AA)
-
-
-def _median_abs_mismatch(matches: list[CornerMatch]) -> tuple[float, int]:
-    """Median |row mismatch| over the valid matches, and how many were valid."""
-    vals = [abs(m.row_mismatch) for m in matches if m.valid]
-    if not vals:
-        return float("nan"), 0
-    return float(np.median(vals)), len(vals)
-
-
-def _stereo_row(left_bgr: np.ndarray, right_bgr: np.ndarray, gap: int = 8,
-                ) -> np.ndarray:
-    """Stack a left|right pair side by side with a thin separator gutter."""
-    h = left_bgr.shape[0]
-    sep = np.full((h, gap, 3), _BG, dtype=np.uint8)
-    return np.hstack([left_bgr, sep, right_bgr])
-
-
 def render_epipolar_png(ef: EpipolarFrame, out_path: str | Path,
                         n_scanlines: int = 13) -> str:
     """Write the 2-row before/after epipolar figure to ``out_path`` (abs path back).
 
-    Top row  = chip-rectified LEFT | RAW right (raw rows do not align).
-    Bottom row = chip-rectified LEFT | RECTIFIED right (rows snap onto the same
-    scanline). Each row carries the shared scanlines, the corner markers, and a
-    per-row median |row mismatch| readout so the before -> after collapse is
-    quantitative, not just visual.
+    Delegates the figure to the SHARED :func:`ui.viz.epipolar_render.render_epipolar`
+    (one renderer for this tool + the live window), then converts its RGB canvas to
+    BGR for ``cv2.imwrite``.
     """
-    # --- Build the four panels (BGR) with scanlines + corner annotations. ---- #
-    lb, rb = _to_bgr(ef.left_before), _to_bgr(ef.right_before)
-    la, ra = _to_bgr(ef.left_after), _to_bgr(ef.right_after)
-    for panel in (lb, rb, la, ra):
-        _draw_scanlines(panel, n_scanlines)
-    _annotate_matches(lb, rb, ef.matches_before)
-    _annotate_matches(la, ra, ef.matches_after)
+    import cv2  # noqa: PLC0415 (approved dep; array/PNG backend, lazy like sgm_cost)
+    from ui.viz.epipolar_render import render_epipolar  # noqa: PLC0415
 
-    med_before, n_before = _median_abs_mismatch(ef.matches_before)
-    med_after, n_after = _median_abs_mismatch(ef.matches_after)
-
-    top = _stereo_row(lb, rb)
-    bot = _stereo_row(la, ra)
-    width = max(top.shape[1], bot.shape[1])
-
-    # --- Per-row caption strips (panel labels + median row mismatch). -------- #
-    def _caption(text: str, sub: str) -> np.ndarray:
-        strip = np.full((42, width, 3), _BG, dtype=np.uint8)
-        cv2.putText(strip, text, (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                    _TEXT, 1, cv2.LINE_AA)
-        cv2.putText(strip, sub, (8, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
-                    _TEXT, 1, cv2.LINE_AA)
-        return strip
-
-    before_med = ("median |row mismatch| = n/a (no valid corner matches)"
-                  if n_before == 0
-                  else f"median |row mismatch| = {med_before:.1f}px "
-                       f"over {n_before} corners  (off-row = RED)")
-    after_med = ("median |row mismatch| = n/a (no valid corner matches)"
-                 if n_after == 0
-                 else f"median |row mismatch| = {med_after:.1f}px "
-                      f"over {n_after} corners  (on-row = GREEN)")
-    cap_top = _caption(
-        "BEFORE  -  chip-rectified LEFT  |  RAW right (unrectified)", before_med)
-    cap_bot = _caption(
-        "AFTER   -  chip-rectified LEFT  |  RightRectifier(raw right)", after_med)
-
-    # --- Header banner explaining the read. ---------------------------------- #
-    banner = np.full((56, width, 3), _BG, dtype=np.uint8)
-    cv2.putText(banner, "Stereo rectification epipolar view: do matches land on the "
-                        "SAME scanline after rectify?",
-                (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.52, _TEXT, 1, cv2.LINE_AA)
-    cv2.putText(banner, "scanlines drawn across BOTH images; a corner + its right "
-                        "match should straddle one line (GREEN) once rectified",
-                (10, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.42, _TEXT, 1, cv2.LINE_AA)
-
-    out = np.vstack([banner, cap_top, top, cap_bot, bot])
+    rgb = render_epipolar(
+        ef.left_before, ef.right_before, ef.left_after, ef.right_after,
+        ef.matches_before, ef.matches_after,
+        before_label="BEFORE  -  chip-rectified LEFT  |  RAW right (unrectified)",
+        after_label="AFTER   -  chip-rectified LEFT  |  RightRectifier(raw right)",
+        n_scanlines=n_scanlines)
     out_path = str(Path(out_path).resolve())
-    cv2.imwrite(out_path, out)
+    cv2.imwrite(out_path, rgb[..., ::-1])        # RGB -> BGR for cv2
     return out_path
 
 
@@ -365,8 +180,8 @@ def main(argv: list[str] | None = None) -> int:
 
     ef = compute_epipolar_frame(args.session, args.frame,
                                 max_corners=args.max_corners)
-    med_before, n_before = _median_abs_mismatch(ef.matches_before)
-    med_after, n_after = _median_abs_mismatch(ef.matches_after)
+    med_before, n_before = median_abs_mismatch(ef.matches_before)
+    med_after, n_after = median_abs_mismatch(ef.matches_after)
     H, W = ef.left_before.shape
     print(f"loaded {args.session} frame {args.frame}: {W}x{H}, "
           f"{len(ef.corners)} corners")

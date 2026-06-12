@@ -455,6 +455,44 @@ class ImuCamPacket:
 
 
 @dataclass(frozen=True)
+class CalibStereo:
+    """FULL stereo calibration the rectifiers need (topic ``calib.stereo``).
+
+    Published RETAINED by the capture process on boot alongside the
+    :class:`comms.wire.WireCalibBundle` (``calib.bundle``). Where the bundle
+    carries only the rectified-left ``K``, this carries the COMPLETE stereo calib a
+    :class:`sky.depth.stereo.LeftRectifier` / :class:`sky.depth.stereo.RightRectifier`
+    needs to be BUILT from scratch: BOTH cameras' intrinsics + distortion and the
+    left->right rigid extrinsic. The UI's "Epipolar / Rectification" window reads it
+    DIRECTLY off the wire (no flow message) and rectifies a live raw left+right
+    pair, exactly the fields ``LeftRectifier.from_calib`` /
+    ``RightRectifier.from_calib`` read off a ``StereoCalib``
+    (``sky/depth/stereo.py``): ``calib.left.K`` / ``calib.left.dist`` /
+    ``calib.right.K`` / ``calib.right.dist`` / ``calib.T_left_right`` /
+    ``calib.left.width`` / ``calib.left.height``.
+
+    Pure POD (no shared-memory ring -- it is a handful of small matrices). The
+    distortion vectors are variable length (``N`` OpenCV coefficients, possibly 0);
+    the codec ships every ndarray by ``dtype.name`` + shape, so any length
+    round-trips faithfully.
+
+    * ``left_K`` / ``right_K`` -- ``(3, 3)`` float64 pinhole intrinsics.
+    * ``left_dist`` / ``right_dist`` -- ``(N,)`` float64 OpenCV distortion
+      coefficients (``[k1, k2, p1, p2, k3, ...]``); ``N`` may be 0.
+    * ``T_left_right`` -- ``(4, 4)`` float64 left->right rigid transform (metres).
+    * ``width`` / ``height`` -- the (left) image dimensions the rectifier maps span.
+    """
+
+    left_K: np.ndarray
+    left_dist: np.ndarray
+    right_K: np.ndarray
+    right_dist: np.ndarray
+    T_left_right: np.ndarray
+    width: int
+    height: int
+
+
+@dataclass(frozen=True)
 class ImuRaw:
     """The RAW IMU samples for one frame interval, before any calibration.
 

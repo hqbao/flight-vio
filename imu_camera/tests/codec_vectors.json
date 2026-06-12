@@ -1,6 +1,7 @@
 {
   "calib_bundle_full": "71616797b5fb82b44802442f38aba53957ed91f47da2d6e38bf922bf2748536a",
   "calib_bundle_minimal": "bd37dbbd5159bf68848ef54e41e2385a650cfb3231ad3868c037bd1e5d1723f0",
+  "calib_stereo": "9a82bf446d73bd5af4ab9cac6570b3bd71111c9a9512189d622eb81d6bc563b7",
   "cam_sync": "dbec0d679c54677d82be46c283d4b37c44cb001927f6570d11c2bdaa5e1b1342",
   "cam_sync_mono": "859adf6d3e6f0d0f2abd557acec1f59a08f671489eb0c28a2e7fe8ce853cf3df",
   "depth_frame": "5f74890799d6b316548ef7d68b7b9e87cecff55f6a3b4ef7a75c5f716b5794aa",

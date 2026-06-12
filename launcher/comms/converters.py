@@ -347,6 +347,10 @@ def _frontend_to_local(wm: WireFrameFrontend, rings: RingRegistry) -> FrameFront
 # Registry: topic -> (to_wire, to_local). Bridges pick converters by topic.
 # Map-overlay + calib-bundle topics travel WITHOUT a local-side reconstruction
 # (they're not flow messages); the UI subscribes to them directly off the wire.
+# This includes the retained ``calib.bundle`` / ``calib.stereo`` and ``vio.map``:
+# they are PUBLISHED as their wire form directly (``server.publish(topic, wire)``,
+# never through ``to_wire``) and READ directly off the wire by the UI, so they
+# need a ``Wire*`` class in ``TOPIC_WIRE`` (for the codec) but NO converter here.
 # --------------------------------------------------------------------------- #
 ToWire = Callable[[Any, RingRegistry, str], Any]
 ToLocal = Callable[[Any, RingRegistry], Any]

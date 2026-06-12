@@ -40,7 +40,7 @@ from imu_camera.comms import (                                    # noqa: E402
     IPCPublisher, IPCPubSub, LocalPubSub, RingRegistry, topics,
 )
 from imu_camera.comms.ring_registry import default_capture_specs  # noqa: E402
-from imu_camera.comms.wire import WireCalibBundle                 # noqa: E402
+from imu_camera.comms.wire import WireCalibBundle, WireCalibStereo  # noqa: E402
 from imu_camera.io.reader import SessionReader                    # noqa: E402
 
 LOG = logging.getLogger("imu_camera.main")
@@ -57,6 +57,12 @@ _DATA_TOPICS = [
     topics.FRAME_DEPTH,
 ]
 _CALIB_TOPIC = "calib.bundle"
+#: Sibling RETAINED topic carrying the FULL stereo calib (both intrinsics +
+#: distortion + the left->right extrinsic) the rectifiers need. Published ALONGSIDE
+#: ``calib.bundle`` (which carries only the rectified-left K) so the UI's Epipolar
+#: window can build a Left/RightRectifier from a live raw pair. ADDITIVE: the
+#: oracle never consumes it and ``calib.bundle`` is byte-unchanged -> gap=0 holds.
+_CALIB_STEREO_TOPIC = "calib.stereo"
 
 
 def _build_calib_bundle_replay(reader: SessionReader) -> WireCalibBundle:
@@ -128,6 +134,31 @@ def _build_calib_bundle_live(cal) -> WireCalibBundle:
     )
 
 
+def _build_calib_stereo(calib) -> WireCalibStereo:
+    """Build the retained ``calib.stereo`` wire message from a ``StereoCalib``.
+
+    ``calib`` is the SAME :class:`depth.io.reader.StereoCalib` (replay:
+    ``reader.calib``; live: ``cal.calib``) the depth path already uses to build its
+    stereo matcher -- this just EXPOSES the rectifier-relevant fields on the wire.
+    It carries exactly what ``Left/RightRectifier.from_calib`` read
+    (``sky/depth/stereo.py``): both cameras' ``K`` + distortion, the left->right
+    rigid transform, and the (left) image dimensions the rectifier maps span.
+
+    The native source-resolution calib is published as-is (no ToF K-scaling): the
+    rectifiers operate on the raw full-resolution left+right the UI receives on
+    ``imucam.sample``, so the calib must match THAT grid, not a downsampled one.
+    """
+    return WireCalibStereo(
+        left_K=np.asarray(calib.left.K, dtype=np.float64).reshape(3, 3),
+        left_dist=np.asarray(calib.left.dist, dtype=np.float64).reshape(-1),
+        right_K=np.asarray(calib.right.K, dtype=np.float64).reshape(3, 3),
+        right_dist=np.asarray(calib.right.dist, dtype=np.float64).reshape(-1),
+        T_left_right=np.asarray(calib.T_left_right, dtype=np.float64).reshape(4, 4),
+        width=int(calib.left.width),
+        height=int(calib.left.height),
+    )
+
+
 # --------------------------------------------------------------------------- #
 def run_capture_replay(session: Path, endpoint: str, *,
                        width: int, height: int,
@@ -154,7 +185,8 @@ def run_capture_replay(session: Path, endpoint: str, *,
     # Live mode uses non-blocking publish (drop-oldest on stall so the OAK-D
     # firmware watchdog never fires). Replay mode below uses blocking=True so
     # every replayed frame reaches VIO.
-    server = IPCPubSub(endpoint, role="server", retain_topics={_CALIB_TOPIC},
+    server = IPCPubSub(endpoint, role="server",
+                       retain_topics={_CALIB_TOPIC, _CALIB_STEREO_TOPIC},
                        blocking=False)
     local = LocalPubSub()
 
@@ -188,6 +220,10 @@ def run_capture_replay(session: Path, endpoint: str, *,
     if tof_sim:
         bundle = _scale_bundle_to_tof(bundle, src_w=width, src_h=height)
     server.publish(_CALIB_TOPIC, bundle)
+    # Sibling retained FULL stereo calib for the UI's Epipolar window (additive;
+    # the oracle never reads it). Built from the SAME StereoCalib the depth path
+    # uses, at native source resolution (the rectifiers run on the raw pair).
+    server.publish(_CALIB_STEREO_TOPIC, _build_calib_stereo(reader.calib))
     LOG.info("capture[%s] replay session=%s frames=%d src=%dx%d pub=%dx%d%s",
              endpoint, session, len(reader), width, height, pub_w, pub_h,
              " (vl53l9cx ToF sim)" if tof_sim else "")
@@ -279,7 +315,8 @@ def run_capture_live(endpoint: str, *,
     # breaking VIO (the gyro continuity required by PreintegratePrior and the KLT
     # continuity required by TrackFeatures). Backpressure belongs at the IPC
     # boundary, not at the VIO inputs.
-    server = IPCPubSub(endpoint, role="server", retain_topics={_CALIB_TOPIC},
+    server = IPCPubSub(endpoint, role="server",
+                       retain_topics={_CALIB_TOPIC, _CALIB_STEREO_TOPIC},
                        blocking=False)
     local = LocalPubSub()
     # ToF: drop cam.sync from the bridge -- it carries the source-res pair, which
@@ -309,6 +346,10 @@ def run_capture_live(endpoint: str, *,
     if tof_sim:
         bundle = _scale_bundle_to_tof(bundle, src_w=width, src_h=height)
     server.publish(_CALIB_TOPIC, bundle)
+    # Sibling retained FULL stereo calib for the UI's Epipolar window (additive;
+    # the oracle never reads it). Built from the SAME live StereoCalib the depth
+    # path uses, at native source resolution (the rectifiers run on the raw pair).
+    server.publish(_CALIB_STEREO_TOPIC, _build_calib_stereo(cal.calib))
     LOG.info("capture[%s] live src=%dx%d pub=%dx%d@%d depth_fast=%s%s",
              endpoint, width, height, pub_w, pub_h, fps, depth_fast,
              " (vl53l9cx ToF sim)" if tof_sim else "")

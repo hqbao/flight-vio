@@ -185,6 +185,12 @@ def _build_vectors(mod):
          w.WireCalibBundle(K=K, width=640, height=400, fps=20,
                            T_imu_left=T, R_imu_cam=K, accel_align=accel[0],
                            gyro_bias=gyro[0], device_id="dev-01")),
+        (w.topics.CALIB_STEREO,
+         w.WireCalibStereo(
+             left_K=K, left_dist=(np.arange(8, dtype=np.float64) * 0.01),
+             right_K=(K + 0.25),
+             right_dist=(np.arange(8, dtype=np.float64) * 0.011 - 0.002),
+             T_left_right=T, width=640, height=400)),
         (w.topics.VIO_MAP,
          w.WireVioMap(kf_ids=ids,
                       kf_positions=pts[:, :1].repeat(3, axis=1))),

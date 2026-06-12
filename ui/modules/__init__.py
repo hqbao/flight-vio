@@ -59,11 +59,11 @@ from .triplet import UiTripletModule
 _IPC_ADAPTERS = frozenset({
     "IpcImuRawSource", "IpcStereoRawSource", "IpcGyroFuseSource",
     "IpcLoopMatchSource", "IpcBaWindowSource", "IpcFrontendVizSource",
-    "IpcPoseGraphSource",
+    "IpcPoseGraphSource", "IpcEpipolarSource",
     "IpcTripletWorker", "IpcKeypointWorker", "IpcSlamMapSource",
     "ipc_triplet_factory", "ipc_keypoint_factory", "ipc_slam_map_factory",
     "ipc_loop_factory", "ipc_ba_window_factory", "ipc_frontend_viz_factory",
-    "ipc_pose_graph_factory",
+    "ipc_pose_graph_factory", "ipc_epipolar_factory",
 })
 
 __all__ = [
@@ -81,6 +81,7 @@ __all__ = [
     "IpcBaWindowSource",
     "IpcFrontendVizSource",
     "IpcPoseGraphSource",
+    "IpcEpipolarSource",
     "IpcTripletWorker",
     "IpcKeypointWorker",
     "IpcSlamMapSource",
@@ -91,6 +92,7 @@ __all__ = [
     "ipc_ba_window_factory",
     "ipc_frontend_viz_factory",
     "ipc_pose_graph_factory",
+    "ipc_epipolar_factory",
 ]
 
 

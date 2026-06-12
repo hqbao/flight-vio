@@ -409,6 +409,180 @@ class IpcStereoRawSource:
 
 
 # --------------------------------------------------------------------------- #
+# (1a3) Live Epipolar / Rectification source for the in-app window
+# --------------------------------------------------------------------------- #
+class IpcEpipolarSource:
+    """Duck-typed source for the "Epipolar / Rectification" window.
+
+    The window needs TWO things from the CAPTURE process: a live RAW left+right
+    pair (to rectify) and the FULL stereo calibration (to BUILD the rectifiers).
+    This adapter wires both off the capture endpoint and delivers a finished
+    ``EpipolarRender`` record (the four before/after panels + the two corner-match
+    lists) the window just blits -- mirroring the other Visualize sources'
+    ``start(callback)`` / ``stop()`` / ``.error`` contract.
+
+    * RAW pairs ride ``imucam.sample`` -- delivered the SAME proven way the camera
+      calibration wizard gets them: an embedded :class:`IpcStereoRawSource` (which
+      attaches capture's shared-memory rings + an :class:`IPCSubscriber`).
+    * The FULL stereo calib rides the retained ``calib.stereo`` topic, read
+      DIRECTLY off the wire (a :class:`WireCalibStereo`, like ``calib.bundle`` --
+      no converter), so a late-joining window receives it immediately on connect.
+
+    Once BOTH a calib AND a raw pair are in hand, the rectifiers
+    (:class:`sky.depth.stereo.LeftRectifier` / ``RightRectifier``) are built ONCE
+    (lazy), then every frame: rectify BOTH raw frames, detect a few strong left
+    corners, locate them in the right BEFORE (raw) and AFTER (rectified), and emit
+    the rendered record. Until both arrive the callback is not invoked (the window
+    shows its "waiting for calib / stereo…" placeholder).
+
+    Heavy work (rectify + block-match) runs on the frame recv thread; the window
+    coalesces with a latest-wins ``_pending`` latch + a QTimer, so a slow render
+    never backs up the IPC transport (mirrors :class:`ui.qt.ba_window.BaWindow`).
+
+    Device-agnostic: consumes only the abstract ``imucam.sample`` + ``calib.stereo``
+    topics + Wire POD types; no depthai / OAK-D specifics cross into the UI.
+    """
+
+    #: Max strong left corners tracked across the pair (same as the offline tool).
+    MAX_CORNERS = 14
+
+    def __init__(self, capture_endpoint: str, width: int, height: int, *,
+                 connect_timeout_s: float = 30.0) -> None:
+        self._endpoint = capture_endpoint
+        self._w = int(width)
+        self._h = int(height)
+        self._connect_timeout_s = float(connect_timeout_s)
+        self.error: str | None = None
+
+        # Frame transport: reuse the proven raw-stereo source (rings + subscriber).
+        self._frames = IpcStereoRawSource(
+            capture_endpoint, width, height,
+            connect_timeout_s=connect_timeout_s)
+        # Calib transport: a direct retained client (WireCalibStereo off the wire,
+        # like calib.bundle -- pure POD, no rings).
+        self._calib_client: IPCPubSub | None = None
+        self._calib_rings = RingRegistry()
+        self._cb = None
+
+        self._lock = threading.Lock()
+        self._calib = None                            # WireCalibStereo, once seen
+        # Rectifiers, built lazily once a calib arrives (the build is ~50 ms, so
+        # do it off the recv thread's first frame, not in start()).
+        self._left_rect = None
+        self._right_rect = None
+
+    # ------------------------------------------------------------------ #
+    def start(self, callback) -> None:
+        """Connect both transports; emit an EpipolarRender once both data arrive."""
+        self._cb = callback
+        # 1) Calib: subscribe the retained calib.stereo (arrives on connect).
+        client = IPCPubSub(self._endpoint, role="client",
+                           connect_timeout_s=self._connect_timeout_s)
+        client.subscribe(topics.CALIB_STEREO, self._on_calib)
+        try:
+            client.start()
+        except Exception as e:                                     # noqa: BLE001
+            self.error = f"capture calib.stereo connect failed: {e}"
+            return
+        self._calib_client = client
+        # 2) Frames: the embedded raw-stereo source (rings + IPCSubscriber).
+        self._frames.start(self._on_pair)
+        if self._frames.error and self.error is None:
+            self.error = self._frames.error
+
+    def _on_calib(self, wm) -> None:
+        """Calib recv thread: latch the WireCalibStereo (read directly off wire)."""
+        if wm is END:
+            return
+        with self._lock:
+            self._calib = wm
+            # A NEW calib invalidates any rectifiers built from an older one.
+            self._left_rect = None
+            self._right_rect = None
+
+    def _ensure_rectifiers(self, calib):
+        """Build the Left/Right rectifiers from a WireCalibStereo ONCE (lock held).
+
+        Constructs the rectifiers directly from the flat wire fields (rather than
+        ``from_calib``, which expects a ``StereoCalib`` object): the left->right
+        rotation + translation come from ``T_left_right``.
+        """
+        if self._left_rect is not None and self._right_rect is not None:
+            return True
+        from sky.depth.stereo import LeftRectifier, RightRectifier
+
+        T = np.asarray(calib.T_left_right, dtype=np.float64).reshape(4, 4)
+        R = T[:3, :3]
+        t = T[:3, 3]
+        w, h = int(calib.width), int(calib.height)
+        K_left = np.asarray(calib.left_K, dtype=np.float64).reshape(3, 3)
+        K_right = np.asarray(calib.right_K, dtype=np.float64).reshape(3, 3)
+        d_left = np.asarray(calib.left_dist, dtype=np.float64).reshape(-1)
+        d_right = np.asarray(calib.right_dist, dtype=np.float64).reshape(-1)
+        self._left_rect = LeftRectifier(K_left, d_left, R, t, w, h)
+        self._right_rect = RightRectifier(K_left, K_right, d_right, R, t, w, h)
+        return True
+
+    def _on_pair(self, seq: int, ts_ns: int, gray_left, gray_right) -> None:
+        """Frame recv thread: rectify both, match corners, emit a render record.
+
+        Skipped silently until a calib has arrived (the window stays on its
+        placeholder). The right frame is guaranteed present here -- the embedded
+        :class:`IpcStereoRawSource` latches an error + stops on a mono stream.
+        """
+        from ui.viz.epipolar_render import (
+            EpipolarRender, detect_left_corners, match_corners)
+
+        with self._lock:
+            calib = self._calib
+            if calib is None:
+                return                                # no calib yet -> wait
+            try:
+                self._ensure_rectifiers(calib)
+            except Exception as e:                                 # noqa: BLE001
+                self.error = f"rectifier build failed: {e}"
+                return
+            left_rect = self._left_rect
+            right_rect = self._right_rect
+
+        raw_l = np.ascontiguousarray(gray_left)
+        raw_r = np.ascontiguousarray(gray_right)
+        # Rectify BOTH raw frames (the fully VPU-free path): the window's BEFORE
+        # row is the raw pair, the AFTER row the rectified pair.
+        rect_l = np.clip(left_rect.rectify(raw_l), 0, 255).astype(np.uint8)
+        rect_r = np.clip(right_rect.rectify(raw_r), 0, 255).astype(np.uint8)
+
+        # Detect strong corners on the rectified LEFT (the rows we track across),
+        # then locate each in the BEFORE (raw) and AFTER (rectified) right images.
+        corners = detect_left_corners(rect_l, max_corners=self.MAX_CORNERS)
+        matches_before = match_corners(raw_l, raw_r, corners)
+        matches_after = match_corners(rect_l, rect_r, corners)
+
+        rec = EpipolarRender(
+            seq=int(seq), ts_ns=int(ts_ns),
+            left_before=raw_l, right_before=raw_r,
+            left_after=rect_l, right_after=rect_r,
+            matches_before=matches_before, matches_after=matches_after)
+        cb = self._cb
+        if cb is not None:
+            cb(rec)
+
+    def stop(self) -> None:
+        """Stop both transports (idempotent; swallow teardown errors)."""
+        try:
+            self._frames.stop()
+        except Exception:                                          # noqa: BLE001
+            pass
+        client = self._calib_client
+        self._calib_client = None
+        if client is not None:
+            try:
+                client.stop()
+            except Exception:                                      # noqa: BLE001
+                pass
+
+
+# --------------------------------------------------------------------------- #
 # (1b) Gyro-fusion source for the strip-chart window
 # --------------------------------------------------------------------------- #
 class IpcGyroFuseSource:
@@ -2323,6 +2497,20 @@ def ipc_frontend_viz_factory(vio_endpoint: str, *, buffer: int = 240,
     """
     return lambda: IpcFrontendVizSource(vio_endpoint, buffer=buffer,
                                         connect_timeout_s=connect_timeout_s)
+
+
+def ipc_epipolar_factory(capture_endpoint: str, width: int, height: int, *,
+                         connect_timeout_s: float = 30.0):
+    """Return a zero-arg factory building an :class:`IpcEpipolarSource`.
+
+    Binds the CAPTURE endpoint (the raw ``imucam.sample`` left+right pair + its
+    shared-memory rings, AND the retained ``calib.stereo`` the rectifiers need), so
+    the caller (``ui.main``) just opens the Epipolar window with the returned
+    source. A pure CONSUMER of two always-published capture topics (no new IPC
+    field, no flag) -- the byte-parity oracle is unaffected.
+    """
+    return lambda: IpcEpipolarSource(capture_endpoint, width, height,
+                                     connect_timeout_s=connect_timeout_s)
 
 
 def ipc_pose_graph_factory(vio_endpoint: str, slam_endpoint: str, *,

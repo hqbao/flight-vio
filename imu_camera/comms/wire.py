@@ -136,6 +136,33 @@ class WireCalibBundle:
     device_id: str | None = None                  # per-device IMU calib key
 
 
+@dataclass(frozen=True)
+class WireCalibStereo:
+    """Wire form of :class:`comms.messages.CalibStereo` (topic ``calib.stereo``).
+
+    The FULL stereo calibration the rectifiers need, broadcast RETAINED on boot
+    alongside :class:`WireCalibBundle` (which carries ONLY the rectified-left ``K``).
+    Pure POD -- a handful of small matrices, no shared-memory ring. The distortion
+    vectors are variable length (``N`` coefficients, possibly 0); the codec ships
+    every ndarray by ``dtype.name`` + shape, so any length round-trips exactly.
+
+    ADDITIVE: ``calib.bundle`` is byte-UNCHANGED -- this is a separate topic the
+    oracle never consumes, so the byte-parity gate is UNAFFECTED (mirrors
+    :class:`WireBaWindow` / :class:`WireFrameFrontend`).
+
+    Field ORDER is the FROZEN codec contract (see module docstring): it MUST match
+    :class:`comms.messages.CalibStereo` field-for-field, name + order + dtype.
+    """
+
+    left_K: np.ndarray                            # (3, 3) float64
+    left_dist: np.ndarray                         # (N,) float64 OpenCV coeffs
+    right_K: np.ndarray                           # (3, 3) float64
+    right_dist: np.ndarray                        # (N,) float64 OpenCV coeffs
+    T_left_right: np.ndarray                      # (4, 4) float64 (metres)
+    width: int
+    height: int
+
+
 # --------------------------------------------------------------------------- #
 # VIO outputs: vio --> SLAM / UI
 # --------------------------------------------------------------------------- #
@@ -424,5 +451,6 @@ TOPIC_WIRE: dict[str, type] = {
     # Retained / read-directly topics (no converter), but the registry MUST cover
     # them so consumers can decode the wire object. See blueprint risk #5.
     topics.CALIB_BUNDLE:    WireCalibBundle,
+    topics.CALIB_STEREO:    WireCalibStereo,
     topics.VIO_MAP:         WireVioMap,
 }

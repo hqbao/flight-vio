@@ -635,6 +635,7 @@ def run_ui(*, vio_endpoint: str = DEFAULT_VIO_ENDPOINT,
     from ui.qt.loop_window import LoopClosureWindow
     from ui.qt.ba_window import BaWindow
     from ui.qt.frontend_window import FrontendWindow
+    from ui.qt.epipolar_window import EpipolarWindow
     from ui.qt.posegraph_window import PoseGraphWindow
     from ui.qt.map_window import MapWindow
     from ui.qt.calib_dialogs import GyroCalibDialog, AccelCalibDialog
@@ -645,7 +646,7 @@ def run_ui(*, vio_endpoint: str = DEFAULT_VIO_ENDPOINT,
         IpcImuRawSource, IpcStereoRawSource, IpcGyroFuseSource,
         ipc_triplet_factory, ipc_keypoint_factory, ipc_slam_map_factory,
         ipc_loop_factory, ipc_ba_window_factory, ipc_frontend_viz_factory,
-        ipc_pose_graph_factory,
+        ipc_pose_graph_factory, ipc_epipolar_factory,
     )
 
     # 1. Wait for VIO + SLAM to be ready (and learn the capture resolution).
@@ -841,6 +842,26 @@ def run_ui(*, vio_endpoint: str = DEFAULT_VIO_ENDPOINT,
     keypoints_act = QAction("Keypoint Depth Tracker…", win)
     keypoints_act.triggered.connect(_open_keypoints)
     vis_menu.addAction(keypoints_act)
+
+    def _open_epipolar() -> None:
+        if getattr(win, "_epipolar_win", None) is None:
+            # Source binds the CAPTURE endpoint: the raw imucam.sample left+right
+            # pair (+ its rings) AND the retained calib.stereo the rectifiers need.
+            # A pure consumer of two always-published capture topics (no flag),
+            # device-agnostic like the other Visualize windows.
+            win._epipolar_win = EpipolarWindow(
+                ipc_epipolar_factory(capture_endpoint, W, H,
+                                     connect_timeout_s=calib_timeout_s),
+                parent=win)
+        win._epipolar_win.show()
+        win._epipolar_win.raise_()
+        win._epipolar_win.activateWindow()
+        win._epipolar_win.ensure_started()
+        win.statusBar().showMessage("Epipolar / Rectification opened.", 2500)
+
+    epipolar_act = QAction("Epipolar / Rectification…", win)
+    epipolar_act.triggered.connect(_open_epipolar)
+    vis_menu.addAction(epipolar_act)
 
     def _open_gyrofuse() -> None:
         if getattr(win, "_gyrofuse_win", None) is None:
@@ -1144,7 +1165,7 @@ def run_ui(*, vio_endpoint: str = DEFAULT_VIO_ENDPOINT,
         # their handler's `finally`, so there's nothing to clean up for them here.
         for _attr in ("_triplet_win", "_keypoints_win", "_gyrofuse_win",
                       "_loop_win", "_ba_window_win", "_frontend_win",
-                      "_pose_graph_win", "_slam_map_win"):
+                      "_pose_graph_win", "_slam_map_win", "_epipolar_win"):
             _w = getattr(win, _attr, None)
             if _w is not None:
                 try:

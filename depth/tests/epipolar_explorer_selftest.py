@@ -30,8 +30,11 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from depth.tools.epipolar_explorer import (                          # noqa: E402
-    compute_epipolar_frame, render_epipolar_png, _median_abs_mismatch,
+    compute_epipolar_frame, render_epipolar_png,
 )
+# The block-match / median helpers now live in the SHARED renderer that the live
+# window and this offline tool both call (DRY); import the median from there.
+from ui.viz.epipolar_render import median_abs_mismatch as _median_abs_mismatch  # noqa: E402
 
 
 def _check(session: str, frame: int) -> bool:

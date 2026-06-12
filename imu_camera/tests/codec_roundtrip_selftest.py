@@ -37,9 +37,10 @@ from imu_camera.comms import topics
 from imu_camera.comms.codec import decode, encode
 from imu_camera.comms.shared_array import SharedArrayRef, SharedArrayRing
 from imu_camera.comms.wire import (
-    WireCalibBundle, WireCamSync, WireDepthFrame, WireEnd, WireFrameInliers,
-    WireFrameTracks, WireGyroFuse, WireImuCamPacket, WireImuRaw, WireKeyframe,
-    WireLoopCorrection, WireLoopMatch, WirePoseMsg, WireSlamMap, WireVioMap,
+    WireCalibBundle, WireCalibStereo, WireCamSync, WireDepthFrame, WireEnd,
+    WireFrameInliers, WireFrameTracks, WireGyroFuse, WireImuCamPacket, WireImuRaw,
+    WireKeyframe, WireLoopCorrection, WireLoopMatch, WirePoseMsg, WireSlamMap,
+    WireVioMap,
 )
 
 #: Where the frozen sha256 digests live (the cross-copy byte-parity oracle).
@@ -244,6 +245,18 @@ def build_vectors() -> list[tuple[str, str, object]]:
                          device_id="OAK-D-PRO-12345")),
         ("vio_map", topics.VIO_MAP,
          WireVioMap(kf_ids=slam_ids, kf_positions=slam_pos)),
+        # FULL stereo calib (the rectifiers' source): both K + variable-length
+        # distortion + the left->right extrinsic. Read directly off the wire, like
+        # the calib bundle. ``right_dist`` is a DIFFERENT length than ``left_dist``
+        # so the codec's per-array shape header is exercised on a ragged pair.
+        ("calib_stereo", topics.CALIB_STEREO,
+         WireCalibStereo(
+             left_K=K, left_dist=np.array([0.1, -0.2, 1e-3, -1e-3, 0.05],
+                                          dtype=np.float64),
+             right_K=(K + 0.5),
+             right_dist=np.array([0.11, -0.22, 2e-3, -2e-3, 0.06, 0.01, 0.0, 0.0],
+                                 dtype=np.float64),
+             T_left_right=T, width=640, height=400)),
 
         # --- END sentinel (handled out-of-band via tag 0x0A) ---------------- #
         ("wire_end", topics.IMUCAM_SAMPLE, WireEnd(topics.IMUCAM_SAMPLE)),

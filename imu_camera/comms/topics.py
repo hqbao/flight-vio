@@ -93,6 +93,16 @@ IMU_RAW = "imu.raw"
 # process publishes on boot; read DIRECTLY by VIO / SLAM / UI (no flow message).
 CALIB_BUNDLE = "calib.bundle"
 
+# One-shot retained FULL stereo calibration the capture process publishes ON BOOT
+# alongside ``calib.bundle`` -- the left+right intrinsics + distortion + the
+# left->right extrinsic the stereo RECTIFIERS need (``calib.bundle`` carries ONLY
+# the rectified-left K, which is not enough to BUILD a rectifier). Consumed only by
+# the UI's "Epipolar / Rectification" window to rectify a live raw left+right pair.
+# ADDITIVE + read DIRECTLY off the wire (no flow message, like ``calib.bundle``):
+# the oracle never consumes it and ``calib.bundle`` is byte-UNCHANGED, so the
+# byte-parity gate is UNAFFECTED (mirrors ``ba.window`` / ``frame.frontend``).
+CALIB_STEREO = "calib.stereo"
+
 # Periodic snapshot of the VIO process's windowed-BA refined trajectory, read
 # directly by the UI (no flow message, like calib.bundle).
 VIO_MAP = "vio.map"
