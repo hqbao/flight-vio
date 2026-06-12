@@ -301,11 +301,20 @@ Out: precomputed `map_u, map_v (H,W) float32`; per frame a rectified `float32 (H
 **Code.** `sky/depth/stereo.py:383` (rotations), `:401` (distortion), `:430`
 (remap), `:456` (RightRectifier), `:507` (LeftRectifier), `:949` (rectified-left+depth).
 
-**How to see it.** *New view needed.* Overlaid **horizontal epipolar lines** on a
-left|right pair, before vs after: draw the same ~15 horizontal scanlines across both
-rectified images — corresponding features must sit on the same line after rectification
-(and visibly don't before). Equivalent: a left-right anaglyph blend where vertical
-disparity = mis-rectification. This is the canonical "is my rectification correct" view.
+**How to see it.** *Built — `depth/tools/epipolar_explorer.py`* (offline; `--render`
+PNG, no GUI). Overlaid **horizontal scanlines** on a left|right pair, before vs after:
+the same ~13 scanlines are drawn across both images in a 2-row figure (top = BEFORE,
+bottom = AFTER) — a handful of strong left corners are located in the right by a
+same-row-band block search, and their **vertical row-mismatch** is annotated and
+median-reported, collapsing from raw → rectified (e.g. `corridor_60s#80`: 2.0px →
+0.5px). HONEST about the data: a gold session stores the chip's *already-rectified*
+LEFT + a *raw* RIGHT, so the genuinely-raw image is the right one — the BEFORE row is
+labelled "chip-rectified LEFT | RAW right" and the AFTER right is
+`RightRectifier.rectify(raw_right)` (the left is kept as the common rectified grid, not
+re-warped, exactly as the replay depth path does). Run::
+
+    .venv/bin/python -m depth.tools.epipolar_explorer \
+        --session sessions/gold/lab_loop_30s --frame 40 --render /tmp/epipolar.png
 
 ## 1.6 SGM dense stereo matcher (end-to-end)
 
@@ -1157,8 +1166,11 @@ frame cue is the origin triad + drone triad in `Viewer3D`.
 `depth/tools/sgm_cost_explorer.py` — the SGM cost-volume explorer (§1.6 "How to see it"):
 click a pixel → plot its raw `C(d)` + aggregated `S(d)` matching-cost curves; loads one
 gold frame and runs the SGM with the opt-in volume-capture hook (production path unchanged).
+`depth/tools/epipolar_explorer.py` — the stereo-rectification epipolar explorer (§1.5
+"How to see it"): scanlines over a left|right pair, before vs after rectify, with the
+corner row-mismatch collapsing toward 0 (`--render` PNG; imports only the `RightRectifier`).
 
 **Algorithms with NO visualization at all:** ORB loop-closure matches + epipolar geometry;
-pose-graph residuals/edges; windowed-BA reprojection residuals + landmarks; stereo
-rectification maps; the inertial filter; the camera↔IMU time-sync bucketing; the gravity
+pose-graph residuals/edges; windowed-BA reprojection residuals + landmarks;
+the inertial filter; the camera↔IMU time-sync bucketing; the gravity
 sphere; the frame ladder.

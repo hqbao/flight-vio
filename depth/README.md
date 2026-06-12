@@ -165,11 +165,43 @@ production depth output, and the capture hook leaves `sgm_disparity` unchanged.
     --session sessions/gold/corridor_60s --frame 40 --render /tmp/sgm_cost.png
 ```
 
+## `depth.tools.epipolar_explorer` — the stereo-rectification epipolar explorer (learning tool)
+
+A standalone, offline tool that answers **"is my rectification correct?"**. SGM only
+works if a 3D point lands on the **same row** in both images; raw cameras don't satisfy
+this (distortion + inter-camera rotation push matches onto different rows). It loads ONE
+gold frame, rectifies the recorded raw right via `RightRectifier` + the session
+calibration, and draws a **2-row figure**: top = BEFORE (raw rows drift), bottom = AFTER
+(rows snap onto the same scanline). The same ~13 horizontal scanlines are drawn across
+both left|right panels; a handful of strong Shi-Tomasi corners detected in the left are
+located in the right by a same-row-band block search, and each corner's **vertical
+row-mismatch** is annotated (GREEN = on-row, RED = off-row) with the per-row median
+reported — collapsing from raw → rectified.
+
+**Honest about the data:** a gold session stores the chip's *already-rectified* LEFT
+(`rectifiedLeft`) + a *raw* RIGHT (`syncedRight`), so the only genuinely raw image is the
+right one. The BEFORE row is therefore labelled `chip-rectified LEFT | RAW right` (the
+row-mismatch lives in the right), and the AFTER right is `RightRectifier.rectify(raw_right)`;
+the left is kept as the common rectified grid (not re-warped through `LeftRectifier`,
+which expects a raw left), exactly as the replay depth path does
+(`from_calib(..., rectify_left=False)`). It is purely a consumer of the rectifier math —
+it never touches the data path, comms, or oracle.
+
+```bash
+# headless: write the before/after scanline PNG (numpy -> cv2, no GUI)
+.venv/bin/python -m depth.tools.epipolar_explorer \
+    --session sessions/gold/lab_loop_30s --frame 40 --render /tmp/epipolar.png
+```
+
 ## Run
 
 ```bash
 # the SGM-vs-chip-depth regression self-test (no device; offline gold sessions)
 .venv/bin/python -m depth.tests.stereo_sgm_selftest
+
+# the epipolar-explorer self-test: asserts the render is non-blank AND rectification
+# reduces the corner row-mismatch on gold frames (offline; no device)
+.venv/bin/python -m depth.tests.epipolar_explorer_selftest
 
 # depth-as-a-process pair (replay; no device needed). Capture publishes cam.sync
 # on its endpoint; depth consumes it and publishes frame.depth on its own.
