@@ -35,7 +35,8 @@ from launcher.main import build_vio_args                       # noqa: E402
 def _ns(**over) -> types.SimpleNamespace:
     """A launcher-args namespace with sane defaults, overridable per test."""
     base = dict(kf_every=5, no_gyro=False, worker=False,
-                tight=False, stabilize_velocity=False, depth_icp=False)
+                tight=False, stabilize_velocity=False, depth_icp=False,
+                ba_window=False)
     base.update(over)
     return types.SimpleNamespace(**base)
 

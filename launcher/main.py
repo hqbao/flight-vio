@@ -205,6 +205,20 @@ def build_capture_args(args, cap_ep: str) -> list[str]:
     return capture_args
 
 
+def resolve_ba_window(args) -> bool:
+    """Effective BA-Window capture state (pure -> unit-testable).
+
+    The BA Window is a UI diagnostic tool, so it is ON by default whenever the UI
+    runs on the loose path ("just works", no flag needed), and OFF when headless
+    (lean flight path) or under ``--tight`` (there is no loose BA window there).
+    ``--ba-window`` forces it on (e.g. headless, for the PNG smoke); ``--no-ba-window``
+    forces it off. Oracle-safe either way: the capture runs the SAME frozen
+    ``run_ba`` and ``oracle_replay_selftest`` never goes through this launcher path.
+    """
+    return (not args.no_ba_window) and (
+        args.ba_window or (not args.no_ui and not args.tight))
+
+
 def build_vio_args(args, cap_ep: str, vio_ep: str, slam_ep: str,
                    use_worker: bool) -> list[str]:
     """Build the ``vio.main`` argv from the parsed launcher ``args``.
@@ -341,12 +355,19 @@ def main() -> int:
                          "Forwarded to vio.main --depth-icp only with --tight; "
                          "ignored (warned) on the loose path.")
     ap.add_argument("--ba-window", action="store_true",
-                    help="enable the BA Window visualiser: VIO publishes ba.window "
-                         "solve snapshots (window keyframe poses + 3D landmarks + "
-                         "observation rays + reprojection error) and the UI exposes "
-                         "Visualize > BA Window. Loose-only; OFF by default "
-                         "(oracle byte-identical); ignored under --tight.")
+                    help="force the BA Window visualiser ON (VIO publishes ba.window "
+                         "solve snapshots: window keyframe poses + 3D landmarks + "
+                         "observation rays + reprojection error; UI exposes "
+                         "Visualize > BA Window). It is a UI tool, so it is ALREADY ON "
+                         "by default whenever the UI runs on the loose path -- this "
+                         "flag only forces it on headless (e.g. for the PNG smoke). "
+                         "Loose-only; ignored under --tight; oracle byte-identical.")
+    ap.add_argument("--no-ba-window", action="store_true",
+                    help="force the BA Window capture OFF even when the UI is shown "
+                         "(skip its small per-keyframe snapshot/publish cost).")
     args = ap.parse_args()
+
+    args.ba_window = resolve_ba_window(args)
 
     # SLAM keeps its live map current via a LATEST-ONLY in-process inbox (set in
     # slam.main) -- it drops a backlog instead of lagging, with NO worker
