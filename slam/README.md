@@ -31,7 +31,7 @@ matching the oracle loop count.
 |---------|------|---------------------------|
 | `slam/comms/` | the **FROZEN** vendored comms contract | copied **bit-identically** from `imu_camera/comms` |
 | `slam/mathlib/` | the engine SLAM owns (`engine/` + `resolution_build`); the loop-closure math now comes from `sky.slam` | `ours/lib/engine` (loop algorithms consolidated into `sky.slam`) |
-| `slam/modules/` | the loop-closure reactive module | `ours/flows/slam` |
+| `slam/modules/` | the loop-closure pipeline (**procedural** functions + a plain worker thread) | `ours/flows/slam` |
 | `slam/main.py` | the SLAM process | `ours/proc/slam.py` |
 | `slam/tests/` | regression self-tests | `ours/tools/posegraph_selftest.py` |
 
@@ -44,8 +44,11 @@ internal imports are RELATIVE, so the copy works as `slam.comms` unchanged. **Ne
 hand-edit it** — change `imu_camera/comms` and re-vendor.
 
 Public API the SLAM process uses: `LocalPubSub`, `IPCPubSub(role="server"|"client")`,
-`IPCPublisher`, `IPCSubscriber`, `Module`, `Step`, `RingRegistry`, `topics`, and
-`wire.WireCalibBundle`. The `keyframe`, `loop.correction`, `slam.map`, `slam.loop`
+`IPCPublisher`, `IPCSubscriber`, `RingRegistry`, `topics`, and
+`wire.WireCalibBundle`. (The reactive `Module` / `Step` classes are still **defined**
+in the vendored comms — other processes use them — but `slam/` no longer imports them:
+its pipeline is plain procedural Python, see below.) The `keyframe`, `loop.correction`,
+`slam.map`, `slam.loop`
 topics and the `Keyframe` / `LoopCorrection` / `SlamOverlay` / `LoopMatch` messages
 already live in the shared comms contract. `slam.loop` (LIVE-only, additive) is the
 per-loop-CANDIDATE match funnel for the UI's "Loop Closure" window — the matched ORB
@@ -103,34 +106,60 @@ been removed — there is no BA backend under `slam/mathlib/`.
 > **no numba JIT** to pre-compile — its ORB frontend is pure NumPy — so no warmup
 > module exists.
 
-### `slam/modules/` — the reactive pipeline (Flow → Module, Task → Step)
+### `slam/modules/` — the procedural pipeline (no reactive `Module` / `Step`)
 
-`SlamModule` subscribes `keyframe` and publishes `loop.correction`. It wraps
-`SlamMap` behind a swappable engine; every keyframe is submitted (the map's own
-motion gate may skip redundant ones), and on a confirmed loop the pose graph is
-optimised and the rewritten keyframe poses are published as a correction.
+The pipeline is **plain procedural Python**. The per-keyframe work is one function,
+`process_keyframe(engine, bus, kf, *, publish_map)`, which calls the single-purpose
+step functions in order — the data flow reads as straight-line code, not a framework
+step chain:
 
-The single-purpose steps each own one responsibility: `SlamStep` (submit + poll
-the engine → `LoopCorrection` on a loop), `PublishCorrection` (emit on
-`loop.correction`), `PublishSlamMap` (poll the cheap overlay → `slam.map`),
-`PublishLoops` (poll the per-candidate match funnel → `slam.loop`, LIVE-only).
+- `slam_submit(engine, kf)` — `engine.submit` + `engine.poll`; returns a
+  `LoopCorrection` **on a confirmed loop**, else `None`.
+- `publish_correction(bus, msg)` — emit it on `loop.correction` (called only when
+  `slam_submit` returned non-`None`; the None-guard is now explicit at the call site).
+- (LIVE only) `publish_loops(engine, bus)` — poll the per-candidate match funnel →
+  `slam.loop`; `publish_slam_map(engine, bus)` — poll the cheap overlay → `slam.map`.
+  Both poll **independent** engine channels **after** the submit above.
 
-Two key behaviours are preserved verbatim from the oracle:
+`SlamWorker` (a plain `threading.Thread`, exported also under the legacy name
+`SlamModule`) drains a keyframe inbox and runs `process_keyframe`. It is the
+procedural replacement for the old reactive `Module` — it owns the inbox, the
+optional coalescing, END handling, and the downstream-END forwarding as **explicit
+code**, not framework hooks.
 
-- **`publish_map` flag** (LIVE-only, defaults `False`). When on, SlamModule emits
-  a continuous `slam.map` overlay so the UI draws keyframe dots **every** keyframe
+Two key behaviours are preserved byte-for-byte from the oracle:
+
+- **`publish_map` flag** (LIVE-only, defaults `False`). When on, the worker emits a
+  continuous `slam.map` overlay so the UI draws keyframe dots **every** keyframe
   instead of only after a loop closes, AND captures the loop-closure match funnel
   (`make_slam_engine(capture_loops=True)`) to publish a `LoopMatch` on `slam.loop`
   for every verified candidate (for the UI's "Loop Closure" window). The offline
-  path (flag off) is byte-identical: the engine never captures, so the deterministic
+  path (flag off) is byte-identical: `process_keyframe` reduces to `slam_submit` +
+  conditional `publish_correction`, the engine never captures, and the deterministic
   `loop.correction` scoring path runs the byte-frozen `verify` with no extra work.
-- **`_RunCorrectionChain`** — `Module.on` keeps **one** step list per topic, and
-  `SlamStep` returns `None` on every non-loop keyframe (which short-circuits the
-  chain). So the live path wraps `[SlamStep(), PublishCorrection()]` in one step
-  that always returns the keyframe, letting the outer chain continue to
-  `PublishLoops` (passes the keyframe through) and `PublishSlamMap` (terminal, polls
-  the overlay **after** the submit). One combined chain, correct order, zero impact
-  on the `loop.correction` semantics.
+  (The old `_RunCorrectionChain` wrapper existed only to force "submit-then-overlay"
+  ordering inside the single reactive route; procedurally that order is just the
+  call order in `process_keyframe`, so the wrapper is gone.)
+- **`latest_only` coalescing — LOAD-BEARING, kept explicit.** SLAM consumes
+  `keyframe` with `latest_only=True` on the LIVE path: the ORB + pose-graph solve
+  cannot keep up under real-time load, so the inbox must **drop intermediate
+  keyframes and always solve the freshest one** (a strict-FIFO inbox would back up
+  without bound and the `slam.map` overlay would lag seconds behind). `SlamWorker`
+  replicates this with a single-slot "latest keyframe" holder its bus feeder
+  overwrites + a wake-up-token inbox the worker drains — byte-for-byte the old
+  `Module._coalesce` / `Module.run`, specialised to the one keyframe topic. `END` is
+  never coalesced, so clean shutdown still propagates. This is **why the confirmed-loop
+  count in `proc3_smoke_selftest` is non-deterministic-but-bounded** (a variable
+  number of keyframes is dropped each run). The OFFLINE / oracle callers build the
+  worker with `latest_only=False` for a strict-FIFO inbox (the deterministic path
+  must process every keyframe).
+
+> **`SlamWorker` has two in-process consumers besides `slam.main`:**
+> `vio/tests/closed_loop_drift_selftest.py` and `verification/loop_teleport_diag.py`
+> both construct it directly (as `SlamModule`, `latest_only=False`, `worker=False`,
+> `publish_map=False`) over a `LocalPubSub` bus to collect real `loop.correction`s.
+> The legacy `SlamModule` name is kept as an alias of `SlamWorker` so they are
+> unchanged.
 
 ### `slam/main.py` — the SLAM process
 

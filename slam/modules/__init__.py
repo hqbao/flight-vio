@@ -1,22 +1,24 @@
-"""``slam.modules`` -- the SLAM reactive pipeline (ORB loop closure + pose graph).
+"""``slam.modules`` -- the SLAM pipeline (ORB loop closure + pose graph).
 
-The single reactive module and the single-purpose steps it composes (ported
-verbatim from ``ours.flows.slam``; Flow -> Module, Task -> Step, Bus ->
-LocalPubSub):
+PROCEDURAL Python (no reactive ``Module`` / ``Step`` graph). The per-keyframe
+work is the plain function :func:`~slam.modules.pipeline.process_keyframe`, which
+calls the single-purpose step functions in order:
 
-* :class:`~slam.modules.pipeline.SlamModule` -- subscribes ``keyframe`` and
-  publishes ``loop.correction``. Wraps :class:`~sky.slam.slam.SlamMap`:
-  every keyframe is added (the map's own motion gate may skip redundant ones);
-  when a loop is confirmed the pose graph is optimised and the rewritten keyframe
-  poses are published as a correction. The heavy ORB + pose-graph solve runs
-  behind a swappable :class:`~slam.mathlib.engine.base.Engine` (in-process offline,
-  subprocess live). With ``publish_map=True`` (live) it also emits a continuous
-  ``slam.map`` keyframe overlay -- see :class:`~slam.modules.pipeline._RunCorrectionChain`.
+* :func:`~slam.modules.slam_step.slam_submit` -- submit the keyframe to the SLAM
+  engine; on a confirmed loop return the rewritten poses.
+* :func:`~slam.modules.publish_correction.publish_correction` -- emit it on
+  ``loop.correction``.
+* (LIVE only) :func:`~slam.modules.publish_loops.publish_loops` +
+  :func:`~slam.modules.publish_slam_map.publish_slam_map` -- poll the engine's
+  independent loop-funnel + map-overlay channels for the UI.
 
-The single-purpose steps (:mod:`~slam.modules.slam_step` /
-:mod:`~slam.modules.publish_correction` / :mod:`~slam.modules.publish_slam_map`)
-each own one responsibility on the keyframe -> correction chain.
+:class:`~slam.modules.pipeline.SlamWorker` (exported also under the legacy name
+:data:`~slam.modules.pipeline.SlamModule`) is the plain thread that drains the
+keyframe inbox -- with the LOAD-BEARING ``latest_only`` coalescing kept explicit
+-- and runs ``process_keyframe``. The heavy ORB + pose-graph solve runs behind a
+swappable :class:`~slam.mathlib.engine.base.Engine` (in-process offline,
+subprocess live).
 """
-from .pipeline import SlamModule
+from .pipeline import SlamModule, SlamWorker, process_keyframe
 
-__all__ = ["SlamModule"]
+__all__ = ["SlamModule", "SlamWorker", "process_keyframe"]

@@ -1,10 +1,20 @@
 """slam process: subscribe to VIO's keyframes, run loop closure + pose graph.
 
 Subscribes (over IPC) to the ``vio`` endpoint for ``keyframe`` and the retained
-``calib.bundle`` (intrinsics only); runs the same
-:class:`~slam.modules.pipeline.SlamModule` the pre-split in-process graph ran;
-then republishes ``loop.correction`` + ``slam.map`` on its own
+``calib.bundle`` (intrinsics only); runs the procedural SLAM pipeline
+(:class:`~slam.modules.pipeline.SlamWorker` ->
+:func:`~slam.modules.pipeline.process_keyframe`) that replaced the pre-split
+reactive graph; then republishes ``loop.correction`` + ``slam.map`` on its own
 :class:`~slam.comms.IPCPubSub` endpoint ``"oak.slam"`` for the UI / tools.
+
+This shell is PROCEDURAL -- there is no reactive ``Module`` / ``Step`` graph. The
+keyframe arrives over IPC on the :class:`~slam.comms.IPCSubscriber` recv thread,
+which drops it onto the local bus; the :class:`~slam.modules.pipeline.SlamWorker`
+feeder coalesces it into a single-slot "latest keyframe" holder, and the worker
+thread runs :func:`~slam.modules.pipeline.process_keyframe` on the FRESHEST
+keyframe (dropping superseded ones under real-time load -- the LIVE viewer must
+stay current, not back up). The coalescing is LOAD-BEARING and lives explicitly
+in the worker; see its module docstring.
 
 This process owns the SLAM map (ORB feature index, pose-graph). The VIO map
 lives in the VIO process (windowed BA); the two maps are independent by design
@@ -50,7 +60,7 @@ from slam.comms import (                                            # noqa: E402
 from slam.comms.messages import END                                # noqa: E402
 from slam.comms.wire import WireCalibBundle                        # noqa: E402
 from slam.comms.ring_registry import default_vio_specs             # noqa: E402
-from slam.modules import SlamModule                                # noqa: E402
+from slam.modules import SlamWorker                                # noqa: E402
 from sky.slam.slam import SlamConfig                      # noqa: E402
 
 LOG = logging.getLogger("slam.main")
@@ -112,23 +122,24 @@ def run_slam(*,
     vio_rings = RingRegistry().attach_all(default_vio_specs(
         endpoint=vio_endpoint, width=width, height=height))
 
-    # 3. Build local bus + the SLAM module (loop closure + pose graph).
+    # 3. Build local bus + the SLAM worker (loop closure + pose graph).
     # latest_only=True: this is the LIVE viewer's SLAM, not the deterministic
     # scoring path. The ORB + pose-graph solve grows with the map, so a strict
     # FIFO inbox would back up without bound and the `slam.map` overlay would lag
-    # further and further behind real time. A coalescing inbox drops the backlog
-    # and always solves the FRESHEST keyframe, so the map stays current (it skips
-    # intermediate keyframes only when overloaded). END is never coalesced, so
-    # clean shutdown still propagates.
+    # further and further behind real time. The worker's coalescing inbox drops
+    # the backlog and always solves the FRESHEST keyframe, so the map stays
+    # current (it skips intermediate keyframes only when overloaded). END is never
+    # coalesced, so clean shutdown still propagates. The worker subscribes itself
+    # to `keyframe` on construction.
     local = LocalPubSub()
-    # Motion-gated keyframe insertion (live-only; the offline SlamModule default
+    # Motion-gated keyframe insertion (live-only; the offline worker default
     # stays 0/0 = insert every keyframe). A new keyframe joins the pose graph
     # only when the camera moved >= 10 cm OR rotated >= 5 deg since the LAST
     # INSERTED keyframe, so a stationary / slowly-panning camera stops piling up
     # near-identical redundant keyframes (the main driver of unbounded memory and
     # the O(N^3) PGO cost on long live sessions). The odometry edge is still
     # taken between consecutive INSERTED keyframes, so the chain stays exact.
-    slam = SlamModule(local, bundle.K,
+    slam = SlamWorker(local, bundle.K,
                       SlamConfig(loop_max_odom_rot_deg=30.0,
                                  kf_min_trans_m=0.1, kf_min_rot_deg=5.0),
                       latest_only=True, worker=worker, publish_map=True)
@@ -158,8 +169,10 @@ def run_slam(*,
 
     LOG.info("slam[%s] subscribing to %s for keyframes", endpoint, vio_endpoint)
 
-    # 7. Start everything (slam first so its subscriptions are wired before the
-    #    bridge starts pushing messages onto the local bus).
+    # 7. Start everything. The worker already subscribed itself to `keyframe` on
+    #    construction (step 3), so its inbox feeder is wired; start its thread
+    #    BEFORE the bridge starts pushing keyframes onto the local bus so the
+    #    inbox is being drained from the first message.
     slam.start()
     in_bridge.start()
 
@@ -180,14 +193,15 @@ def run_slam(*,
         # keyframes can take seconds to chew through (loop closure is heavy).
         # Under SIGTERM the operator wants a fast exit and VIO is also
         # shutting down so END will never arrive -- cap the wait at 2 s and
-        # let Module.stop() force-kill the drain thread, otherwise the launcher
+        # let SlamWorker.stop() unblock the worker thread, otherwise the launcher
         # SIGKILLs us at its 10 s deadline (no SHM rings here, but a clean
         # shutdown still keeps the launcher logs free of SIGKILL noise).
         drain_timeout = 2.0 if stop[0] else 120.0
         slam.done.wait(timeout=drain_timeout)
         slam.stop()
-        # SlamModule forwards END to loop.correction via its `_emit_end`; the
-        # publisher bridge mirrors that onto IPC. No explicit publish_end.
+        # The worker forwards END to loop.correction / slam.map / slam.loop when
+        # it drains END (process_keyframe path); the publisher bridge mirrors that
+        # onto IPC. No explicit publish_end.
         time.sleep(0.3)
         pub.stop()
         server.close()

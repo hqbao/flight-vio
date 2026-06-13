@@ -18,8 +18,10 @@ Built by replicating the PROVEN ``imu_camera`` / ``vio`` template:
   FORCED dependencies of the loop import graph (PnP RANSAC, the SO(3)/SE(3)
   helpers). The math-coupled config builder (:mod:`slam.mathlib.resolution_build`)
   lives in ``slam.mathlib`` per the architecture rule.
-* :mod:`slam.modules` -- the loop-closure reactive module (was
-  ``ours.flows.slam``), wired by :class:`~slam.modules.pipeline.SlamModule`.
+* :mod:`slam.modules` -- the loop-closure pipeline (was ``ours.flows.slam``),
+  now PROCEDURAL: the plain function :func:`~slam.modules.pipeline.process_keyframe`
+  driven by the plain worker thread :class:`~slam.modules.pipeline.SlamWorker`
+  (legacy alias :data:`~slam.modules.pipeline.SlamModule`).
 * :mod:`slam.main` -- the SLAM process: a calib + keyframe client onto the VIO
   endpoint, the local SLAM graph, and an :class:`~slam.comms.IPCPublisher`
   mirroring ``loop.correction`` / ``slam.map`` onto the ``oak.slam`` endpoint.
