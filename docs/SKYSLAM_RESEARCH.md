@@ -33,6 +33,59 @@ If you read nothing else, read this.
 
 ---
 
+## Experiment log
+
+### 2026-06-13 — Dense DIRECT RGB-D VO @ 54x42 ToF (Stage-1 hypothesis test)
+
+**Hypothesis.** At the 54x42 ToF target the SPARSE corner/KLT VIO suffers *scale
+collapse* (measured Sim3 scale 0.23-0.63, ATE 50-98 cm) from feature starvation
+(~2300 px). Lever (Steinbrucker'11 / Kerl ICRA'13 / Whelan ICRA'13): dense
+DIRECT photometric alignment over ALL gradient pixels, with the accurate
+per-pixel ToF depth giving metric scale directly -> pose is pure 6-DoF, scale is
+OBSERVED from depth (should kill scale collapse), no features needed.
+
+**Built.** `sky/front/direct.py` (`estimate_pose_direct`, leaf, cv2-lazy):
+photometric residual `I_cur(warp(p)) - I_ref(p)`, coarse-to-fine Gauss-Newton on
+the SE(3) LEFT twist `[rho;phi]` with Jacobian `g^T @ J_pi @ [I3 | -skew(P_cur)]`,
+valid-aware depth pyramid, Kerl Student-t robust weight. Harness
+`verification/direct_vo_bench.py` (frame-to-keyframe, gyro-seeded) over the gold
+suite @ 54x42 ToF, same columns as `loose_vs_tight_bench`, side-by-side with the
+sparse baseline. Synthetic known-motion recovery: 2.55 mm / 0.093 deg (math
+verified). gap=0 unchanged.
+
+**Result (54x42 ToF, DIRECT vs SPARSE).**
+
+| session                 | DIRECT ATE | SPARSE ATE | DIRECT scale | SPARSE scale | verdict |
+|---|---|---|---|---|---|
+| lab_straight_20s        | **18 cm**  | 98 cm | **0.95** | 0.63 | WIN (scale FIXED) |
+| push_straight_fast_15s  | 1160 cm    | 53 cm | 0.01 | 0.38 | DIVERGES |
+| push_shake_20s          | 545 cm     | 91 cm | 0.05 | 0.38 | DIVERGES |
+| quick_motion_15s        | 5902 cm    | 75 cm | 0.00 | 0.23 | DIVERGES |
+
+**Verdict — PARTIALLY SUPPORTED (split result, NOT a clean win).**
+- On SLOW, smooth motion (`lab_straight`) the hypothesis is *confirmed*: ATE
+  98->18 cm (-81%) AND scale 0.63->0.95. Dense direct + ToF depth genuinely
+  observes metric scale and kills the collapse there.
+- On FAST / aggressive motion (`push_fast`, `shake`, `quick_motion`) it
+  *diverges* catastrophically: single-frame jumps of 9-140 m. Root cause is
+  fundamental to frame-to-frame photometry at 54x42, not tuning (tighter
+  keyframing 1160->1016 cm only): the inter-frame baseline exceeds the
+  convergence basin (only 3 pyramid levels fit; coarsest 11x14), and the
+  forward-translation / FOE DoF is unconstrained by the gyro-only seed -> GN
+  walks off into a wrong local minimum (conv% stays 95-97% because the local
+  solve still *settles* — it converges to the wrong pose).
+
+**Implication for Stage 2.** The hypothesis is supported enough to proceed, but
+direct-only is insufficient. Stage 2 needs exactly what the literature pairs with
+direct: (1) a metric TRANSLATION seed, not just gyro rotation — IMU
+preintegration (constant-velocity / dead-reckon) to land the GN inside the basin
+on fast frames; (2) a point-to-plane GEOMETRIC (ICP) term to constrain the
+forward DoF the photometry leaves weak; (3) a divergence guard (reject a frame
+whose post-solve residual/step is an outlier, fall back to the prior). The
+slow-motion win shows the core estimator + scale-from-depth is correct.
+
+---
+
 ## Part 1 — Research synthesis
 
 ### 1.1 depthai BasaltVIO node
