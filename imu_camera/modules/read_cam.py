@@ -1,28 +1,37 @@
-"""read_cam module: pull stereo on a schedule, trigger the IMU pack.
+"""read_cam producer: pull stereo on a schedule, trigger the IMU pack.
 
 One half of the acquisition front-end (``imu_cam`` is the other). It owns the
 *schedule*: one stereo pair per scheduler tick (``fps`` Hz). For each pair it
 publishes a single :class:`~imu_camera.comms.messages.CamSync` (the frames + their
 device timestamp) on ``cam.sync`` -- the trigger the
-:class:`~imu_camera.modules.pipeline.ImuCamModule` reacts to.
+:class:`~imu_camera.modules.pipeline.ImuCamWorker` reacts to.
 
-This module is exactly ONE source module: the :class:`ReadCamModule` plus its
-publish step and the pull-based frame sources (replay offline / live OAK-D).
-depthai is only touched by :class:`LiveCamSource`, imported lazily, so the offline
-path never pulls the device library.
+This module is exactly ONE producer: the :class:`ReadCamModule` (a plain
+``threading.Thread``) plus the pull-based frame sources (replay offline / live
+OAK-D). depthai is only touched by :class:`LiveCamSource`, imported lazily, so the
+offline path never pulls the device library.
 
 A source is pull-based -- :meth:`CamSource.read` returns the next
 ``(seq, ts_ns, gray_left, gray_right)`` or ``None`` when exhausted -- because the
-camera module, unlike the free-running IMU, decides *when* to grab a frame.
+camera producer, unlike the free-running IMU, decides *when* to grab a frame.
+
+Procedural shape: :class:`ReadCamModule` was a reactive ``SourceModule`` whose
+single step published ``cam.sync``. It is now a plain ``threading.Thread`` that
+publishes ``cam.sync`` inline and forwards END on the same topic when the source
+exhausts -- the framework's ``SourceModule.run`` / step-chain machinery was just
+glue for a one-step source, so it is written out explicitly here. The public
+surface (constructor, ``start`` / ``stop`` / ``join`` / ``is_alive`` / ``done`` /
+``error``) is unchanged so ``imu_camera.main`` + the selftest drive it as before.
 """
 from __future__ import annotations
 
+import threading
 import time
 
 import numpy as np
 
-from imu_camera.comms import LocalPubSub, SourceModule, Step, topics
-from imu_camera.comms.messages import CamSync
+from imu_camera.comms import LocalPubSub, topics
+from imu_camera.comms.messages import END, CamSync
 from imu_camera.io.reader import SessionReader
 
 
@@ -141,45 +150,59 @@ class LiveCamSource(CamSource):
 
 
 # --------------------------------------------------------------------------- #
-# Steps
+# Producer thread
 # --------------------------------------------------------------------------- #
-class PublishCamSyncStep(Step):
-    """publish_cam_sync step: emit one stereo pair as the IMU sync trigger."""
+class ReadCamModule(threading.Thread):
+    """Producer thread: emit one :class:`~imu_camera.comms.messages.CamSync` per frame.
 
-    name = "publish_cam_sync"
-
-    def run(self, ctx, msg: CamSync):
-        ctx.bus.publish(topics.CAM_SYNC, msg)
-        return None
-
-
-# --------------------------------------------------------------------------- #
-# Module
-# --------------------------------------------------------------------------- #
-class ReadCamModule(SourceModule):
-    """Source module: emit one :class:`~imu_camera.comms.messages.CamSync` per frame.
+    A plain procedural replacement for the old reactive ``SourceModule`` (which
+    pushed each frame through a one-step publish chain). It owns the schedule and
+    publishes ``cam.sync`` directly, then forwards END on ``cam.sync`` when the
+    source exhausts (or ``stop`` is requested) so the downstream
+    :class:`~imu_camera.modules.pipeline.ImuCamWorker` drains and shuts down.
 
     ``fps`` sets the schedule; ``realtime`` paces ticks to it (live-like) versus
     running free (deterministic offline replay). ``source`` supplies the frames
     (``ReplayCamSource`` offline, ``LiveCamSource`` on the bench).
+
+    The name + ``start`` / ``stop`` / ``join`` / ``is_alive`` / ``done`` / ``error``
+    surface matches the old ``SourceModule`` so ``imu_camera.main`` (which polls
+    ``is_alive`` and calls ``stop`` / ``done.wait``) and the selftest are unchanged.
     """
 
     def __init__(self, bus: LocalPubSub, source: CamSource, *, fps: int = 20,
                  realtime: bool = False) -> None:
-        super().__init__("cam", bus, [PublishCamSyncStep()])
+        super().__init__(name="cam", daemon=True)
+        self.bus = bus
         self.source = source
         self.fps = max(1, int(fps))
         self.realtime = bool(realtime)
         self.error: str | None = None
-        self.forwards_to(topics.CAM_SYNC)
+        self._stop = threading.Event()
+        self.done = threading.Event()   #: set after the producer loop emits END
 
-    def produce(self):
+    def stop(self) -> None:
+        """Request the produce loop to break at the next item boundary."""
+        self._stop.set()
+
+    def run(self) -> None:
+        # Produce frames, publishing cam.sync inline; on exit emit END once on
+        # cam.sync and signal done. Mirrors the old SourceModule.run (produce ->
+        # _run_chain(publish) -> _emit_end -> done.set), specialised to the single
+        # cam.sync publish.
+        try:
+            self._produce()
+        finally:
+            self.bus.publish(topics.CAM_SYNC, END)
+            self.done.set()
+
+    def _produce(self) -> None:
         try:
             self.source.open()
         except Exception as e:                                    # noqa: BLE001
             # e.g. the OAK-D is absent (X_LINK_DEVICE_NOT_FOUND). Record the
-            # reason and return cleanly so the module still emits END -- the graph
-            # drains and the UI can surface the failure instead of hanging.
+            # reason and return cleanly so the producer still emits END -- the
+            # graph drains and the UI can surface the failure instead of hanging.
             self.error = f"camera open failed: {e}"
             return
         period = 1.0 / self.fps
@@ -199,7 +222,8 @@ class ReadCamModule(SourceModule):
                 if item is None:
                     break
                 seq, ts_ns, gray_left, gray_right = item
-                yield CamSync(seq=seq, ts_ns=ts_ns,
-                              gray_left=gray_left, gray_right=gray_right)
+                self.bus.publish(topics.CAM_SYNC, CamSync(
+                    seq=seq, ts_ns=ts_ns,
+                    gray_left=gray_left, gray_right=gray_right))
         finally:
             self.source.close()

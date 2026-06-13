@@ -11,8 +11,8 @@ valid (>0) source-depth pixels fills the small holes a low-res solve would leave
 and averages the noise -- the clean, dense per-pixel depth a real ToF returns
 (empirically ~3x the valid coverage of direct 54x42 stereo).
 
-This single step REPLACES the normal ``PublishImuCam`` / ``ComputeDepth`` /
-``PublishDepth`` trio in the ToF chain (see :class:`pipeline.ImuCamModule`):
+This single step REPLACES the normal ``publish_imucam`` / ``compute_depth`` /
+``publish_depth`` trio in the ToF chain (see :mod:`imu_camera.modules.pipeline`):
 depth is computed here at source res, both the gray and the depth are reduced to
 ``TOF_W x TOF_H``, and the step publishes the 54x42 ``imucam.sample`` (gray +
 calibrated IMU) AND the 54x42 ``frame.depth``. The capture process sizes its
@@ -36,7 +36,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from imu_camera.comms import Step, topics
+from imu_camera.comms import LocalPubSub, topics
 from imu_camera.comms.messages import DepthFrame, ImuCamPacket
 from imu_camera.comms.runtime import NUMBA_PARALLEL_LOCK
 from sky.depth.stereo import SGMStereoMatcher
@@ -73,53 +73,47 @@ def _block_median_valid(depth: np.ndarray, out_h: int, out_w: int) -> np.ndarray
     return out
 
 
-class ToFDownsampleStep(Step):
+def tof_downsample(matcher: SGMStereoMatcher, bus: LocalPubSub,
+                   out_w: int, out_h: int, msg: ImuCamPacket) -> None:
     """Simulate a VL53L9CX ToF frame: SGM at source res, then reduce to 54x42.
+
+    Was ``ToFDownsampleStep(Step)``; the matcher (was ``ctx.state["matcher"]``),
+    the bus and the output grid are now explicit args. Logic byte-identical.
 
     Consumes the calibrated :class:`ImuCamPacket` (source-res stereo + the synced,
     calibrated IMU), runs the dense matcher at source res, downsamples gray +
     depth to ``(out_h, out_w)``, and publishes both ``imucam.sample`` (the 54x42
     gray bundled with the SAME IMU) and ``frame.depth`` (the 54x42 metric depth).
-    Returns ``None`` so the chain ends here (this step IS the ToF publisher).
+    Returns ``None`` -- this function IS the ToF publisher (chain ends here).
     """
+    with NUMBA_PARALLEL_LOCK:        # SGM uses numba parallel=True
+        # Depth + the tracking-grid left at SOURCE resolution (exactly the
+        # normal compute_depth): rectify_left=True on the live matcher
+        # returns float32, so cast the gray back to uint8 (storage contract;
+        # the bilinear-interp precision is already spent).
+        gray_track, depth = matcher.dense_depth_rectified_left(
+            msg.gray_left, msg.gray_right)
+    if gray_track.dtype != np.uint8:
+        gray_track = np.clip(gray_track, 0.0, 255.0).astype(np.uint8)
 
-    name = "tof_downsample"
+    # GRAY -> ToF grid by area averaging (cv2 size arg is (W, H)).
+    gray_tof = cv2.resize(gray_track, (out_w, out_h),
+                          interpolation=cv2.INTER_AREA)
+    if gray_tof.dtype != np.uint8:                  # INTER_AREA keeps dtype
+        gray_tof = gray_tof.astype(np.uint8)        # defensive
 
-    def __init__(self, out_w: int, out_h: int) -> None:
-        self._w = int(out_w)
-        self._h = int(out_h)
+    # DEPTH (metres) -> ToF grid by block-median of valid pixels (NOT linear).
+    depth_tof = _block_median_valid(depth, out_h, out_w)
 
-    def run(self, ctx, msg: ImuCamPacket):
-        matcher: SGMStereoMatcher = ctx.state["matcher"]
-        with NUMBA_PARALLEL_LOCK:        # SGM uses numba parallel=True
-            # Depth + the tracking-grid left at SOURCE resolution (exactly the
-            # normal ComputeDepthStep): rectify_left=True on the live matcher
-            # returns float32, so cast the gray back to uint8 (storage contract;
-            # the bilinear-interp precision is already spent).
-            gray_track, depth = matcher.dense_depth_rectified_left(
-                msg.gray_left, msg.gray_right)
-        if gray_track.dtype != np.uint8:
-            gray_track = np.clip(gray_track, 0.0, 255.0).astype(np.uint8)
+    # imucam.sample: the 54x42 gray bundled with the SAME calibrated IMU
+    # (gray_right is dropped -- a ToF returns intensity + depth, no stereo
+    # pair, and nothing downstream of the ToF path consumes the right frame).
+    packet_tof = ImuCamPacket(
+        seq=msg.seq, ts_ns=msg.ts_ns,
+        gray_left=gray_tof, gray_right=None,
+        imu_ts=msg.imu_ts, gyro=msg.gyro, accel=msg.accel)
+    bus.publish(topics.IMUCAM_SAMPLE, packet_tof)
 
-        # GRAY -> ToF grid by area averaging (cv2 size arg is (W, H)).
-        gray_tof = cv2.resize(gray_track, (self._w, self._h),
-                              interpolation=cv2.INTER_AREA)
-        if gray_tof.dtype != np.uint8:                  # INTER_AREA keeps dtype
-            gray_tof = gray_tof.astype(np.uint8)        # defensive
-
-        # DEPTH (metres) -> ToF grid by block-median of valid pixels (NOT linear).
-        depth_tof = _block_median_valid(depth, self._h, self._w)
-
-        # imucam.sample: the 54x42 gray bundled with the SAME calibrated IMU
-        # (gray_right is dropped -- a ToF returns intensity + depth, no stereo
-        # pair, and nothing downstream of the ToF path consumes the right frame).
-        packet_tof = ImuCamPacket(
-            seq=msg.seq, ts_ns=msg.ts_ns,
-            gray_left=gray_tof, gray_right=None,
-            imu_ts=msg.imu_ts, gyro=msg.gyro, accel=msg.accel)
-        ctx.bus.publish(topics.IMUCAM_SAMPLE, packet_tof)
-
-        # frame.depth: the 54x42 metric depth aligned to the 54x42 gray.
-        ctx.bus.publish(topics.FRAME_DEPTH,
-                        DepthFrame(msg.seq, msg.ts_ns, gray_tof, depth_tof))
-        return None
+    # frame.depth: the 54x42 metric depth aligned to the 54x42 gray.
+    bus.publish(topics.FRAME_DEPTH,
+                DepthFrame(msg.seq, msg.ts_ns, gray_tof, depth_tof))

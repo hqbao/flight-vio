@@ -236,8 +236,8 @@ def run_capture_replay(session: Path, endpoint: str, *,
     stop = [False]
     def _on_sigterm(_signo, _frame):
         stop[0] = True
-        # cam_module is a SourceModule; setting its _stop flag breaks out of the
-        # produce() loop at the next item boundary so the join() returns.
+        # cam_module is a producer thread; setting its _stop flag breaks out of
+        # the produce loop at the next item boundary so the join() returns.
         cam_module.stop()
     signal.signal(signal.SIGTERM, _on_sigterm)
 
@@ -257,18 +257,18 @@ def run_capture_replay(session: Path, endpoint: str, *,
         LOG.info("capture: SIGINT -> stopping")
         stop[0] = True
     finally:
-        # ReadCamModule (SourceModule) emits END on CAM_SYNC when produce()
-        # returns; ImuCamModule forwards END from CAM_SYNC to IMU_RAW +
-        # IMUCAM_SAMPLE + FRAME_DEPTH (see its `forwards_to`). The publisher
+        # ReadCamModule (producer thread) emits END on CAM_SYNC when its produce
+        # loop returns; ImuCamWorker forwards END from CAM_SYNC to IMU_RAW +
+        # IMUCAM_SAMPLE + FRAME_DEPTH (its `_downstream` list). The publisher
         # bridge converts those local-bus ENDs to WireEnd and sends them on the
         # IPC server.
         #
-        # CRITICAL: wait for ImuCamModule's drain to chew through every queued
+        # CRITICAL: wait for ImuCamWorker's drain to chew through every queued
         # CAM_SYNC + the END BEFORE calling imu_module.stop(). stop() sets
         # `_stop`, which the drain checks at the TOP of every loop iteration --
         # so if we stop while CAM_SYNC items are still queued, we discard them
-        # AND the END. `done` is set inside `_handle_end` after expected_ends
-        # have been processed, which only happens when END is drained.
+        # AND the END. `done` is set inside `_handle_end` after the END is
+        # drained (single-input worker -> the first END is terminal).
         #
         # Under SIGTERM the operator wants a fast exit, NOT a full drain --
         # END will never arrive from a half-killed producer, so cap the wait
@@ -375,8 +375,9 @@ def run_capture_live(endpoint: str, *,
             device.release()
         except Exception:                                          # noqa: BLE001
             pass
-        # Same as the replay path: the front-end modules already forward END
-        # via _emit_end / forwards_to on disconnect; the bridge mirrors them.
+        # Same as the replay path: the front-end threads already forward END
+        # (read_cam on cam.sync, ImuCamWorker to its downstream) on disconnect;
+        # the bridge mirrors them.
         time.sleep(0.3)
         pub.stop()
         server.close()
