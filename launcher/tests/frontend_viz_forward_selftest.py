@@ -42,7 +42,7 @@ def _vio_ns(**over) -> types.SimpleNamespace:
     """A launcher-args namespace for build_vio_args (the VIO forwarding test)."""
     base = dict(kf_every=5, no_gyro=False, worker=False,
                 tight=False, stabilize_velocity=False, depth_icp=False,
-                ba_window=False, frontend_viz=False)
+                ba_window=False, frontend_viz=False, direct=False)
     base.update(over)
     return types.SimpleNamespace(**base)
 

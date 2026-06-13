@@ -125,7 +125,8 @@ def run_vio(*,
             stabilize_velocity: bool = False,
             depth_icp: bool = False,
             ba_window: bool = False,
-            frontend_viz: bool = False) -> int:
+            frontend_viz: bool = False,
+            direct: bool = False) -> int:
     """Run the VIO process until END / SIGTERM / Ctrl-C.
 
     ``tight`` selects the TIGHT-coupled VIO backend (the joint visual + IMU
@@ -158,6 +159,22 @@ def run_vio(*,
     inter-keyframe Delta-p that the feature-starved 54x42 frontend cannot observe.
     Opt-in and ``--tight`` ONLY (same contract as ``stabilize_velocity``); OFF
     leaves the tight config + oracle byte-identical.
+
+    ``direct`` selects the opt-in DENSE DIRECT RGB-D VO odometry mode
+    (``--direct``): the front-end's sparse corner/KLT track -> PnP path is replaced
+    by dense direct photometric frame-to-keyframe alignment
+    (:func:`sky.front.direct.estimate_pose_direct`) seeded by the live IMU
+    dead-reckon and protected by a divergence guard
+    (:class:`~vio.modules.direct_odometry.DirectOdometryEngine`). It is meant to
+    pair with ``--vl53l9cx`` (the 54x42 ToF profile, where the sparse VIO suffers
+    scale collapse and direct wins); at full resolution the sparse path is already
+    fine. A THIRD mode selected ONLY by this flag: when off the loose default +
+    ``--tight`` path is byte-identical to before, so the byte-parity oracle stays
+    gap=0. ``direct`` is independent of ``tight`` (it owns its own IMU seed); if
+    both are set, direct's front-end wins and the tight backend still windows on the
+    direct keyframes. The published topics (``pose.odom`` / ``pose.vo`` /
+    ``keyframe`` / ``frame.tracks`` / ``frame.inliers``) are unchanged, so comms /
+    the UI / SLAM are untouched.
 
     ``ba_window`` enables the BA-window visualiser snapshot stream (``--ba-window``):
     the LOOSE backend builds the capture-aware engine and republishes one
@@ -221,7 +238,12 @@ def run_vio(*,
                           publish_vo=True,   # live viewer's pure-vision "VO" line
                           retain_imu=tight,  # tight backend needs inter-KF IMU
                           loop_correct=loop_correct,  # closed-loop SLAM feedback
-                          frontend_viz=frontend_viz)  # Frontend Internals capture
+                          frontend_viz=frontend_viz,  # Frontend Internals capture
+                          direct=direct)     # opt-in dense direct RGB-D VO mode
+    if direct:
+        LOG.info("vio: DENSE DIRECT RGB-D VO odometry mode selected (--direct) "
+                 "-- dense photometric frame-to-keyframe + IMU seed + guard "
+                 "(pair with --vl53l9cx for the 54x42 ToF recipe)")
     if tight:
         LOG.info("vio: TIGHT-coupled VIO backend selected (--tight) "
                  "[imu_info_weight=True]")
@@ -434,6 +456,14 @@ def main() -> int:
                          "reprojection error) for the UI's BA Window visualiser. "
                          "Opt-in; OFF by default (oracle byte-identical); ignored "
                          "with --tight.")
+    ap.add_argument("--direct", action="store_true",
+                    help="select the DENSE DIRECT RGB-D VO odometry mode: replace "
+                         "the sparse corner/KLT->PnP front-end with dense direct "
+                         "photometric frame-to-keyframe alignment (sky.front.direct) "
+                         "seeded by the live IMU dead-reckon + a divergence guard. "
+                         "Opt-in (default OFF -> loose/tight byte-identical, oracle "
+                         "gap=0); meant to pair with --vl53l9cx (the 54x42 ToF "
+                         "profile where the sparse VIO scale-collapses).")
     ap.add_argument("--frontend-viz", action="store_true",
                     help="publish frame.frontend snapshots (Shi-Tomasi response "
                          "heatmap + accepted corners + KLT flow field coloured by "
@@ -458,6 +488,7 @@ def main() -> int:
         depth_icp=args.depth_icp,
         ba_window=args.ba_window,
         frontend_viz=args.frontend_viz,
+        direct=args.direct,
     )
 
 

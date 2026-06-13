@@ -280,6 +280,15 @@ def build_vio_args(args, cap_ep: str, vio_ep: str, slam_ep: str,
     # solve, so even a live --ba-window run keeps pose.refined byte-identical.
     if args.ba_window:
         vio_args += ["--ba-window"]
+    # Dense DIRECT RGB-D VO odometry mode: opt-in, default OFF. Forwarded ONLY when
+    # --direct is set, on BOTH live AND replay (direct is a real odometry mode, not
+    # a viz, and is exercised on replay too -- the target recipe is the replay
+    # ``--vl53l9cx --direct`` smoke). It is a THIRD front-end selected only by this
+    # flag, so the loose/tight paths and the offline byte-parity oracle (which never
+    # passes --direct and never goes through this launcher) stay gap=0. Independent
+    # of --tight (direct owns its own IMU seed), so it is NOT gated on it.
+    if args.direct:
+        vio_args += ["--direct"]
     # Frontend-internals snapshot stream: opt-in, works on BOTH loose AND tight
     # (the KLT frontend is identical), and on BOTH live AND replay (the view
     # scrubs a replay segment too). Oracle-safe: the CaptureKLTFrontend returns
@@ -366,6 +375,14 @@ def main() -> int:
                          "(joint visual + IMU window optimiser) instead of the "
                          "default loose windowed-BA backend. Forwarded to "
                          "vio.main --tight; loose stays the default.")
+    ap.add_argument("--direct", action="store_true",
+                    help="run the VIO process in DENSE DIRECT RGB-D VO odometry "
+                         "mode: replace the sparse corner/KLT->PnP front-end with "
+                         "dense direct photometric frame-to-keyframe alignment + "
+                         "live IMU seed + divergence guard. Forwarded to "
+                         "vio.main --direct. Opt-in (default OFF); meant to pair "
+                         "with --vl53l9cx (the 54x42 ToF recipe where the sparse "
+                         "VIO scale-collapses). Oracle byte-identical (gap=0).")
     ap.add_argument("--stabilize-velocity", action="store_true",
                     help="tight only: enable Phase-4 velocity regularisation "
                          "(CV prior + gated ZUPT) to curb 54x42/shake velocity "

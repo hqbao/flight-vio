@@ -84,15 +84,16 @@ def preintegrate_prior(state: dict, msg: ImuCamPacket) -> None:
         for seq in sorted(priors)[:-256]:
             priors.pop(seq, None)
 
-    # TIGHT path only: retain this interval's RAW IMU samples (rotated into
-    # the camera optical frame) keyed by frame seq, so emit_keyframe can hand
-    # the inter-keyframe IMU block to the tight backend's preintegrator. This
-    # is a no-op for the LOOSE / oracle path (``retain_imu`` defaults False),
-    # so it never allocates on or perturbs the byte-identical loose path. The
-    # tight backend's body frame == camera optical frame, hence the per-sample
-    # ``R_imu_cam @ v`` rotation here (the gyro prior above already uses the
-    # same extrinsic via integrate_gyro_camera).
-    if state.get("retain_imu") and R_imu_cam is not None:
+    # TIGHT and DIRECT paths: retain this interval's RAW IMU samples (rotated
+    # into the camera optical frame) keyed by frame seq. The TIGHT path hands the
+    # inter-keyframe block to its backend preintegrator (via emit_keyframe); the
+    # DIRECT path feeds each per-frame block to its IMU dead-reckon seed
+    # (process_frame_direct). This is a no-op for the LOOSE / oracle path (both
+    # ``retain_imu`` and ``direct`` default False), so it never allocates on or
+    # perturbs the byte-identical loose path. The body frame == camera optical
+    # frame, hence the per-sample ``R_imu_cam @ v`` rotation here (the gyro prior
+    # above already uses the same extrinsic via integrate_gyro_camera).
+    if (state.get("retain_imu") or state.get("direct")) and R_imu_cam is not None:
         R_ic = np.asarray(R_imu_cam, dtype=np.float64)
         imu_segs = state["imu_segs"]
         if gyro.shape[0]:

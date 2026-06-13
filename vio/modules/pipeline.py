@@ -56,10 +56,13 @@ from vio.comms.module import ModuleContext
 
 from sky.front.frontend import CaptureKLTFrontend, FrontendConfig, KLTFrontend
 from sky.front.odometry import OdometryConfig, RGBDVisualOdometry
+from sky.front.direct import DirectConfig
 from sky.backend.bundle import BAConfig
 from sky.backend.windowed import WindowedConfig
 from sky.vio.window import WindowedVIOConfig
 from vio.engine import make_ba_engine, make_vi_engine
+from vio.comms.messages import FrameInliers, FrameTracks, Keyframe, PoseMsg
+from .direct_odometry import DirectOdometryEngine
 from .preintegrate_prior import preintegrate_prior
 from .track_features import track_features
 from .publish_tracks import publish_tracks
@@ -150,6 +153,82 @@ def process_frame(ctx: ModuleContext, msg) -> None:
     emit_keyframe(vo, state, bus, step)
 
 
+def process_frame_direct(ctx: ModuleContext, msg) -> None:
+    """Run the dense DIRECT RGB-D VO frame path (``--direct``) for one depth frame.
+
+    The opt-in third odometry mode. It REPLACES the sparse chain
+    (``track_features -> ... -> estimate_motion``) with the offline-proven dense
+    direct frame-to-keyframe alignment + live IMU dead-reckon seed + divergence
+    guard (:class:`~vio.modules.direct_odometry.DirectOdometryEngine`), but still
+    publishes the SAME downstream topics the other modes do, so the UI + SLAM
+    contract is unchanged (comms untouched, no new IPC topic):
+
+    * ``frame.tracks`` / ``frame.inliers`` -- EMPTY (direct has no corner tracks /
+      PnP inliers), so the topics still tick once per frame and the keypoint
+      visualiser short-circuits cleanly (M == 0) instead of waiting on a dead topic.
+    * ``pose.odom`` -- the direct world pose (camera->world).
+    * ``pose.vo`` (when ``publish_vo``) -- the SAME direct pose (there is no
+      separate pure-vision accumulator in direct mode; the guard already separates
+      VO from IMU-only frames, so the "VO" line mirrors the published pose).
+    * ``keyframe`` -- emitted on the engine's NATURAL keyframe cadence (trans/rot/
+      overlap/divergence promotion), NOT the fixed ``kf_every`` count -- the depth
+      + gray the SLAM backend windows on still ride the keyframe payload.
+
+    This path NEVER runs ``propagate_imu`` (the tight nav-state) or the sparse
+    estimate; the IMU seed is owned entirely by the direct engine. Gated on
+    ``state["direct"]`` -- when off this function is never called, so the loose /
+    tight / oracle paths are byte-identical.
+    """
+    state = ctx.state
+    bus = ctx.bus
+    engine: DirectOdometryEngine = state["direct_engine"]
+    frame = msg
+
+    # The startup gravity-level accel for the FIRST-frame IMU anchor: use the
+    # bundle's startup gravity REFERENCE (``state["accel_align"]``, camera optical
+    # frame), the SAME seed the sparse path's one-shot align_gravity bootstrap uses
+    # (vio/modules/align_gravity). It MUST come from this stable startup reference,
+    # NOT the per-frame prior's accel: the early frames' IMU packet cut (prev_ts, ts]
+    # is often EMPTY, so the per-frame prior carries accel_cam=None on exactly the
+    # frame-0 anchor -- which would fall back to a straight-down default gravity and
+    # mis-rotate the whole dead-reckon world frame (the explosion the direct smoke
+    # caught). The per-frame prior is still popped to keep the dict bounded.
+    state["priors"].pop(frame.seq, None)
+    accel_cam0 = state.get("accel_align")
+    # This frame's retained raw IMU block (camera optical frame) -- the SAME live
+    # per-frame segment the tight path consumes; drives the direct engine's seed.
+    seg = state["imu_segs"].pop(frame.seq, None) if "imu_segs" in state else None
+
+    T_world_cur, is_kf, info = engine.process_frame(
+        frame.gray_left, frame.depth_m, frame.ts_ns, seg,
+        accel_cam0=accel_cam0, bg0=state.get("direct_bg0"))
+
+    # frame.tracks / frame.inliers: EMPTY but ticking (direct has no sparse data).
+    bus.publish(topics.FRAME_TRACKS,
+                FrameTracks(frame.seq, frame.ts_ns,
+                            np.empty((0,), dtype=np.int64),
+                            np.empty((0, 2), dtype=np.float32)))
+    bus.publish(topics.FRAME_INLIERS,
+                FrameInliers(frame.seq, frame.ts_ns,
+                             np.empty((0,), dtype=np.int64),
+                             np.empty((0, 2), dtype=np.float32),
+                             np.empty((0,), dtype=bool)))
+    # pose.odom (always) + pose.vo (live only): the direct world pose.
+    bus.publish(topics.POSE_ODOM,
+                PoseMsg(frame.seq, frame.ts_ns, T_world_cur, info))
+    if state.get("publish_vo"):
+        bus.publish(topics.POSE_VO,
+                    PoseMsg(frame.seq, frame.ts_ns, T_world_cur.copy(), info))
+    # keyframe on the NATURAL direct cadence (no KLT tracks -> ids/px None).
+    if is_kf:
+        bus.publish(topics.KEYFRAME,
+                    Keyframe(frame.seq, T_world_cur,
+                             frame.gray_left, frame.depth_m,
+                             track_ids=None, track_px=None, accel=None,
+                             inlier_ids=None, ts_ns=int(frame.ts_ns),
+                             imu_seg=None))
+
+
 class OdometryWorker(threading.Thread):
     """The VIO odometry front-end: a plain thread joining two input edges.
 
@@ -191,7 +270,9 @@ class OdometryWorker(threading.Thread):
                  kf_every: int = 5, use_gyro: bool = True,
                  latest_only: bool = False, level_tilt: bool = False,
                  publish_vo: bool = False, retain_imu: bool = False,
-                 loop_correct: bool = False, frontend_viz: bool = False) -> None:
+                 loop_correct: bool = False, frontend_viz: bool = False,
+                 direct: bool = False,
+                 direct_cfg: DirectConfig | None = None) -> None:
         super().__init__(name="odometry", daemon=True)
         self.bus = bus
         self.ctx = ModuleContext(bus, "odometry")
@@ -231,7 +312,15 @@ class OdometryWorker(threading.Thread):
         # default (False) keeps the LOOSE / oracle front-end byte-identical -- the
         # extra retention is a no-op (preintegrate_prior / emit_keyframe gate on it).
         state["retain_imu"] = bool(retain_imu)
-        if retain_imu:
+        # DIRECT mode (opt-in, --direct): the dense direct front-end's IMU 6-DoF
+        # seed reuses the SAME per-frame raw-IMU retention the tight nav-state uses
+        # (preintegrate_prior stores (ts, gyro_cam, accel_cam) keyed by seq). So
+        # direct forces the segment store on too -- WITHOUT touching retain_imu
+        # (which also gates the tight propagate_imu nav-state; direct routes to its
+        # OWN frame path and never runs propagate_imu). The store is allocated when
+        # EITHER tight OR direct is on; the loose / oracle path leaves it absent.
+        state["direct"] = bool(direct)
+        if retain_imu or direct:
             state["imu_segs"] = {}
             state["last_kf_seq"] = -1
             # Fixed world gravity ACCELERATION vector (optical-world "down" = +y),
@@ -239,6 +328,17 @@ class OdometryWorker(threading.Thread):
             # forward-integration + ZUPT. Kept identical to the tight backend so the
             # live dead-reckoning and the keyframe nav-state share one gravity model.
             state["g_world"] = (0.0, 9.81, 0.0)
+        if direct:
+            # The dense direct VO engine owns ALL per-keyframe + IMU-seed state.
+            # The intrinsics are the calib-bundle K (already ToF-scaled when paired
+            # with --vl53l9cx -- the target recipe). geo OFF by default at 54x42
+            # (ablation showed it redundant); the caller can pass a cfg to enable it.
+            state["direct_engine"] = DirectOdometryEngine(K, cfg=direct_cfg)
+            # Startup gyro bias for the dead-reckon anchor: estimated from the first
+            # near-static frames' priors. Seeded None (predict_state then uses bg=0
+            # the first frame); refined lazily by preintegrate_prior is overkill --
+            # the complementary correction anchors the state to vision regardless.
+            state["direct_bg0"] = None
         # Closed-loop SLAM correction (LIVE + --tight only). When on, propagate_imu
         # bleeds the SLAM pose-graph correction (loop.correction) back into the live
         # nav-state so accumulated drift is BOUNDED on revisits. The correction
@@ -272,10 +372,14 @@ class OdometryWorker(threading.Thread):
             self._downstream.append(topics.FRAME_FRONTEND)
 
         # The two input edges, each routed to its own chain function. This is the
-        # 2-input join the old ``.on(topic, chain)`` pair set up.
+        # 2-input join the old ``.on(topic, chain)`` pair set up. ``--direct``
+        # swaps the depth edge to the dense direct VO path (process_frame_direct);
+        # the imucam edge is unchanged (it still preintegrates the prior + retains
+        # the per-frame IMU the direct seed consumes). Loose / tight keep the
+        # sparse process_frame -- the swap is gated on the direct flag only.
         self._routes = {
             topics.IMUCAM_SAMPLE: process_imucam,
-            topics.FRAME_DEPTH: process_frame,
+            topics.FRAME_DEPTH: process_frame_direct if direct else process_frame,
         }
         #: see BOTH ENDs before forwarding END / draining (was expected_ends = 2).
         self.expected_ends = len(self._routes)

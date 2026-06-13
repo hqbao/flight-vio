@@ -134,6 +134,48 @@ vision-only odometry pose, so the byte-parity oracle is untouched. Gates:
 `vio.tests.imu_push_response_selftest` (the push-profile gate), `imu_propagate_selftest`,
 `tight_live_pose_selftest`.
 
+#### DIRECT odometry mode — `process_frame_direct` (`--direct` only)
+
+`--direct` selects a **third** odometry mode (alongside loose-default and `--tight`):
+dense **direct** RGB-D visual odometry, for the 54×42 VL53-class ToF target where the
+sparse corner/KLT front-end scale-collapses (Sim3 scale 0.23–0.63) from feature
+starvation. It is opt-in and **byte-identical-off**: with no flag the loose/tight
+path is unchanged and the byte-parity oracle stays gap=0 (the oracle never passes
+`--direct` and runs its own in-process harness, not this worker).
+
+On `--direct` the `frame.depth` edge routes to `process_frame_direct` (not the sparse
+`process_frame`), which drives `DirectOdometryEngine` (`vio/modules/direct_odometry.py`)
+— the live port of the offline-proven loop in `verification/direct_vo_bench.py`. Per
+frame:
+
+1. **Dense direct frame-to-keyframe alignment.** `sky.front.direct.estimate_pose_direct`
+   (the LEAF estimator, reused verbatim) aligns every gradient pixel by photometric
+   Gauss-Newton against the current keyframe, reading metric scale straight from the
+   accurate per-pixel ToF depth (geometric point-to-plane term OFF by default — the
+   ablation showed it redundant at 54×42; available via `DirectConfig.geo_weight`).
+2. **Live IMU 6-DoF seed (reused, not rebuilt).** The GN `init_T` is the keyframe→cur
+   relative pose from an IMU dead-reckon nav-state propagated with the SAME
+   `sky.vio.imu.predict_state` the live tight path runs, gravity-levelled once with
+   `gravity_aligned_R0` (seeded from the **bundle's** `accel_align` startup reference —
+   the per-frame prior is empty on the no-IMU startup frames), and pulled toward each
+   accepted fix with `complementary_correct` (same gains as the tight path). The
+   per-frame raw-IMU block comes from the SAME `preintegrate_prior` retention the tight
+   path uses (`--direct` forces it on, independent of `retain_imu`).
+3. **Divergence guard.** A frame's VO pose is rejected — replaced by the IMU
+   dead-reckon, which is also what the dead-reckoner is then corrected toward (so the
+   seed velocity is not poisoned) — when the estimator flags `diverged` OR the VO
+   keyframe-relative step ≫ the IMU-predicted step (ratio gate with a floor). This is
+   the lever that kills the fast-motion divergence.
+
+Keyframes are emitted on a **natural** cadence (trans ≥ 0.1 m / rot ≥ 6° / overlap
+drop / divergence), not the fixed `kf_every` count. The published topics are the SAME
+as the other modes (`pose.odom`, `pose.vo`, `keyframe`, and empty-but-ticking
+`frame.tracks` / `frame.inliers`), so the UI + SLAM + comms are untouched (no new IPC
+topic). `--direct` is independent of `--tight` and is meant to pair with `--vl53l9cx`:
+the live recipe is `./run.sh --vl53l9cx --direct`. Gate: `vio.tests.direct_smoke_selftest`
+(live worker smoke + Sim3-scale sanity vs Basalt); launcher forwarding:
+`launcher.tests.direct_forward_selftest`.
+
 ### `vio/main.py` — the VIO process
 
 Two-client startup against the capture endpoint (a **calib client** that blocks on
