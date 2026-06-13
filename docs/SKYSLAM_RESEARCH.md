@@ -144,6 +144,71 @@ DoF on the residual fast frames. The seed converted "diverges catastrophically"
 into "converges but loses on the hardest session" — a far better starting point
 for the guard than Stage-1's 100s-of-metres walk-offs.
 
+### 2026-06-13 — Stage 2b: point-to-plane GEO term + divergence GUARD
+
+**Levers.** Two, both from Whelan ICRA'13's fused `E = E_photo + w·E_geo`:
+1. **Point-to-plane GEOMETRIC term** in `sky/front/direct.py` (the leaf). For each
+   warped reference point `P_cur_est = T_cur_ref·P_ref` projected to the current
+   pixel `(u,v)`: measured point `P_cur_meas = depth_cur(u,v)·K⁻¹[u,v,1]ᵀ`, surface
+   normal `n` from the current depth's local cross-difference (`_current_normals`),
+   residual `r_geo = n·(P_cur_est − P_cur_meas)`, Jacobian
+   `J_geo = [nᵀ | (P_cur_est × n)ᵀ]` (left twist). Fused into the SAME GN normal
+   equations as `H += w·H_geo`, `b += w·b_geo` (`DirectConfig.geo_weight=0.1`, own
+   metric robust scale). `estimate_pose_direct` now also takes `depth_cur`. The
+   Jacobian is verified against central finite-difference to 2e-10.
+2. **Divergence GUARD** in `verification/direct_vo_bench.py`. The estimator returns
+   a `diverged` signal (finest-level RMSE grew, or GN step ran away from the seed)
+   plus the raw numbers; the harness ALSO computes a `vo/imu` signal (VO keyframe-
+   relative translation > `vo_imu_ratio=4×` the IMU dead-reckoned one). On a
+   flagged frame the harness REJECTS the VO pose, accepts the IMU dead-reckon
+   prediction, AND feeds the dead-reckoner that IMU-only prediction (not the
+   diverged VO fix) — breaking the poisoned-velocity feedback loop.
+
+**Result (54x42 ToF — Stage-2a vs Stage-2b vs SPARSE).**
+
+| session                 | S2a ATE / scale | **S2b ATE / scale** | SPARSE ATE / scale | rej% | verdict |
+|---|---|---|---|---|---|
+| lab_straight_20s        | 18 cm / 0.95    | **16 cm / 0.96**    | 98 cm / 0.63 | 0.8 | slow win HELD (slightly better) |
+| push_straight_fast_15s  | 51 cm / 0.48    | **26 cm / 0.80**    | 53 cm / 0.38 | 2.0 | improved further, beats sparse |
+| push_shake_20s          | 53 cm / 0.87    | **45 cm / 1.18**    | 91 cm / 0.38 | 1.5 | improved, beats sparse |
+| quick_motion_15s        | 344 cm / 0.04   | **27 cm / 0.76**    | 75 cm / 0.23 | 2.0 | **DIVERGENCE CLOSED** |
+
+`quick_motion` max single-frame step collapsed 387 → 23 cm. **4/4 sessions now
+beat sparse AND have scale closer to 1.0**; mean direct Sim3 scale 0.59 → 0.93.
+
+**HONEST lever attribution (ablation, the important caveat).** The two levers are
+NOT equal contributors — the **guard does essentially all the work**:
+
+| session (hard) | S2a (neither) | geo-only (guard off) | guard-only (geo off) | both (S2b) |
+|---|---|---|---|---|
+| quick_motion   | 344 cm | 284 cm | **27 cm** | 27 cm |
+| push_fast      | 51 cm  | 82 cm  | **26 cm** | 26 cm |
+
+- **Guard-only already closes quick_motion (27 cm) and improves push_fast (26 cm).**
+- **Geo-only (guard disabled) does NOT close quick_motion (284 cm) and HURTS
+  push_fast (51→82 cm)** — on fast frames the point-to-plane correspondences pull
+  GN further off, and without the guard those bad frames are integrated.
+- With the guard ON, geo vs no-geo are byte-for-practical-purposes identical across
+  all 4 sessions (lab 15.65↔15.72, the rest exact) — **the geo term is inert/
+  redundant at 54x42 once the guard catches the frames where it would have
+  helped/hurt.** Its weighted block has real magnitude (‖w·H_geo‖≈20 on fast
+  frames), so this is not a weighting bug — the photometric+depth-seed solve
+  already constrains the forward DoF well enough at this resolution that the geo
+  term adds no net signal the guard hasn't already protected.
+
+**Threshold sensitivity (honest).** `vo_imu_ratio ∈ {3,4,5,6}` all give quick_motion
+27.0–27.5 cm — the result is NOT a tuned knife-edge. The rejected fraction is small
+(0.8–2.0%): the guard is surgical, not a blunt IMU-fallback that throws away VO.
+
+**Verdict.** quick_motion is CLOSED (27 cm < 75 cm sparse) without regressing the
+three prior wins and without scale collapse — direct+seed+guard now beats sparse on
+ALL 4. The geometric term is correct and kept (it is the right tool when the seed is
+absent and is needed for the eventual live path / lower-res sensors), but the
+EMPIRICAL win at 54x42 is the divergence guard, not the geo factor. The offline
+direction is proven enough to wire live (Stage 3): a per-frame "reject VO, trust IMU
+dead-reckon, don't poison velocity" gate on the tight path. gap=0 preserved; the
+change is offline-only (`sky/front/direct.py` leaf + the read-only bench).
+
 ---
 
 ## Part 1 — Research synthesis

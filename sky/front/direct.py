@@ -64,6 +64,60 @@ normal equations accumulate ``H = sum_p w_p J_p^T J_p`` (6x6) and
 small Levenberg-Marquardt diagonal damping for conditioning), applied on the
 left. We iterate to convergence per pyramid level, COARSE -> FINE.
 
+THE GEOMETRIC (POINT-TO-PLANE) TERM -- Stage-2b (Whelan ICRA'13)
+----------------------------------------------------------------
+Photometric alignment weakly constrains the FORWARD (focus-of-expansion)
+translation DoF on fast frames: moving along the optical axis barely changes the
+image away from the FOE, so ``E_photo`` is nearly flat in that direction. Whelan
+ICRA'13 fuses a point-to-plane ICP residual into the SAME Gauss-Newton solve --
+``E = E_photo + w * E_geo`` -- because the geometric term reads that DoF straight
+from the depth, and the two terms are robust on COMPLEMENTARY degeneracies
+(``E_geo`` on flat-but-textured, ``E_photo`` on textured-but-flat).
+
+The geometric term needs the CURRENT frame's depth too (hence ``estimate_pose_
+direct`` now also takes ``depth_cur``). For each reference pixel with valid depth:
+
+1. ``P_cur_est = T_cur_ref @ P_ref``   -- the SAME warped point the photometric
+   term already computes (ref point pushed into the current frame).
+2. project ``P_cur_est`` to a current pixel ``(u, v)`` (the same projection).
+3. measured point: ``P_cur_meas = depth_cur(u, v) * K^{-1} [u, v, 1]^T`` -- back-
+   project the CURRENT depth at the warped pixel (bilinear depth lookup).
+4. surface normal ``n`` at ``(u, v)``: from the local depth gradient of the
+   current depth map (cross-product of the two neighbouring back-projected rays;
+   see :func:`_current_normals`), normalised. This is the plane the measured
+   point lies on.
+5. residual: ``r_geo = n . (P_cur_est - P_cur_meas)``  -- the signed distance of
+   the warped reference point from the measured surface tangent plane.
+
+Standard ICP linearisation freezes the correspondence per iteration: ``n`` and
+``P_cur_meas`` are treated as CONSTANTS w.r.t. the pose (re-evaluated each
+iteration after re-projecting), so ``r_geo`` depends on ``dxi`` only through
+``P_cur_est``. With the LEFT perturbation ``Exp(dxi) @ T`` acting on the already-
+warped point, ``d P_cur_est / d dxi = [ I_3 | -skew(P_cur_est) ]`` (the same warp
+Jacobian the photometric term uses), so
+
+    ``J_geo = n^T @ [ I_3 | -skew(P_cur_est) ]
+            = [ n^T | (P_cur_est x n)^T ]``     (a 1x6 row)
+
+using ``n^T (-skew(P)) = (skew(P) n)^T = (P x n)^T``. The two terms accumulate
+into the SAME 6x6 normal equations, the geometric block scaled by the fused
+weight ``w`` (``DirectConfig.geo_weight``, Whelan's ``w ~= 0.1`` metric-scale-
+reconciling default): ``H = H_photo + w * H_geo``, ``b = b_photo + w * b_geo``.
+The geo residual is robustly re-weighted too (its own t-scale, in METRES).
+
+DIVERGENCE GUARD -- Stage-2b (protect the seed velocity)
+--------------------------------------------------------
+A sustained VO divergence poisons the IMU dead-reckoner's velocity (the
+documented Stage-2a ``quick_motion`` failure). The estimator therefore reports a
+``diverged`` signal and the raw numbers behind it so the CALLER (the harness)
+can reject the VO pose and fall back to the IMU-only prediction for that frame --
+crucially feeding the dead-reckoner the IMU-only prediction, NOT the diverged VO
+fix, so a bad stretch cannot corrupt the velocity. ``diverged`` is True when, at
+the finest level, the final fused residual was NOT reduced below the initial one
+(GN ran uphill) OR the total applied pose step is implausibly large relative to
+the seed (a runaway). The thresholds + the raw ``step_norm`` / ``rmse_ratio``
+are exposed in ``info`` for the caller (and for honest sensitivity reporting).
+
 ROBUST WEIGHTING (Kerl)
 -----------------------
 The photometric residual is heavy-tailed (occlusion, ToF depth holes, moving
@@ -72,7 +126,8 @@ edges). We use the iteratively-reweighted **Student-t** weight Kerl prescribes:
 re-estimated each iteration from the residuals (the t-distribution scale). A
 Huber weight is also provided as a fallback. Per-pixel depth validity (and the
 warp falling inside the current image, with positive projected depth) gates which
-pixels contribute at all.
+pixels contribute at all. The geometric residual gets its OWN t-scale (it lives
+in metres, not intensity units) so the two robust weightings do not interfere.
 
 LEAF / PORT RULES
 -----------------
@@ -150,6 +205,41 @@ class DirectConfig:
     # fraction of the valid set (1.0 == use all valid). Kept conservative so the
     # solve is driven by textured regions, matching the direct-VO literature.
     grad_select_frac: float = 1.0
+
+    # ---- Stage-2b: fused point-to-plane GEOMETRIC term (Whelan ICRA'13) ------ #
+    geo_weight: float = 0.1
+    """Fused weight ``w`` of the point-to-plane geometric block in
+    ``E = E_photo + w * E_geo`` (Whelan's metric-scale-reconciling default ~0.1).
+    Set to 0.0 to disable the geometric term entirely (pure photometric, the
+    Stage-2a behaviour -- used to prove the photometric path is unregressed)."""
+
+    geo_normal_max_angle_deg: float = 75.0
+    """Reject a geometric correspondence whose estimated surface normal is more
+    than this far from facing the camera (``|cos| < cos(angle)``): a grazing /
+    ill-conditioned normal gives a meaningless point-to-plane distance."""
+
+    geo_max_dist_m: float = 0.5
+    """Hard gate (m) on the point-to-plane distance: a correspondence further than
+    this from the measured surface is treated as an outlier (occlusion / wrong
+    match) and dropped before the robust weighting, so a gross mismatch cannot
+    dominate ``H_geo``."""
+
+    # ---- Stage-2b: divergence GUARD (reported, the caller decides) ----------- #
+    diverge_step_ratio: float = 8.0
+    """Flag ``diverged`` when the total applied pose step at the finest level
+    exceeds this multiple of the seed-implied step magnitude (a runaway GN). The
+    seed step is the translation of ``init_T`` relative to identity; a small floor
+    keeps a near-stationary seed from making the ratio explode spuriously."""
+
+    diverge_seed_floor_m: float = 0.02
+    """Floor (m) on the seed step used in the ``diverge_step_ratio`` test, so a
+    near-zero seed translation does not make the ratio blow up on tiny real
+    motion. Roughly one inter-frame translation at slow speed."""
+
+    diverge_rmse_grow: float = 1.05
+    """Flag ``diverged`` when the finest-level final photometric RMSE is MORE than
+    this multiple of the level's initial RMSE (Gauss-Newton ran uphill -- the
+    alignment got worse, the unmistakable signature of a divergent solve)."""
 
 
 # --------------------------------------------------------------------------- #
@@ -303,6 +393,74 @@ def _image_gradients(img: np.ndarray):
     return gx, gy
 
 
+def _current_normals(depth: np.ndarray, K: np.ndarray, dmin: float, dmax: float):
+    """Per-pixel surface normals of a depth map, in the CAMERA frame.
+
+    For the point-to-plane geometric term we need, at every current-frame pixel,
+    the local surface-tangent plane the measured ToF point lies on. We obtain its
+    normal the standard organised-point-cloud way (KinectFusion / Whelan): back-
+    project the whole depth grid to a 3D point map ``P(u,v)``, then take the cross
+    product of the two in-plane tangent vectors estimated by central differences
+    along the image axes,
+
+        ``n(u,v) = (P_{u+1} - P_{u-1}) x (P_{v+1} - P_{v-1})``  (then normalise),
+
+    oriented to FACE the camera (``n_z < 0`` in the optical frame where +z points
+    away from the camera, so we flip any normal whose z-component is positive).
+
+    Returns ``(normals, normal_valid)`` where ``normals`` is ``(H, W, 3)`` and
+    ``normal_valid`` is the ``(H, W)`` bool mask of pixels whose own depth AND
+    all four cross-difference neighbours are valid (so the tangent vectors are
+    real surface directions, not depth-edge / hole artefacts) and whose normal is
+    non-degenerate. Invalid pixels carry a zero normal.
+    """
+    h, w = depth.shape[:2]
+    fx, fy = float(K[0, 0]), float(K[1, 1])
+    cx, cy = float(K[0, 2]), float(K[1, 2])
+
+    # Back-project the whole grid to a (H, W, 3) organised point map.
+    uu, vv = np.meshgrid(np.arange(w, dtype=np.float64),
+                         np.arange(h, dtype=np.float64))
+    Z = depth.astype(np.float64)
+    P = np.empty((h, w, 3), dtype=np.float64)
+    P[..., 0] = (uu - cx) * Z / fx
+    P[..., 1] = (vv - cy) * Z / fy
+    P[..., 2] = Z
+
+    valid = (Z > dmin) & (Z < dmax)
+
+    # Central-difference tangents along the image x/y axes (in 3D). The interior
+    # slices keep the (H, W, 3) shape; the 1px border is left invalid below.
+    du = np.zeros_like(P)
+    dv = np.zeros_like(P)
+    du[:, 1:-1, :] = P[:, 2:, :] - P[:, :-2, :]
+    dv[1:-1, :, :] = P[2:, :, :] - P[:-2, :, :]
+
+    n = np.cross(du, dv)                       # (H, W, 3), unnormalised normal
+    norm = np.linalg.norm(n, axis=-1)          # (H, W)
+    good = norm > 1e-9
+    inv = np.zeros_like(norm)
+    inv[good] = 1.0 / norm[good]
+    n *= inv[..., None]
+
+    # Orient toward the camera: optical +z points away, so a camera-facing surface
+    # has n_z < 0; flip any normal pointing away.
+    flip = n[..., 2] > 0.0
+    n[flip] *= -1.0
+
+    # A normal is trustworthy only where its own depth AND every neighbour used in
+    # the two central differences is valid, and the cross product was non-degenerate.
+    nbr_valid = np.zeros((h, w), dtype=bool)
+    nbr_valid[1:-1, 1:-1] = (
+        valid[1:-1, 1:-1]
+        & valid[1:-1, 2:] & valid[1:-1, :-2]      # left/right (du)
+        & valid[2:, 1:-1] & valid[:-2, 1:-1]      # up/down   (dv)
+    )
+    normal_valid = nbr_valid & good
+    n[~normal_valid] = 0.0
+    return n, normal_valid
+
+
 # --------------------------------------------------------------------------- #
 # Robust weights (Kerl Student-t, or Huber)
 # --------------------------------------------------------------------------- #
@@ -362,6 +520,7 @@ def estimate_pose_direct(
     gray_cur: np.ndarray,
     K: np.ndarray,
     *,
+    depth_cur: np.ndarray | None = None,
     init_T: np.ndarray | None = None,
     levels: int = 3,
     max_iters: int = 30,
@@ -370,17 +529,22 @@ def estimate_pose_direct(
     """Dense direct RGB-D odometry: estimate ``T_cur_ref`` (4x4 SE(3)).
 
     Aligns the CURRENT image to the REFERENCE frame's geometry by minimising the
-    photometric residual ``I_cur(warp(p)) - I_ref(p)`` over every selected
+    FUSED photometric + point-to-plane geometric residual over every selected
     reference pixel with valid depth, by coarse-to-fine Gauss-Newton on the SE(3)
-    left twist (see the module docstring for the full formulation).
+    left twist (see the module docstring for the full formulation):
+    ``E = E_photo + cfg.geo_weight * E_geo``.
 
     Parameters
     ----------
     gray_ref, gray_cur : (H, W) arrays (uint8 or float) -- reference & current
         intensity images, SAME resolution.
     depth_ref : (H, W) float -- metric depth (m) for the REFERENCE frame; 0 (or
-        outside ``[cfg.depth_min, cfg.depth_max]``) marks invalid pixels. The
-        current frame needs NO depth (that is the point: pose only).
+        outside ``[cfg.depth_min, cfg.depth_max]``) marks invalid pixels.
+    depth_cur : optional (H, W) float -- metric depth (m) for the CURRENT frame.
+        Required for the Stage-2b point-to-plane GEOMETRIC term; when None (or
+        ``cfg.geo_weight == 0``) the solve is pure photometric (Stage-2a). At the
+        VL53 ToF target the current frame's depth is available, so the geometric
+        term is on by default.
     K : (3, 3) pinhole intrinsics for this resolution.
     init_T : optional 4x4 SE(3) seed for ``T_cur_ref`` (e.g. an IMU/gyro prior);
         identity if None.
@@ -391,11 +555,18 @@ def estimate_pose_direct(
 
     Returns
     -------
-    (T_cur_ref, info) where ``info`` carries convergence diagnostics:
+    (T_cur_ref, info) where ``info`` carries convergence + DIVERGENCE diagnostics:
         ``converged`` (bool), ``final_rmse`` (intensity units, finest level),
         ``iters`` (total GN steps over all levels), ``valid_frac`` (fraction of
         selected finest-level pixels that stayed usable), ``n_pixels`` (finest
-        level), ``per_level`` (list of dicts), ``sigma`` (final t-scale).
+        level), ``per_level`` (list of dicts), ``sigma`` (final photometric
+        t-scale), ``geo_sigma`` (final geometric t-scale, m), ``n_geo`` (finest-
+        level geometric correspondences used), and the Stage-2b divergence guard:
+        ``diverged`` (bool -- the CALLER decides what to do), ``step_norm`` (m,
+        total finest-level translation step the solve applied beyond the seed),
+        ``step_ratio`` (``step_norm`` / seed step, vs ``cfg.diverge_step_ratio``),
+        ``rmse_ratio`` (finest-level final/initial photometric RMSE, vs
+        ``cfg.diverge_rmse_grow``).
     """
     cfg = cfg or DirectConfig()
     # Explicit positional args win over cfg defaults when the caller set them.
@@ -411,10 +582,20 @@ def estimate_pose_direct(
 
     pyr_ref = build_pyramid(gref, dref, K, L,
                             depth_min=cfg.depth_min, depth_max=cfg.depth_max)
-    pyr_cur = build_pyramid(gcur, None, K, L)
+    # The CURRENT frame needs depth only when the geometric term is active; build
+    # its valid-aware depth pyramid then (same reduction as the reference depth).
+    use_geo = cfg.geo_weight > 0.0 and depth_cur is not None
+    if use_geo:
+        dcur = np.ascontiguousarray(depth_cur, dtype=np.float32)
+        pyr_cur = build_pyramid(gcur, dcur, K, L,
+                                depth_min=cfg.depth_min, depth_max=cfg.depth_max)
+    else:
+        pyr_cur = build_pyramid(gcur, None, K, L)
 
-    # Working estimate of T_cur_ref (left-perturbed during the solve).
-    T = np.eye(4) if init_T is None else np.asarray(init_T, dtype=np.float64).copy()
+    # Working estimate of T_cur_ref (left-perturbed during the solve). Keep the
+    # seed so the divergence guard can measure how far the solve moved from it.
+    T_seed = np.eye(4) if init_T is None else np.asarray(init_T, dtype=np.float64)
+    T = T_seed.copy()
 
     total_iters = 0
     per_level: list[dict] = []
@@ -422,14 +603,25 @@ def estimate_pose_direct(
     final_valid_frac = 0.0
     final_n = 0
     final_sigma = float("nan")
+    final_geo_sigma = float("nan")
+    final_n_geo = 0
+    final_rmse_ratio = float("nan")
     any_converged = False
 
     # COARSE -> FINE: iterate from the coarsest level (last in the FINE->COARSE
     # pyramid list) down to the finest (index 0).
     for lvl in range(L - 1, -1, -1):
         g_ref_l, d_ref_l, K_l = pyr_ref[lvl]
-        g_cur_l, _, _ = pyr_cur[lvl]
+        g_cur_l, d_cur_l, _ = pyr_cur[lvl]
         gx_l, gy_l = _image_gradients(g_cur_l)
+        # Pre-compute the current-frame surface normals + point map ONCE per level
+        # for the point-to-plane term (pose-independent: they live in the current
+        # camera frame, looked up at the warped pixel each iteration).
+        geo_l = None
+        if use_geo and d_cur_l is not None:
+            n_cur_l, nvalid_l = _current_normals(
+                d_cur_l, K_l, cfg.depth_min, cfg.depth_max)
+            geo_l = (d_cur_l, n_cur_l, nvalid_l)
 
         cache = _select_reference_pixels(g_ref_l, d_ref_l, K_l, cfg)
         if cache is None:
@@ -437,7 +629,7 @@ def estimate_pose_direct(
             continue
 
         T, lvl_info = _solve_level(
-            T, cache, g_cur_l, gx_l, gy_l, K_l, cfg)
+            T, cache, g_cur_l, gx_l, gy_l, K_l, cfg, geo_l)
         lvl_info["level"] = lvl
         per_level.append(lvl_info)
         total_iters += lvl_info["iters"]
@@ -447,6 +639,24 @@ def estimate_pose_direct(
             final_valid_frac = lvl_info["valid_frac"]
             final_n = lvl_info["n_pixels"]
             final_sigma = lvl_info["sigma"]
+            final_geo_sigma = lvl_info["geo_sigma"]
+            final_n_geo = lvl_info["n_geo"]
+            final_rmse_ratio = lvl_info["rmse_ratio"]
+
+    # ---- Stage-2b divergence guard (report; the caller decides) ------------- #
+    # step_norm: how far (m) the finest-level solve translated the pose AWAY from
+    # the seed -- i.e. the magnitude of the correction GN applied on top of the
+    # IMU/gyro prior. A runaway GN produces a step far larger than the plausible
+    # inter-frame motion the seed implies.
+    seed_step = float(np.linalg.norm(T_seed[:3, 3] - np.eye(4)[:3, 3]))
+    step_norm = float(np.linalg.norm(T[:3, 3] - T_seed[:3, 3]))
+    seed_ref = max(seed_step, cfg.diverge_seed_floor_m)
+    step_ratio = step_norm / seed_ref
+    rmse_ratio = final_rmse_ratio
+    diverged = bool(
+        (step_ratio > cfg.diverge_step_ratio)
+        or (np.isfinite(rmse_ratio) and rmse_ratio > cfg.diverge_rmse_grow)
+    )
 
     info = {
         "converged": bool(any_converged),
@@ -455,7 +665,14 @@ def estimate_pose_direct(
         "valid_frac": final_valid_frac,
         "n_pixels": final_n,
         "sigma": final_sigma,
+        "geo_sigma": final_geo_sigma,
+        "n_geo": final_n_geo,
         "per_level": per_level,
+        # Stage-2b divergence guard signals.
+        "diverged": diverged,
+        "step_norm": step_norm,
+        "step_ratio": step_ratio,
+        "rmse_ratio": rmse_ratio,
     }
     return T, info
 
@@ -529,19 +746,36 @@ def _solve_level(
     gy_cur: np.ndarray,
     K: np.ndarray,
     cfg: DirectConfig,
+    geo: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
 ) -> tuple[np.ndarray, dict]:
-    """One pyramid level of robust Gauss-Newton. Returns (updated T, level info)."""
+    """One pyramid level of robust Gauss-Newton (fused photometric + geometric).
+
+    ``geo`` (when not None) is ``(depth_cur, normals_cur, normal_valid)`` for the
+    Stage-2b point-to-plane term: the current-frame depth map, its per-pixel
+    surface normals and the normal-validity mask, all in the CURRENT camera frame
+    (pose-independent; looked up at the warped pixel each iteration). When ``geo``
+    is None or ``cfg.geo_weight == 0`` the solve is pure photometric and the
+    normal-equation accumulation is BYTE-IDENTICAL to the pre-Stage-2b path.
+    """
     fx, fy = K[0, 0], K[1, 1]
     cx, cy = K[0, 2], K[1, 2]
     P_ref = cache.P_ref          # (M, 3) reference-frame points
     I_ref = cache.I_ref          # (M,)
     M = P_ref.shape[0]
 
+    use_geo = geo is not None and cfg.geo_weight > 0.0
+    if use_geo:
+        depth_cur, normals_cur, normal_valid_cur = geo
+        cos_min = float(np.cos(np.radians(cfg.geo_normal_max_angle_deg)))
+
     converged = False
     iters_done = 0
     rmse = float("nan")
+    rmse0 = float("nan")     # the FIRST iteration's photometric RMSE (for the guard)
     valid_frac = 0.0
     sigma = float("nan")
+    geo_sigma = float("nan")
+    n_geo = 0
 
     for it in range(cfg.max_iters):
         iters_done = it + 1
@@ -578,6 +812,8 @@ def _solve_level(
             wts, sigma = _t_scale_and_weights(r, cfg.t_dof)
 
         rmse = float(np.sqrt(np.mean(r * r)))
+        if it == 0:
+            rmse0 = rmse
 
         # ---- Per-pixel 1x6 Jacobians (left twist, translation-first) -------- #
         # J = g^T @ J_pi @ [I3 | -skew(P_cur)]
@@ -615,6 +851,18 @@ def _solve_level(
         H = J.T @ WJ                      # (6, 6)
         grad = -(J.T @ (wts * r))         # (6,)
 
+        # ---- Stage-2b: fused point-to-plane GEOMETRIC block ---------------- #
+        # E = E_photo + w * E_geo  ->  H += w * H_geo, grad += w * grad_geo.
+        # Built on the SAME warped points P_cur (no re-projection); see the module
+        # docstring for the residual + Jacobian derivation.
+        if use_geo:
+            H_g, grad_g, geo_sigma, n_geo = _geo_normal_equations(
+                P_cur, usable, u, v, depth_cur, normals_cur, normal_valid_cur,
+                fx, fy, cx, cy, cos_min, cfg)
+            if n_geo > 0:
+                H = H + cfg.geo_weight * H_g
+                grad = grad + cfg.geo_weight * grad_g
+
         # Levenberg-Marquardt diagonal damping for conditioning.
         H[np.diag_indices(6)] += cfg.lm_damping * np.diag(H)
         # Tiny absolute floor so an all-zero column (degenerate DoF) is solvable.
@@ -632,11 +880,125 @@ def _solve_level(
             converged = True
             break
 
+    # Ratio of final to initial photometric RMSE at this level: > 1 means GN ran
+    # UPHILL (got worse) -- the divergence-guard's "alignment degraded" signal.
+    rmse_ratio = (rmse / rmse0) if (np.isfinite(rmse0) and rmse0 > 1e-9) else float("nan")
+
     return T, {
         "iters": iters_done,
         "converged": converged,
         "rmse": rmse,
+        "rmse_ratio": rmse_ratio,
         "valid_frac": valid_frac,
         "n_pixels": M,
         "sigma": sigma,
+        "geo_sigma": geo_sigma,
+        "n_geo": n_geo,
     }
+
+
+def _geo_normal_equations(
+    P_cur: np.ndarray,
+    usable: np.ndarray,
+    u: np.ndarray,
+    v: np.ndarray,
+    depth_cur: np.ndarray,
+    normals_cur: np.ndarray,
+    normal_valid_cur: np.ndarray,
+    fx: float, fy: float, cx: float, cy: float,
+    cos_min: float,
+    cfg: DirectConfig,
+) -> tuple[np.ndarray, np.ndarray, float, int]:
+    """Point-to-plane geometric block ``(H_geo, grad_geo, sigma_geo, n_geo)``.
+
+    Implements the Stage-2b geometric term (Whelan ICRA'13). For each USABLE warped
+    reference point ``P_cur_est`` (already in the current camera frame) projected
+    to the current pixel ``(u, v)``:
+
+      * measured point ``P_cur_meas = depth_cur(u,v) * K^{-1}[u,v,1]^T`` (back-
+        project the CURRENT depth at the warped pixel),
+      * surface normal ``n = normals_cur(u,v)`` (nearest-neighbour lookup of the
+        pre-computed current-frame normals; the normal/measured point are FROZEN
+        per iteration, standard ICP correspondence linearisation),
+      * residual ``r_geo = n . (P_cur_est - P_cur_meas)``  (signed plane distance),
+      * Jacobian ``J_geo = [ n^T | (P_cur_est x n)^T ]``  (1x6, left twist).
+
+    Outliers are gated BEFORE robust weighting: the measured depth must be valid,
+    the normal must be valid and facing the camera (``|n . ray_dir| >= cos_min``),
+    and the plane distance must be ``<= cfg.geo_max_dist_m``. The surviving
+    residuals get their own Student-t / Huber robust weights (scale in METRES).
+    Returns zero matrices + ``n_geo = 0`` when nothing survives.
+    """
+    Pu = P_cur[usable]                          # (n_use, 3) warped points (cur frame)
+    uu = u[usable]
+    vu = v[usable]
+    h, w = depth_cur.shape[:2]
+
+    # Nearest current pixel for the depth + normal lookup (round-to-nearest; the
+    # warp already gated in-bounds, but clamp defensively). The depth map and the
+    # normal map are organised per integer pixel, so the measured point must be
+    # back-projected at the SAME integer pixel ``(ui, vi)`` the depth was sampled
+    # at -- using the float warp coords here would put the measured point off its
+    # own depth ray by up to half a pixel.
+    ui = np.clip(np.round(uu).astype(np.int64), 0, w - 1)
+    vi = np.clip(np.round(vu).astype(np.int64), 0, h - 1)
+
+    Zmeas = depth_cur[vi, ui].astype(np.float64)
+    nrm = normals_cur[vi, ui]                    # (n_use, 3)
+    nvalid = normal_valid_cur[vi, ui]
+
+    valid_meas = (Zmeas > cfg.depth_min) & (Zmeas < cfg.depth_max) & nvalid
+    if not valid_meas.any():
+        return np.zeros((6, 6)), np.zeros(6), float("nan"), 0
+
+    Pu = Pu[valid_meas]
+    ui = ui[valid_meas]
+    vi = vi[valid_meas]
+    Zmeas = Zmeas[valid_meas]
+    nrm = nrm[valid_meas]
+
+    # Measured 3D point: back-project the current depth at the (integer) pixel it
+    # was sampled at, so ``Pmeas`` lies exactly on its own depth ray.
+    Pmeas = np.empty_like(Pu)
+    Pmeas[:, 0] = (ui.astype(np.float64) - cx) * Zmeas / fx
+    Pmeas[:, 1] = (vi.astype(np.float64) - cy) * Zmeas / fy
+    Pmeas[:, 2] = Zmeas
+
+    # Grazing-angle gate: the viewing ray dir to the measured point vs the normal.
+    # A near-parallel (grazing) surface gives an ill-conditioned plane distance.
+    ray = Pmeas / np.maximum(np.linalg.norm(Pmeas, axis=1, keepdims=True), 1e-9)
+    cos_face = np.abs(np.sum(nrm * ray, axis=1))
+    facing = cos_face >= cos_min
+
+    # Point-to-plane signed distance r = n . (P_est - P_meas).
+    diff = Pu - Pmeas
+    r_geo_all = np.sum(nrm * diff, axis=1)
+
+    keep = facing & (np.abs(r_geo_all) <= cfg.geo_max_dist_m)
+    n_geo = int(keep.sum())
+    if n_geo < 6:
+        return np.zeros((6, 6)), np.zeros(6), float("nan"), 0
+
+    Pk = Pu[keep]
+    nk = nrm[keep]
+    r_geo = r_geo_all[keep]
+
+    # Robust weights for the geometric residual (own scale, in METRES).
+    if cfg.robust == "huber":
+        # Reuse a metric Huber transition tied to the outlier gate (10% of it),
+        # so a near-outlier is softly down-weighted before the hard cut.
+        wts_g = _huber_weights(r_geo, 0.1 * cfg.geo_max_dist_m)
+        geo_sigma = float(np.median(np.abs(r_geo)) * 1.4826)
+    else:
+        wts_g, geo_sigma = _t_scale_and_weights(r_geo, cfg.t_dof)
+
+    # Jacobian rows: J_geo = [ n^T | (P_est x n)^T ]  (left twist, trans-first).
+    #   n^T (-skew(P)) = (skew(P) n)^T = (P x n)^T   -> rotation block = P_est x n.
+    Jg = np.empty((n_geo, 6), dtype=np.float64)
+    Jg[:, 0:3] = nk
+    Jg[:, 3:6] = np.cross(Pk, nk)
+
+    WJg = Jg * wts_g[:, None]
+    H_g = Jg.T @ WJg                            # (6, 6)
+    grad_g = -(Jg.T @ (wts_g * r_geo))          # (6,)
+    return H_g, grad_g, geo_sigma, n_geo

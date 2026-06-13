@@ -282,6 +282,8 @@ def run_session_direct(
     converged_overlap_min: float = 0.30,
     max_frames: int = 0,
     seed: str = "gyro",
+    vo_imu_ratio: float = 4.0,
+    vo_imu_floor_m: float = 0.03,
 ) -> dict | None:
     """Run frame-to-keyframe direct VO over a session reduced to 54x42 ToF.
 
@@ -302,6 +304,14 @@ def run_session_direct(
       (keyframe->cur, rotation AND translation) from :func:`sky.vio.imu.
       predict_state`, the same gravity-aware ``predictState`` the tight path uses.
       See :func:`_imu_seed_state` for how the velocity is obtained.
+
+    Stage-2b DIVERGENCE GUARD (only with ``seed='imu'``): a frame's VO pose is
+    REJECTED -- replaced by the IMU dead-reckon prediction, which is ALSO what the
+    dead-reckoner is corrected toward (protecting the seed velocity) -- when EITHER
+    the estimator flags ``diverged`` OR the VO keyframe-relative translation
+    exceeds ``vo_imu_ratio`` times the IMU-dead-reckoned keyframe-relative
+    translation (with an absolute floor ``vo_imu_floor_m`` so a near-static frame
+    cannot inflate the ratio). The rejected-frame fraction is reported.
     """
     reader = SessionReader(session_dir)
     n = len(reader) if max_frames <= 0 else min(max_frames, len(reader))
@@ -360,12 +370,16 @@ def run_session_direct(
     T_prev_kf = np.eye(4)        # previous frame -> keyframe (for seeding)
     n_aligned = 0
     n_converged = 0
+    n_rejected = 0              # Stage-2b: frames whose VO fix the guard rejected
     t_start = time.perf_counter()
 
     for i in range(1, n):
         f, gray, depth = reduce_frame(i)
 
         # ---- Gauss-Newton seed (the Stage-2a lever) ----------------------- #
+        # ``T_world_cur_dr`` is the IMU-only dead-reckoned world pose of THIS
+        # frame; it is BOTH the GN seed AND the Stage-2b divergence fallback.
+        T_world_cur_dr = None
         if dr is not None:
             # STAGE-2a: dead-reckon the IMU nav-state forward to THIS frame, then
             # the 6-DoF seed is the relative pose keyframe->cur expressed as the
@@ -382,24 +396,65 @@ def run_session_direct(
                 R_pp = pre.delta_rotation(prev_ts, f.ts_ns)  # prev->cur rotation
                 init_T[:3, :3] = R_pp @ T_prev_kf[:3, :3]
 
-        # Align CURRENT frame to the KEYFRAME (T_cur_kf).
+        # Align CURRENT frame to the KEYFRAME (T_cur_kf). The current frame's
+        # depth feeds the Stage-2b point-to-plane GEOMETRIC term.
         T_cur_kf, info = estimate_pose_direct(
-            gray_kf, depth_kf, gray, K_tof, init_T=init_T, cfg=cfg)
+            gray_kf, depth_kf, gray, K_tof,
+            depth_cur=depth, init_T=init_T, cfg=cfg)
         n_aligned += 1
         if info["converged"]:
             n_converged += 1
 
-        # Global pose of the current frame.
-        T_world_cur = T_world_kf @ _inv_se3(T_cur_kf)
+        # ---- Stage-2b DIVERGENCE GUARD ------------------------------------ #
+        # REJECT the VO pose for this frame and accept the IMU dead-reckon
+        # prediction when the solve looks divergent. CRITICALLY, the dead-reckoner
+        # is then corrected toward its OWN prediction (a no-op pull), NOT the
+        # diverged VO fix -- so a bad VO stretch cannot poison the seed velocity
+        # (the documented Stage-2a quick_motion failure). On a non-diverged frame
+        # nothing changes vs Stage-2a.
+        #
+        # Two complementary divergence signals (the brief's "step >> IMU-predicted
+        # step, or residual not reduced"):
+        #   * the ESTIMATOR's own ``diverged`` (a finest-level RMSE that grew, or a
+        #     GN step that ran away from the seed -- catches the gross runaway), and
+        #   * a HARNESS signal only computable here: the VO keyframe-relative
+        #     translation vs the IMU-DEAD-RECKONED keyframe-relative translation.
+        #     A VO step many times the (independent) IMU-predicted step is the
+        #     creeping-divergence signature on quick_motion that a per-frame RMSE
+        #     ratio misses. We compare the magnitudes with an absolute floor so a
+        #     near-static frame's tiny IMU step does not inflate the ratio.
+        vo_imu_diverged = False
+        if T_world_cur_dr is not None:
+            # Both translations are keyframe->cur. ``init_T`` IS the IMU
+            # T_cur_kf (point ref-cam -> cur-cam), so its inverse's translation is
+            # the IMU-predicted keyframe->cur displacement; ditto for the VO fix.
+            vo_trans = float(np.linalg.norm(_inv_se3(T_cur_kf)[:3, 3]))
+            imu_trans = float(np.linalg.norm(_inv_se3(init_T)[:3, 3]))
+            imu_ref = max(imu_trans, vo_imu_floor_m)
+            vo_imu_diverged = (vo_trans / imu_ref) > vo_imu_ratio
+        guard_reject = (bool(info.get("diverged")) or vo_imu_diverged) \
+            and (T_world_cur_dr is not None)
+        if guard_reject:
+            n_rejected += 1
+            T_world_cur = T_world_cur_dr.copy()
+            # Re-express the accepted IMU pose as the keyframe-relative T_cur_kf so
+            # the keyframe-promotion test + next-frame seeding stay consistent.
+            T_cur_kf = _inv_se3(T_world_cur_dr) @ T_world_kf_dr
+            vo_fix_for_dr = T_world_cur_dr        # protect velocity: feed IMU-only
+        else:
+            T_world_cur = T_world_kf @ _inv_se3(T_cur_kf)
+            vo_fix_for_dr = T_world_cur           # accept the metric VO fix
+
         est[f.seq] = T_world_cur[:3, 3].copy()
         seqs_in_order.append(f.seq)
 
-        # Pull the IMU dead-reckoned nav-state toward this metric VO fix so the
+        # Pull the IMU dead-reckoned nav-state toward the ACCEPTED fix so the
         # velocity it feeds the NEXT seed stays scaled by depth-true vision (the
-        # same complementary correction the live tight path applies). This is what
-        # keeps the accel-only velocity from drifting over the session.
+        # same complementary correction the live tight path applies). On a guard-
+        # rejected frame ``vo_fix_for_dr`` IS the IMU prediction, so this is a
+        # self-correction that leaves the velocity IMU-driven (un-poisoned).
         if dr is not None:
-            dr.correct_toward(T_world_cur, f.ts_ns)
+            dr.correct_toward(vo_fix_for_dr, f.ts_ns)
 
         # --- keyframe promotion test --------------------------------------- #
         xi = se3_log(T_cur_kf)
@@ -413,6 +468,7 @@ def run_session_direct(
             or gap >= kf_max_gap
             or (not info["converged"])
             or overlap < converged_overlap_min
+            or guard_reject     # a rejected frame breaks the keyframe -- re-anchor
         )
         if promote:
             # The new keyframe is THIS frame; anchor its world pose (photometric
@@ -467,6 +523,8 @@ def run_session_direct(
         "n_aligned": n_aligned,
         "n_converged": n_converged,
         "conv_frac": (n_converged / n_aligned) if n_aligned else 0.0,
+        "n_rejected": n_rejected,
+        "rej_frac": (n_rejected / n_aligned) if n_aligned else 0.0,
         "ms_per_frame": (elapsed / max(n, 1)) * 1000.0,
         "est_aligned": aligned,
         "gt": dst,
@@ -518,17 +576,26 @@ def _verdict(name: str, direct: dict | None) -> str:
 
 def run_benchmark(*, cfg: DirectConfig, only: list[str] | None,
                   max_frames: int, kf_trans_m: float, kf_rot_deg: float,
-                  seed: str) -> int:
+                  seed: str, vo_imu_ratio: float, vo_imu_floor_m: float) -> int:
     names = only if only else DEFAULT_SESSIONS
     sessions = [GOLD_DIR / nm for nm in names]
 
-    stage = "STAGE-2a (IMU 6-DoF seed)" if seed == "imu" else "STAGE-1"
+    if seed == "imu":
+        stage = ("STAGE-2b (IMU seed + point-to-plane geo + divergence guard)"
+                 if cfg.geo_weight > 0.0
+                 else "STAGE-2a (IMU 6-DoF seed)")
+    else:
+        stage = "STAGE-1"
     print("=" * 104)
     print(f"{stage} DENSE DIRECT RGB-D VO @ 54x42 ToF  vs  the measured SPARSE baseline")
     print("ATE = rigid-SE3 RMSE (cm) | scale = Sim3 vs Basalt | drift = end-start "
           "(cm) | conv% = frames converged")
     print(f"DirectConfig: levels={cfg.levels} max_iters={cfg.max_iters} "
-          f"robust={cfg.robust} min_grad={cfg.min_grad} | "
+          f"robust={cfg.robust} min_grad={cfg.min_grad} "
+          f"geo_w={cfg.geo_weight} | "
+          f"guard: step_ratio>{cfg.diverge_step_ratio} "
+          f"rmse_grow>{cfg.diverge_rmse_grow} "
+          f"vo/imu>{vo_imu_ratio}(floor {vo_imu_floor_m}m) | "
           f"KF: trans>={kf_trans_m}m rot>={kf_rot_deg}deg seed={seed}")
     if max_frames:
         print(f"(max_frames={max_frames} -- quick mode)")
@@ -542,7 +609,8 @@ def run_benchmark(*, cfg: DirectConfig, only: list[str] | None,
             continue
         results[d.name] = run_session_direct(
             d, cfg=cfg, kf_trans_m=kf_trans_m, kf_rot_deg=kf_rot_deg,
-            max_frames=max_frames, seed=seed)
+            max_frames=max_frames, seed=seed,
+            vo_imu_ratio=vo_imu_ratio, vo_imu_floor_m=vo_imu_floor_m)
         print(f"  scored {d.name}")
 
     # ----- the table (direct row + sparse baseline row, per session) ----- #
@@ -551,8 +619,8 @@ def run_benchmark(*, cfg: DirectConfig, only: list[str] | None,
     print("#  54x42 ToF  --  DIRECT (this prototype)  vs  SPARSE (measured baseline)")
     print("#" * 104)
     hdr = (f"{'session':24s} {'method':8s} {'ATE cm':>8s} {'scale':>7s} "
-           f"{'drift':>8s} {'maxstep':>9s} {'conv%':>7s} {'frames':>7s} "
-           f"{'ms/f':>7s}")
+           f"{'drift':>8s} {'maxstep':>9s} {'conv%':>7s} {'rej%':>6s} "
+           f"{'frames':>7s} {'ms/f':>7s}")
     print(hdr)
     print("-" * len(hdr))
     for nm in names:
@@ -561,18 +629,20 @@ def run_benchmark(*, cfg: DirectConfig, only: list[str] | None,
         # DIRECT row.
         if m is None:
             print(f"{nm:24s} {'DIRECT':8s} {'--':>8s} {'--':>7s} {'--':>8s} "
-                  f"{'--':>9s} {'--':>7s} {'--':>7s} {'--':>7s}")
+                  f"{'--':>9s} {'--':>7s} {'--':>6s} {'--':>7s} {'--':>7s}")
         else:
             print(f"{nm:24s} {'DIRECT':8s} "
                   f"{_fmt(m['ate_cm'], 8)} {_fmt(m['scale'], 7, 3)} "
                   f"{_fmt(m['drift_cm'], 8)} {_fmt(m['max_step_cm'], 9)} "
-                  f"{_fmt(m['conv_frac'] * 100.0, 7, 1)} {m['n_frames']:>7d} "
+                  f"{_fmt(m['conv_frac'] * 100.0, 7, 1)} "
+                  f"{_fmt(m['rej_frac'] * 100.0, 6, 1)} {m['n_frames']:>7d} "
                   f"{_fmt(m['ms_per_frame'], 7, 1)}")
         # SPARSE baseline row (only the two recorded columns are known).
         if base is not None:
             print(f"{'':24s} {'SPARSE':8s} "
                   f"{_fmt(base['ate_cm'], 8)} {_fmt(base['scale'], 7, 3)} "
-                  f"{'--':>8s} {'--':>9s} {'--':>7s} {'--':>7s} {'--':>7s}")
+                  f"{'--':>8s} {'--':>9s} {'--':>7s} {'--':>6s} {'--':>7s} "
+                  f"{'--':>7s}")
         print(f"{'':24s} {'verdict:':8s} {_verdict(nm, m)}")
         print()
 
@@ -620,6 +690,22 @@ def main() -> int:
     ap.add_argument("--max-iters", type=int, default=30)
     ap.add_argument("--robust", choices=("t", "huber"), default="t")
     ap.add_argument("--min-grad", type=float, default=4.0)
+    ap.add_argument("--geo-weight", type=float, default=0.1,
+                    help="Stage-2b fused point-to-plane geometric weight w in "
+                         "E = E_photo + w*E_geo (0.1 default; 0 disables = 2a)")
+    ap.add_argument("--diverge-step-ratio", type=float, default=8.0,
+                    help="Stage-2b guard: flag diverged when the applied step "
+                         "exceeds this multiple of the seed step")
+    ap.add_argument("--diverge-rmse-grow", type=float, default=1.05,
+                    help="Stage-2b guard: flag diverged when final/initial "
+                         "photometric RMSE exceeds this (GN ran uphill)")
+    ap.add_argument("--vo-imu-ratio", type=float, default=4.0,
+                    help="Stage-2b guard: reject the VO frame when its keyframe-"
+                         "relative translation exceeds this multiple of the IMU "
+                         "dead-reckoned translation (the creeping-divergence sig)")
+    ap.add_argument("--vo-imu-floor-m", type=float, default=0.03,
+                    help="Absolute floor (m) on the IMU step in the --vo-imu-ratio "
+                         "test, so a near-static frame cannot inflate the ratio")
     ap.add_argument("--kf-trans-m", type=float, default=0.10)
     ap.add_argument("--kf-rot-deg", type=float, default=6.0)
     ap.add_argument("--seed", choices=("none", "gyro", "imu"), default="gyro",
@@ -632,10 +718,14 @@ def main() -> int:
 
     seed = "none" if args.no_gyro_seed else args.seed
     cfg = DirectConfig(levels=args.levels, max_iters=args.max_iters,
-                       robust=args.robust, min_grad=args.min_grad)
+                       robust=args.robust, min_grad=args.min_grad,
+                       geo_weight=args.geo_weight,
+                       diverge_step_ratio=args.diverge_step_ratio,
+                       diverge_rmse_grow=args.diverge_rmse_grow)
     return run_benchmark(
         cfg=cfg, only=args.only, max_frames=args.max_frames,
-        kf_trans_m=args.kf_trans_m, kf_rot_deg=args.kf_rot_deg, seed=seed)
+        kf_trans_m=args.kf_trans_m, kf_rot_deg=args.kf_rot_deg, seed=seed,
+        vo_imu_ratio=args.vo_imu_ratio, vo_imu_floor_m=args.vo_imu_floor_m)
 
 
 if __name__ == "__main__":
