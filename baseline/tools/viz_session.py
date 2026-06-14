@@ -25,10 +25,11 @@ import json
 import sys
 from pathlib import Path
 
-import cv2
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from baseline.capture.pngio import imread_gray            # noqa: E402
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal              # noqa: E402
 from PyQt6.QtGui import (                                    # noqa: E402
@@ -44,6 +45,48 @@ import pyqtgraph as pg                                       # noqa: E402
 import pyqtgraph.opengl as gl                                # noqa: E402
 
 from baseline.ui import theme                                # noqa: E402
+
+
+# ============================================================================
+# Turbo colormap (cv2-free)
+# ============================================================================
+#
+# A self-contained 256-entry Turbo LUT replaces ``cv2.applyColorMap(...,
+# COLORMAP_TURBO)`` + ``cv2.cvtColor(BGR2RGB)``. Turbo is a perceptually
+# uniform rainbow (Google, 2019); we sample Anton Mikhailov's published
+# 7th-degree polynomial fit to its RGB channels, which reproduces the cv2
+# look closely (it is the same source curve cv2's COLORMAP_TURBO is built
+# from). Output is RGB in [0, 255], so the QImage path needs no BGR swap.
+
+# Polynomial coefficients (lowest -> highest degree) for each channel, on a
+# normalized input t in [0, 1]. Public-domain fit from the Turbo author.
+_TURBO_R = (0.13572138, 4.61539260, -42.66032258, 132.13108234,
+            -152.94239396, 59.28637943)
+_TURBO_G = (0.09140261, 2.19418839, 4.84296658, -14.18503333,
+            4.27729857, 2.82956604)
+_TURBO_B = (0.10667330, 12.64194608, -60.58204836, 110.36276771,
+            -89.90310912, 27.34824973)
+
+_TURBO_LUT: np.ndarray | None = None
+
+
+def _turbo_lut() -> np.ndarray:
+    """``(256, 3)`` uint8 RGB Turbo LUT (built once, then cached)."""
+    global _TURBO_LUT
+    if _TURBO_LUT is None:
+        t = np.linspace(0.0, 1.0, 256, dtype=np.float64)
+        rgb = np.stack(
+            [np.polynomial.polynomial.polyval(t, c)
+             for c in (_TURBO_R, _TURBO_G, _TURBO_B)],
+            axis=1,
+        )
+        _TURBO_LUT = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
+    return _TURBO_LUT
+
+
+def turbo_rgb(norm_u8: np.ndarray) -> np.ndarray:
+    """Map a ``(H, W)`` uint8 normalized image -> ``(H, W, 3)`` uint8 RGB Turbo."""
+    return _turbo_lut()[norm_u8]
 
 
 # ============================================================================
@@ -294,8 +337,10 @@ class FrameTab(QWidget):
         rec = self.frames[idx]
         w, h = int(rec["width"]), int(rec["height"])
         base = self.session_dir / "input"
-        left = cv2.imread(str(base / rec["left_path"]), cv2.IMREAD_GRAYSCALE)
-        right = cv2.imread(str(base / rec["right_path"]), cv2.IMREAD_GRAYSCALE)
+        # Pure-Python PNG read (same codec the recorder writes with) — the
+        # recorder stores left/right as 8-bit grayscale PNGs, so no cv2 needed.
+        left = imread_gray(base / rec["left_path"])
+        right = imread_gray(base / rec["right_path"])
         depth = np.fromfile(base / rec["depth_path"], dtype="<u2").reshape(h, w)
 
         self._set_gray(self.lbl_left["img"], left)
@@ -334,10 +379,11 @@ class FrameTab(QWidget):
         norm[valid] = np.clip(
             (depth_u16[valid].astype(np.float32) / vmax * 255.0), 0, 255
         ).astype(np.uint8)
-        colored = cv2.applyColorMap(norm, cv2.COLORMAP_TURBO)
-        colored[~valid] = 0
-        h, w = colored.shape[:2]
-        rgb = cv2.cvtColor(colored, cv2.COLOR_BGR2RGB)
+        # NumPy Turbo LUT -> RGB directly (no cv2, no BGR->RGB swap).
+        rgb = turbo_rgb(norm)
+        rgb[~valid] = 0
+        h, w = rgb.shape[:2]
+        rgb = np.ascontiguousarray(rgb)
         qimg = QImage(rgb.tobytes(), w, h, 3 * w, QImage.Format.Format_RGB888)
         pm = QPixmap.fromImage(qimg).scaled(
             label.size(), Qt.AspectRatioMode.KeepAspectRatio,

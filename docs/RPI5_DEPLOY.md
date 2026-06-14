@@ -220,3 +220,54 @@ re-deriving:
 What remains genuinely Pi-only is therefore **not the code** but the **arch
 wheels** (numba/llvmlite, depthai) and the **real-time throughput** — captured
 as the ⚠️ items in §4.
+
+---
+
+## 7. Running the baseline on the Pi
+
+`baseline/` is the **independent DepthAI/Basalt reference pipeline** — it runs
+the OAK-D's **on-chip** BasaltVIO + RTABMapSLAM blobs over `depthai` and renders
+their pose in a Qt 3D viewer (it imports **no** `ours`/`sky`, so it is not on the
+gap=0 oracle). Like the flight stack it is **cv2-free**: the recorder reads/writes
+frames with the pure-Python PNG codec (`baseline/capture/pngio.py`), and the
+offline session viewer (`baseline/tools/viz_session.py`) colourises depth with a
+NumPy Turbo LUT — no OpenCV anywhere.
+
+### Install
+
+```bash
+.venv/bin/pip install -r requirements-baseline.txt
+```
+
+`requirements-baseline.txt` is the **lean baseline install**: `numpy` + `depthai`
+(the real dependency — the OAK-D on-chip Basalt source) plus the viewer trio
+`PyQt6` + `pyqtgraph` + `PyOpenGL`. **No OpenCV.**
+
+- **Headless record-only board** → you only need **`depthai` + `numpy`**. Drop the
+  Qt trio (PyQt6 / pyqtgraph / PyOpenGL) — the record/replay path never imports
+  them.
+- **Viewer board** → add the Qt trio for the live pose viewer
+  (`./run-baseline.sh`) and the offline session inspector
+  (`baseline/tools/viz_session.py`).
+
+### Validate (cv2-free, runs on the dev box too)
+
+```bash
+.venv/bin/python -m verification.cv2_absent_baseline_litmus
+#   (gate: verification/cv2_absent_baseline_litmus.py — LITMUS PASSED)
+```
+
+This imports the whole baseline surface (sources/capture/ui/tools.viz_session)
+and runs two cv2-free runtime slices (`FakePoseSource` + the `viz_session` PNG
+decode → NumPy Turbo depth) with `import cv2` **blocked**. depthai/OAK-D is not
+exercised here (no device on the dev box); it is reached only on the live path.
+
+> ### ⚠️ depthai aarch64 wheel — same caveat as the flight stack
+> `depthai` is the **only** native device dependency and the **same open unknown**
+> as in §4/§5: do prebuilt **aarch64** wheels exist for your `depthai` version? If
+> not it must build from source (needs `build-essential` + `python3.13-dev`), or
+> there may be no aarch64 wheel at all. A **replay/viewer-only** baseline board
+> can drop the `depthai` line entirely — `depthai` is imported **lazily** inside
+> the Basalt sources' worker thread, so `FakePoseSource`, `viz_session`, and the
+> Qt viewer all run without it. PyQt6/PyOpenGL aarch64 wheels are the other arch
+> unknown for a viewer board; a headless record-only board avoids them.

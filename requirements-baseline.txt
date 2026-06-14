@@ -1,0 +1,27 @@
+# Lean BASELINE install for the Pi (no OpenCV).
+#
+# `baseline/` is the INDEPENDENT DepthAI/Basalt reference pipeline: it runs the
+# OAK-D's on-device BasaltVIO / RTABMapSLAM blobs over `depthai` and renders
+# their pose in a Qt 3D viewer (it imports NO `ours`/`sky`). Like the flight
+# stack it is cv2-free: the recorder reads/writes frames with a pure-Python PNG
+# codec (`baseline/capture/pngio.py`) and the session viewer colourises depth
+# with a NumPy Turbo LUT -- so the heavy `opencv-python` wheel is NOT installed
+# here. Proven by `python -m verification.cv2_absent_baseline_litmus`.
+#
+# Use the full `requirements.txt` for development / the from-scratch stack's
+# calib + oracle tooling (those still use OpenCV).
+
+# Numerics: pose math, PNG decode buffers, the depth Turbo LUT.
+numpy>=2.0
+
+# OAK-D / camera device driver -- the REAL baseline dependency: it streams the
+# on-chip Basalt VIO + RTABMap SLAM blobs. Required for live capture/record on
+# the board. A headless RECORD-ONLY board needs only `depthai` + `numpy`.
+depthai>=3.6
+
+# Qt 3D VIEWER (optional -- omit for a headless record-only board). These add
+# the live pose viewer and the offline `baseline/tools/viz_session.py` session
+# inspector; the record/replay path itself does not import them.
+PyQt6>=6.6
+pyqtgraph>=0.13
+PyOpenGL>=3.1
