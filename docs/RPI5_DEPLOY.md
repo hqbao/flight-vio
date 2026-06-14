@@ -243,11 +243,20 @@ NumPy Turbo LUT — no OpenCV anywhere.
 (the real dependency — the OAK-D on-chip Basalt source) plus the viewer trio
 `PyQt6` + `pyqtgraph` + `PyOpenGL`. **No OpenCV.**
 
-- **Headless record-only board** → you only need **`depthai` + `numpy`**. Drop the
-  Qt trio (PyQt6 / pyqtgraph / PyOpenGL) — the record/replay path never imports
-  them.
-- **Viewer board** → add the Qt trio for the live pose viewer
-  (`./run-baseline.sh`) and the offline session inspector
+- **Headless / FC-only board** → you only need **`depthai` + `numpy`**. Drop the
+  Qt trio (PyQt6 / pyqtgraph / PyOpenGL). Run the **live pose stream with NO UI**:
+
+  ```bash
+  ./run-baseline.sh --no-ui --source oak     # Basalt VIO, headless; pose -> stdout
+  ```
+
+  `--no-ui` runs the Basalt source headless and streams the pose to stdout — the
+  **FC-output path**: wire the MAVLink `VISION_POSITION_ESTIMATE` send into
+  `_on_pose()` in `baseline/tools/view_pose3d.py`. It imports no Qt, and Ctrl+C /
+  SIGTERM tears the OAK-D down cleanly (no firmware crash on quit). Record-only
+  (`baseline/tools/record_session.py`) is likewise Qt-free.
+- **Viewer board (dev)** → add the Qt trio for the live 3D pose viewer
+  (`./run-baseline.sh`, no `--no-ui`) and the offline session inspector
   (`baseline/tools/viz_session.py`).
 
 ### Validate (cv2-free, runs on the dev box too)

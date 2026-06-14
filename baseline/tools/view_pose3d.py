@@ -11,17 +11,18 @@ from-scratch pipeline — that now runs as the 5-project split via ``./run.sh``
 from __future__ import annotations
 
 import argparse
+import signal
 import sys
+import time
 from pathlib import Path
 
 # allow running directly without `pip install -e .`
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from PyQt6.QtWidgets import QApplication       # noqa: E402
-
 from baseline.pose import PoseHistory                   # noqa: E402
 from baseline.sources import FakePoseSource             # noqa: E402
-from baseline.ui.mainwindow import MainWindow           # noqa: E402
+# PyQt6 / baseline.ui are imported LAZILY inside main()'s UI branch, so the
+# --no-ui (headless / FC-only) path runs with NO Qt installed.
 
 
 def _build_source(name: str, args):
@@ -46,6 +47,64 @@ def _build_source(name: str, args):
     raise SystemExit(f"unknown --source '{name}' (expected: fake|oak|slam)")
 
 
+def _run_headless(source, source_name: str) -> int:
+    """Run the pose source with NO UI — the FC-only / Pi deployment path.
+
+    Starts the source, forwards every pose to ``_on_pose`` (the hook where a
+    MAVLink ``VISION_POSITION_ESTIMATE`` send to the flight controller goes),
+    prints a throttled status line, and tears the device down CLEANLY on
+    Ctrl+C/SIGTERM (``source.stop()`` waits for the depthai pipeline to close,
+    same as the UI fix — so a headless quit never crashes the OAK-D firmware).
+    """
+    stop = {"flag": False}
+
+    def _sig(_signum, _frame):
+        stop["flag"] = True
+
+    signal.signal(signal.SIGINT, _sig)
+    signal.signal(signal.SIGTERM, _sig)
+
+    latest = {"pose": None}
+    count = {"n": 0}
+
+    def _on_pose(p) -> None:
+        # === FC OUTPUT HOOK ===
+        # This is the single place a real deployment forwards the pose to the
+        # flight controller (e.g. MAVLink VISION_POSITION_ESTIMATE). For now we
+        # just keep the latest sample for the status line below.
+        latest["pose"] = p
+        count["n"] += 1
+
+    print(f"baseline headless: source={source_name}  (Ctrl+C to stop)")
+    print("  pose -> stdout; wire the FC forward in _on_pose().")
+    source.start(_on_pose)
+
+    last_print = 0.0
+    try:
+        while not stop["flag"]:
+            if source.error:
+                print(f"[{source_name}] error: {source.error}", file=sys.stderr)
+                return 1
+            if not source.is_running():
+                print(f"[{source_name}] source stopped (stream ended).")
+                break
+            now = time.monotonic()
+            if now - last_print >= 0.5:
+                last_print = now
+                p = latest["pose"]
+                if p is not None:
+                    x, y, z = p.pos_ned
+                    print(f"  t={p.t:7.2f}s  NED=({x:+.3f},{y:+.3f},{z:+.3f})m"
+                          f"  fps={source.fps:5.1f}  n={count['n']}")
+            time.sleep(0.05)
+    finally:
+        # Clean device teardown (waits for the depthai pipeline to close) — the
+        # headless counterpart of the MainWindow quit fix.
+        source.stop(timeout=10.0)
+        print("baseline headless: stopped cleanly.")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="OAK-D 3D pose viewer (baseline)")
     ap.add_argument("--source", default="fake",
@@ -61,11 +120,21 @@ def main() -> int:
                     help="path to a Basalt vio_config.json fed to "
                          "BasaltVIO.setConfigPath (advanced; default = stock "
                          "auto-config)")
+    ap.add_argument("--no-ui", action="store_true",
+                    help="headless: run the source + stream pose to stdout (the "
+                         "FC-output path), NO Qt viewer. Clean Ctrl+C teardown. "
+                         "Needs no PyQt6 -- the Pi FC-only deployment path.")
     args = ap.parse_args()
 
-    history = PoseHistory(capacity=8192)
     source = _build_source(args.source, args)
 
+    if args.no_ui:
+        return _run_headless(source, args.source)
+
+    # UI path: import Qt + the viewer LAZILY so --no-ui needs no PyQt6 installed.
+    from PyQt6.QtWidgets import QApplication
+    from baseline.ui.mainwindow import MainWindow
+    history = PoseHistory(capacity=8192)
     app = QApplication(sys.argv)
     win = MainWindow(history, source, source_name=args.source)
     win.show()

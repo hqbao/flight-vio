@@ -16,12 +16,14 @@ numpy>=2.0
 
 # OAK-D / camera device driver -- the REAL baseline dependency: it streams the
 # on-chip Basalt VIO + RTABMap SLAM blobs. Required for live capture/record on
-# the board. A headless RECORD-ONLY board needs only `depthai` + `numpy`.
+# the board. A HEADLESS board (record-only, OR the live `--no-ui` FC-output
+# path `view_pose3d --no-ui`) needs ONLY `depthai` + `numpy` -- no Qt below.
 depthai>=3.6
 
-# Qt 3D VIEWER (optional -- omit for a headless record-only board). These add
-# the live pose viewer and the offline `baseline/tools/viz_session.py` session
-# inspector; the record/replay path itself does not import them.
+# Qt 3D VIEWER (optional -- OMIT on a headless/FC-only board; --no-ui needs none
+# of these). These add the live pose viewer and the offline
+# `baseline/tools/viz_session.py` session inspector; neither the record/replay
+# path nor the `--no-ui` headless pose stream imports them.
 PyQt6>=6.6
 pyqtgraph>=0.13
 PyOpenGL>=3.1
