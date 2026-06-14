@@ -330,6 +330,49 @@ def _terminate(procs: list[subprocess.Popen], *, deadline_s: float = 10.0,
                 pass
 
 
+def _start_pose_logger(vio_ep: str):
+    """``--no-ui`` FC-output preview: subscribe to the vio pose, print pos + quat.
+
+    A READ-ONLY consumer on the vio endpoint -- the ours FC-output HOOK, the
+    single place a real MAVLink ``VISION_POSITION_ESTIMATE`` send will go (mirrors
+    baseline's ``_on_pose``). Prints the RAW pose (position + quaternion; the FC
+    derives heading itself), throttled to ~2 Hz. Best-effort: returns the
+    ``IPCPubSub`` client to ``stop()`` on teardown, or ``None`` if it cannot
+    attach (logging must never break the flight run). Pose is ``T_world_cam`` in
+    the pipeline's gravity-aligned WORLD frame; the FC NED / body-extrinsic
+    mapping is the (future) FC-link step, not done here.
+    """
+    from launcher.comms import IPCPubSub, topics
+    from launcher.comms.lib.misc.frames import rot_to_quat
+
+    st = {"last": 0.0, "n": 0}
+
+    def _on_pose(wm) -> None:
+        # === FC OUTPUT HOOK (ours) -- wire MAVLink VISION_POSITION_ESTIMATE here.
+        st["n"] += 1
+        now = time.monotonic()
+        if now - st["last"] < 0.5:
+            return
+        st["last"] = now
+        T = wm.T_world_cam
+        qw, qx, qy, qz = rot_to_quat(T[:3, :3])
+        LOG.info("pose: pos WORLD=(%+.3f %+.3f %+.3f) m  "
+                 "quat wxyz=(%+.4f %+.4f %+.4f %+.4f)  n=%d",
+                 T[0, 3], T[1, 3], T[2, 3], qw, qx, qy, qz, st["n"])
+
+    try:
+        client = IPCPubSub(vio_ep, role="client", connect_timeout_s=5.0)
+        client.subscribe(topics.POSE_ODOM, _on_pose)
+        client.start()
+    except Exception as e:                                          # noqa: BLE001
+        LOG.warning("launcher: --no-ui pose logger could not attach to %r: %s",
+                    vio_ep, e)
+        return None
+    LOG.info("launcher: --no-ui pose logger on %r (pose.odom -> pos+quat; "
+             "the FC-output hook)", vio_ep)
+    return client
+
+
 # --------------------------------------------------------------------------- #
 def main() -> int:
     logging.basicConfig(level=logging.INFO,
@@ -561,10 +604,13 @@ def main() -> int:
     if args.no_ui:
         # No restart button without a UI -- the --no-ui path runs exactly ONCE,
         # independent of the restart loop below.
+        pose_client = None
         try:
             _spawn_pipeline()
             cap_proc = procs[0]
             vio_proc, slam_proc = procs[1], procs[2]
+            # FC-output preview: print the live pose (pos + quat) to the log.
+            pose_client = _start_pose_logger(vio_ep)
             LOG.info("launcher: --no-ui set; waiting for capture to exit "
                      "(Ctrl-C to stop)")
             try:
@@ -586,6 +632,11 @@ def main() -> int:
                                 "_terminate will SIGTERM/SIGKILL",
                                 child.args, child.pid)
         finally:
+            if pose_client is not None:
+                try:
+                    pose_client.stop()
+                except Exception:                                  # noqa: BLE001
+                    pass
             LOG.info("launcher: shutting down background procs ...")
             _terminate(procs)
             LOG.info("launcher: bye")

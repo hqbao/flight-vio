@@ -93,9 +93,15 @@ def _run_headless(source, source_name: str) -> int:
                 last_print = now
                 p = latest["pose"]
                 if p is not None:
+                    # RAW pose for the FC: position natively NED (X=North,
+                    # Y=East, Z=Down) + the NED-world body-attitude quaternion
+                    # (w,x,y,z). We send position + quaternion as-is and let the
+                    # FC derive heading/euler itself.
                     x, y, z = p.pos_ned
-                    print(f"  t={p.t:7.2f}s  NED=({x:+.3f},{y:+.3f},{z:+.3f})m"
-                          f"  fps={source.fps:5.1f}  n={count['n']}")
+                    qw, qx, qy, qz = p.quat_wxyz
+                    print(f"  pos NED=(N{x:+.3f} E{y:+.3f} D{z:+.3f}) m"
+                          f"   quat wxyz=({qw:+.4f} {qx:+.4f} {qy:+.4f} {qz:+.4f})"
+                          f"   fps={source.fps:5.1f}   n={count['n']}")
             time.sleep(0.05)
     finally:
         # Clean device teardown (waits for the depthai pipeline to close) — the
