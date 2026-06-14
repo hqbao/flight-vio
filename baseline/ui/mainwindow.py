@@ -4,7 +4,7 @@ from __future__ import annotations
 from PyQt6 import QtCore
 from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
-    QHBoxLayout, QLabel, QMainWindow, QStatusBar,
+    QApplication, QHBoxLayout, QLabel, QMainWindow, QStatusBar,
     QToolBar, QVBoxLayout, QWidget,
 )
 
@@ -13,6 +13,14 @@ from ..sources.base import PoseSource
 from . import theme
 from .panels import TelemetryPanel
 from .viewer3d import Viewer3D
+
+#: Quit teardown budget. Closing the depthai pipeline (the source worker's
+#: ``with dai.Pipeline()`` __exit__) can take a few seconds; the process MUST
+#: wait for it, else the daemon worker is killed mid-stream and the OAK-D
+#: firmware CRASHES (device drops off USB). Generous, but ``stop()``'s join
+#: returns as soon as the worker actually finishes -- so fast sources (fake)
+#: don't pay it.
+_TEARDOWN_TIMEOUT_S = 10.0
 
 
 def _header(title: str, subtitle: str) -> QWidget:
@@ -41,6 +49,15 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.history = history
         self.source = source
+
+        # Clean device teardown on EVERY quit path. The window-close (X) path
+        # runs closeEvent; the macOS Cmd+Q / app-menu Quit path does NOT call
+        # closeEvent (it ends the event loop directly), so ALSO hook
+        # aboutToQuit. Both funnel to the idempotent _teardown -> stop the
+        # worker + wait for the depthai device to close before the process exits.
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self._teardown)
 
         self.setWindowTitle(f"OAK-D Pose Viewer  ·  source: {source_name}")
         self.resize(1400, 860)
@@ -162,8 +179,18 @@ class MainWindow(QMainWindow):
         self.viewer.set_follow(on)
         self.statusBar().showMessage(f"Follow camera: {'ON' if on else 'OFF'}", 1500)
 
+    def _teardown(self) -> None:
+        """Stop the source worker and WAIT for the depthai device to close.
+
+        Idempotent (``stop()`` no-ops once the worker thread is gone), so it is
+        safe to call from BOTH closeEvent and aboutToQuit. The generous timeout
+        lets the worker's ``with dai.Pipeline()`` __exit__ finish, so the device
+        is closed cleanly before the process exits (no mid-stream firmware crash).
+        """
+        self.source.stop(timeout=_TEARDOWN_TIMEOUT_S)
+
     def closeEvent(self, event) -> None:                              # noqa: N802
         try:
-            self.source.stop()
+            self._teardown()
         finally:
             super().closeEvent(event)
