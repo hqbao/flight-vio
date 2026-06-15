@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Cross-project ``comms`` byte-parity gate for the 5-project split.
+"""Cross-project ``comms`` byte-parity gate for the split + the netbridge copy.
 
 The split vendors ONE comms contract (``comms/``) bit-identically into all five
-projects (imu_camera / vio / slam / ui / launcher). This test proves the contract
-did NOT silently diverge between copies, on three independent axes:
+projects (imu_camera / vio / slam / ui / launcher) PLUS ``netbridge`` (the
+cross-machine TCP bridge, which vendors comms as a 7th copy). This test proves
+the contract did NOT silently diverge between copies, on three independent axes:
 
 1. SOURCE PARITY -- ``diff -r --exclude=__pycache__ <proj>/comms imu_camera/comms``
    must be EMPTY for proj in {vio, slam, ui, launcher}. (imu_camera is the anchor.)
 
 2. CODEC PARITY -- import EACH copy's ``codec`` + ``wire``, encode a FIXED set of
    ``Wire*`` test vectors, and compare a sha256 digest of the produced bytes
-   ACROSS ALL 5 COPIES. Identical source guarantees identical bytes; this is the
+   ACROSS ALL COPIES. Identical source guarantees identical bytes; this is the
    live functional proof (catches a codec that would diverge even if the dir-diff
    were somehow fooled, e.g. an import-root that changed encoding). Each copy must
    ALSO decode every other copy's bytes back to an equal Wire object (the whole
@@ -45,7 +46,9 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
 ANCHOR = "imu_camera"
-COPIES = ("imu_camera", "vio", "slam", "ui", "launcher")
+# The 5 split projects + ``netbridge`` (the cross-machine TCP bridge, which
+# vendors comms as a 7th copy). Every copy must be byte-identical to the anchor.
+COPIES = ("imu_camera", "vio", "slam", "ui", "launcher", "netbridge")
 
 
 def _check(cond: bool, msg: str) -> bool:
@@ -60,7 +63,10 @@ def test_source_parity() -> bool:
     print("\n[1] comms/ source parity (diff -r --exclude=__pycache__)")
     ok = True
     anchor_dir = REPO / ANCHOR / "comms"
-    for proj in ("vio", "slam", "ui", "launcher"):
+    # Every non-anchor copy (the 5 split projects + ``netbridge``) must dir-diff
+    # EMPTY against the anchor. Derived from COPIES so a new copy is covered here
+    # the moment it's added to the tuple above.
+    for proj in (c for c in COPIES if c != ANCHOR):
         proj_dir = REPO / proj / "comms"
         res = subprocess.run(
             ["diff", "-r", "--exclude=__pycache__",
@@ -249,7 +255,8 @@ def _wire_eq(a, b) -> bool:
 
 
 def test_codec_parity() -> bool:
-    print("\n[2] codec byte-parity across all 5 copies (sha256 of encoded vectors)")
+    print(f"\n[2] codec byte-parity across all {len(COPIES)} copies "
+          f"(sha256 of encoded vectors)")
     ok = True
     digests = {}
     blobs_by_copy = {}
@@ -421,7 +428,8 @@ def test_bridge_roundtrip() -> bool:
 
 # --------------------------------------------------------------------------- #
 def main() -> int:
-    print("ipc_comms_selftest -- cross-project comms byte-parity (5 copies)")
+    print(f"ipc_comms_selftest -- cross-project comms byte-parity "
+          f"({len(COPIES)} copies)")
     results = {
         "source parity":   test_source_parity(),
         "codec parity":    test_codec_parity(),
@@ -433,8 +441,8 @@ def main() -> int:
     for name, ok in results.items():
         print(f"  [{'ok' if ok else 'FAIL'}] {name}")
     if all_ok:
-        print("\nPASS -- the vendored comms contract is byte-identical across all "
-              "5 copies and round-trips intact.")
+        print(f"\nPASS -- the vendored comms contract is byte-identical across "
+              f"all {len(COPIES)} copies and round-trips intact.")
         return 0
     print("\nFAIL -- a comms copy DIVERGED. VETO: see the [FAIL] lines above.")
     return 1

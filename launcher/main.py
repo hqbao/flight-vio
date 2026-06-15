@@ -373,6 +373,41 @@ def _start_pose_logger(vio_ep: str):
     return client
 
 
+def build_forward_args(host: str, port: int, args, cap_ep: str, vio_ep: str,
+                       slam_ep: str) -> list[str]:
+    """Build the ``netbridge.forward`` argv (pure -> unit-testable).
+
+    The forward process runs ON THE PI alongside the flight stack: it subscribes
+    the local capture/vio/slam IPC endpoints and re-serves them over TCP for a
+    remote Mac UI. It must attach to the SAME ring resolution capture created, so
+    the launcher's ``--width`` / ``--height`` (and the ToF override they imply) are
+    forwarded verbatim. The endpoints are the launcher's resolved (possibly
+    suffixed) names so a ``--auto-suffix`` run still bridges the right sockets.
+    """
+    return ["--listen", f"{host}:{port}",
+            "--capture-endpoint", cap_ep,
+            "--vio-endpoint", vio_ep,
+            "--slam-endpoint", slam_ep,
+            "--width", str(args.width),
+            "--height", str(args.height)]
+
+
+def parse_host_port(s: str, *, default_host: str = "0.0.0.0") -> tuple[str, int]:
+    """Parse a ``--forward HOST:PORT`` (or bare ``:PORT`` / ``PORT``) value.
+
+    Pure helper so the launcher CLI parsing is testable. A bare port binds the
+    forward server on ``0.0.0.0`` (all interfaces) so a Mac on the LAN can reach
+    it; an explicit host narrows the bind (e.g. a Wireguard interface address).
+    """
+    s = str(s).strip()
+    if ":" in s:
+        host, _, port = s.rpartition(":")
+        host = host or default_host
+    else:
+        host, port = default_host, s
+    return host, int(port)
+
+
 # --------------------------------------------------------------------------- #
 def main() -> int:
     logging.basicConfig(level=logging.INFO,
@@ -409,6 +444,13 @@ def main() -> int:
                     help="derive endpoint suffix from this launcher's PID")
     ap.add_argument("--no-ui", action="store_true",
                     help="don't open the UI -- useful for capture-only headless runs")
+    ap.add_argument("--forward", default=None, metavar="HOST:PORT",
+                    help="ALSO run the cross-machine bridge: spawn "
+                         "netbridge.forward bound to HOST:PORT (bare :PORT or PORT "
+                         "binds 0.0.0.0) so a remote Mac UI can connect over "
+                         "TCP/WiFi (run `run-ui-remote.sh` there). Additive -- the "
+                         "local UI / --no-ui path is unaffected. Requires "
+                         "OAKD_NETBRIDGE_KEY set (the shared HMAC secret).")
     ap.add_argument("--vl53l9cx", action="store_true",
                     help="simulate a VL53L9CX-class ToF camera in the capture "
                          "process: compute depth at the source resolution then "
@@ -496,6 +538,20 @@ def main() -> int:
 
     py = sys.executable
     env = dict(os.environ)
+
+    # ---- Cross-machine bridge (--forward) --------------------------------
+    # Resolve + validate the forward endpoint ONCE, before spawning, so a bad
+    # value (or a missing authkey) fails fast instead of crashing a child later.
+    forward_hostport: tuple[str, int] | None = None
+    if args.forward:
+        forward_hostport = parse_host_port(args.forward)
+        if not env.get("OAKD_NETBRIDGE_KEY"):
+            LOG.error("launcher: --forward requires OAKD_NETBRIDGE_KEY (the shared "
+                      "HMAC secret) set in the environment; refusing to open a "
+                      "network socket with no auth. Export it on the Pi AND the Mac.")
+            return 2
+        LOG.info("launcher: --forward bridge will listen on %s:%d (remote Mac UI "
+                 "connects via run-ui-remote.sh)", *forward_hostport)
 
     # ---- Build per-proc argv ---------------------------------------------
     # Capture argv (mode branch + flag forwarding) lives in build_capture_args so
@@ -600,6 +656,16 @@ def main() -> int:
         procs.append(_spawn(py, "vio.main", vio_args, env=env, name="vio"))
         procs.append(_spawn(py, "slam.main", slam_args, env=env,
                             name="slam"))
+        # Cross-machine bridge: spawn netbridge.forward LAST (it connects to the
+        # capture/vio/slam IPC servers, which retry, so order is cosmetic) when
+        # --forward is set. It joins `procs`, so _terminate tears it down with the
+        # rest. Additive -- a missing --forward leaves the pipeline unchanged.
+        if forward_hostport is not None:
+            fwd_host, fwd_port = forward_hostport
+            forward_args = build_forward_args(fwd_host, fwd_port, args,
+                                              cap_ep, vio_ep, slam_ep)
+            procs.append(_spawn(py, "netbridge.forward", forward_args, env=env,
+                                name="netbridge.forward"))
 
     if args.no_ui:
         # No restart button without a UI -- the --no-ui path runs exactly ONCE,

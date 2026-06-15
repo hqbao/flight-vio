@@ -86,6 +86,39 @@ in the gate below. `--vl53l9cx` selects the VL53-class ToF source (downsample to
 54×42); `--direct` selects the dense direct photometric VO front-end tuned for
 that low-res ToF recipe.
 
+### 3a. Remote UI over WiFi (`netbridge`)
+
+The UI can run **live on a Mac** against the Pi's flight stack, over TCP/WiFi —
+the `netbridge` project bridges the Pi's local IPC to the Mac. The UI is
+**byte-for-byte unchanged**: the Mac re-serves the same `oak.capture` / `oak.vio`
+/ `oak.slam` endpoints the UI already consumes.
+
+```bash
+# --- on the Pi: run the flight stack WITH the bridge (additive to --no-ui) ---
+export OAKD_NETBRIDGE_KEY=$(openssl rand -hex 32)   # shared secret (see below)
+./run.sh --no-ui --vl53l9cx --direct --forward 0.0.0.0:8787
+
+# --- on the Mac: run the UI against the Pi (SAME secret) ---
+export OAKD_NETBRIDGE_KEY=<the-same-secret-from-the-Pi>
+./run-ui-remote.sh --connect <pi-host>:8787
+```
+
+`--forward HOST:PORT` spawns `netbridge.forward` as one more managed flight
+subprocess (torn down with the rest). On the Mac, `run-ui-remote.sh` starts
+`netbridge.receive` (which sizes its rings from the forwarded `calib.bundle`, so a
+54×42 ToF run is re-served at 54×42, not 640×400), waits for the re-served
+sockets, then runs the unchanged `ui.main`.
+
+**Security (HONEST):** `OAKD_NETBRIDGE_KEY` is a shared HMAC secret that
+**authenticates** the peer — a wrong/missing key is refused, no silent open
+socket. It does **not encrypt** the stream (LAN threat model). For an untrusted
+network, tunnel it: `ssh -L 8787:localhost:8787 pi@<pi-host>` then
+`./run-ui-remote.sh --connect 127.0.0.1:8787` (or run over Wireguard) — the tunnel
+provides the encryption and netbridge sees only loopback.
+
+See `netbridge/README.md` for the full design + the gate
+(`verification/netbridge_loopback_selftest.py`).
+
 ---
 
 ## 4. BOARD-ARRIVAL VALIDATION CHECKLIST
