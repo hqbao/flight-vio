@@ -16,7 +16,7 @@
         <mxCell id="lane_slam" value="SLAM - RTABMapSLAM node (host CPU)" style="html=1;swimlane;horizontal=0;startSize=30;fillColor=#5a1a3a;strokeColor=#e25fa4;fontColor=#ffffff;fontSize=14;fontStyle=1;swimlaneFillColor=#1f0814;" vertex="1" parent="1">
           <mxGeometry x="1260" y="40" width="540" height="1240" as="geometry" />
         </mxCell>
-        <mxCell id="lane_out" value="APP + STORAGE (oak-d project)" style="html=1;swimlane;horizontal=0;startSize=30;fillColor=#2b2b50;strokeColor=#8aa0e8;fontColor=#ffffff;fontSize=14;fontStyle=1;swimlaneFillColor=#0c0c20;" vertex="1" parent="1">
+        <mxCell id="lane_out" value="APP + STORAGE (flight-vio project)" style="html=1;swimlane;horizontal=0;startSize=30;fillColor=#2b2b50;strokeColor=#8aa0e8;fontColor=#ffffff;fontSize=14;fontStyle=1;swimlaneFillColor=#0c0c20;" vertex="1" parent="1">
           <mxGeometry x="1820" y="40" width="540" height="1240" as="geometry" />
         </mxCell>
         <mxCell id="caml" value="&lt;b&gt;Left mono camera&lt;/b&gt;&#10;OmniVision OV9282 (W)&#10;800x800 @ 30 fps&#10;global shutter, IR-cut" style="html=1;rounded=1;fillColor=#2d5a8a;strokeColor=#ffffff;fontColor=#ffffff;align=center;whiteSpace=wrap;" vertex="1" parent="1">

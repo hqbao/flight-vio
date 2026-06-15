@@ -1,6 +1,6 @@
 # Tight-Coupled RGB-D Visual-Inertial Estimator — Implementation Plan
 
-**Project:** oak-d / `vio`
+**Project:** flight-vio / `vio`
 **Goal:** add a **tightly-coupled RGB-D VI estimator**, **selectable** alongside the
 existing **loose** one (`--tight`), with a **loose-vs-tight ATE comparison**. The
 LOOSE path must stay **byte-identical** so the byte-parity oracle keeps `gap = 0`.

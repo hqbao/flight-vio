@@ -1,4 +1,4 @@
-# CLAUDE.md — oak-d
+# CLAUDE.md — flight-vio
 
 ## AI Team Orchestration (Manager workflow)
 

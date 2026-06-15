@@ -1,4 +1,4 @@
-# RPi5 Deploy Runbook — oak-d FLIGHT runtime
+# RPi5 Deploy Runbook — flight-vio FLIGHT runtime
 
 Deploy the from-scratch RGB-D VIO/SLAM flight stack
 (`imu_camera → vio → slam`) on a **Raspberry Pi 5 (Debian, aarch64)**, headless.
@@ -35,7 +35,7 @@ missing — it never runs `sudo` itself.
 ### Option A — one script (recommended)
 
 ```bash
-git clone <repo> oak-d && cd oak-d        # or copy the repo onto the Pi
+git clone git@github.com:hqbao/flight-vio.git && cd flight-vio   # or copy the repo onto the Pi
 ./scripts/setup_pi.sh
 ```
 

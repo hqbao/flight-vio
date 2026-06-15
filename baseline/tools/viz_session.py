@@ -820,7 +820,7 @@ class PlaybackBar(QFrame):
 class SessionViewer(QMainWindow):
     def __init__(self, session_dir: Path) -> None:
         super().__init__()
-        self.setWindowTitle(f"oak-d session viewer — {session_dir.name}")
+        self.setWindowTitle(f"flight-vio session viewer — {session_dir.name}")
         self.resize(1400, 900)
         self.setStyleSheet(theme.QSS)
 

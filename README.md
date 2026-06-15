@@ -1,4 +1,4 @@
-# oak-d
+# flight-vio
 
 Companion-computer project to turn an **OAK-D W** stereo camera into a 6-DoF
 position source for the flight-controller. Runs on a Mac mini today, will move
@@ -9,7 +9,7 @@ into **five independent projects** + a launcher + a verification harness. The
 DepthAI/Basalt reference (`baseline/`) is kept for ATE comparison.
 
 ```
-oak-d/
+flight-vio/
   imu_camera/   capture process: owns the OAK-D, syncs cam+IMU, applies IMU
                 calibration, computes dense depth (SGM, INLINE). main.py = the
                 capture process.
@@ -409,7 +409,7 @@ to the C `libsky*` layering. Sub-packages so far:
   collection, the K + distortion + `T_left_right` solve, and the `calib.json` writer.
 
 **Movability rule (enforced).** `sky.*` may import only `numpy` (+ optional
-`numba` JIT) and must NEVER import any oak-d process / `comms` / `io` module.
+`numba` JIT) and must NEVER import any flight-vio process / `comms` / `io` module.
 `cv2` is no longer in any `sky.*` flight path — the gradients/pyramids
 (`sky.front.direct`), stereo denoise (`sky.depth.stereo`), ORB loop closure
 (`sky.slam.orb`), KLT/corners/PnP are all pure-NumPy; cv2 is imported lazily ONLY

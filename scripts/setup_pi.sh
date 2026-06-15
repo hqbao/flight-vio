@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# setup_pi.sh -- idempotent RPi5 (Debian / aarch64) bootstrap for the oak-d
+# setup_pi.sh -- idempotent RPi5 (Debian / aarch64) bootstrap for the flight-vio
 # FLIGHT runtime.
 #
 # Goal: plug-and-run. On a fresh Raspberry Pi 5 (Debian "bookworm"/"trixie",
@@ -68,11 +68,11 @@ rule() { printf -- '------------------------------------------------------------
 # --------------------------------------------------------------------------- #
 # 0. Sanity: we are in the right place.                                         #
 # --------------------------------------------------------------------------- #
-[ -f "$REQ_FLIGHT" ] || die "requirements-flight.txt not found at $REQ_FLIGHT (run from the oak-d repo)."
-[ -f "$REPO_ROOT/run.sh" ] || die "run.sh not found -- is $REPO_ROOT the oak-d repo root?"
+[ -f "$REQ_FLIGHT" ] || die "requirements-flight.txt not found at $REQ_FLIGHT (run from the flight-vio repo)."
+[ -f "$REPO_ROOT/run.sh" ] || die "run.sh not found -- is $REPO_ROOT the flight-vio repo root?"
 
 rule
-say "oak-d RPi5 flight bootstrap"
+say "flight-vio RPi5 flight bootstrap"
 say "repo:   $REPO_ROOT"
 say "python: $PY_VERSION   venv: $VENV_DIR"
 rule

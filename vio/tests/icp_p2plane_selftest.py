@@ -14,7 +14,7 @@ the math-reviewer spec calls out for the leaf module:
      plane-normal (depth) translation stays well-conditioned -- the signal the
      VIO factor's eigenvalue remap projects out.
 
-  4. LEAF: ``sky.depth.icp`` pulls in no oak-d process/comms/io module.
+  4. LEAF: ``sky.depth.icp`` pulls in no flight-vio process/comms/io module.
 
 Run::
 
@@ -166,7 +166,7 @@ def main() -> int:
     leaf_ok = leaf.returncode == 0
     ok = ok and leaf_ok
     print(f"[{'ok' if leaf_ok else 'FAIL'}] sky.depth.icp import is leaf-clean "
-          "(fresh interpreter, no oak-d process leaked)")
+          "(fresh interpreter, no flight-vio process leaked)")
 
     print("\n" + ("PASS -- ICP geometry + information + degeneracy checks hold."
                   if ok else "FAIL -- see flagged checks above."))

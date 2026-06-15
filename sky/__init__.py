@@ -1,4 +1,4 @@
-"""``sky`` -- the ONE shared algorithm library for the oak-d projects.
+"""``sky`` -- the ONE shared algorithm library for the flight-vio projects.
 
 The five processes (``imu_camera`` -> ``depth`` -> ``vio`` -> ``slam`` -> ``ui``)
 used to copy-paste their algorithm code into per-project ``mathlib/`` trees. This
@@ -31,10 +31,10 @@ import sys
 #: the kernel dependency; ``cv2`` / ``numba`` are permitted only because the
 #: already-moved algorithm code (SGM stereo) genuinely uses them. Anything else
 #: from the third-party world is fine too -- the rule we actually police is the
-#: NEGATIVE one below (no oak-d process / comms / io may be reachable).
+#: NEGATIVE one below (no flight-vio process / comms / io may be reachable).
 ALLOWED_THIRD_PARTY = frozenset({"numpy", "cv2", "numba"})
 
-#: Top-level oak-d packages that ``sky.*`` must never depend on. Importing any of
+#: Top-level flight-vio packages that ``sky.*`` must never depend on. Importing any of
 #: these from inside ``sky`` would invert the dependency arrow and make the
 #: library un-movable / un-portable.
 FORBIDDEN_PACKAGES = frozenset({
@@ -44,7 +44,7 @@ FORBIDDEN_PACKAGES = frozenset({
 
 
 def assert_import_clean() -> None:
-    """Fail if importing ``sky`` dragged in any forbidden oak-d package.
+    """Fail if importing ``sky`` dragged in any forbidden flight-vio package.
 
     Call this from a fresh interpreter that has done nothing but ``import
     sky`` (and the ``sky.*`` sub-modules under test). It scans
@@ -58,6 +58,6 @@ def assert_import_clean() -> None:
         if name.split(".", 1)[0] in FORBIDDEN_PACKAGES
     )
     assert not leaked, (
-        "sky.* must not import any oak-d process/comms/io module; "
+        "sky.* must not import any flight-vio process/comms/io module; "
         f"these leaked into sys.modules: {leaked}"
     )

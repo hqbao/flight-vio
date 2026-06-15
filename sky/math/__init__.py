@@ -1,4 +1,4 @@
-"""``sky.math`` -- the in-tree pure-math kernel shared across the oak-d projects.
+"""``sky.math`` -- the in-tree pure-math kernel shared across the flight-vio projects.
 
 This is the math sub-package of the shared :mod:`sky` library (it was the
 standalone ``skymath`` package, re-homed under ``sky`` so the project has ONE
