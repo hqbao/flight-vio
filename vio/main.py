@@ -110,6 +110,17 @@ def _await_calib_bundle(endpoint: str, timeout_s: float) -> WireCalibBundle:
     return bundle[0]
 
 
+def _drain_wait(done_evt, ceiling_s: float, stop) -> None:
+    """Wait up to ``ceiling_s`` for ``done_evt``, polling so a late SIGINT/SIGTERM
+    (``stop[0]``) short-circuits the wait. The caller then forces the worker out
+    via ``.stop()`` instead of blocking on an END that will never arrive."""
+    waited = 0.0
+    while waited < ceiling_s and not stop[0]:
+        if done_evt.wait(timeout=0.1):
+            return
+        waited += 0.1
+
+
 # --------------------------------------------------------------------------- #
 def run_vio(*,
             capture_endpoint: str = DEFAULT_CAPTURE_ENDPOINT,
@@ -364,15 +375,18 @@ def run_vio(*,
     stop = [False]
     def _on_sigterm(_signo, _frame):
         stop[0] = True
+    # SIGINT (Ctrl-C) and SIGTERM (launcher) both request the SAME clean stop:
+    # set the flag and let the run loop + drain react. Handling SIGINT here (vs
+    # the default KeyboardInterrupt) means teardown can NEVER abort on a raw
+    # traceback -- the operator Ctrl-Cs once and we exit cleanly.
     signal.signal(signal.SIGTERM, _on_sigterm)
+    signal.signal(signal.SIGINT, _on_sigterm)
 
     try:
         # Run until: (a) replay capture sends END on every input -> finished, or
-        # (b) operator interrupts -> stop[0] / KeyboardInterrupt.
+        # (b) the operator interrupts -> SIGINT/SIGTERM sets stop[0].
         while not stop[0] and not finished.is_set():
             time.sleep(0.1)
-    except KeyboardInterrupt:
-        LOG.info("vio: SIGINT -> stopping")
     finally:
         # Drain order: stop input bridge so no more messages arrive, then wait
         # for odom + backend to finish their inboxes (END is already in flight),
@@ -382,13 +396,13 @@ def run_vio(*,
         # easily take 3-5 s; allow a generous ceiling here, and let SIGTERM
         # short-circuit if the operator gives up.
         #
-        # Under SIGTERM the operator wants a fast exit. Capture is also
-        # shutting down so END will never arrive on imucam.sample / frame.depth
-        # -- waiting 120 s on `odom.done` would let the launcher SIGKILL us
-        # (10 s deadline), leaking every vio_rings slot. Cap the wait at 2 s
-        # under SIGTERM, then Module.stop() forces the drain thread out at the
-        # top of its next loop iteration. Natural END (finished.is_set()) keeps
-        # the generous 120 s ceiling so a busy backend can finish.
+        # On interrupt the operator wants a fast exit. Capture is also shutting
+        # down so END will never arrive on imucam.sample / frame.depth -- waiting
+        # 120 s on `odom.done` would let the launcher SIGKILL us (10 s deadline),
+        # leaking every vio_rings slot. `_drain_wait` polls stop[0], so a late
+        # SIGINT/SIGTERM during a natural-END drain short-circuits the wait and
+        # `.stop()` forces the worker out. Natural END (no interrupt) keeps the
+        # generous 120 s ceiling so a busy backend can finish.
         in_bridge.stop()
         # Stop the closed-loop feedback bridge too (no more corrections needed
         # once we're tearing down). Idempotent + safe if its connect never
@@ -396,9 +410,9 @@ def run_vio(*,
         if loop_bridge is not None:
             loop_bridge.stop()
         drain_timeout = 2.0 if stop[0] else 120.0
-        odom.done.wait(timeout=drain_timeout)
+        _drain_wait(odom.done, drain_timeout, stop)
         odom.stop()
-        backend.done.wait(timeout=drain_timeout)
+        _drain_wait(backend.done, drain_timeout, stop)
         backend.stop()
         # The modules already forward END on their declared downstream topics
         # via `_emit_end` (see `Module._handle_end`), but those go onto the

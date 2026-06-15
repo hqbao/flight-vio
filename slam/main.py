@@ -100,6 +100,17 @@ def _await_calib_bundle(endpoint: str, timeout_s: float) -> WireCalibBundle:
     return bundle[0]
 
 
+def _drain_wait(done_evt, ceiling_s: float, stop) -> None:
+    """Wait up to ``ceiling_s`` for ``done_evt``, polling so a late SIGINT/SIGTERM
+    (``stop[0]``) short-circuits the wait. The caller then forces the worker out
+    via ``.stop()`` instead of blocking on an END that will never arrive."""
+    waited = 0.0
+    while waited < ceiling_s and not stop[0]:
+        if done_evt.wait(timeout=0.1):
+            return
+        waited += 0.1
+
+
 # --------------------------------------------------------------------------- #
 def run_slam(*,
              vio_endpoint: str = DEFAULT_VIO_ENDPOINT,
@@ -180,24 +191,27 @@ def run_slam(*,
 
     def _on_sigterm(_signo, _frame):
         stop[0] = True
+    # SIGINT (Ctrl-C) and SIGTERM (launcher) both request the SAME clean stop:
+    # set the flag and let the run loop + drain react. Handling SIGINT here (vs
+    # the default KeyboardInterrupt) means teardown can NEVER abort on a raw
+    # traceback -- the operator Ctrl-Cs once and we exit cleanly.
     signal.signal(signal.SIGTERM, _on_sigterm)
+    signal.signal(signal.SIGINT, _on_sigterm)
 
     try:
         while not stop[0] and not finished.is_set():
             time.sleep(0.1)
-    except KeyboardInterrupt:
-        LOG.info("slam: SIGINT -> stopping")
     finally:
         in_bridge.stop()
-        # Same generous drain window as VIO -- a full inbox of buffered
-        # keyframes can take seconds to chew through (loop closure is heavy).
-        # Under SIGTERM the operator wants a fast exit and VIO is also
-        # shutting down so END will never arrive -- cap the wait at 2 s and
-        # let SlamWorker.stop() unblock the worker thread, otherwise the launcher
-        # SIGKILLs us at its 10 s deadline (no SHM rings here, but a clean
-        # shutdown still keeps the launcher logs free of SIGKILL noise).
+        # Same generous drain window as VIO -- a full inbox of buffered keyframes
+        # can take seconds to chew through (loop closure is heavy). On interrupt
+        # the operator wants a fast exit and VIO is also shutting down so END
+        # will never arrive -- `_drain_wait` polls stop[0] so a late SIGINT/SIGTERM
+        # short-circuits the wait and SlamWorker.stop() unblocks the worker,
+        # otherwise the launcher SIGKILLs us at its 10 s deadline (no SHM rings
+        # here, but a clean shutdown keeps the launcher logs free of SIGKILL noise).
         drain_timeout = 2.0 if stop[0] else 120.0
-        slam.done.wait(timeout=drain_timeout)
+        _drain_wait(slam.done, drain_timeout, stop)
         slam.stop()
         # The worker forwards END to loop.correction / slam.map / slam.loop when
         # it drains END (process_keyframe path); the publisher bridge mirrors that

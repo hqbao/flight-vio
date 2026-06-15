@@ -37,6 +37,7 @@ Run::
 from __future__ import annotations
 
 import argparse
+import contextlib
 import glob
 import logging
 import os
@@ -306,6 +307,19 @@ def _spawn(py: str, mod: str, args: list[str], *, env: dict[str, str],
     p = subprocess.Popen(cmd, env=env)
     LOG.info("launcher: spawned %s pid=%d -> %s", name, p.pid, " ".join(cmd))
     return p
+
+
+@contextlib.contextmanager
+def _ignore_sigint():
+    """Make the wrapped teardown atomic against Ctrl-C: a SECOND SIGINT during
+    process shutdown can't abort it half-way (which would orphan children or
+    surface a raw KeyboardInterrupt traceback). Restores the prior handler on
+    exit so a later pipeline generation stays interruptible."""
+    prev = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, prev)
 
 
 def _terminate(procs: list[subprocess.Popen], *, deadline_s: float = 10.0,
@@ -681,33 +695,46 @@ def main() -> int:
             pose_client = _start_pose_logger(vio_ep)
             LOG.info("launcher: --no-ui set; waiting for capture to exit "
                      "(Ctrl-C to stop)")
+            interrupted = False
             try:
                 cap_proc.wait()
             except KeyboardInterrupt:
                 LOG.info("launcher: SIGINT -> stopping")
+                interrupted = True
             rc = cap_proc.returncode if cap_proc.returncode is not None else 0
-            # After capture exits, vio + slam see END on their inputs (capture's
-            # publisher bridge converts each Flow's `_emit_end` to a wire END
-            # then drains them onto the socket before close). Give them a
-            # natural-exit window BEFORE `_terminate` SIGKILLs them: each one
-            # has its own 120 s drain ceiling so a busy back-end won't lose data.
-            LOG.info("launcher: waiting for vio + slam to drain naturally ...")
-            for child in (vio_proc, slam_proc):
-                try:
-                    child.wait(timeout=30.0)
-                except subprocess.TimeoutExpired:
-                    LOG.warning("launcher: %s pid=%d still running after 30 s; "
-                                "_terminate will SIGTERM/SIGKILL",
-                                child.args, child.pid)
+            # After capture exits NATURALLY, vio + slam see END on their inputs
+            # (capture's publisher bridge converts each Flow's `_emit_end` to a
+            # wire END then drains them onto the socket before close). Give them a
+            # natural-exit window BEFORE `_terminate` SIGKILLs them: each one has
+            # its own 120 s drain ceiling so a busy back-end won't lose data. On
+            # Ctrl-C, skip this wait -- END never arrives, so `_terminate`'s
+            # SIGTERM (which the children fast-teardown on) is the clean path.
+            if not interrupted:
+                LOG.info("launcher: waiting for vio + slam to drain naturally ...")
+                for child in (vio_proc, slam_proc):
+                    try:
+                        child.wait(timeout=30.0)
+                    except subprocess.TimeoutExpired:
+                        LOG.warning("launcher: %s pid=%d still running after 30 s; "
+                                    "_terminate will SIGTERM/SIGKILL",
+                                    child.args, child.pid)
+                    except KeyboardInterrupt:
+                        # Ctrl-C during the drain -> stop waiting; the `finally`
+                        # _terminate() SIGTERMs both children (fast teardown).
+                        LOG.info("launcher: SIGINT during drain -> terminating")
+                        break
         finally:
-            if pose_client is not None:
-                try:
-                    pose_client.stop()
-                except Exception:                                  # noqa: BLE001
-                    pass
-            LOG.info("launcher: shutting down background procs ...")
-            _terminate(procs)
-            LOG.info("launcher: bye")
+            # Teardown is bounded + must complete to release SHM rings / reap
+            # children -- ignore a second Ctrl-C so it can't abort us mid-way.
+            with _ignore_sigint():
+                if pose_client is not None:
+                    try:
+                        pose_client.stop()
+                    except Exception:                              # noqa: BLE001
+                        pass
+                LOG.info("launcher: shutting down background procs ...")
+                _terminate(procs)
+                LOG.info("launcher: bye")
         return int(rc)
 
     # ---- Restart loop ----------------------------------------------------
@@ -734,9 +761,12 @@ def main() -> int:
                     pass
                 rc = ui_proc.wait(timeout=5.0)
             # Tear down THIS generation on the main thread (no waitpid race: the
-            # UI is already reaped by `ui_proc.wait()` above).
+            # UI is already reaped by `ui_proc.wait()` above). Ignore a second
+            # Ctrl-C so the teardown can't be aborted half-way (the restored
+            # handler keeps the NEXT generation interruptible).
             LOG.info("launcher: shutting down background procs ...")
-            _terminate(procs)
+            with _ignore_sigint():
+                _terminate(procs)
             if rc == RESTART_EXIT_CODE:
                 LOG.info("launcher: restart requested -> respawning pipeline")
                 continue

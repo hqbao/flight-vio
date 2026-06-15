@@ -159,6 +159,17 @@ def _build_calib_stereo(calib) -> WireCalibStereo:
     )
 
 
+def _drain_wait(done_evt, ceiling_s: float, stop) -> None:
+    """Wait up to ``ceiling_s`` for ``done_evt``, polling so a late SIGINT/SIGTERM
+    (``stop[0]``) short-circuits the wait. The caller then forces the worker out
+    via ``.stop()`` instead of blocking on an END that will never arrive."""
+    waited = 0.0
+    while waited < ceiling_s and not stop[0]:
+        if done_evt.wait(timeout=0.1):
+            return
+        waited += 0.1
+
+
 # --------------------------------------------------------------------------- #
 def run_capture_replay(session: Path, endpoint: str, *,
                        width: int, height: int,
@@ -239,23 +250,24 @@ def run_capture_replay(session: Path, endpoint: str, *,
         # cam_module is a producer thread; setting its _stop flag breaks out of
         # the produce loop at the next item boundary so the join() returns.
         cam_module.stop()
+    # SIGINT (Ctrl-C) and SIGTERM (launcher) both request the SAME clean stop:
+    # handling SIGINT here (vs the default KeyboardInterrupt) means teardown can
+    # NEVER abort on a raw traceback -- the operator Ctrl-Cs once and we exit.
     signal.signal(signal.SIGTERM, _on_sigterm)
+    signal.signal(signal.SIGINT, _on_sigterm)
 
     imu_module.start()
     cam_module.start()
     LOG.info("capture: cam + imu modules started, waiting for join ...")
     try:
-        # Poll instead of pure join() so KeyboardInterrupt + signal handlers
-        # are delivered promptly. The poll cadence (0.2 s) matches the live
-        # path; cam_module.is_alive() flips False after produce() returns or
-        # _stop is observed inside the loop.
+        # Poll instead of pure join() so the signal handler is delivered
+        # promptly. The poll cadence (0.2 s) matches the live path;
+        # cam_module.is_alive() flips False after produce() returns or _stop is
+        # observed inside the loop.
         while not stop[0] and cam_module.is_alive():
             time.sleep(0.2)
         LOG.info("capture: cam loop exit (stop=%s, alive=%s)",
                  stop[0], cam_module.is_alive())
-    except KeyboardInterrupt:
-        LOG.info("capture: SIGINT -> stopping")
-        stop[0] = True
     finally:
         # ReadCamModule (producer thread) emits END on CAM_SYNC when its produce
         # loop returns; ImuCamWorker forwards END from CAM_SYNC to IMU_RAW +
@@ -270,16 +282,17 @@ def run_capture_replay(session: Path, endpoint: str, *,
         # AND the END. `done` is set inside `_handle_end` after the END is
         # drained (single-input worker -> the first END is terminal).
         #
-        # Under SIGTERM the operator wants a fast exit, NOT a full drain --
-        # END will never arrive from a half-killed producer, so cap the wait
-        # at 2 s. Natural end-of-replay keeps the generous 120 s ceiling so a
-        # busy backend can finish.
+        # On interrupt the operator wants a fast exit, NOT a full drain -- END
+        # will never arrive from a half-killed producer. `_drain_wait` polls
+        # stop[0] so a late SIGINT/SIGTERM short-circuits the wait. Natural
+        # end-of-replay keeps the generous 120 s ceiling so a busy backend can
+        # finish.
         cam_module.stop()
         drain_timeout = 2.0 if stop[0] else 120.0
         LOG.info("capture: waiting for imu module to drain (timeout=%.1fs) ...",
                  drain_timeout)
-        ok = imu_module.done.wait(timeout=drain_timeout)
-        LOG.info("capture: imu_module.done=%s", ok)
+        _drain_wait(imu_module.done, drain_timeout, stop)
+        LOG.info("capture: imu_module.done=%s", imu_module.done.is_set())
         imu_module.stop()
         # Give the bridge a brief window to flush the buffered WireEnds onto
         # the socket before we tear down the server.
@@ -357,15 +370,19 @@ def run_capture_live(endpoint: str, *,
     stop = [False]
     def _on_sigterm(_signo, _frame):
         stop[0] = True
+    # SIGINT (Ctrl-C) and SIGTERM both request the SAME clean stop. Handling
+    # SIGINT here (vs the default KeyboardInterrupt) is CRITICAL on the device
+    # path: a raw Ctrl-C traceback could abort the finally mid-way through
+    # device.release(), tripping the OAK-D firmware watchdog (the crash we hit
+    # before). One clean stop -> orderly device close.
     signal.signal(signal.SIGTERM, _on_sigterm)
+    signal.signal(signal.SIGINT, _on_sigterm)
 
     imu_module.start()
     cam_module.start()
     try:
         while not stop[0] and cam_module.is_alive():
             time.sleep(0.2)
-    except KeyboardInterrupt:
-        LOG.info("capture: SIGINT -> stopping")
     finally:
         # Close the device FIRST: the OAK-D firmware watchdog is only ~1.5s and
         # tearing down the bridge / IPC before release() risks tripping it.

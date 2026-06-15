@@ -86,6 +86,12 @@ in the gate below. `--vl53l9cx` selects the VL53-class ToF source (downsample to
 54×42); `--direct` selects the dense direct photometric VO front-end tuned for
 that low-res ToF recipe.
 
+**Clean stop.** A single `Ctrl-C` (or `SIGTERM`) shuts the whole stack down
+cleanly — each process handles `SIGINT`/`SIGTERM` identically (set a stop flag,
+short-circuit the drain, release SHM rings + close the OAK-D in an order the
+firmware watchdog tolerates), and the launcher ignores further `Ctrl-C` while
+tearing down so a second press can never abort cleanup or print a traceback.
+
 ### 3a. Remote UI over WiFi (`netbridge`)
 
 The UI can run **live on a Mac** against the Pi's flight stack, over TCP/WiFi —
