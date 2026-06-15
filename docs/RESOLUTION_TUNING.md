@@ -11,8 +11,8 @@ numbers become too coarse and feature tracking / depth / pose quality degrade.
 the single place that scales those parameters from the baseline to the live
 `(width, height)`; the math-coupled builders that turn it into the live
 frontend/odometry/BA/loop configs live in each project's
-`mathlib/resolution_build.py` (`vio/mathlib/resolution_build.py`,
-`slam/mathlib/resolution_build.py`, `imu_camera/mathlib/resolution_build.py`). The
+`resolution_build.py` (`vio/resolution_build.py`,
+`slam/resolution_build.py`, `imu_camera/resolution_build.py`). The
 capture process builds one from `--width/--height` and auto-scales; any knob can be
 overridden at runtime for the co-tuning workflow below.
 

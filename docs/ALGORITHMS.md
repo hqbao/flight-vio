@@ -179,7 +179,7 @@ The bias is subtracted for every drained sample by `ImuCalibration.apply`
 **I/O.** In: raw gyro stream + stillness thresholds. Out: `gyro_bias (3,)` rad/s
 (persisted per device); a `CalibVerdict{ok, message, metric}` for the SAVE gate.
 
-**Code.** `imu_camera/mathlib/device/live_calib.py:99,196`; `sky/sensors/calib_collect.py:70,103`;
+**Code.** `imu_camera/device/live_calib.py:99,196`; `sky/sensors/calib_collect.py:70,103`;
 replay `modules/pipeline.py:144`.
 
 **How to see it.** *Partially exists — extend.* `ui/viz/imucam_render.py:GyroChart`
@@ -227,7 +227,7 @@ persisted per device; applied via `AccelCalibration.apply` → `a_cal = (a − b
 (line 83).
 
 **Code.** `sky/sensors/accel_calib.py:64,121`; `sky/sensors/calib_collect.py:217,269,244`;
-gravity-align `sky/imu/imu.py:257` + seed `imu_camera/mathlib/device/live_calib.py:123`,
+gravity-align `sky/imu/imu.py:257` + seed `imu_camera/device/live_calib.py:123`,
 `modules/pipeline.py:172`.
 
 **How to see it (the most illuminating one for this stage).** *Built —
@@ -882,7 +882,7 @@ only in the capture function, never in the solve). The UI's `IpcBaWindowSource`
 buffers the last `K` (≈240) snapshots in a lock-guarded deque for the slider;
 `ui/viz/ba_render.py` renders the top-down image (cv2, PNG-verifiable offscreen).
 
-**Code.** `vio/mathlib/engine/steps.py` (`ba_step_capture`, `_build_ba_window`,
+**Code.** `vio/engine/ba_capture.py` (`ba_step_capture`, `_build_ba_window`,
 `ba_window_overlay`, `BaWindowSnap`), `vio/modules/publish_ba_window.py`,
 `comms/{messages,wire,converters,topics}.py` (`BaWindow` / `WireBaWindow` /
 `ba.window`), `ui/modules/ipc_sources.py` (`IpcBaWindowSource`),
@@ -1159,13 +1159,13 @@ flowchart LR
 
 **The chain, step by step:**
 1. **IMU → camera optical** — `R_imu_cam` (3×3) from the device extrinsic
-   `getImuToCameraExtrinsics(left)` (`imu_camera/mathlib/device/live_calib.py:92`); replay
+   `getImuToCameraExtrinsics(left)` (`imu_camera/device/live_calib.py:92`); replay
    reads `calib.T_imu_left` (`imu_camera/main.py:66`). Raw accel rotated into optical with
    `R_imu_cam @ a` (`live_calib.py:126`). Gyro rotation is **conjugated**:
    `R_cam = R_imu_cam @ R_imu @ R_imu_camᵀ` (`sky/imu/imu.py:195, :219`). *Why:* the
    IMU and camera are physically rotated; gyro/accel must speak the camera's optical axes
    before seeding PnP or leveling attitude. The cm-scale lever arm is treated as noise
-   (`vio/mathlib/backend/vio_window.py:16`).
+   (`sky/vio/window.py:16`).
 2. **Optical world origin leveled to gravity** — `gravity_aligned_R0(accel_cam)`
    (`sky/imu/imu.py:257`) builds the initial `R_cam←world` so optical +y (down)
    aligns with measured gravity; yaw stays at the camera's start heading (no magnetometer).

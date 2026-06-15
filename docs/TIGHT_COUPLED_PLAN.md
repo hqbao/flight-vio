@@ -32,31 +32,31 @@ Everything else in the design/math inputs holds.
 
 **The live and offline runtime path is loosely coupled — vision-led, IMU as a prior, never a factor.**
 
-- **Front-end** `vio/mathlib/odometry/odometry.py` — `RGBDVisualOdometry` is RGB-D PnP
+- **Front-end** `sky/front/odometry.py` — `RGBDVisualOdometry` is RGB-D PnP
   frame-to-frame. The IMU enters ONLY as: (1) a gyro `R_prior` seeding PnP, (2)
   complementary roll/pitch leveling from accel, (3) `gyro_fuse` complementary
   correction of the PnP rotation, (4) gyro-propagated rotation on vision dropout.
   **The accelerometer is never integrated into translation; there is no velocity
   state and no bias state.** This is loose by construction.
-- **Back-end** `vio/mathlib/backend/windowed.py` — `WindowedBAMap` /
+- **Back-end** `sky/backend/windowed.py` — `WindowedBAMap` /
   `WindowedRGBDOdometry` is **visual-only BA**: reprojection + metric-depth
   residuals + an optional accel **gravity prior** (leveling only) + an optional
   **VO relative-translation prior** that, per its own docstring, "plays the role IMU
   preintegration plays in a tight-coupled VIO, **using our own VO instead**." No
   preintegration factor, no velocity, no bias.
 - **Wiring** `vio/main.py` → `BackendModule` (`vio/modules/pipeline.py:155`) →
-  `make_ba_engine` (`vio/mathlib/engine/__init__.py:28`) builds **only**
+  `make_ba_engine` (`vio/engine/__init__.py:30`) builds **only**
   `WindowedBAMap`. There is **no tight option exposed anywhere.**
 
 **The gap is NOT "write a tight estimator" — a complete, tested one already exists but is orphaned.**
 
-- `vio/mathlib/backend/vio_window.py` contains `optimize_vio` + `VioState`/`VioConfig`
+- `sky/vio/window.py` contains `optimize_vio` + `VioState`/`VioConfig`
   (joint NLS over pose + **velocity** + **gyro/accel bias** + landmarks, with real
   Forster IMU preintegration factors, bias random-walk, optional tilt-lock), plus
   `WindowedVIOMap` and `WindowedVIORGBDOdometry` — a drop-in sibling of the
   visual-only windowed odometry.
 - It is **validated** by `vio/tests/vio_ba_selftest.py` (sub-mm / sub-mdeg recovery
-  incl. bias) and uses the real Forster preintegration in `vio/mathlib/imu/imu.py`
+  incl. bias) and uses the real Forster preintegration in `sky/imu/imu.py`
   (`preintegrate_imu`, `ImuPreintegration.corrected`).
 - A repo-wide grep shows **zero importers** of `optimize_vio` / `WindowedVIOMap` /
   `WindowedVIORGBDOdometry` outside `vio_window.py` and its self-test. **It is not
@@ -138,7 +138,7 @@ Schur landmark machinery).
 
 ## 3. MATH (concise, correct, mapped onto existing `vio` math)
 
-Conventions inherited verbatim from `vio/mathlib/backend/bundle.py`: **left** SE(3)
+Conventions inherited verbatim from `sky/backend/bundle.py`: **left** SE(3)
 perturbation `T ← Exp(ξ)·T`, `ξ = [ρ(3); φ(3)]`, `so3_exp/log`, `se3_exp/log`,
 `skew`, `so3_right_jacobian` all present and tested. `bundle.py` stores `T_cw`
 (world→cam); the IMU lives on the body/IMU frame via the known extrinsic `T_bc`
@@ -146,7 +146,7 @@ perturbation `T ← Exp(ξ)·T`, `ξ = [ρ(3); φ(3)]`, `so3_exp/log`, `se3_exp/
 
 ### (a) IMU preintegration between keyframes (Forster TRO 2017)
 
-`vio/mathlib/imu/imu.py::preintegrate_imu` ALREADY computes, in the body frame and
+`sky/imu/imu.py::preintegrate_imu` ALREADY computes, in the body frame and
 verified to ≤3e-10 vs central finite differences:
 
 - increments `ΔR, Δv, Δp` over `Δt` s.t. `R_j ≈ R_i·ΔR`,
@@ -278,16 +278,16 @@ flag-free, which protects byte-parity and portability.
 
 | File | Action | Why |
 |---|---|---|
-| `vio/mathlib/imu/imu.py` | **Extend**: add `Σ_ij` to `preintegrate_imu` + `ImuPreintegration` slot; per-edge preint cache (template: `GyroPreintegrator`). **DONE (P2.5)** also adds `predict_state` (per-frame forward propagation / Basalt `predictState`) + `imu_at_rest` (ZUPT gate) — both purely additive. | The only new math; needed for `Ω_I` (P1) + the live per-frame propagation (P2.5). |
-| `vio/mathlib/backend/vio_window.py` | **Wire `Ω_I`** into the IMU residual weight (else reuse as-is) | Core already complete + tested. |
+| `sky/imu/imu.py` | **Extend**: add `Σ_ij` to `preintegrate_imu` + `ImuPreintegration` slot; per-edge preint cache (template: `GyroPreintegrator`). **DONE (P2.5)** also adds `predict_state` (per-frame forward propagation / Basalt `predictState`) + `imu_at_rest` (ZUPT gate) — both purely additive. | The only new math; needed for `Ω_I` (P1) + the live per-frame propagation (P2.5). |
+| `sky/vio/window.py` | **Wire `Ω_I`** into the IMU residual weight (else reuse as-is) | Core already complete + tested. |
 | `vio/comms/messages.py` | **DONE (P2)** `Keyframe` gains `ts_ns: int = 0` + `imu_seg = None` (synced across all 6 vendored comms copies). `WireKeyframe`/converter UNCHANGED — both fields stay LOCAL-bus only (tight backend is in-process with odometry), so the IPC wire + comms diff-check are byte-identical. | Tight needs the timestamp + raw IMU between KFs; loose `accel` field unchanged. |
 | `vio/modules/preintegrate_prior.py` | **DONE (P2)** retains each frame's raw IMU rotated into the camera frame (`R_imu_cam @ v`) keyed by seq, gated on `retain_imu` (default OFF → loose no-op). | The one genuinely new bit of plumbing. |
 | `vio/modules/emit_keyframe.py` | **DONE (P2)** concatenates the per-frame segs since the last KF (strict-increasing-ts cleaned) → `imu_seg` + sets `ts_ns`, gated on `retain_imu`. **DONE (P2.5)** on the tight path consumes `PropagateImu`'s `is_kf_frame` cadence boolean instead of owning the kf counter (loose path counter byte-identical). | Threads IMU to the back-end. |
 | `vio/modules/propagate_imu.py` | **NEW (P2.5)** `PropagateImu` step: live per-frame IMU forward-propagation of `pose.odom` + keyframe re-anchor + ZUPT, gated on `retain_imu`. Wired before `PublishPose`. LOOSE = pass-through no-op. | The live freeze fix (covered camera + move keeps moving via IMU). |
 | `vio/modules/run_ba.py` | **DONE (P2)** `submit` shapes the tuple per backend: 6-tuple `(…, ts_ns, imu_seg)` tight / historical 5-tuple loose (reads the `tight` state flag). | Carrier through the engine boundary. |
-| `vio/mathlib/engine/steps.py` | **DONE (P2)** `vio_step` / `vio_overlay` mirror `ba_step`/`ba_overlay`. | Submit a KF to `WindowedVIOMap.add_keyframe` + `run_ba`, carrying ts + IMU seg. |
-| `vio/mathlib/engine/subprocess.py` | **DONE (P2)** `_vio_worker_main` (no stored stream; live block rides `imu_seg`). | Tight can run `worker=True` (live, off the GIL). |
-| `vio/mathlib/engine/__init__.py` | **DONE (P2)** `make_vi_engine(K, cfg, *, worker=False)`. | Symmetric with `make_ba_engine`; builds `WindowedVIOMap`. |
+| `vio/engine/steps.py` | **DONE (P2)** `vio_step` / `vio_overlay` mirror `ba_step`/`ba_overlay`. | Submit a KF to `WindowedVIOMap.add_keyframe` + `run_ba`, carrying ts + IMU seg. |
+| `vio/engine/subprocess.py` | **DONE (P2)** `_vio_worker_main` (no stored stream; live block rides `imu_seg`). | Tight can run `worker=True` (live, off the GIL). |
+| `vio/engine/__init__.py` | **DONE (P2)** `make_vi_engine(K, cfg, *, worker=False)`. | Symmetric with `make_ba_engine`; builds `WindowedVIOMap`. |
 | `vio/modules/pipeline.py` | **DONE (P2)** `BackendModule(tight=False)` → `make_vi_engine` w/ `imu_info_weight=True`; `OdometryModule(retain_imu=tight)`. Default branch is literally today's code. **DONE (P2.5)** frame-chain inserts `PropagateImu()` before `PublishPose`; `OdometryModule` seeds `g_world` in ctx when `retain_imu`. | `tight` → `make_vi_engine` + IMU stream + live per-frame IMU propagation; default branch is literally today's code. |
 | `vio/main.py` | **DONE (P2)** `--tight` flag threaded through `run_vio` → `OdometryModule(retain_imu=)` + `BackendModule(tight=)`; `launcher/main.py` forwards `--tight`; `./run.sh --tight` via `"$@"`. | Opt-in; default unchanged. |
 | `vio/tests/tight_smoke_selftest.py` | **NEW (P2)** drives the EXACT `--tight` engine path on a gold session → asserts a finite/sane/non-exploding trajectory. | Phase-2 RUNS gate (deterministic, no IPC graph). |
@@ -414,12 +414,12 @@ Re-run `oracle_replay_selftest.py` after wiring to confirm `gap = 0`.
 ### Phase 2 — Engine + selection plumbing (LOOSE byte-identical) · DONE (2026-06-10)
 - **DONE — `--tight` selects the tight backend; LOOSE is the byte-identical default.**
   - **Engine layer (additive, sibling of the BA engine):**
-    `vio/mathlib/engine/steps.py` gains `vio_step` (consumes the SUPERSET
+    `vio/engine/steps.py` gains `vio_step` (consumes the SUPERSET
     snapshot `(T_cw, ids, pts, depth_m, ts_ns, imu_seg)` → `WindowedVIOMap
     .add_keyframe(..., imu_seg=) → run_ba`) + `vio_overlay`;
-    `vio/mathlib/engine/subprocess.py` gains `_vio_worker_main` (builds
+    `vio/engine/subprocess.py` gains `_vio_worker_main` (builds
     `WindowedVIOMap` with NO stored stream — the live block rides `imu_seg`);
-    `vio/mathlib/engine/__init__.py` gains `make_vi_engine(K, cfg, *, worker=)`,
+    `vio/engine/__init__.py` gains `make_vi_engine(K, cfg, *, worker=)`,
     symmetric with `make_ba_engine`.
   - **Carrier superset (default-inert):** `Keyframe` (`comms/messages.py`, synced
     across all six vendored comms copies) gains `ts_ns: int = 0` +
@@ -479,7 +479,7 @@ propagation of the live output** — that was the user-visible "covered camera +
 = stays still" bug. Phase 2.5 closes it, **`--tight`-only**.
 
 - **DONE — per-frame IMU forward-propagation + re-anchor + ZUPT on the live pose.**
-  - **New math primitives (purely additive)** in `vio/mathlib/imu/imu.py`:
+  - **New math primitives (purely additive)** in `sky/imu/imu.py`:
     - `predict_state(R,p,v, ts,gyro,accel, bg,ba, g_world)` — Basalt-style
       `predictState`: integrates a raw IMU block forward under gravity
       (gyro→rotation, gravity-removed accel→velocity→position), matched to
@@ -765,23 +765,23 @@ accuracy/compute trade is explicit (Delmerico protocol).
 
 ## Key files (all absolute)
 
-- **Loose path:** `/Users/bao/skydev/oak-d/vio/mathlib/odometry/odometry.py`,
-  `/Users/bao/skydev/oak-d/vio/mathlib/backend/windowed.py`,
+- **Loose path:** `/Users/bao/skydev/oak-d/sky/front/odometry.py`,
+  `/Users/bao/skydev/oak-d/sky/backend/windowed.py`,
   `/Users/bao/skydev/oak-d/vio/modules/pipeline.py`,
   `/Users/bao/skydev/oak-d/vio/main.py`
 - **Tight core (exists, tested, ORPHANED):**
-  `/Users/bao/skydev/oak-d/vio/mathlib/backend/vio_window.py`, validated by
+  `/Users/bao/skydev/oak-d/sky/vio/window.py`, validated by
   `/Users/bao/skydev/oak-d/vio/tests/vio_ba_selftest.py`
 - **IMU preintegration (`Σ_ij`) + per-frame propagation (`predict_state`) + ZUPT
-  gate (`imu_at_rest`):** `/Users/bao/skydev/oak-d/vio/mathlib/imu/imu.py`
+  gate (`imu_at_rest`):** `/Users/bao/skydev/oak-d/sky/imu/imu.py`
 - **Live per-frame IMU propagation step (P2.5, the freeze fix):**
   `/Users/bao/skydev/oak-d/vio/modules/propagate_imu.py`, validated by
   `/Users/bao/skydev/oak-d/vio/tests/imu_propagate_selftest.py` (KEY unit gate) +
   `/Users/bao/skydev/oak-d/vio/tests/tight_live_pose_selftest.py` (KEY functional gate)
 - **Engine selection layer to extend:**
-  `/Users/bao/skydev/oak-d/vio/mathlib/engine/__init__.py`,
-  `/Users/bao/skydev/oak-d/vio/mathlib/engine/steps.py`,
-  `/Users/bao/skydev/oak-d/vio/mathlib/engine/subprocess.py`
+  `/Users/bao/skydev/oak-d/vio/engine/__init__.py`,
+  `/Users/bao/skydev/oak-d/vio/engine/steps.py`,
+  `/Users/bao/skydev/oak-d/vio/engine/subprocess.py`
 - **Carrier + front-end plumbing:** `/Users/bao/skydev/oak-d/vio/comms/messages.py`,
   `/Users/bao/skydev/oak-d/vio/modules/preintegrate_prior.py`,
   `/Users/bao/skydev/oak-d/vio/modules/emit_keyframe.py`,

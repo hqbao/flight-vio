@@ -143,7 +143,7 @@ Visual output  : Monte-Carlo gate (analytic Σ vs empirical covariance of 4000
 Pass gate      : MET — full-matrix relative Frobenius 2.6 %; Σ-trace
                  monotonically increasing; position 1σ 0.25 cm over 0.25 s (sane).
 Ý nghĩa        : cho bộ tối ưu biết "tin IMU tới mức nào" — trọng số của factor IMU.
-Builds         : covariance accumulation in `vio/mathlib/imu/imu.py` (additive,
+Builds         : covariance accumulation in `sky/imu/imu.py` (additive,
                  deltas bit-unchanged) + `vio/tests/imu_preint_cov_selftest.py`.
 
 ### A6 — Residual + bias correction (the IMU factor)   · DONE (2026-06-10)
@@ -171,7 +171,7 @@ Pass gate      : MET — residual → ~0 at the optimum; recovery pos ≤ 0.19 m
                  nay được cân đúng bằng hiệp phương sai thật Σ_ij⁻¹, không phải
                  sigma cố định.
 Builds         : `Ω_I` whitening + `_ImuEdge` per-edge cache in
-                 `vio/mathlib/backend/vio_window.py` + scenarios D/E/F in
+                 `sky/vio/window.py` + scenarios D/E/F in
                  `vio/tests/vio_ba_selftest.py`.
                  **Track A done = Block 2 done.**
 
@@ -206,7 +206,7 @@ Pass gate      : MET — oracle `gap=0` flags OFF (incl. `backend="vio"`); FD/an
 Ý nghĩa        : tiêm "thông tin vận tốc tuyệt đối" mà factor IMU đơn lẻ thiếu —
                  hãm đà phân kỳ vận tốc ở 54×42 mà KHÔNG đụng đường loose/oracle.
 Builds         : `vel_cv_prior`/`vel_zupt` + gravity-aware gate in
-                 `vio/mathlib/backend/vio_window.py`; `stabilize_velocity` knob;
+                 `sky/vio/window.py`; `stabilize_velocity` knob;
                  `vio/tests/phase4_velprior_selftest.py`;
                  `verification/phase4_bench_velprior.py` (+ `--vel-*` flags on
                  `verification/phase4_velocity_bisect.py`).
@@ -340,7 +340,7 @@ Pass gate      : trajectory continuous across marginalisation; ATE improves vs
                  Track C (C had no memory of dropped states).
 Ý nghĩa        : giữ thông tin quá khứ → quỹ đạo mượt, không giật khi keyframe rời
                  cửa sổ. Đây là thứ làm Basalt drift cực thấp.
-Builds         : `MargHelper` sqrt marginalisation in `vio/mathlib/backend/marginalize.py` (extend) + selftest.
+Builds         : `MargHelper` sqrt marginalisation in `sky/backend/marginalize.py` (extend) + selftest.
 
 ### E2 — FEJ (first-estimates Jacobian) null-space check
 How it works   : freeze the linearisation point of marginalised states; convert
@@ -403,7 +403,7 @@ Builds         : nothing new (composes T0.2 `--plot` + `view_pose3d`).
 ```
 vio/mathlib/imu/preintegration.py     # Track A (Block 2)
 vio/mathlib/backend/vio_solve.py      # Track C (Block 3) — window solve
-vio/mathlib/backend/marginalize.py    # Track E (Block 5) — extend existing
+sky/backend/marginalize.py           # Track E (Block 5) — extend existing
 vio/tools/imu_preint_viz.py           # A1–A6 plots
 vio/tools/imu_only_odom.py            # B1
 vio/tools/vi_bundle_viz.py            # C1, C3

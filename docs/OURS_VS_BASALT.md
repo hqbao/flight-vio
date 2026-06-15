@@ -31,7 +31,7 @@ recorded Basalt poses + the frozen `baseline_metrics.json`)
 | Visual input | Raw **stereo** (left+right), multi-view triangulation | **RGB-D**: left gray + the chip's stereo **depth map** (SGBM blob output) |
 | Scale source | IMU (metric) + stereo baseline, jointly | **Depth map** per-frame (blur-biased on fast motion) |
 | Rotation | Joint with everything | **Gyro preintegration** owns it; vision corrects, weighted by inlier confidence + a gyro-disagreement gate |
-| Translation | Joint, IMU-constrained | Frame-to-frame **own PnP** (`vio/mathlib/odometry/pnp.py`: RANSAC DLT + LM, library-free, default) with depth → metric `t`; smoothed by `InertialTranslationFilter` |
+| Translation | Joint, IMU-constrained | Frame-to-frame **own PnP** (`sky/front/pnp.py`: RANSAC DLT + LM, library-free, default) with depth → metric `t`; smoothed by `InertialTranslationFilter` |
 | Accelerometer | Constrains velocity/position/scale (preint factor) | **Tilt leveling only** (complementary filter at rest); feed-forward to position is **OFF** by default |
 | Optimiser | Sliding-window **bundle adjustment + marginalisation prior** | Production `ours`: **none** (pure f2f). `ours-ba`: analytic Schur BA window. `ours-slam`: + ORB loop + SE(3) pose graph |
 | Bias estimation | Online gyro+accel bias in the window | Gyro bias from a startup static window only (no online accel bias on the production path) |
@@ -44,19 +44,19 @@ recorded Basalt poses + the frozen `baseline_metrics.json`)
   the IMU samples that fall in each frame interval `(t_prev, t_cur]` on the one
   recorder `ts_ns` clock. Honest-only: every panel traces to a real recorded stream.
 - Frontend (own pure-NumPy KLT + Shi-Tomasi, forward-backward check):
-  `vio/mathlib/frontend/{frontend,klt,klt_numba,corners}.py`
-- Frame-to-frame RGB-D PnP + gyro fusion: `vio/mathlib/odometry/odometry.py`
+  `sky/front/{frontend,klt,klt_numba,corners}.py`
+- Frame-to-frame RGB-D PnP + gyro fusion: `sky/front/odometry.py`
   (`RGBDVisualOdometry`, `OdometryConfig`); own library-free PnP solver in
-  `vio/mathlib/odometry/pnp.py` (RANSAC DLT + robust-LM seed rescue + LM refine,
+  `sky/front/pnp.py` (RANSAC DLT + robust-LM seed rescue + LM refine,
   default; `OAKD_OWN_PNP=0` switches to the cv2 oracle for the dev A/B only)
-- Position smoother: `imu_camera/mathlib/imu/inertial_filter.py`
+- Position smoother: `sky/imu/inertial_filter.py`
   (`InertialTranslationFilter`, `use_accel_prediction=False`)
-- IMU preintegration (Forster): `vio/mathlib/imu/imu.py`
-- Windowed BA (depth-anchored, analytic Schur): `vio/mathlib/backend/{bundle,windowed}.py`
+- IMU preintegration (Forster): `sky/imu/imu.py`
+- Windowed BA (depth-anchored, analytic Schur): `sky/backend/{bundle,windowed}.py`
 - **Experimental tight-coupled window** (the Basalt-style path):
-  `vio/mathlib/backend/vio_window.py` (`optimize_vio`, `WindowedVIOMap`,
+  `sky/vio/window.py` (`optimize_vio`, `WindowedVIOMap`,
   `VioConfig`) — see §4
-- Loop closure + pose graph: `slam/mathlib/loop/{loopclosure,posegraph,slam}.py`
+- Loop closure + pose graph: `sky/slam/{loopclosure,posegraph,slam}.py`
 
 ---
 
@@ -84,7 +84,7 @@ These are the deltas to attack if the goal is "be Basalt".
    (push_straight 0.39→0.97, push_fwdback 0.30→0.78). This anchors `ours-ba`/
    `ours-slam` to the VO scale; closing the remaining gap to Basalt still needs
    true IMU-in-the-estimator (the tight-coupled path:
-   `vio/mathlib/backend/vio_window.py`, offline
+   `sky/vio/window.py`, offline
    `verification/vio_oracle_runner.py --backend vio` — see §4.1).
 
 2. **RGB-D depth map instead of raw stereo triangulation.** We consume the
@@ -140,7 +140,7 @@ discriminator is **`n_inliers`** (white-wall median 0 vs real motion ≥ ~33).
 
 ## 4. The Basalt-style path we already have: `--backend vio`
 
-`vio/mathlib/backend/vio_window.py` is the **tight-coupled** experiment — the
+`sky/vio/window.py` is the **tight-coupled** experiment — the
 seed for parity. It folds IMU preint (rotation + velocity + position increments) and
 visual reprojection + depth into ONE window solve for pose + velocity +
 gyro/accel bias + landmarks (true Basalt style).
@@ -162,13 +162,13 @@ by `vio/tests/vio_ba_selftest.py` scenario C (tilt-locked yaw+pos recovery).
 
 ### 4.1 The tight-coupled path today (offline) + what a live rebuild inherits
 
-The tight-coupled window solver lives in `vio/mathlib/backend/vio_window.py`
+The tight-coupled window solver lives in `sky/vio/window.py`
 (`optimize_vio`, `WindowedVIOMap`, `VioConfig`) and is exercised **offline** by
 `verification/vio_oracle_runner.py --backend vio` and validated by
 `vio/tests/vio_ba_selftest.py`.
 
 > A live tight-coupled viewer would be rebuilt on the `vio` process exactly like the
-> `ba` / `slam` backends (the swappable engine in `vio/mathlib/engine/`), reusing the
+> `ba` / `slam` backends (the swappable engine in `vio/engine/`), reusing the
 > out-of-process engine so the solve never holds the camera read-loop GIL.
 
 Two properties measured offline are **already inherited by the `vio` process**, so a
@@ -189,7 +189,7 @@ rebuild starts from them:
    vectorised (batched numpy: einsum + `np.add.at` scatter) so it releases the GIL,
    **numerically identical** to the old scalar version (`vio_ba_selftest` A/B/C
    PASS). On the rebuilt path the heavy solve runs **out-of-process**
-   (`vio/mathlib/engine/subprocess.py`), which removes GIL contention entirely — the
+   (`vio/engine/subprocess.py`), which removes GIL contention entirely — the
    same mechanism that keeps the BA/SLAM fast-push from undershooting.
 
 ---

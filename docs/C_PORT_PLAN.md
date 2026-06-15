@@ -1,5 +1,25 @@
 # C99 Port Plan — oak-d (Python) → `skyslam` (C)
 
+> ## ⛔ ABANDONED (2026-06-13) — DO NOT RE-PROPOSE
+> The C port was **de-risked, then abandoned and rolled back.** The de-risk built two
+> spikes — an SO3 kernel and the SGM stereo via pybind11 — and both were **bit-exact and
+> `gap=0`-safe.** It worked. It still wasn't worth it:
+> - **Scalar C is 12–19× SLOWER** than the parallel Numba it would replace (`@njit(parallel=True)`).
+> - **SGM live is already ~8 ms in Numba** — it is not a bottleneck, so there is nothing to win.
+>
+> `git reset --hard origin/main` dropped all three C-port commits plus the `_c/`,
+> `tests/parity/`, and `.so` artifacts; the repo is back at `4f6e160`, `gap=0`, `sky/`
+> leaf, ahead=0.
+>
+> **Hard rule: do NOT re-propose C** unless a concrete tiny-board / hard-real-time
+> deploy target appears **AND** Numba has been profiled as the actual wall. The real
+> blocker is the **algorithm** (low-res VIO / VL53 ToF), not the language.
+>
+> Everything below is retained as the **historical record** — it is the justification
+> for the de-risk that was run, and the design that was ultimately rejected.
+
+## (historical — the plan that was abandoned)
+
 Status: **PLAN (approved-pending) — no code yet.** Synthesized from an architecture
 review + a cited research pass (2026-06-11). Supersedes the single-binary framing in
 `docs/SKYSLAM_ROADMAP.md` §3/§5 (that doc's library layering + repo skeleton §8 are
