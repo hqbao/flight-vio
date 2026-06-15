@@ -89,6 +89,35 @@ def _g_world_default() -> np.ndarray:
     return np.array([0.0, 9.81, 0.0])
 
 
+# --- VIO position-noise model for the FC's ESKF (deliberately SIMPLE) ------ #
+# A per-frame position-noise sigma (metres) from the TWO physical roots of VIO
+# position uncertainty: how MANY usable observations (N) and how FAR the scene is
+# (median depth Z). Physics: position information ~ N / Z^2 (each observation
+# contributes ~1/Z^2 translation info -- a far point barely parallax-shifts, so
+# scale is weakly observed), hence variance ~ Z^2 / N  ->  sigma ~ Z / sqrt(N).
+# Clamped to a sane band. The constants are ROUGH / uncalibrated -- the principled
+# inverse-Hessian marginal covariance + a NEES/chi-square calibration are the
+# documented future upgrade; the FC ESKF floors this value regardless.
+_POS_SIGMA_REF = 0.08     # m, nominal sigma at the reference operating point
+_POS_DEPTH_REF = 2.0      # m, reference scene depth
+_POS_N_REF = 600.0        # nominal usable-observation count (direct @ 54x42)
+_POS_SIGMA_FLOOR = 0.05   # m, never claim better than this
+_POS_SIGMA_CEIL = 3.0     # m, a rejected / feature-starved / very-far frame
+
+
+def position_noise_sigma(n_obs: float, depth_median_m: float) -> float:
+    """Simple per-frame VIO position-noise sigma (m): sigma ~ Z / sqrt(N).
+
+    Few usable observations (N) OR a far scene (Z) both inflate it (a far scene =
+    weak parallax = uncertain scale). Clamped to [floor, ceil]; a guard-rejected
+    frame passes ``n_obs=0`` -> saturates to the ceiling (don't trust it).
+    """
+    z = max(float(depth_median_m), 0.1)
+    n = max(float(n_obs), 1.0)
+    sigma = _POS_SIGMA_REF * (z / _POS_DEPTH_REF) * float(np.sqrt(_POS_N_REF / n))
+    return float(min(max(sigma, _POS_SIGMA_FLOOR), _POS_SIGMA_CEIL))
+
+
 class DirectOdometryEngine:
     """Frame-to-keyframe dense direct RGB-D VO with an IMU seed + divergence guard.
 
@@ -276,6 +305,9 @@ class DirectOdometryEngine:
             info = {"ok": True, "n_inliers": self.cfg.max_pixels,
                     "converged": True, "diverged": False, "rejected": False,
                     "valid_frac": 1.0, "n_pixels": 0, "inertial_dr": False,
+                    # First frame = the world origin, not a motion measurement;
+                    # mark the FC position untrusted (ceiling sigma).
+                    "pos_sigma_m": _POS_SIGMA_CEIL,
                     "inlier_ids": np.empty((0,), dtype=np.int64)}
             return self._T_world_kf.copy(), True, info
 
@@ -393,4 +425,10 @@ class DirectOdometryEngine:
             "inertial_dr": guard_reject,
             "inlier_ids": np.empty((0,), dtype=np.int64),
         }
+        # Position-noise sigma for the FC ESKF, from the two physical signals:
+        # usable-observation count (info["n_inliers"], 0 on a guard reject -> high
+        # sigma) and median scene depth (far -> weak scale -> high sigma).
+        _valid = depth[depth > 0.0]
+        _z_med = float(np.median(_valid)) if _valid.size else _POS_DEPTH_REF
+        info["pos_sigma_m"] = position_noise_sigma(info["n_inliers"], _z_med)
         return T_world_cur, promote, info

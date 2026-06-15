@@ -356,9 +356,11 @@ def _start_pose_logger(vio_ep: str):
         st["last"] = now
         T = wm.T_world_cam
         qw, qx, qy, qz = rot_to_quat(T[:3, :3])
+        sig = wm.info.get("pos_sigma_m") if isinstance(wm.info, dict) else None
+        sig_s = "  sig_pos=%.3fm" % sig if sig is not None else ""
         LOG.info("pose: pos WORLD=(%+.3f %+.3f %+.3f) m  "
-                 "quat wxyz=(%+.4f %+.4f %+.4f %+.4f)  n=%d",
-                 T[0, 3], T[1, 3], T[2, 3], qw, qx, qy, qz, st["n"])
+                 "quat wxyz=(%+.4f %+.4f %+.4f %+.4f)%s  n=%d",
+                 T[0, 3], T[1, 3], T[2, 3], qw, qx, qy, qz, sig_s, st["n"])
 
     try:
         client = IPCPubSub(vio_ep, role="client", connect_timeout_s=5.0)
