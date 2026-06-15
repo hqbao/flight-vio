@@ -92,7 +92,40 @@ short-circuit the drain, release SHM rings + close the OAK-D in an order the
 firmware watchdog tolerates), and the launcher ignores further `Ctrl-C` while
 tearing down so a second press can never abort cleanup or print a traceback.
 
-### 3a. Remote UI over WiFi (`netbridge`)
+### 3a. FC output — the pose stream
+
+`--no-ui` **is** the FC-output path. The launcher attaches a pose logger
+(`_start_pose_logger` → `_on_pose` in `launcher/main.py`) that subscribes to the
+VIO's `pose.odom` topic and prints each pose, throttled to ~2 Hz:
+
+```
+pose: pos WORLD=(+0.005 -0.027 -0.003) m  quat wxyz=(+0.003 +0.017 -0.025 +0.999)  sig_pos=0.076m  n=14
+```
+
+| field | meaning |
+|---|---|
+| `pos WORLD` | position in the VIO world frame, metres (`wm.T_world_cam[:3,3]`) |
+| `quat wxyz` | orientation quaternion — the FC derives heading from it |
+| `sig_pos`   | **position noise σ (m)** for the FC ESKF: `R ≈ sig_pos²`. Only on `--direct` (`wm.info["pos_sigma_m"]`); σ ∝ Z/√N, clamped [0.05, 3.0] m. High at startup / few features / far scene; ~0.07 m when tracking well |
+| `n`         | cumulative pose-message counter (the print is throttled, not every msg) |
+
+**Wiring the real FC link (TODO — not done yet).** The log line is a *preview*.
+To feed the FC, send a MAVLink `VISION_POSITION_ESTIMATE` from inside `_on_pose`
+(marked `# === FC OUTPUT HOOK`): pose from `wm.T_world_cam`, covariance from
+`wm.info["pos_sigma_m"]`. Two caveats before flight:
+
+- **Frame.** `WORLD` is gravity-aligned *optical* (+Y down), **not** NED. Rotate
+  the position *and* the 3×3 covariance into the FC frame before sending — don't
+  ship raw axes.
+- **Loop closure is a JUMP, not a measurement.** When SLAM closes a loop the pose
+  steps discontinuously; signal it with the MAVLink `reset_counter` (+ re-anchor
+  the ESKF), never as a fused position update — a fused jump injects phantom
+  velocity. VIO is odometry and drifts, so prefer fusing velocity where the FC
+  supports it. (`sig_pos` is the deliberately-simple first model — commit
+  `7f9769a`; the principled upgrade is the inverse-Hessian marginal covariance
+  with NEES calibration, left as future work since the FC floors the value.)
+
+### 3b. Remote UI over WiFi (`netbridge`)
 
 The UI can run **live on a Mac** against the Pi's flight stack, over TCP/WiFi —
 the `netbridge` project bridges the Pi's local IPC to the Mac. The UI is
@@ -155,6 +188,10 @@ gate in parentheses.
 # [✅-4] cv2-free flight — full --vl53l9cx --direct flight runs with cv2 BLOCKED.
 .venv/bin/python -m verification.cv2_absent_flight_litmus --max-frames 30
 #   (gate: verification/cv2_absent_flight_litmus.py — LITMUS PASSED on mac)
+
+# [✅-5] netbridge copied clean — TCP bridge round-trips on loopback (no 2nd box).
+.venv/bin/python verification/netbridge_loopback_selftest.py
+#   (gate: verification/netbridge_loopback_selftest.py — confirms 3b will work)
 ```
 
 > Note: the litmus passing on the Pi additionally proves the *aarch64* install is
