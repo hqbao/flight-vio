@@ -21,7 +21,7 @@ will use. In particular the loader converts the `T_left_right` translation from
 ≈ 0.075 m) and specifically catches a skipped or doubled cm→m conversion.
 
 ```sh
-cd /Users/bao/skydev/oak-d
+cd /Users/bao/skydev/flight-vio
 
 # Validate a recorded session (primary — also checks recorded-frame consistency)
 .venv/bin/python -m imu_camera.tools.calib_check --session sessions/gold/lab_loop_30s
@@ -68,7 +68,7 @@ max off-diagonal misalignment and `residual_g` are annotated; grey connectors dr
 each raw→calibrated "snap".
 
 ```sh
-cd /Users/bao/skydev/oak-d
+cd /Users/bao/skydev/flight-vio
 
 # REAL stored calib (auto-picks the only device in .cache/imu_calib.json)
 .venv/bin/python -m imu_camera.tools.gravity_sphere --render /tmp/gravity_sphere.png

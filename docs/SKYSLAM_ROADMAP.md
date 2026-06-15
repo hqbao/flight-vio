@@ -719,7 +719,7 @@ skyslam/
 
 ## 12. Cross-references
 
-- Current project using Basalt + RTAB-Map: `/Users/bao/skydev/oak-d`
+- Current project using Basalt + RTAB-Map: `/Users/bao/skydev/flight-vio`
 - IMU rate / filter setting reference for FC: user memory `icm42688p-godr-vs-sample-rate.md`
 - LPF design rule: user memory `lpf-time-constant-rule.md`
 

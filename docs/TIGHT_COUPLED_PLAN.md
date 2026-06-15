@@ -765,33 +765,33 @@ accuracy/compute trade is explicit (Delmerico protocol).
 
 ## Key files (all absolute)
 
-- **Loose path:** `/Users/bao/skydev/oak-d/sky/front/odometry.py`,
-  `/Users/bao/skydev/oak-d/sky/backend/windowed.py`,
-  `/Users/bao/skydev/oak-d/vio/modules/pipeline.py`,
-  `/Users/bao/skydev/oak-d/vio/main.py`
+- **Loose path:** `/Users/bao/skydev/flight-vio/sky/front/odometry.py`,
+  `/Users/bao/skydev/flight-vio/sky/backend/windowed.py`,
+  `/Users/bao/skydev/flight-vio/vio/modules/pipeline.py`,
+  `/Users/bao/skydev/flight-vio/vio/main.py`
 - **Tight core (exists, tested, ORPHANED):**
-  `/Users/bao/skydev/oak-d/sky/vio/window.py`, validated by
-  `/Users/bao/skydev/oak-d/vio/tests/vio_ba_selftest.py`
+  `/Users/bao/skydev/flight-vio/sky/vio/window.py`, validated by
+  `/Users/bao/skydev/flight-vio/vio/tests/vio_ba_selftest.py`
 - **IMU preintegration (`Σ_ij`) + per-frame propagation (`predict_state`) + ZUPT
-  gate (`imu_at_rest`):** `/Users/bao/skydev/oak-d/sky/imu/imu.py`
+  gate (`imu_at_rest`):** `/Users/bao/skydev/flight-vio/sky/imu/imu.py`
 - **Live per-frame IMU propagation step (P2.5, the freeze fix):**
-  `/Users/bao/skydev/oak-d/vio/modules/propagate_imu.py`, validated by
-  `/Users/bao/skydev/oak-d/vio/tests/imu_propagate_selftest.py` (KEY unit gate) +
-  `/Users/bao/skydev/oak-d/vio/tests/tight_live_pose_selftest.py` (KEY functional gate)
+  `/Users/bao/skydev/flight-vio/vio/modules/propagate_imu.py`, validated by
+  `/Users/bao/skydev/flight-vio/vio/tests/imu_propagate_selftest.py` (KEY unit gate) +
+  `/Users/bao/skydev/flight-vio/vio/tests/tight_live_pose_selftest.py` (KEY functional gate)
 - **Engine selection layer to extend:**
-  `/Users/bao/skydev/oak-d/vio/engine/__init__.py`,
-  `/Users/bao/skydev/oak-d/vio/engine/steps.py`,
-  `/Users/bao/skydev/oak-d/vio/engine/subprocess.py`
-- **Carrier + front-end plumbing:** `/Users/bao/skydev/oak-d/vio/comms/messages.py`,
-  `/Users/bao/skydev/oak-d/vio/modules/preintegrate_prior.py`,
-  `/Users/bao/skydev/oak-d/vio/modules/emit_keyframe.py`,
-  `/Users/bao/skydev/oak-d/vio/modules/run_ba.py`
-- **ATE machinery to reuse:** `/Users/bao/skydev/oak-d/baseline/tools/compare_sessions.py`
+  `/Users/bao/skydev/flight-vio/vio/engine/__init__.py`,
+  `/Users/bao/skydev/flight-vio/vio/engine/steps.py`,
+  `/Users/bao/skydev/flight-vio/vio/engine/subprocess.py`
+- **Carrier + front-end plumbing:** `/Users/bao/skydev/flight-vio/vio/comms/messages.py`,
+  `/Users/bao/skydev/flight-vio/vio/modules/preintegrate_prior.py`,
+  `/Users/bao/skydev/flight-vio/vio/modules/emit_keyframe.py`,
+  `/Users/bao/skydev/flight-vio/vio/modules/run_ba.py`
+- **ATE machinery to reuse:** `/Users/bao/skydev/flight-vio/baseline/tools/compare_sessions.py`
   (`_umeyama_se3`, `ate`, `rpe`)
 - **Byte-parity oracle (must stay gap=0):**
-  `/Users/bao/skydev/oak-d/verification/oracle_replay.py`,
-  `/Users/bao/skydev/oak-d/verification/oracle_replay_selftest.py`,
-  `/Users/bao/skydev/oak-d/verification/baseline_metrics.json`
+  `/Users/bao/skydev/flight-vio/verification/oracle_replay.py`,
+  `/Users/bao/skydev/flight-vio/verification/oracle_replay_selftest.py`,
+  `/Users/bao/skydev/flight-vio/verification/baseline_metrics.json`
 - **54×42 simulation (benchmark resolution 2):**
-  `/Users/bao/skydev/oak-d/imu_camera/modules/tof_downsample.py`
-- **Gold sessions:** `/Users/bao/skydev/oak-d/sessions/gold/` (10 sessions)
+  `/Users/bao/skydev/flight-vio/imu_camera/modules/tof_downsample.py`
+- **Gold sessions:** `/Users/bao/skydev/flight-vio/sessions/gold/` (10 sessions)

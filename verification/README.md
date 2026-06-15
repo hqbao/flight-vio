@@ -44,7 +44,7 @@ Two independent things are proven:
 ## How to run
 
 ```sh
-cd /Users/bao/skydev/oak-d
+cd /Users/bao/skydev/flight-vio
 
 # 1) Head-to-head single run (must print the baseline 75.9 mm)
 .venv/bin/python verification/vio_oracle_runner.py \

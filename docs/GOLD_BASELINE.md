@@ -1,7 +1,7 @@
 # Gold Baseline Report
 
 **Generated**: 2026-05-29 13:02:37
-**Source**: `/Users/bao/skydev/oak-d/sessions/gold`
+**Source**: `/Users/bao/skydev/flight-vio/sessions/gold`
 **Pipeline**: BasaltVIO + RTABMapSLAM (depthai 3.6.1)
 **RPE window**: 1.0s
 

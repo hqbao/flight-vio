@@ -208,7 +208,7 @@ python -m vio.main --capture-endpoint oak.capture --endpoint oak.vio
 ## Verify
 
 ```bash
-cd /Users/bao/skydev/oak-d
+cd /Users/bao/skydev/flight-vio
 
 # 1. comms byte-identical (build caches excluded; they are git-ignored)
 diff -r -x '__pycache__' -x '*.pyc' -x '*.nbc' -x '*.nbi' \

@@ -191,7 +191,7 @@ python -m slam.main --vio-endpoint oak.vio --endpoint oak.slam
 ## Verify
 
 ```bash
-cd /Users/bao/skydev/oak-d
+cd /Users/bao/skydev/flight-vio
 
 # 1. comms byte-identical (build caches excluded; they are git-ignored)
 diff -r --exclude=__pycache__ slam/comms imu_camera/comms && echo "COMMS BYTE-IDENTICAL"
