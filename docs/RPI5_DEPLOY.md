@@ -7,8 +7,56 @@ Deploy the from-scratch RGB-D VIO/SLAM flight stack
 > was proven on the macOS development box and is reproduced by named gates in
 > this repo. Everything under **"⚠️ MUST verify on the Pi"** is a
 > hardware-/architecture-specific unknown that *only the board can answer* —
-> aarch64 wheels and real-time throughput. Those are **not** claimed as tested.
-> Do not treat a ⚠️ item as done until you have run it on the Pi.
+> aarch64 wheels and real-time throughput. Do not treat a ⚠️ item as done until
+> you have run it on the Pi.
+>
+> **aarch64 wheels: CONFIRMED (2026-06-15)** on a real Pi 5 / Debian 13 (trixie) /
+> Python 3.13 — `numpy 2.4.6`, `numba 0.65.1`, `llvmlite 0.47.0`, `pyserial 3.5`,
+> `depthai 3.7.1` all install from prebuilt manylinux-aarch64 wheels (no source
+> build), import cleanly, and the IPC codec round-trips. **Still open:** live
+> real-time throughput (the ~20 Hz target) — measure on the board.
+
+---
+
+## 0. Deploy from the Mac (recommended) — `deploy/`
+
+The whole lifecycle is driven from the Mac; **you never log into the Pi**. The
+scripts in `deploy/` share one cached, key-authenticated connection (you enter the
+Pi user/host/password ONCE):
+
+```bash
+./deploy/pi-discover.sh                      # 1. find the Pi, authenticate once, cache it
+./deploy/pi-deploy.sh                        # 2. rsync the repo (code only) + build the aarch64 venv
+./deploy/pi-optimize.sh --reboot             # 3. cut boot time (disable unneeded services), reboot, re-measure
+./deploy/pi-run.sh --vl53l9cx --direct       # 4. run the flight VIO, headless + detached
+./deploy/pi-run.sh --logs                    #    tail the live log
+./deploy/pi-stop.sh                          #    stop it
+```
+
+Watch the live UI on the Mac over WiFi (`netbridge`):
+
+```bash
+export OAKD_NETBRIDGE_KEY=<shared-secret>    # same secret on both ends (authenticated)
+./deploy/pi-run.sh --ui --vl53l9cx --direct  # start the stack on the Pi WITH the bridge
+./deploy/pi-ui.sh                            # on the Mac: UI auto-connects to the cached Pi
+```
+
+> **No secret to manage?** On a trusted home LAN you can skip the key entirely:
+> **leave `OAKD_NETBRIDGE_KEY` unset** and both ends fall back to the same built-in
+> **default key**, so `pi-run.sh --ui` and `pi-ui.sh` connect with no setup (each
+> prints a one-line note). That default is public (it's in the source) — convenience,
+> not a secret — so export a real `OAKD_NETBRIDGE_KEY` on both hosts for security on
+> an untrusted network. The stream is unencrypted either way (tunnel over SSH if the
+> network is untrusted).
+
+Maintenance: `./deploy/pi-discover.sh --reset` (forget the Pi / re-discover after a
+DHCP change), `./deploy/pi-discover.sh --status` (show the cached connection),
+`./deploy/pi-uninstall.sh [--restore-boot] [--forget]` (remove the stack; optionally
+revert the boot optimisation and the SSH key). The connection cache lives in the
+gitignored `.cache/pi_connection.env` (0600).
+
+The sections below document the **on-Pi** scripts (`deploy/pi/setup_pi.sh`,
+`deploy/pi/optimize_pi.sh`) those host-side commands drive, and the manual path.
 
 ---
 
@@ -22,7 +70,7 @@ sudo apt update && sudo apt install -y \
     python3.13 python3.13-venv python3.13-dev build-essential
 ```
 
-`scripts/setup_pi.sh` **checks** for these and prints this exact line if any are
+`deploy/pi/setup_pi.sh` **checks** for these and prints this exact line if any are
 missing — it never runs `sudo` itself.
 
 > If Raspberry Pi OS does not ship `python3.13` in its repos for your release,
@@ -36,7 +84,7 @@ missing — it never runs `sudo` itself.
 
 ```bash
 git clone git@github.com:hqbao/flight-vio.git && cd flight-vio   # or copy the repo onto the Pi
-./scripts/setup_pi.sh
+./deploy/pi/setup_pi.sh
 ```
 
 It is **idempotent** (re-running reuses an existing `.venv`) and does:
@@ -47,7 +95,7 @@ It is **idempotent** (re-running reuses an existing `.venv`) and does:
 3. run the **validation smoke** — codec round-trip + a headless `--no-ui` replay
    + the cv2-absent litmus — and print PASS/FAIL + next steps.
 
-`./scripts/setup_pi.sh --no-smoke` bootstraps only (skips the validation run).
+`./deploy/pi/setup_pi.sh --no-smoke` bootstraps only (skips the validation run).
 
 ### Option B — manual venv
 
@@ -139,20 +187,23 @@ export OAKD_NETBRIDGE_KEY=$(openssl rand -hex 32)   # shared secret (see below)
 
 # --- on the Mac: run the UI against the Pi (SAME secret) ---
 export OAKD_NETBRIDGE_KEY=<the-same-secret-from-the-Pi>
-./run-ui-remote.sh --connect <pi-host>:8787
+./deploy/pi-ui.sh --connect <pi-host>:8787
 ```
 
 `--forward HOST:PORT` spawns `netbridge.forward` as one more managed flight
-subprocess (torn down with the rest). On the Mac, `run-ui-remote.sh` starts
+subprocess (torn down with the rest). On the Mac, `deploy/pi-ui.sh` starts
 `netbridge.receive` (which sizes its rings from the forwarded `calib.bundle`, so a
 54×42 ToF run is re-served at 54×42, not 640×400), waits for the re-served
 sockets, then runs the unchanged `ui.main`.
 
 **Security (HONEST):** `OAKD_NETBRIDGE_KEY` is a shared HMAC secret that
-**authenticates** the peer — a wrong/missing key is refused, no silent open
-socket. It does **not encrypt** the stream (LAN threat model). For an untrusted
-network, tunnel it: `ssh -L 8787:localhost:8787 pi@<pi-host>` then
-`./run-ui-remote.sh --connect 127.0.0.1:8787` (or run over Wireguard) — the tunnel
+**authenticates** the peer at connect time (one-time handshake, not per frame) — a
+wrong key is refused. If it is **unset**, both ends use a built-in **default key**
+(public, in the source) so the bridge connects with no setup on a trusted LAN — that
+is convenience auth, not a secret, so export a real key on both hosts for security.
+It does **not encrypt** the stream (LAN threat model). For an untrusted network,
+tunnel it: `ssh -L 8787:localhost:8787 pi@<pi-host>` then
+`./deploy/pi-ui.sh --connect 127.0.0.1:8787` (or run over Wireguard) — the tunnel
 provides the encryption and netbridge sees only loopback.
 
 See `netbridge/README.md` for the full design + the gate
@@ -204,18 +255,21 @@ These cannot be answered on the macOS dev box. Treat each as open until it passe
 on the actual Pi 5.
 
 ```bash
-# [⚠️-1] aarch64 flight-deps install — esp. numba/llvmlite AND depthai wheels.
-.venv/bin/pip install -r requirements-flight.txt
-#   OPEN UNKNOWN: do prebuilt aarch64 wheels exist for your numba/llvmlite and
-#   depthai versions? If not, they build from source (needs build-essential +
-#   python3.13-dev) or depthai may have no aarch64 wheel at all.
-#   → see Troubleshooting (numba aarch64 / depthai aarch64).
+# [✅-1] aarch64 flight-deps install — CONFIRMED 2026-06-15 (Pi 5 / Debian 13 /
+#        py3.13). numpy 2.4.6, numba 0.65.1, llvmlite 0.47.0, pyserial 3.5,
+#        depthai 3.7.1 ALL install from prebuilt manylinux-aarch64 wheels (no
+#        source build), import cleanly, and the IPC codec round-trips. Driven by:
+./deploy/pi-deploy.sh          # rsync + venv + the import/codec validation
+#   (The Troubleshooting fallbacks below apply only if YOUR pinned versions have
+#    no aarch64 wheel — the current pins do.)
 
-# [⚠️-2] cv2-absent litmus rc=0 ON aarch64.
-.venv/bin/python -m verification.cv2_absent_flight_litmus
+# [⚠️-2] cv2-absent litmus rc=0 ON aarch64.  (codec round-trip already PASSES on
+#        the Pi; the litmus replays a gold session, which the lean deploy does NOT
+#        ship — sync one session to run it, or rely on the live run below.)
+.venv/bin/python -m verification.cv2_absent_flight_litmus --session <a-synced-session>
 #   Expect rc=0. Proven on mac; re-prove on the Pi's CPython/arch.
 
-# [⚠️-3] headless replay rc=0 ON aarch64.
+# [⚠️-3] headless replay rc=0 ON aarch64 (also needs a synced gold session).
 ./run.sh --no-ui --session sessions/gold/lab_loop_30s
 #   Expect rc=0 and slam keyframe count growing.
 
@@ -238,6 +292,10 @@ on the actual Pi 5.
 ## 5. Troubleshooting
 
 **depthai has no aarch64 wheel / fails to install.**
+> Note: `depthai 3.7.1` **does** ship a prebuilt aarch64 (py3.13) wheel — confirmed
+> installing on the Pi 2026-06-15. This fallback applies only if you pin a version
+> that lacks one.
+
 `depthai` is the OAK-D device driver — needed **only** for `--live` capture.
 Because of the project's VL53-ToF pivot, depthai is **optional**: headless
 **replay** (`--session ...`) and any non-OAK source run **without it**. Options,
@@ -247,6 +305,10 @@ from `requirements-flight.txt` for a replay-only board. If you skip it, the
 import is only reached on the live path, so replay validation still runs.
 
 **numba / llvmlite has no aarch64 wheel / build is heavy.**
+> Note: `numba 0.65.1` + `llvmlite 0.47.0` **do** ship prebuilt aarch64 (py3.13)
+> wheels — confirmed on the Pi 2026-06-15. This applies only if you pin versions
+> without one.
+
 numba only **JIT-accelerates** the pure-NumPy hot paths (SGM cost volume,
 optical flow, etc.). The runtime has a **pure-NumPy fallback** and runs
 correctly without numba — just **slower** (this is noted in
@@ -259,7 +321,7 @@ performance only — which directly feeds the ⚠️-4 real-time measurement.
 If your Raspberry Pi OS release doesn't package `python3.13`, install it via the
 `deadsnakes` PPA (if available for your base), `pyenv`, or build from source.
 The stack requires 3.13 (it uses 3.13-era syntax/stdlib). Once `python3.13`,
-`python3.13-venv`, and `python3.13-dev` resolve, `scripts/setup_pi.sh` proceeds
+`python3.13-venv`, and `python3.13-dev` resolve, `deploy/pi/setup_pi.sh` proceeds
 unchanged.
 
 **Qt / display errors.**
@@ -347,12 +409,12 @@ and runs two cv2-free runtime slices (`FakePoseSource` + the `viz_session` PNG
 decode → NumPy Turbo depth) with `import cv2` **blocked**. depthai/OAK-D is not
 exercised here (no device on the dev box); it is reached only on the live path.
 
-> ### ⚠️ depthai aarch64 wheel — same caveat as the flight stack
-> `depthai` is the **only** native device dependency and the **same open unknown**
-> as in §4/§5: do prebuilt **aarch64** wheels exist for your `depthai` version? If
-> not it must build from source (needs `build-essential` + `python3.13-dev`), or
-> there may be no aarch64 wheel at all. A **replay/viewer-only** baseline board
-> can drop the `depthai` line entirely — `depthai` is imported **lazily** inside
-> the Basalt sources' worker thread, so `FakePoseSource`, `viz_session`, and the
-> Qt viewer all run without it. PyQt6/PyOpenGL aarch64 wheels are the other arch
-> unknown for a viewer board; a headless record-only board avoids them.
+> ### depthai aarch64 wheel — RESOLVED for the flight stack
+> `depthai` is the **only** native device dependency. As in §4/§5 it now has a
+> prebuilt aarch64 (py3.13) wheel (`3.7.1`, confirmed on the Pi 2026-06-15), so the
+> flight install needs no source build. If you pin a version without one it must
+> build from source (`build-essential` + `python3.13-dev`); a **replay/viewer-only**
+> baseline board can drop the `depthai` line entirely — it is imported **lazily**
+> inside the Basalt sources' worker thread, so `FakePoseSource`, `viz_session`, and
+> the Qt viewer all run without it. **Still open for a baseline VIEWER board:**
+> PyQt6/PyOpenGL aarch64 wheels (the flight Pi is headless, so it avoids them).

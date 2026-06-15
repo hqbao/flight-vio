@@ -21,9 +21,9 @@
 # `readlink -f`, no `sed -i ''`); validates clean under `bash -n` and shellcheck.
 #
 # Usage (on the Pi, from the repo root or anywhere):
-#   ./scripts/setup_pi.sh              # full bootstrap + smoke
-#   ./scripts/setup_pi.sh --no-smoke   # bootstrap only (skip the validation run)
-#   ./scripts/setup_pi.sh --help
+#   ./deploy/pi/setup_pi.sh              # full bootstrap + smoke
+#   ./deploy/pi/setup_pi.sh --no-smoke   # bootstrap only (skip the validation run)
+#   ./deploy/pi/setup_pi.sh --help
 #
 set -eu
 
@@ -31,7 +31,7 @@ set -eu
 # Locate the repo root from this script's own path (portable: no realpath/-f).  #
 # --------------------------------------------------------------------------- #
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
-REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
+REPO_ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)   # deploy/pi/setup_pi.sh -> repo root
 cd "$REPO_ROOT"
 
 PY_VERSION="python3.13"
@@ -115,7 +115,7 @@ if [ -n "$MISSING" ]; then
   done
   warn "missing apt prerequisites:$DEDUP"
   echo ""
-  echo "    Run this (needs sudo), then re-run scripts/setup_pi.sh:"
+  echo "    Run this (needs sudo), then re-run deploy/pi/setup_pi.sh:"
   echo ""
   echo "        sudo apt update && sudo apt install -y$DEDUP"
   echo ""
@@ -160,7 +160,7 @@ say "flight deps installed:"
 if [ "$RUN_SMOKE" -eq 0 ]; then
   rule
   say "bootstrap complete (--no-smoke: validation skipped)."
-  say "Run the smoke yourself with: ./scripts/setup_pi.sh   (no flag)"
+  say "Run the smoke yourself with: ./deploy/pi/setup_pi.sh   (no flag)"
   exit 0
 fi
 

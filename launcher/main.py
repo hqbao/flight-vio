@@ -181,9 +181,10 @@ def build_capture_args(args, cap_ep: str) -> list[str]:
 
     ``--use-camera-calib`` is forwarded ONLY in the live branch and ONLY when set --
     it opts the capture process into the operator's saved stereo calib (default OFF =
-    factory). Only capture needs it; vio/slam get whatever calib capture publishes on
-    the retained ``calib.bundle``. ``--vl53l9cx`` applies to both modes, so it is
-    appended after the mode branch.
+    factory). ``--model`` is forwarded the same way (live + set only): it selects
+    which OAK device capture opens when several are connected. Only capture needs both;
+    vio/slam get whatever calib capture publishes on the retained ``calib.bundle``.
+    ``--vl53l9cx`` applies to both modes, so it is appended after the mode branch.
     """
     capture_args: list[str] = ["--endpoint", cap_ep,
                                "--width", str(args.width),
@@ -201,6 +202,11 @@ def build_capture_args(args, cap_ep: str) -> list[str]:
             capture_args += ["--recalibrate-bias"]
         if args.use_camera_calib:
             capture_args += ["--use-camera-calib"]
+        # --model picks WHICH OAK device capture opens when several are plugged in;
+        # live-only (replay has no device) and forwarded only when the operator set
+        # it, mirroring --use-camera-calib above.
+        if args.model:
+            capture_args += ["--model", args.model]
     if args.vl53l9cx:
         capture_args += ["--vl53l9cx"]
     return capture_args
@@ -449,6 +455,11 @@ def main() -> int:
                          "(from the wizard) instead of the FACTORY calib. Default "
                          "OFF -- factory is the trusted reference. Forwarded to the "
                          "capture subprocess.")
+    ap.add_argument("--model", default=None,
+                    help="live: select which OAK device to open when several are "
+                         "connected, by product-name substring (e.g. 'lite') or "
+                         "deviceId. Forwarded to the capture subprocess. Device "
+                         "capabilities (IMU, mono resolution) are auto-detected.")
     ap.add_argument("--worker", action="store_true",
                     help="run the heavy BA/SLAM solves in worker subprocesses "
                          "(GIL-free). Off by default -- SLAM already stays "
@@ -464,9 +475,10 @@ def main() -> int:
                     help="ALSO run the cross-machine bridge: spawn "
                          "netbridge.forward bound to HOST:PORT (bare :PORT or PORT "
                          "binds 0.0.0.0) so a remote Mac UI can connect over "
-                         "TCP/WiFi (run `run-ui-remote.sh` there). Additive -- the "
-                         "local UI / --no-ui path is unaffected. Requires "
-                         "OAKD_NETBRIDGE_KEY set (the shared HMAC secret).")
+                         "TCP/WiFi (run `deploy/pi-ui.sh` there). Additive -- the "
+                         "local UI / --no-ui path is unaffected. Authenticates with "
+                         "OAKD_NETBRIDGE_KEY if set, else a built-in default key "
+                         "(no setup needed on a trusted LAN).")
     ap.add_argument("--vl53l9cx", action="store_true",
                     help="simulate a VL53L9CX-class ToF camera in the capture "
                          "process: compute depth at the source resolution then "
@@ -561,13 +573,13 @@ def main() -> int:
     forward_hostport: tuple[str, int] | None = None
     if args.forward:
         forward_hostport = parse_host_port(args.forward)
-        if not env.get("OAKD_NETBRIDGE_KEY"):
-            LOG.error("launcher: --forward requires OAKD_NETBRIDGE_KEY (the shared "
-                      "HMAC secret) set in the environment; refusing to open a "
-                      "network socket with no auth. Export it on the Pi AND the Mac.")
-            return 2
+        # The bridge is always authenticated: OAKD_NETBRIDGE_KEY if set, else a
+        # built-in default key (netbridge.tcp_transport.resolve_authkey) so a remote
+        # UI connects with no setup on a trusted LAN. Just log which is in use.
         LOG.info("launcher: --forward bridge will listen on %s:%d (remote Mac UI "
-                 "connects via run-ui-remote.sh)", *forward_hostport)
+                 "connects via deploy/pi-ui.sh)%s", *forward_hostport,
+                 "" if env.get("OAKD_NETBRIDGE_KEY")
+                 else "  [using the built-in default bridge key]")
 
     # ---- Build per-proc argv ---------------------------------------------
     # Capture argv (mode branch + flag forwarding) lives in build_capture_args so

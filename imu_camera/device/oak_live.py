@@ -32,13 +32,17 @@ class SharedLiveDevice:
     """
 
     def __init__(self, *, width: int = 640, height: int = 400, fps: int = 20,
-                 imu_rate_hz: int = 200,
+                 imu_rate_hz: int = 200, model: str | None = None,
                  opener: Callable[["SharedLiveDevice"], tuple] | None = None,
                  ) -> None:
         self.width = int(width)
         self.height = int(height)
         self.fps = int(fps)
         self.imu_rate_hz = int(imu_rate_hz)
+        # Optional --model selector: when several OAK devices are plugged in, the
+        # real opener uses this (deviceId or product-name substring) to pick which
+        # one to connect to. None -> the single connected device.
+        self.model = model
         self._opener = opener or _open_oak_pipeline
         self._lock = threading.Lock()
         self._refs = 0
@@ -47,6 +51,13 @@ class SharedLiveDevice:
         self.q_left = None
         self.q_right = None
         self.q_imu = None
+        # Runtime capabilities of the connected device, filled by the REAL opener
+        # as a side effect of acquire(). ``has_imu`` defaults True so the existing
+        # fake-opener tests (which return only the 4-tuple and never touch caps)
+        # behave as before; the real opener overwrites both from the live probe so
+        # a no-IMU device is handled (no IMU node built, no startup IMU read).
+        self.has_imu: bool = True
+        self.caps = None
 
     def acquire(self) -> None:
         """Connect (the first caller opens; later callers just attach).
@@ -149,25 +160,63 @@ def _read_device_id(handle) -> str:
 
 
 def _open_oak_pipeline(dev: SharedLiveDevice) -> tuple:
-    """Open one depthai pipeline with both mono cameras + the IMU (lazy import)."""
+    """Open one depthai pipeline with both mono cameras + the IMU (lazy import).
+
+    Capability-adaptive (see :mod:`imu_camera.device.probe`): the connected device
+    is selected (``dev.model``), then PROBED, and the pipeline is built to match
+    what the hardware actually offers --
+
+    * the requested ``(dev.width, dev.height)`` is CLAMPED to the connected mono
+      sensor's maximum (so an OAK-D Lite's OV7251 640x480 is not asked for the
+      OAK-D W's 1280x800), and
+    * the IMU node is created ONLY when the device reports an IMU. On a no-IMU
+      device (e.g. the OAK-D Lite Kickstarter) building it would not raise but the
+      first IMU read would HANG forever (luxonis/depthai #598), so we skip it and
+      hand back ``q_imu = None``; :meth:`SharedLiveDevice.poll` already returns
+      None for a missing queue.
+
+    The probed capabilities are written back onto ``dev`` (``dev.caps`` /
+    ``dev.has_imu``) as a side effect so the calibration reader and the IMU source
+    can adapt too -- the fake-opener test path never calls this function, so its
+    ``has_imu=True`` default is preserved.
+    """
     import depthai as dai
 
-    p = dai.Pipeline()
+    from .probe import probe_capabilities, select_device
+
+    # Pick + open the target device (single device, or the --model-selected one),
+    # then read its real capabilities and bind the pipeline to the open handle.
+    device, _seen = select_device(dev.model)
+    caps = probe_capabilities(device)
+    dev.caps = caps
+    dev.has_imu = caps.has_imu
+
+    # Clamp the requested resolution to what the connected mono sensor supports.
+    req_w, req_h = dev.width, dev.height
+    max_w, max_h = caps.mono_max
+    width = min(req_w, max_w)
+    height = min(req_h, max_h)
+
+    p = dai.Pipeline(device)
     left = p.create(dai.node.Camera).build(
         dai.CameraBoardSocket.CAM_B, sensorFps=dev.fps)
     right = p.create(dai.node.Camera).build(
         dai.CameraBoardSocket.CAM_C, sensorFps=dev.fps)
-    imu = p.create(dai.node.IMU)
-    imu.enableIMUSensor([dai.IMUSensor.ACCELEROMETER_RAW,
-                         dai.IMUSensor.GYROSCOPE_RAW], dev.imu_rate_hz)
-    imu.setBatchReportThreshold(1)
-    imu.setMaxBatchReports(20)
 
-    left_out = left.requestOutput((dev.width, dev.height))
-    right_out = right.requestOutput((dev.width, dev.height))
+    left_out = left.requestOutput((width, height))
+    right_out = right.requestOutput((width, height))
     q_left = left_out.createOutputQueue(maxSize=4, blocking=False)
     q_right = right_out.createOutputQueue(maxSize=4, blocking=False)
-    q_imu = imu.out.createOutputQueue(maxSize=100, blocking=False)
+
+    # IMU node + queue ONLY when the device has one (see the no-IMU hang above).
+    q_imu = None
+    if caps.has_imu:
+        imu = p.create(dai.node.IMU)
+        imu.enableIMUSensor([dai.IMUSensor.ACCELEROMETER_RAW,
+                             dai.IMUSensor.GYROSCOPE_RAW], dev.imu_rate_hz)
+        imu.setBatchReportThreshold(1)
+        imu.setMaxBatchReports(20)
+        q_imu = imu.out.createOutputQueue(maxSize=100, blocking=False)
 
     p.start()
     return p, q_left, q_right, q_imu

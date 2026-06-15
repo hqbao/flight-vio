@@ -28,7 +28,7 @@ abstract endpoints the UI already consumes.
 | File | Role |
 |------|------|
 | `comms/` | The vendored comms contract — a **7th bit-identical copy** (`cp -R ui/comms`). sha256-gated by `verification/ipc_comms_selftest.py` alongside the other 6. **Never hand-edited.** netbridge is a *consumer* of comms. |
-| `tcp_transport.py` | AF_INET frame transport: `TcpServer` / `TcpClient` with an HMAC authkey (`OAKD_NETBRIDGE_KEY`, **required** — refuses to start if unset), a `_BYE` sentinel, and retained-topic replay on connect. The network analogue of `IPCPubSub`. |
+| `tcp_transport.py` | AF_INET frame transport: `TcpServer` / `TcpClient` with an HMAC authkey (`OAKD_NETBRIDGE_KEY` if set, else a built-in **default key** so no setup is needed on a trusted LAN), a `_BYE` sentinel, and retained-topic replay on connect. The network analogue of `IPCPubSub`. |
 | `topics_allowlist.py` | The single source of truth for **which** topics cross the wire (UI-needed only), split into POD / image / retained, plus the direct-wire (retained config) set. Forward and receive both import it. |
 | `wire_full.py` | The ref-free `Wire*` ⇄ local-dataclass converter for the four image topics — puts **full ndarrays** where the in-host wire would hold a `SharedArrayRef`. |
 | `forward.py` | Runs on the **Pi**. The local IPC → TCP pump. **The only re-encode point.** |
@@ -81,22 +81,29 @@ lives in `TcpServer` (`image_topics` set).
 ## Security (HONEST)
 
 `OAKD_NETBRIDGE_KEY` is a shared HMAC secret (`multiprocessing.connection`
-challenge-response). It **authenticates** the peer — a wrong key is refused, a
-missing key refuses to start (no silent open socket). It does **NOT encrypt** the
-stream — built for a trusted LAN. For an untrusted network, tunnel it through
-**Wireguard** or an **SSH `-L` forward** (netbridge then sees only loopback and the
-tunnel encrypts).
+challenge-response, done **once at connect**, not per frame). It **authenticates**
+the peer — a wrong key is refused. It does **NOT encrypt** the stream — built for a
+trusted LAN. For an untrusted network, tunnel it through **Wireguard** or an
+**SSH `-L` forward** (netbridge then sees only loopback and the tunnel encrypts).
+
+**No key to manage (trusted LAN).** If `OAKD_NETBRIDGE_KEY` is **unset**, both ends
+fall back to the same built-in **default key** — so the bridge connects with zero
+setup (handy for testing). That default is **public** (it's in the source), so it is
+convenience auth, not a secret: export a real `OAKD_NETBRIDGE_KEY` on both hosts for
+security on an untrusted network. It is the same speed either way (one-time handshake).
 
 ## Run
 
 ```bash
 # on the Pi — additive to the normal flight launch:
-export OAKD_NETBRIDGE_KEY=$(openssl rand -hex 32)
-./run.sh --no-ui --vl53l9cx --direct --forward 0.0.0.0:8787
+./run.sh --no-ui --vl53l9cx --direct --forward 0.0.0.0:8787   # no key -> default key
 
-# on the Mac — SAME secret:
-export OAKD_NETBRIDGE_KEY=<same-secret>
-./run-ui-remote.sh --connect <pi-host>:8787
+# on the Mac — connects with the same default key, no setup:
+./deploy/pi-ui.sh --connect <pi-host>:8787
+
+# OR with a real shared secret (export the SAME value on BOTH hosts):
+export OAKD_NETBRIDGE_KEY=$(openssl rand -hex 32)   # Pi  (and the same on the Mac)
+./run.sh --no-ui --vl53l9cx --direct --forward 0.0.0.0:8787
 ```
 
 ## Gate

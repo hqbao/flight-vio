@@ -1,8 +1,28 @@
 # flight-vio
 
-Companion-computer project to turn an **OAK-D W** stereo camera into a 6-DoF
-position source for the flight-controller. Runs on a Mac mini today, will move
-to a Raspberry Pi 5 later.
+Companion-computer project to turn an **OAK-D-class** stereo camera (OAK-D W or
+OAK-D Lite) into a 6-DoF position source for the flight-controller. Runs on a Mac
+mini today, will move to a Raspberry Pi 5 later.
+
+The live device path is **capability auto-detecting** (`imu_camera/device/probe.py`):
+it probes the connected device at open time and builds the pipeline to match —
+the IMU node is created only when the device reports an IMU (an OAK-D Lite
+Kickstarter unit has none; retail Lite has a BMI270; OAK-D W has a BNO086) and the
+requested mono resolution is clamped to the sensor's max (the Lite's OV7251 tops
+out at 640×480). No IMU → the stack runs **vision-only** automatically. When
+several OAK devices are plugged into one host, pick one with **`--model`** (a
+product-name substring like `lite`, or an exact `deviceId`).
+
+> **OAK-D Lite IMU extrinsic (one-time fix).** The Lite's BMI270 EEPROM ships a
+> *wrong nominal* IMU→camera rotation (`Rx(90°)`) that **flips the gravity-aligned
+> startup attitude ~180° in roll** (the OAK-D W's BNO086 value is correct). Fix it
+> once per device with the pose wizard — it measures the true rotation from the
+> accelerometer in a few held poses and stores it per `deviceId`; every later live
+> run auto-uses it (overriding the bad EEPROM value, for both the gravity seed and
+> the gyro prior):
+> ```bash
+> .venv/bin/python -m imu_camera.tools.imu_cam_calib            # or --model lite
+> ```
 
 The from-scratch VIO/SLAM pipeline (formerly the `ours/` monolith) is now split
 into **five independent projects** + a launcher + a verification harness. The
@@ -120,7 +140,7 @@ its own `depth.main` harness (see [depth/README.md](depth/README.md)).
 
 # remote UI over WiFi: Pi runs the flight stack, Mac runs the UI
 ./run.sh --no-ui --forward HOST:PORT          # on the Pi
-./run-ui-remote.sh --connect <pi-host>:PORT   # on the Mac (same OAKD_NETBRIDGE_KEY)
+./deploy/pi-ui.sh --connect <pi-host>:PORT   # on the Mac (same OAKD_NETBRIDGE_KEY)
 ```
 
 - **`--vl53l9cx --direct` — the 54×42 ToF recipe.** `--vl53l9cx` feeds the
@@ -141,11 +161,14 @@ its own `depth.main` harness (see [depth/README.md](depth/README.md)).
   the hook is wired and the pose is flowing.
 - **Remote UI over WiFi (`netbridge`).** With `--forward HOST:PORT` the launcher
   ALSO spawns `netbridge.forward` on the Pi (one more managed flight subprocess) to
-  bridge the local IPC graph to TCP; on the Mac `./run-ui-remote.sh --connect
+  bridge the local IPC graph to TCP; on the Mac `./deploy/pi-ui.sh --connect
   <pi>:PORT` starts `netbridge.receive`, which re-serves the same `oak.*` endpoints
-  into Mac-local rings so the **UI is byte-for-byte unchanged**. Both ends share the
-  `OAKD_NETBRIDGE_KEY` HMAC secret (required — `--forward` refuses to start without
-  it). Full setup: [docs/RPI5_DEPLOY.md §3a](docs/RPI5_DEPLOY.md) +
+  into Mac-local rings so the **UI is byte-for-byte unchanged**. Auth is the
+  `OAKD_NETBRIDGE_KEY` HMAC secret (a one-time connect handshake, not per-frame, and
+  **not** encryption); if it is unset both ends fall back to a built-in **default
+  key** so the bridge connects with no setup on a trusted LAN (export a real secret
+  on both hosts for an untrusted network). Full setup:
+  [docs/RPI5_DEPLOY.md §3a](docs/RPI5_DEPLOY.md) +
   [netbridge/README.md](netbridge/README.md).
 - **RPi5 deploy.** The intended flight target is a Raspberry Pi 5; the flight
   runtime is **cv2-free and Qt-free** (`requirements-flight.txt`: numpy + numba +
@@ -198,6 +221,13 @@ Tips:
 - **`--use-camera-calib`** to apply your **own** saved stereo calib instead of the
   factory one (default OFF — the OAK-D factory calib is the trusted metrology
   reference). Opt in only after running the camera wizard.
+- **`--model NAME`** (live) picks which OAK device to open when several are plugged
+  into the host — a product-name substring (`--model lite`) or an exact `deviceId`.
+  With a single device connected it is optional. Capabilities (IMU presence, mono
+  resolution) are **always** auto-detected from the selected device; `--model` only
+  chooses *which* device, not *what* it can do. On an OAK-D Lite without an IMU the
+  stack runs vision-only — for the low-res ToF recipe pair it with `--vl53l9cx
+  --direct` (dense direct VO carries its own seed and needs no IMU).
 - The half-res live SGM preset (`depth_fast`) is always on — no flag needed.
 - ⚠️ **160×100 is the practical stereo VIO floor.** Below it the depth map is
   structurally starved (the disparity-search floor spans an ever-larger fraction
@@ -238,7 +268,12 @@ are all at 54×42 and consistent (K is scaled **anisotropically**: `fx,cx ×54/W
 The **baseline** (DepthAI/Basalt) reference pipeline has its own launcher,
 `run-baseline.sh`, the sibling of `run.sh` (run.sh = the 5-project from-scratch
 pipeline; run-baseline.sh = the DepthAI/Basalt reference). It opens the OAK-D
-directly, so run it only when the live pipeline is not holding the device:
+directly, so run it only when the live pipeline is not holding the device.
+Runs on any OAK-D-class device with a stereo pair **and an IMU** — verified on the
+OAK-D W (BNO086) and the OAK-D Lite retail (BMI270 @ 640×400). (The Lite shipped a
+wrong EEPROM IMU extrinsic that flipped the startup attitude ~180°; fixed by flashing
+the corrected `diag(1,-1,-1)` into the device EEPROM — see `baseline/sources/basalt_vio.py`.
+That fixes BasaltVIO AND the from-scratch stack, since both read the device EEPROM.)
 
 ```bash
 ./run-baseline.sh                          # Basalt VIO (oak)  — default
@@ -865,7 +900,7 @@ clobber each other, and `imu_camera/device/camera_calib_store.py`
 - [~] Port to RPi5 — deploy-prep done: the flight runtime is **cv2-free + Qt-free**
       (`requirements-flight.txt`, no OpenCV/PyQt6), the RPi5 setup + runbook is in
       [docs/RPI5_DEPLOY.md](docs/RPI5_DEPLOY.md), and a **remote UI over WiFi**
-      (`netbridge` — Pi flight stack → Mac UI, `--forward` / `run-ui-remote.sh`) is
+      (`netbridge` — Pi flight stack → Mac UI, `--forward` / `deploy/pi-ui.sh`) is
       shipped and gated. **Real-Pi (on-board) validation is still pending** — not yet
       run end-to-end on actual Pi hardware
 - [ ] `skyslam` Python package (replace Basalt + RTABMap)

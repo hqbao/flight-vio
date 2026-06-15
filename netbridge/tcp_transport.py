@@ -4,17 +4,21 @@ The network analogue of the AF_UNIX :class:`comms.ipc.IPCPubSub` boundary. Where
 ``IPCPubSub`` length-frames ``codec.encode`` bytes over a Unix-domain socket on one
 host, this carries the SAME codec bytes over a TCP socket between hosts, with:
 
-* **Authkey (HMAC challenge-response).** ``multiprocessing.connection.Listener`` /
-  :func:`multiprocessing.connection.Client` perform the standard sha256
-  challenge-response when constructed with ``authkey=<bytes>``. The key comes from
-  the ``OAKD_NETBRIDGE_KEY`` environment variable; both ends REFUSE TO START if it
-  is unset (no silent open socket on the network). A peer with the wrong key fails
-  the handshake -> ``AuthenticationError`` -> connection refused.
+* **Authkey (HMAC challenge-response).** ``multiprocessing.connection`` performs a
+  standard sha256 challenge-response **at connect time** (NOT per message) when
+  constructed with ``authkey=<bytes>``. The key comes from the ``OAKD_NETBRIDGE_KEY``
+  environment variable; when that is unset both ends fall back to the SAME public
+  :data:`DEFAULT_AUTHKEY` so the bridge connects with no setup (see
+  :func:`resolve_authkey`). The bridge is therefore ALWAYS authenticated -- it never
+  opens a no-auth socket. A peer with the wrong key fails the handshake ->
+  ``AuthenticationError`` -> connection refused.
 
-  HONEST scope: the authkey AUTHENTICATES the peer but does NOT encrypt the
-  stream. Built for a trusted LAN. For an untrusted network, run it inside a
-  Wireguard tunnel or an SSH ``-L`` forward (netbridge then sees only loopback and
-  the tunnel encrypts).
+  HONEST scope: the authkey AUTHENTICATES the peer but does NOT encrypt the stream,
+  and being a one-time handshake it costs nothing once streaming. The default key is
+  PUBLIC (in the source), so it is convenience auth for a trusted LAN, not a secret;
+  export a real ``OAKD_NETBRIDGE_KEY`` for security. For an untrusted network, run it
+  inside a Wireguard tunnel or an SSH ``-L`` forward (netbridge then sees only
+  loopback and the tunnel encrypts) -- the tunnel provides confidentiality.
 
 * **Framing.** Every published message rides as raw bytes:
   ``conn.send_bytes(codec.encode(topic, wire_msg))`` on the wire, decoded with
@@ -97,21 +101,36 @@ def install_sigterm(handler) -> bool:
         return False
 
 
-def require_authkey() -> bytes:
-    """Return the HMAC authkey from ``$OAKD_NETBRIDGE_KEY`` or raise.
+#: Built-in fallback authkey used when ``OAKD_NETBRIDGE_KEY`` is unset. It is PUBLIC
+#: (it lives right here in the source), so it is NOT a secret -- it authenticates
+#: against accidental / casual connects on a trusted LAN and spares you typing a key
+#: while testing. Set ``OAKD_NETBRIDGE_KEY`` to a real secret on an untrusted network.
+DEFAULT_AUTHKEY = "oakd-netbridge-default-key"
 
-    Fail-loud by design: a bridge that opened a network socket with NO auth would
-    let any host on the LAN inject frames into the flight pipeline. Both
-    :class:`TcpServer` and :class:`TcpClient` call this in ``__init__`` so a
-    missing key aborts at construction, before any socket is bound or dialled.
+
+def resolve_authkey() -> bytes:
+    """Return the HMAC authkey: ``$OAKD_NETBRIDGE_KEY`` if set, else a built-in DEFAULT.
+
+    Never raises and never returns ``None`` -- the bridge is ALWAYS authenticated, so
+    it can never open a no-auth socket. The auth is a CONNECT-TIME HMAC
+    challenge-response (``multiprocessing.connection``), NOT a per-message MAC, and it
+    does NOT encrypt the stream.
+
+    * ``OAKD_NETBRIDGE_KEY`` set  -> use it (a real shared secret; for untrusted nets).
+    * unset                       -> both ends fall back to the SAME public
+      :data:`DEFAULT_AUTHKEY` and connect with no setup. Convenient for trusted-LAN
+      testing; it is NOT a secret (anyone with the source knows it), so a custom key
+      is still what gives real security. A custom key is no slower -- the handshake is
+      one-time either way.
     """
     raw = os.environ.get(AUTHKEY_ENV, "")
-    if not raw:
-        raise RuntimeError(
-            f"{AUTHKEY_ENV} is unset -- refusing to open a network socket with "
-            f"no authentication. Export a shared secret on BOTH hosts, e.g. "
-            f"`export {AUTHKEY_ENV}=$(openssl rand -hex 32)`.")
-    return raw.encode("utf-8")
+    if raw:
+        return raw.encode("utf-8")
+    LOG.warning(
+        "%s unset -- using the built-in DEFAULT bridge key (fine for a trusted LAN; "
+        "it is PUBLIC, so set %s to a real secret on an untrusted network).",
+        AUTHKEY_ENV, AUTHKEY_ENV)
+    return DEFAULT_AUTHKEY.encode("utf-8")
 
 
 # --------------------------------------------------------------------------- #
@@ -154,7 +173,7 @@ class TcpServer:
                  retain_topics: Iterable[str] = (),
                  image_topics: Iterable[str] = (),
                  outbound_cap: int = _DEFAULT_OUTBOUND_CAP) -> None:
-        self._authkey = require_authkey()          # fail-loud if unset
+        self._authkey = resolve_authkey()          # env key or the built-in default
         self._host = str(host)
         self._port = int(port)
         self._retain_topics = set(retain_topics)
@@ -375,7 +394,7 @@ class TcpClient:
     def __init__(self, host: str, port: int, *,
                  connect_timeout_s: float = 30.0,
                  connect_retry_s: float = 0.5) -> None:
-        self._authkey = require_authkey()          # fail-loud if unset
+        self._authkey = resolve_authkey()          # env key or the built-in default
         self._host = str(host)
         self._port = int(port)
         self._connect_timeout_s = float(connect_timeout_s)

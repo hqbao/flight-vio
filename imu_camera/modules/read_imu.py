@@ -150,6 +150,16 @@ class LiveImuSource(ImuSource):
         except Exception as e:                                    # noqa: BLE001
             self.error = f"device open failed: {e}"
             return
+        # ``has_imu`` is known only AFTER acquire opens + probes the device. On a
+        # no-IMU device there is no IMU queue to poll, so return cleanly instead of
+        # spinning poll("imu") (which yields None forever). acquire() above already
+        # bumped the shared refcount, so release it in the finally to keep the
+        # device lifecycle balanced.
+        if not getattr(self.device, "has_imu", True):
+            self.error = "device has no IMU (vision-only); IMU stream idle"
+            self.device.release()
+            self._acquired = False
+            return
         try:
             while not self._stop.is_set() and self.device.is_running():
                 msg = self.device.poll("imu")
@@ -221,9 +231,24 @@ class ImuStream:
         except Exception as e:                                    # noqa: BLE001
             self._fail(f"depthai not available: {e}")
             return
+        from imu_camera.device.probe import (
+            _close_quiet, probe_capabilities, select_device)
         p = None
+        device = None
         try:
-            p = dai.Pipeline()
+            # Open the device FIRST and probe it: a device with no IMU (e.g. the
+            # OAK-D Lite Kickstarter) does NOT raise on enableIMUSensor -- the
+            # first IMU read hangs forever (luxonis/depthai #598). So detect the
+            # absence and fail cleanly here instead of building the IMU node.
+            device, _seen = select_device(None)
+            caps = probe_capabilities(device)
+            self.device_id = caps.device_id
+            if not caps.has_imu:
+                _close_quiet(device)
+                self._fail("device has no IMU")
+                return
+
+            p = dai.Pipeline(device)
             imu = p.create(dai.node.IMU)
             imu.enableIMUSensor([dai.IMUSensor.ACCELEROMETER_RAW,
                                  dai.IMUSensor.GYROSCOPE_RAW], self.rate_hz)
@@ -232,7 +257,6 @@ class ImuStream:
             q = imu.out.createOutputQueue(maxSize=100, blocking=False)
             p.start()
             self._pipeline = p
-            self.device_id = self._read_device_id(p)
 
             while not self._stop.is_set() and p.isRunning():
                 msg = q.tryGet()
@@ -252,23 +276,11 @@ class ImuStream:
                     p.stop()
                 except Exception:
                     pass
-
-    @staticmethod
-    def _read_device_id(pipeline) -> str:
-        try:
-            dev = pipeline.getDefaultDevice()
-        except Exception:
-            return "default"
-        for attr in ("getDeviceId", "getMxId", "getDeviceName"):
-            fn = getattr(dev, attr, None)
-            if callable(fn):
-                try:
-                    val = fn()
-                    if val:
-                        return str(val)
-                except Exception:
-                    pass
-        return "default"
+            # Close the explicitly-opened device handle (the pipeline is bound to
+            # it, so close it AFTER stopping the pipeline). _close_quiet swallows
+            # any teardown error so a shutdown race never surfaces a traceback.
+            if device is not None:
+                _close_quiet(device)
 
     def _fail(self, msg: str) -> None:
         self.error = msg

@@ -311,7 +311,8 @@ def run_capture_live(endpoint: str, *,
                      use_gyro: bool = True,
                      recalibrate_bias: bool = False,
                      use_camera_calib: bool = False,
-                     tof_sim: bool = False) -> int:
+                     tof_sim: bool = False,
+                     model: str | None = None) -> int:
     """Live OAK-D capture: device -> bridge -> IPC."""
     from imu_camera.modules.pipeline import TOF_W, TOF_H, build_live_frontend
 
@@ -346,7 +347,7 @@ def run_capture_live(endpoint: str, *,
             use_gyro=use_gyro, depth_fast=depth_fast,
             recalibrate_bias=recalibrate_bias,
             use_camera_calib=use_camera_calib, latest_only=False,
-            tof_sim=tof_sim)
+            tof_sim=tof_sim, model=model)
     except Exception as e:                                         # noqa: BLE001
         LOG.error("capture: live build failed: %s", e)
         pub.stop()
@@ -442,6 +443,12 @@ def main() -> int:
                     help="simulate a VL53L9CX-class ToF camera: compute depth at "
                          "the source resolution then downsample gray + depth to "
                          "54x42 (accurate per-pixel ToF depth + intensity + IMU)")
+    ap.add_argument("--model", default=None,
+                    help="live: select which OAK device to open when several are "
+                         "connected, by product-name substring (e.g. 'lite') or "
+                         "deviceId. Default: the single connected device. Device "
+                         "capabilities (IMU presence, mono resolution) are always "
+                         "auto-detected from the selected device.")
     args = ap.parse_args()
 
     if args.live:
@@ -451,7 +458,7 @@ def main() -> int:
             use_gyro=not args.no_gyro,
             recalibrate_bias=args.recalibrate_bias,
             use_camera_calib=args.use_camera_calib,
-            tof_sim=args.vl53l9cx)
+            tof_sim=args.vl53l9cx, model=args.model)
     return run_capture_replay(
         session=Path(args.session), endpoint=args.endpoint,
         width=args.width, height=args.height,

@@ -492,10 +492,10 @@ def test_two_hop_bit_identity() -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# Test 2: authkey enforcement (wrong key refused; missing key refuses to start).
+# Test 2: authkey enforcement (wrong key refused; no key -> built-in default key).
 # --------------------------------------------------------------------------- #
 def test_authkey_enforced() -> bool:
-    print("\n[2] authkey enforcement (wrong key refused; missing key refused)")
+    print("\n[2] authkey enforcement (wrong key refused; no key -> default key)")
     ok = True
     port = _free_port()
     suffix = f"nba{os.getpid() & 0xFFF:x}"
@@ -540,17 +540,27 @@ def test_authkey_enforced() -> bool:
                 os.environ["OAKD_NETBRIDGE_KEY"] = saved
         ok &= _check(refused, "WRONG authkey -> connection REFUSED")
 
-        # MISSING key -> TcpClient refuses to even construct.
+        # MISSING key -> the client falls back to the built-in DEFAULT key (it no
+        # longer raises at construction). That default does NOT match THIS server's
+        # custom "test" key, so the handshake still fails -> connection refused.
+        from netbridge.tcp_transport import (                       # noqa: PLC0415
+            DEFAULT_AUTHKEY, resolve_authkey)
         saved = os.environ.pop("OAKD_NETBRIDGE_KEY", None)
+        default_used = resolve_authkey() == DEFAULT_AUTHKEY.encode("utf-8")
         missing_refused = False
         try:
-            TcpClient("127.0.0.1", port)
-        except RuntimeError:
+            bad2 = TcpClient("127.0.0.1", port, connect_timeout_s=3.0)
+            bad2.subscribe(topics.CALIB_BUNDLE, lambda *_a: None)
+            bad2.start()
+            time.sleep(0.5)
+            bad2.stop()
+        except Exception:                                          # noqa: BLE001
             missing_refused = True
         finally:
             if saved is not None:
                 os.environ["OAKD_NETBRIDGE_KEY"] = saved
-        ok &= _check(missing_refused, "MISSING authkey -> refuses to start")
+        ok &= _check(default_used, "MISSING key -> falls back to the built-in default key")
+        ok &= _check(missing_refused, "default key != this server's custom key -> REFUSED")
 
         # CORRECT key still works (sanity: the server didn't get wedged by the
         # bad attempt).

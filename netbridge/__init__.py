@@ -27,8 +27,12 @@ adds its own TCP transport on top:
   byte-for-byte unchanged.
 
 Threat model (HONEST): the HMAC authkey AUTHENTICATES the peer (wrong key ->
-connection refused) but does NOT encrypt the stream. It is built for a trusted
-LAN. For an untrusted network, tunnel it through Wireguard or SSH (``ssh -L``) --
-netbridge then sees only loopback and the tunnel provides the encryption.
+connection refused) but does NOT encrypt the stream, and it is a ONE-TIME connect
+handshake (no per-frame cost). Set ``OAKD_NETBRIDGE_KEY`` on both ends for a real
+shared secret; leave it unset and both ends fall back to the same built-in PUBLIC
+default key so the bridge connects with no setup on a trusted LAN (convenience, not
+a secret). Either way the stream is plaintext: for an untrusted network, tunnel
+through Wireguard or SSH (``ssh -L``) -- netbridge then sees only loopback and the
+tunnel provides encryption.
 """
 from __future__ import annotations

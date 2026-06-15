@@ -41,7 +41,7 @@ def _ns(**over) -> types.SimpleNamespace:
                 use_camera_calib=False, vl53l9cx=True, worker=False,
                 tight=False, stabilize_velocity=False, depth_icp=False,
                 ba_window=False, frontend_viz=False, direct=False,
-                forward=None)
+                forward=None, model=None)
     base.update(over)
     return types.SimpleNamespace(**base)
 

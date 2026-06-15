@@ -332,7 +332,8 @@ def build_live_frontend(bus: LocalPubSub, *, width: int = 640, height: int = 400
                         depth_fast: bool = True, recalibrate_bias: bool = False,
                         use_camera_calib: bool = False,
                         latest_only: bool = False,
-                        tof_sim: bool = False):
+                        tof_sim: bool = False,
+                        model: str | None = None):
     """Open the OAK-D and wire ONLY the acquisition front-end (``read_cam`` +
     ``imu_cam`` with depth) off ONE shared device.
 
@@ -340,7 +341,12 @@ def build_live_frontend(bus: LocalPubSub, *, width: int = 640, height: int = 400
     no odometry/backend/slam. The depth matcher rectifies BOTH cameras
     (``rectify_left=True``) since the raw left is unrectified.
     ``use_camera_calib`` opts into the operator's saved per-device stereo calib
-    (default off -> the trusted factory calib is used). ``tof_sim`` enables
+    (default off -> the trusted factory calib is used). ``model`` selects WHICH
+    OAK device to open when several are connected (deviceId or product-name
+    substring); ``None`` picks the single connected device. The device is probed
+    at open time to clamp the requested resolution to the connected mono sensor's
+    maximum and to build the IMU node only when the device has one (auto-detect,
+    always on -- see :mod:`imu_camera.device.probe`). ``tof_sim`` enables
     the VL53L9CX simulation (depth at source res, then gray + depth downsampled to
     ``TOF_W x TOF_H`` before publish). Returns
     ``(device, cam_module, imu_module, cal)`` where ``cal`` is the
@@ -352,7 +358,7 @@ def build_live_frontend(bus: LocalPubSub, *, width: int = 640, height: int = 400
     from .read_cam import LiveCamSource
     from .read_imu import LiveImuSource
 
-    device = SharedLiveDevice(width=width, height=height, fps=fps)
+    device = SharedLiveDevice(width=width, height=height, fps=fps, model=model)
     # Compile the KLT + SGM numba kernels on a background thread NOW, so the
     # ~1-3 s LLVM compile (cold cache) overlaps the device boot + the startup
     # IMU still-window below instead of stalling frame one. Uses the live configs

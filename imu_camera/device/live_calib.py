@@ -28,7 +28,7 @@ import numpy as np
 
 from sky.sensors.accel_calib import AccelCalibration
 from sky.sensors.calib_store import (
-    load_accel_calib, load_gyro_bias, save_gyro_bias)
+    load_accel_calib, load_gyro_bias, load_imu_cam_rotation, save_gyro_bias)
 from sky.sensors.imu_calib import ImuCalibration
 
 from imu_camera.comms.lib.config.resolution import ResolutionProfile
@@ -232,6 +232,20 @@ def read_live_calibration(device: SharedLiveDevice, *, width: int, height: int,
     # of whether the gyro/IMU branch runs (the UI keys saved IMU calib by it).
     dev_id = device.device_id
 
+    # Per-device IMU->camera rotation OVERRIDE. The EEPROM ``getImuToCameraExtrinsics``
+    # is wrong on some devices -- the OAK-D Lite (BMI270) ships a nominal value that
+    # flips the gravity-aligned startup attitude ~180deg in roll. When the operator
+    # has run the pose wizard (``imu_camera.tools.imu_cam_calib``) the calibrated
+    # rotation is stored per device; use it instead of the EEPROM one. It feeds BOTH
+    # the gravity-align seed below AND the downstream gyro rotation prior, so this
+    # single override corrects both. Absent (no wizard run) -> keep the EEPROM value.
+    R_user = load_imu_cam_rotation(dev_id)
+    if R_user is not None:
+        print(f"[live] using SAVED IMU->camera rotation for device {dev_id} "
+              f"(imu_cam_calib wizard) -- EEPROM extrinsic overridden",
+              file=sys.stderr)
+        R_imu_cam = R_user
+
     # FACTORY calib is the default trusted metrology reference. The operator's OWN
     # saved stereo calibration is applied ONLY when explicitly opted into via
     # ``--use-camera-calib`` -- in which case we read the per-device store (keyed by
@@ -244,9 +258,14 @@ def read_live_calibration(device: SharedLiveDevice, *, width: int, height: int,
     K, calib = select_camera_calib(dev_id, K, calib, user_calib,
                                    use_camera_calib=use_camera_calib)
 
+    # Skip the IMU-startup branch entirely on a device with no IMU (e.g. the
+    # OAK-D Lite Kickstarter): there is no IMU queue to read, so _collect_startup
+    # would just burn its 6 s timeout before returning None. The opener sets
+    # ``has_imu`` on the device from the live probe; older fake openers that don't
+    # set it default to True (getattr fallback), preserving prior behaviour.
     accel_align = None
     imu_calibration = None
-    if use_gyro:
+    if use_gyro and getattr(device, "has_imu", True):
         cached = None if recalibrate_bias else load_gyro_bias(dev_id)
         accel_cal: AccelCalibration | None = load_accel_calib(dev_id)
         # Hold-still ONLY when the gyro bias must be measured (first run /

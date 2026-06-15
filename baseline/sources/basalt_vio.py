@@ -2,8 +2,23 @@
 
 DepthAI 3.x ships the Basalt open-source stereo-inertial VIO as a native node
 (``dai.node.BasaltVIO``). We wire two ``Camera`` nodes (CAM_B/CAM_C, the
-stereo pair on the OAK-D W) plus the onboard ``IMU`` into it and read its
-``transform`` output from the host.
+stereo pair) plus the onboard ``IMU`` into it and read its ``transform`` output
+from the host.
+
+Device compatibility: runs unchanged on any OAK-D-class device with a stereo pair
+on CAM_B/CAM_C **and an IMU** -- verified on the OAK-D W (BNO086) and the OAK-D
+Lite retail (BMI270, OV7251 @ 640x480; the default 640x400 is in range). A no-IMU
+unit (e.g. an early Kickstarter Lite) cannot run BasaltVIO -- it is visual-INERTIAL.
+
+IMU extrinsic (Lite): the Lite's BMI270 EEPROM SHIPPED a wrong nominal IMU->camera
+rotation (Rx 90deg) that flipped BasaltVIO's gravity-aligned startup attitude
+~180deg. Because BasaltVIO is an on-device blob that reads the EEPROM, a host-side
+override (the flight stack's imu_cam_calib store) does NOT reach it -- so the fix is
+to flash the CORRECTED extrinsic (diag(1,-1,-1), matching the OAK-D W) into the
+device EEPROM. Once flashed, BasaltVIO and every other depthai consumer read it
+correct (verified: the ~180deg flip is gone). The original calibration is backed up
+under ``.cache/device_calib_backup/<deviceId>.json`` (revert with flashCalibration
+or Device.factoryResetCalibration).
 
 Frame plumbing
 --------------

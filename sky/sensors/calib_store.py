@@ -140,3 +140,47 @@ def save_accel_calib(device_id: str, cal: AccelCalibration, n_poses: int,
     e["accel"] = acc
     data[str(device_id)] = e
     return _save_all(p, data)
+
+
+# -- IMU->camera rotation (extrinsic) -------------------------------------- #
+def load_imu_cam_rotation(device_id: str,
+                          path: Path | None = None) -> np.ndarray | None:
+    """Return the cached IMU->camera rotation ``R`` (3x3) or ``None`` if absent.
+
+    This overrides the device EEPROM's ``getImuToCameraExtrinsics`` rotation when
+    present -- the operator runs the pose wizard
+    (:mod:`imu_camera.tools.imu_cam_calib`) when the factory extrinsic is wrong
+    (e.g. the OAK-D Lite's BMI270 nominal value, which flips the startup attitude
+    ~180deg). Validated as a finite proper rotation before use; anything else
+    yields ``None`` so a corrupt entry falls back to the EEPROM value.
+    """
+    e = _entry(_load_all(path or _DEFAULT_PATH), device_id)
+    ext = e.get("imu_cam")
+    if not isinstance(ext, dict) or "R" not in ext:
+        return None
+    R = np.asarray(ext["R"], dtype=np.float64)
+    if R.shape != (3, 3) or not np.all(np.isfinite(R)):
+        return None
+    # Must be a proper rotation (orthonormal, det +1) -- reject a garbage solve.
+    if not (np.allclose(R @ R.T, np.eye(3), atol=1e-4)
+            and np.isclose(np.linalg.det(R), 1.0, atol=1e-4)):
+        return None
+    return R
+
+
+def save_imu_cam_rotation(device_id: str, R: np.ndarray, n_poses: int,
+                          residual_deg: float | None = None,
+                          path: Path | None = None) -> Path:
+    """Persist the IMU->camera rotation for ``device_id`` (merges into the file)."""
+    p = path or _DEFAULT_PATH
+    data = _load_all(p)
+    e = _entry(data, device_id)
+    e["imu_cam"] = {
+        "R": [[float(x) for x in row]
+              for row in np.asarray(R, dtype=np.float64).reshape(3, 3)],
+        "n_poses": int(n_poses),
+        "residual_deg": (None if residual_deg is None else float(residual_deg)),
+        "ts": time.time(),
+    }
+    data[str(device_id)] = e
+    return _save_all(p, data)

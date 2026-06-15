@@ -13,6 +13,10 @@ drift via loop closure on the rectified+depth pair. We consume
 ``slam.transform`` as the final pose stream — it is the loop-corrected pose
 in the same FLU world frame as BasaltVIO, so the same FLU->NED conversion
 applies.
+
+Device compatibility + the OAK-D Lite IMU-extrinsic caveat are the same as the
+VIO source — see :mod:`baseline.sources.basalt_vio`. Verified running on the
+OAK-D Lite retail (BMI270).
 """
 from __future__ import annotations
 
