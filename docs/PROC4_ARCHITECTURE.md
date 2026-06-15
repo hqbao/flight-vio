@@ -532,7 +532,7 @@ The menu is plain Qt (`QMenuBar` / `QAction`); `ui.main` calls
 - **Calibration** — the FIRST item is **"Calibration status…"** (`CalibrationStatusDialog`,
   `ui/qt/calib_status_dialog.py`): the ONE unified view of all three calibrations.
   It re-queries the **device-agnostic, cv2/depthai-free** API
-  `calibration_status(dev_id)` (`imu_camera/mathlib/device/calib_status.py`, which imports
+  `calibration_status(dev_id)` (`imu_camera/device/calib_status.py`, which imports
   only the three `load_gyro_bias` / `load_accel_calib` / `load_camera_calib` loaders) on
   every show and renders one row per item — a ✓ (`theme.GOOD`) / ✗ (`theme.BAD`) badge +
   the name + a semantics-accurate detail (gyro auto-measures on first capture start; accel
@@ -701,7 +701,7 @@ follow this one pattern:
 
 - **gyro bias / accel calib** → `sky/sensors/calib_store.py`
   (`load_gyro_bias` / `load_accel_calib`), read in `read_live_calibration`.
-- **stereo CAMERA calib** → `imu_camera/mathlib/device/camera_calib_store.py`
+- **stereo CAMERA calib** → `imu_camera/device/camera_calib_store.py`
   (`save_camera_calib` / `load_camera_calib`, store `.cache/camera_calib.json`). On the
   live path `read_live_calibration` reads the factory `K`/`StereoCalib` off the device.
   **FACTORY is the default** (the trusted metrology reference): with **no** flag,
@@ -790,12 +790,93 @@ velocity regularisation**: it flips `WindowedVIOConfig.stabilize_velocity = True
 in the tight backend (`vio/modules/pipeline.py`), which makes `run_ba` enable both
 the constant-velocity smoothness prior (`vel_cv_prior`) and the excitation-gated
 ZUPT (`vel_zupt`) on every solve to curb the 54×42 / shake window-velocity
-divergence (the priors themselves live in `vio/mathlib/backend/vio_window.py`). It
+divergence (the priors themselves live in `sky/vio/window.py`). It
 is **OPT-IN and tight-only**: the default path never sets it, so the loose path and
 the tight-without-flag path are unchanged and the byte-parity oracle stays `gap=0`.
 Passing `--stabilize-velocity` WITHOUT `--tight` logs a warning and is dropped (the
 loose path has no velocity state to regularise). When active, the tight backend logs
 `vio: tight velocity-stabilize ON (CV prior + gated ZUPT)` on startup.
+
+## 7a. Optional cross-machine transport — `netbridge`
+
+Everything above describes the runtime as it actually runs: **4 local processes on
+ONE host**, wired by `IPCPubSub` over AF_UNIX sockets + POSIX shared-memory rings
+(`SharedArrayRing`). That layout depends on a shared kernel — a `SharedArrayRef`
+published by capture is `read_copy`-ed straight out of shared memory by the UI.
+
+`netbridge` is an **OPTIONAL** layer that lifts that boundary across the network so
+the **Pi** runs the whole flight stack (capture + vio + slam) and a **Mac** runs
+only the UI, live over TCP/WiFi. It is **off by default** and changes nothing about
+the local runtime; it is enabled by the launcher's `--forward HOST:PORT` (§7), which
+spawns `netbridge.forward` as one more managed flight subprocess.
+
+```mermaid
+flowchart LR
+    subgraph pi["PI — flight stack"]
+        FS["capture · vio · slam<br/>(AF_UNIX + shm rings)"]
+        FWD["netbridge.forward<br/>(resolve SharedArrayRef → ndarray)"]
+        FS -- "oak.* (IPCPubSub client)" --> FWD
+    end
+    subgraph mac["MAC — UI host"]
+        RCV["netbridge.receive<br/>(re-serve oak.* into Mac rings)"]
+        UI["ui.main (UNCHANGED)"]
+        RCV -- "oak.* (AF_UNIX + shm rings)" --> UI
+    end
+    FWD == "TCP / WiFi · codec 0x08 frames · HMAC authkey" ==> RCV
+```
+
+**Pi-side `forward` — the ONLY re-encode point.** A `comms.bridge.IPCSubscriber`
+reads each Pi endpoint and runs `comms.converters.to_local`, which `read_copy`-s
+every `SharedArrayRef` (codec tag **0x09**, metadata-only — the pixels live in a
+`SharedArrayRing`) into a **real `np.ndarray`**. forward then re-encodes the
+**ref-free, full-ndarray** wire form (`netbridge.wire_full` for the four image
+topics — `WireCamSync` / `WireDepthFrame` / `WireImuCamPacket` / `WireKeyframe`;
+`comms.converters.to_wire` for POD) → `codec.encode` → the arrays now ride inline as
+full ndarrays (tag **0x08**) on the TCP wire. This is the resolve point because the
+Mac cannot `read_copy` the Pi's shared memory. A defensive assert
+(`_assert_no_shared_ref`) refuses to encode any field that is still a
+`SharedArrayRef`, so a ref the Mac can't read fails LOUD instead of silently
+corrupting the UI.
+
+**TCP transport (`netbridge.tcp_transport`).** The network analogue of `IPCPubSub`:
+`TcpServer` / `TcpClient` over AF_INET with an **HMAC authkey**
+(`OAKD_NETBRIDGE_KEY`, **required** — refuses to start if unset; it authenticates
+the peer but does NOT encrypt — built for a trusted LAN, tunnel via Wireguard / `ssh
+-L` otherwise), a `_BYE` sentinel, and retained-topic replay on connect.
+
+**Mac-side `receive` — re-serve unchanged.** `codec.decode` (all 0x08) → local
+dataclass → a standard `comms.bridge.IPCPublisher` writes the arrays back into
+**Mac-local `SharedArrayRing`s** (0x09 over AF_UNIX) on the **same** canonical
+`oak.capture` / `oak.vio` / `oak.slam` endpoints. The UI attaches EXACTLY as if it
+were on the Pi — it is **byte-for-byte unchanged** and imports no netbridge. receive
+**awaits the forwarded `calib.bundle` FIRST** (like `ui.main`) and sizes its rings
+from the bundle's `width`/`height`, so a 54×42 ToF stream is not corrupted by a
+hardcoded 640×400.
+
+**Which topics cross + backpressure.** `netbridge/topics_allowlist.py` is the single
+source of truth for the UI-needed topics, split POD / image / retained. Image topics
+forward **non-blocking latest-wins** — a WiFi stall drops the stale frame and NEVER
+back-pressures capture/vio/slam (the flight stack is never throttled by the link).
+POD + retained config (`calib.bundle` / `calib.stereo` / `vio.map`) forward
+**reliably** (a one-shot calib or a pose is never silently dropped); retained topics
+are cached by the server and replayed to a late-joining UI.
+
+**Frame path is off-bridge.** The FC-output pose path (`--no-ui`
+`_start_pose_logger`, §7) is a separate read-only consumer on the **local** vio
+endpoint on the Pi — it does NOT depend on netbridge and is unaffected whether the
+bridge is up or down.
+
+**Invariants preserved.** `netbridge` vendors `comms/` as a **7th byte-identical
+copy** (`verification/ipc_comms_selftest.py` sha256-gates it alongside the other 6),
+so the wire contract is identical. It is **LIVE-ONLY** — the byte-parity oracle
+(§8) is in-process and never goes near a socket — so it is **`gap = 0`-neutral by
+construction**. The dedicated gate is
+`verification/netbridge_loopback_selftest.py` (two TCP hops over 127.0.0.1: fake
+producer → forward → TCP → receive → headless subscriber; proves `frame.depth`
+pixels bit-identical end-to-end through both ring sets, POD arrays bit-identical,
+retained calib replayed to a late subscriber, a wrong authkey is refused, and an
+offscreen `ui.main` smoke renders). Full design: [`netbridge/README.md`](../netbridge/README.md);
+deploy: [`docs/RPI5_DEPLOY.md` §3a](RPI5_DEPLOY.md).
 
 ## 8. Verification & testing
 
@@ -858,7 +939,7 @@ proven (see [`verification/README.md`](../verification/README.md)):
 11. **`WireCalibBundle.device_id` is the calibration key, carried on the bundle.**
     `WireCalibBundle` (`comms/wire.py`) carries an OPTIONAL `device_id: str | None`.
     **Producer:** capture fills it from the real device id
-    (`imu_camera/mathlib/device/live_calib.py` → the calib bundle builder in
+    (`imu_camera/device/live_calib.py` → the calib bundle builder in
     `imu_camera/main.py`); replay sets it to `None`. VIO **re-broadcasts the same
     bundle**, so the UI reads `device_id` off VIO's bundle. **Consumer:** the UI keys
     any calibration it saves by this id, which is IDENTICALLY the key capture LOADS

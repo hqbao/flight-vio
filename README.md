@@ -35,6 +35,12 @@ oak-d/
                 ./run.sh (--proc) -> python -m launcher.main
   verification/ in-process byte-parity oracle (vs the frozen baseline_metrics.json)
                 + cross-copy comms parity gate + selftests.
+  netbridge/    OPTIONAL cross-machine TCP bridge: runs the flight stack on a Pi
+                (capture + vio + slam) and the UI on a Mac, live over WiFi.
+                forward.py (Pi: local IPC -> TCP) + receive.py (Mac: TCP -> local
+                IPC re-serve) + tcp_transport.py (HMAC-authed AF_INET transport).
+                Vendors comms/ as a 7TH byte-identical copy; the UI is byte-for-byte
+                unchanged. See netbridge/README.md + docs/RPI5_DEPLOY.md §3a.
   baseline/     DepthAI library pipeline (BasaltVIO + RTABMapSLAM); ATE baseline.
     frames.py            NED/ENU/quat math
     pose.py              Pose + PoseHistory
@@ -102,6 +108,49 @@ Runtime = **4 processes** (`imu_camera`, `vio`, `slam`, `ui`); depth runs INLINE
 on the capture process's `imu_cam` thread, so the launcher never spawns a depth
 process. `depth/` is an independent SOURCE TREE — promotable to a 5th process via
 its own `depth.main` harness (see [depth/README.md](depth/README.md)).
+
+### Key live recipes
+
+```bash
+# the 54x42 VL53-class ToF recipe (low-res odometry that beats sparse VIO at 54x42)
+./run.sh --vl53l9cx --direct
+
+# headless flight path (Pi / FC): no GUI, logs raw pose for the flight controller
+./run.sh --no-ui
+
+# remote UI over WiFi: Pi runs the flight stack, Mac runs the UI
+./run.sh --no-ui --forward HOST:PORT          # on the Pi
+./run-ui-remote.sh --connect <pi-host>:PORT   # on the Mac (same OAKD_NETBRIDGE_KEY)
+```
+
+- **`--vl53l9cx --direct` — the 54×42 ToF recipe.** `--vl53l9cx` feeds the
+  ToF-sim depth at the fixed 54×42 grid (below); `--direct` selects the **dense
+  direct photometric** front-end (frame-to-keyframe photometric alignment + an
+  IMU-seeded dead-reckon prior + a divergence guard) instead of the sparse KLT/PnP
+  path. This is the low-res odometry that actually tracks (and beats sparse VIO) at
+  54×42, where features are starved by design. Both are **OPT-IN** (default = the
+  loose sparse path); the offline/oracle path never sees `--direct`, so byte-parity
+  stays `gap = 0`.
+- **`--no-ui` — the Pi / FC path.** Runs capture + vio + slam headless (once, no
+  Restart loop) and starts a read-only pose logger on the VIO endpoint that prints
+  the **raw pose** (position + quaternion in the gravity-aligned WORLD frame; the FC
+  derives heading itself), throttled to ~2 Hz. This is the **FC-output hook** — the
+  single place a real MAVLink `VISION_POSITION_ESTIMATE` send will go
+  (`launcher/main.py:_start_pose_logger`). **The FC link itself is not done yet**
+  (the NED / body-extrinsic mapping + the MAVLink send are the future FC-link step);
+  the hook is wired and the pose is flowing.
+- **Remote UI over WiFi (`netbridge`).** With `--forward HOST:PORT` the launcher
+  ALSO spawns `netbridge.forward` on the Pi (one more managed flight subprocess) to
+  bridge the local IPC graph to TCP; on the Mac `./run-ui-remote.sh --connect
+  <pi>:PORT` starts `netbridge.receive`, which re-serves the same `oak.*` endpoints
+  into Mac-local rings so the **UI is byte-for-byte unchanged**. Both ends share the
+  `OAKD_NETBRIDGE_KEY` HMAC secret (required — `--forward` refuses to start without
+  it). Full setup: [docs/RPI5_DEPLOY.md §3a](docs/RPI5_DEPLOY.md) +
+  [netbridge/README.md](netbridge/README.md).
+- **RPi5 deploy.** The intended flight target is a Raspberry Pi 5; the flight
+  runtime is **cv2-free and Qt-free** (`requirements-flight.txt`: numpy + numba +
+  pyserial + depthai, **no OpenCV, no PyQt6**), so the Pi never installs opencv/Qt.
+  The full setup runbook is [docs/RPI5_DEPLOY.md](docs/RPI5_DEPLOY.md).
 
 ## Resolution presets (suggested run params)
 
@@ -303,10 +352,10 @@ The architecture, endpoints, invariants, and byte-parity story are in
 
 Every project vendors a **byte-identical** `comms/` package — the single source of
 truth is `imu_camera/comms/`, copied verbatim into `depth`, `vio`, `slam`, `ui`,
-and `launcher`. A `diff -r` CI gate keeps the copies in lock-step; all its internal
-imports are RELATIVE, and it pulls **no depthai / no PyQt6 / no cv2** (headless-safe),
-so the package drops into any project unchanged. This is what makes each project
-independently portable.
+`launcher`, and `netbridge` (a **7th** copy). A `diff -r` / sha256 CI gate keeps the
+copies in lock-step; all its internal imports are RELATIVE, and it pulls **no depthai
+/ no PyQt6 / no cv2** (headless-safe), so the package drops into any project
+unchanged. This is what makes each project independently portable.
 
 `comms/` is the merge + rename of the pre-split runtime layer. **The word "flow"
 is gone**; the topic strings are unchanged (the frozen contract).
@@ -791,7 +840,11 @@ clobber each other, and `imu_camera/device/camera_calib_store.py`
       own their own map; `./run.sh`, see [docs/PROC4_ARCHITECTURE.md](docs/PROC4_ARCHITECTURE.md)
 - [x] End-to-end byte-parity vs the pre-split baseline (gap = 0), verified live on
       a real OAK-D; harness in `verification/`
-- [ ] UDP / UART link to flight-controller
+- [~] Link to flight-controller — the `--no-ui` headless path logs the raw pose
+      (position + quaternion, WORLD frame) and exposes the **FC-output hook**
+      (`launcher/main.py:_start_pose_logger`), the single place a MAVLink
+      `VISION_POSITION_ESTIMATE` send will go. The MAVLink/UART link + the NED /
+      body-extrinsic mapping themselves are **not done yet**
 - [x] Tracking-lost UI badge: two-tier debounced master-warning badge on the 3D
       viewer + drone-marker recolour, driven by `pose.tracking_ok` /
       `pose.inertial_dr` — RED `⚠ TRACKING LOST` (no inertial fallback) vs AMBER
@@ -809,7 +862,12 @@ clobber each other, and `imu_camera/device/camera_calib_store.py`
       (`ui/calib`), and writes a reader-compatible `calib.json` with a live
       `calib_check` PASS/WARN/FAIL verdict — this *re-derives* a calibration (the
       check tool above only *validates* one). cv2 stays lazy → flight path cv2-free
-- [ ] Port to RPi5
+- [~] Port to RPi5 — deploy-prep done: the flight runtime is **cv2-free + Qt-free**
+      (`requirements-flight.txt`, no OpenCV/PyQt6), the RPi5 setup + runbook is in
+      [docs/RPI5_DEPLOY.md](docs/RPI5_DEPLOY.md), and a **remote UI over WiFi**
+      (`netbridge` — Pi flight stack → Mac UI, `--forward` / `run-ui-remote.sh`) is
+      shipped and gated. **Real-Pi (on-board) validation is still pending** — not yet
+      run end-to-end on actual Pi hardware
 - [ ] `skyslam` Python package (replace Basalt + RTABMap)
 
 ## Long-term
