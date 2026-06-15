@@ -36,6 +36,8 @@ Two independent things are proven:
 | `vio_oracle_runner.py` | CLI mirror of `ours/tools/vio_run.py` (`--session`/`--backend`/`--max-frames`/`--all`) driving the oracle. Prints the same ATE block. |
 | `oracle_replay_selftest.py` | Byte-parity gate: for each baseline entry, asserts new-oracle == baseline within `TOL_MM=1e-6` mm AND bit-for-bit == the LIVE old oracle (`ours.tools.vio_run.score_session`). Fails loudly with the exact gap. |
 | `ipc_comms_selftest.py` | Cross-project `comms` parity: dir-diff of all 5 copies, 5-copy codec sha256 digest + cross-decode, `SharedArrayRing` round-trip, full bridge round-trip over a real Unix socket. |
+| `netbridge_loopback_selftest.py` | netbridge Pi->Mac TCP bridge gate (two-hop over 127.0.0.1 with a FAKE producer that pre-creates rings @54x42): image 0x09->0x08->0x09 bit-identity through both ring sets, POD bit-identity, retained-calib replay to a late subscriber, authkey enforcement, offscreen `ui.main` smoke. Sets `OAKD_NETBRIDGE_KEY`. |
+| `netbridge_live_replay_selftest.py` | netbridge gate against the **REAL launcher** (`launcher.main --no-ui --direct [--vl53l9cx] --forward`, replay -- no device): spawns the actual capture+vio+slam+`netbridge.forward` pipeline, runs `netbridge.receive` + a headless subscriber, and asserts pose.odom / frame.depth / imucam.sample / slam.map all cross at the RIGHT shape for BOTH the 54x42 ToF (`--vl53l9cx`) and 640x400 full-res ring paths, plus a clean teardown (launcher rc=0, no leftover sockets) and an offscreen `ui.main` smoke. The regression for the forward crash the loopback's pre-created rings hid: calib-driven ToF ring sizing + async (retried) ring attach. Sets `OAKD_NETBRIDGE_KEY`. |
 | `loose_vs_tight_bench.py` | LOOSE-vs-TIGHT ATE benchmark over the gold suite at full-res + 54x42 ToF (read-only; imports the frozen math + scoring). |
 | `direct_vo_bench.py` | **Research harness** (Stage-1 hypothesis test + Stage-2a IMU seed + Stage-2b geo term & divergence guard). Frame-to-keyframe DENSE DIRECT RGB-D VO (`sky.front.direct`) over the gold suite at 54x42 ToF, scored with the SAME columns as `loose_vs_tight_bench` and printed SIDE-BY-SIDE with the measured sparse baseline. Tests whether dense direct + accurate ToF depth fixes the sparse VIO's scale collapse @ 54x42. `--seed {none,gyro,imu}` picks the Gauss-Newton `init_T`: `gyro` (Stage-1, rotation prior only) or `imu` (Stage-2a, full 6-DoF IMU dead-reckoned seed via `sky.vio.imu.predict_state` + `complementary_correct`). **Stage-2b** (with `--seed imu`): `--geo-weight` fuses a point-to-plane geometric term into the GN solve (`E=E_photo+w·E_geo`), and a divergence guard (`--vo-imu-ratio`, `--diverge-step-ratio`, `--diverge-rmse-grow`) rejects a diverged frame's VO pose, falls back to the IMU dead-reckon, and protects the seed velocity (reports `rej%`). Closes the `quick_motion` divergence (344→27 cm); ablation shows the GUARD is the lever, the geo term is ~inert at 54x42. Read-only; touches no frozen path -> oracle stays gap=0. |
 
@@ -53,6 +55,10 @@ cd /Users/bao/skydev/oak-d
 
 # 3) 5-copy comms + codec parity + ring + bridge round-trip
 .venv/bin/python verification/ipc_comms_selftest.py
+
+# 4) netbridge TCP bridge (loopback two-hop + real-launcher replay e2e)
+OAKD_NETBRIDGE_KEY=test .venv/bin/python verification/netbridge_loopback_selftest.py
+OAKD_NETBRIDGE_KEY=test .venv/bin/python verification/netbridge_live_replay_selftest.py
 ```
 
 `oracle_replay_selftest.py` accepts `--no-live-old` to skip importing `ours`

@@ -236,10 +236,62 @@ def _is_end(msg) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+def _await_calib_bundle(endpoint: str, timeout_s: float):
+    """Block until capture's retained ``calib.bundle`` arrives; return it.
+
+    The bundle carries the ACTUAL grid (54x42 under ``--vl53l9cx``, else full res),
+    so the forwarder attaches its Pi-side rings at the resolution capture REALLY
+    created -- NOT the raw ``--width``/``--height`` the launcher passes (too large
+    under ToF -> ``buffer is too small for requested array``). Mirrors
+    ``vio.main._await_calib_bundle`` / ``receive.py``'s calib-driven sizing.
+    """
+    box: list = [None]
+    got = threading.Event()
+
+    def _on(wm) -> None:
+        box[0] = wm
+        got.set()
+
+    client = IPCPubSub(endpoint, role="client", connect_timeout_s=timeout_s)
+    client.subscribe("calib.bundle", _on)
+    client.start()
+    try:
+        if not got.wait(timeout=timeout_s):
+            raise TimeoutError(
+                f"forward: no calib.bundle from {endpoint!r} in {timeout_s}s")
+    finally:
+        client.stop()
+    assert box[0] is not None
+    return box[0]
+
+
+def _attach_all_retry(specs, timeout_s: float, label: str) -> "RingRegistry":
+    """Attach a ring set, RETRYING while the producer is still creating it.
+
+    The rings the forwarders read are created by SEPARATE processes (capture /
+    vio) that boot CONCURRENTLY with this forwarder -- e.g. vio allocates its
+    ``kf_gray``/``kf_depth`` rings only after it has come up and awaited capture's
+    calib, which is AFTER this forwarder gets capture's calib and races ahead. So
+    a ring can legitimately not exist the instant we attach. Retry on
+    FileNotFoundError until the producer has created it (or the timeout -> a clear
+    error, not a startup-race crash). The loopback selftest pre-creates every ring
+    so it never exercised this; the real launcher does.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            return RingRegistry().attach_all(specs)
+        except FileNotFoundError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.2)
+
+
 def run_forward(*, host: str, port: int,
                 capture_endpoint: str, vio_endpoint: str, slam_endpoint: str,
                 width: int, height: int, slots: int = 64,
                 connect_timeout_s: float = 30.0,
+                calib_timeout_s: float = 60.0,
                 ready_event: threading.Event | None = None,
                 stop_event: threading.Event | None = None) -> None:
     """Start the TCP server + the three endpoint forwarders; block until SIGTERM.
@@ -252,13 +304,26 @@ def run_forward(*, host: str, port: int,
     installed) stop it cleanly; when ``None`` a fresh event is used and SIGTERM /
     Ctrl-C drive the teardown.
     """
-    # Pi-side rings the forwarders attach to (consumer side -- capture/vio own them).
-    cap_rings = RingRegistry().attach_all(
+    # The launcher passes the RAW camera res, but under --vl53l9cx capture creates
+    # its rings at the ToF grid (54x42). Await capture's retained calib.bundle (the
+    # source of truth for the actual grid) and attach at THAT res -- else attach_all
+    # sees a too-small shm buffer ("buffer is too small for requested array").
+    bundle = _await_calib_bundle(capture_endpoint, calib_timeout_s)
+    width, height = int(bundle.width), int(bundle.height)
+    LOG.info("forward: calib received (%dx%d) -> attaching Pi rings at that res",
+             width, height)
+
+    # Pi-side rings the forwarders attach to (consumer side -- capture/vio own
+    # them). Retry: capture/vio create these asynchronously as they boot, so a
+    # ring (esp. vio's kf_gray/kf_depth) may not exist the instant we attach.
+    cap_rings = _attach_all_retry(
         default_capture_specs(endpoint=capture_endpoint,
-                              width=width, height=height, slots=slots))
-    vio_rings = RingRegistry().attach_all(
+                              width=width, height=height, slots=slots),
+        calib_timeout_s, "capture")
+    vio_rings = _attach_all_retry(
         default_vio_specs(endpoint=vio_endpoint,
-                          width=width, height=height, slots=slots))
+                          width=width, height=height, slots=slots),
+        calib_timeout_s, "vio")
     # SLAM owns no rings (all its forwarded topics are POD), so an empty registry.
     slam_rings = RingRegistry()
 
