@@ -34,6 +34,32 @@ def ba_step(ba_map, snap: Any):
     return ba_map.run_ba()                    # refined latest T_cw, or None
 
 
+#: Health fields lifted from ``WindowedVIOMap.last_info`` onto the published pose.
+#: ``vio_degraded`` is the load-bearing one (the divergence guard fired this
+#: keyframe -> a detected fault the FC must see); the reprojection error + window
+#: jump are the two diagnostics behind that decision. All are plain scalars so the
+#: tuple crosses the subprocess pickle boundary cleanly (see ``run_ba``).
+_VIO_HEALTH_KEYS = ("vio_degraded", "vio_reproj_px", "vio_window_jump_m")
+
+
+def _vio_health(vio_map) -> dict:
+    """Extract the picklable tight-VIO health fields from ``last_info``.
+
+    Casts ``vio_degraded`` to ``bool`` and the diagnostics to ``float`` so the
+    returned dict holds ONLY plain Python scalars (no numpy types / objects) --
+    the subprocess engine pickles this across the process boundary, and the FC
+    info consumer wants stable scalar types. A key absent from ``last_info`` is
+    simply omitted (e.g. the guard was off / no jump computed).
+    """
+    src = getattr(vio_map, "last_info", None) or {}
+    info: dict = {}
+    for k in _VIO_HEALTH_KEYS:
+        if k not in src:
+            continue
+        info[k] = bool(src[k]) if k == "vio_degraded" else float(src[k])
+    return info
+
+
 def vio_step(vio_map, snap: Any):
     """One tight-coupled VIO keyframe: add the track snapshot + IMU block, solve.
 
@@ -45,15 +71,26 @@ def vio_step(vio_map, snap: Any):
         ``snap`` = ``(T_cw, ids, pts, depth_m, ts_ns, imu_seg)``
 
     where ``imu_seg`` is ``(ts_ns, gyro_cam, accel_cam)`` in the camera optical
-    frame (or ``None`` -> the map slices its stored stream, empty live). Returns
-    the refined latest ``T_cw`` (``4x4``) or ``None`` when the window has not yet
-    enough structure / IMU to optimise.
+    frame (or ``None`` -> the map slices its stored stream, empty live).
+
+    Returns ``(T_cw, health)`` -- the refined latest ``T_cw`` (``4x4``) PLUS the
+    tight health fields the map stamped on ``last_info`` (at least
+    ``vio_degraded``; see :func:`_vio_health`) -- or ``None`` when the window has
+    not yet enough structure / IMU to optimise. The health dict is what carries
+    the divergence-guard verdict end-to-end to the published pose / FC; without
+    it ``vio_degraded`` would be computed at the map and DROPPED at this boundary
+    (a detected fault with no consumer). The loose :func:`ba_step` deliberately
+    returns the bare ``T_cw`` (no tuple), so the loose published pose info is
+    untouched.
     """
     T_cw, ids, pts, depth_m, ts_ns, imu_seg = snap
     if ids is None or pts is None:
         return None
     vio_map.add_keyframe(T_cw, ids, pts, depth_m, ts_ns, imu_seg=imu_seg)
-    return vio_map.run_ba()                    # refined latest T_cw, or None
+    T_cw = vio_map.run_ba()                     # refined latest T_cw, or None
+    if T_cw is None:
+        return None
+    return (T_cw, _vio_health(vio_map))
 
 
 # --------------------------------------------------------------------------- #

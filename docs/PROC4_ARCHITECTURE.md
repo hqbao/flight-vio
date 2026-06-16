@@ -761,6 +761,25 @@ BA/SLAM solves **in-process** and SLAM stays responsive via its latest-only inbo
 (§5.3) — no worker subprocess, no `resource_tracker` noise. Passing `--worker`
 propagates `--worker` to both the vio and slam children.
 
+**Process-parallelism → the bottleneck is the busiest PROCESS, not the serial sum.**
+Because capture / vio / slam are separate `Popen` processes, the achievable frame
+rate is `1000 / (busiest process ms/frame)`, not the sum of all stages. On the Pi5
+(loose 320×200) the vio process is the wall — frontend KLT+PnP (~29 ms after the
+KLT pyramid-reuse change) + IMU (~1 ms) — while capture's SGM (~9 ms) and, under
+`--worker`, the BA solve run concurrently. The bursty windowed BA (~48 ms/keyframe)
+is precisely why `deploy/pi-run.sh` defaults `--worker` ON: in-thread it shares the
+vio core and adds an ~80 ms 1-in-5 hitch. Full per-stage numbers:
+`verification/STAGE_PROFILE_RESULTS.md` (harness `verification/stage_profile.py`).
+
+**`--cap-numba-threads` (opt-in, default off; on under `pi-run.sh`).** Each process
+otherwise spins a numba pool of all cores, so an overlapping SGM (capture) + KLT
+(vio) burst puts ~2× the core count of runnable threads on a small SBC →
+oversubscription thrash. The flag pins `NUMBA_NUM_THREADS` per process, derived
+from `os.cpu_count()` by `_numba_thread_caps` (`launcher/main.py`) and applied at
+the `_spawn` sites via `_role_env`: on the 4-core Pi5 **capture=2, vio=2, slam=1**.
+A user-set `NUMBA_NUM_THREADS` in the environment always wins. It changes no math —
+the oracle stays `gap=0`.
+
 `run.sh` forwards to `python -m launcher.main --auto-suffix "$@"`:
 - `./run.sh ...` — the live 4-process pipeline (default).
 - `./run.sh --proc ...` — explicit alias for the same pipeline (the flag is stripped).
@@ -840,9 +859,10 @@ corrupting the UI.
 
 **TCP transport (`netbridge.tcp_transport`).** The network analogue of `IPCPubSub`:
 `TcpServer` / `TcpClient` over AF_INET with an **HMAC authkey**
-(`OAKD_NETBRIDGE_KEY`, **required** — refuses to start if unset; it authenticates
-the peer but does NOT encrypt — built for a trusted LAN, tunnel via Wireguard / `ssh
--L` otherwise), a `_BYE` sentinel, and retained-topic replay on connect.
+(`OAKD_NETBRIDGE_KEY` if set, else a built-in public `DEFAULT_AUTHKEY` so the bridge
+connects with zero setup on a trusted LAN — `resolve_authkey`; it authenticates the
+peer but does NOT encrypt — tunnel via Wireguard / `ssh -L` on an untrusted net), a
+`_BYE` sentinel, and retained-topic replay on connect.
 
 **Mac-side `receive` — re-serve unchanged.** `codec.decode` (all 0x08) → local
 dataclass → a standard `comms.bridge.IPCPublisher` writes the arrays back into
@@ -860,6 +880,16 @@ back-pressures capture/vio/slam (the flight stack is never throttled by the link
 POD + retained config (`calib.bundle` / `calib.stereo` / `vio.map`) forward
 **reliably** (a one-shot calib or a pose is never silently dropped); retained topics
 are cached by the server and replayed to a late-joining UI.
+
+**Pose-only by default (low-bandwidth).** The bridge defaults to **pose-only**:
+`all_topics(role, include_images=False)` omits the four shm-backed image topics, so
+only the small POD + retained topics cross the wire. The launcher appends
+`--pose-only` to `forward` unless `--bridge-frames`, and `deploy/pi-ui.sh` mirrors it
+on `receive` (both ends must match). This exists because the uncompressed frames
+(~51 Mbit/s at 320×200) the main trajectory + map UI never displays would saturate a
+congested 2.4 GHz link (~1.6 Mbit/s); see [`docs/RPI5_DEPLOY.md` §3c](RPI5_DEPLOY.md)
+for the measured A/B. `--frames` (both ends) opts back into the image topics for the
+camera Visualize windows.
 
 **Frame path is off-bridge.** The FC-output pose path (`--no-ui`
 `_start_pose_logger`, §7) is a separate read-only consumer on the **local** vio
@@ -1011,6 +1041,30 @@ proven (see [`verification/README.md`](../verification/README.md)):
     (`vio/tests/tight_live_regression_selftest.py`, which proves it is a no-op until a
     loop closes) and proven on real data
     (`vio/tests/closed_loop_drift_selftest.py`, ~50 % revisit-drift reduction).
+18. **The tight divergence guard is an ALWAYS-ON flight invariant; `vio_degraded`
+    flows to `pose.refined.info`; the FC consumer is a PENDING gap.** On the
+    `--tight` path the LM window solve can converge into a divergent basin on a
+    bad/blurred frame (a metres-scale one-window pose jump). `WindowedVIOConfig.
+    divergence_guard` (default True, `sky/vio/window.py`) detects that AFTER the solve
+    (post-solve mean reproj > `max_reproj_px=20`, or a reproj-gated jump vs the IMU
+    forward-prediction), REJECTS the window mutation, falls the latest keyframe back to
+    a bounded pose (IMU dead-reckon if it agrees with the frontend seed within a 5 m/s
+    travel bound, else the frontend seed), and does NOT re-anchor the live VO frontend
+    (`self.vo.pose`) on a rejected solve — so one transient fault cannot persistently
+    poison tracking. It is a **pure addition**: a well-conditioned session is
+    bit-identical to the pre-guard solve, and the loose / oracle path never constructs a
+    `WindowedVIOConfig`, so byte-parity stays `gap = 0`. **This guard MUST stay ON on a
+    flight build** (the njit IMU-Jacobian kernel is validated only with it on; see
+    `docs/TIGHT_COUPLED_PLAN.md` §4i–4j). The guard raises `vio_degraded=True` (+
+    `vio_reproj_px` / `vio_window_jump_m` diagnostics), which `vio_step` returns as
+    `(T_cw, health)` and `vio/modules/backend.py::run_ba` merges into the published
+    `pose.refined` `PoseMsg.info`, next to `refined` and the `pos_sigma_m`
+    position-noise field. **PENDING (known gap):** the FC consumer of
+    `pose.refined.info['vio_degraded']` (hook `launcher/main.py::_start_pose_logger
+    ._on_pose`) is NOT wired — the FC link itself is a separate, unbuilt item. The guard
+    makes `--tight` **bounded but NOT yet FC-pose-trustworthy**: until the FC consumes
+    `vio_degraded` (→ `pos_sigma_m` inflation / loiter-RTH on sustained degraded), do
+    NOT use `--tight` as an FC pose source.
 
 ## 10. The split (history)
 

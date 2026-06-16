@@ -94,32 +94,21 @@ def _make_problem(seed: int = 0):
 
 
 def _system(args, cfg):
-    """Build (H, b, cost0) by invoking optimize_vio's internals at the input
-    state. We re-expose build_system/total_cost via running optimize_vio with
-    max_iters=0 (no step taken) and a side-channel: optimize_vio doesn't return
-    H/b, so we reconstruct them by importing the module's functions.
-
-    Simpler: monkeypatch is overkill. We capture the FIRST LM linear solve's
-    (A, b): optimize_vio builds H/b as nested closures and solves ``A delta =
-    -b`` with ``np.linalg.solve``; with init_lambda=0 the first A == H exactly.
+    """Build (H, b, cost0) at the input state via the optimiser's ``_solve_probe``
+    hook. The hook receives the FULL damped (A, b) on every inner LM solve --
+    independent of the Schur-complement fast path -- so the captured matrix is the
+    full ndim assembled system. With ``init_lambda=0`` the first A == H exactly.
     """
     captured = {}
-    orig_solve = np.linalg.solve
 
-    def _capture_solve(A, mb):
-        # On the FIRST LM linear solve, A = H + lam*diag(H_diag), b stored as -mb.
+    def _probe(A, b, _delta):
         if "b" not in captured:
-            captured["b"] = -np.asarray(mb).copy()
+            captured["b"] = np.asarray(b).copy()
             captured["A"] = np.asarray(A).copy()
-        return orig_solve(A, mb)
 
-    np.linalg.solve = _capture_solve
-    try:
-        cfg0 = replace(cfg, max_iters=1, init_lambda=0.0)
-        res = optimize_vio(*args[:6], args[6], args[7], cfg=cfg0, anchor=0)
-    finally:
-        np.linalg.solve = orig_solve
-    # With init_lambda=0, A == H exactly on the first solve.
+    cfg0 = replace(cfg, max_iters=1, init_lambda=0.0)
+    res = optimize_vio(*args[:6], args[6], args[7], cfg=cfg0, anchor=0,
+                       _solve_probe=_probe)
     return captured["A"], captured["b"], res.cost0
 
 
@@ -229,6 +218,59 @@ def main() -> int:
     print(f"[{'ok' if zupt_ok else 'FAIL'}] ZUPT analytic H/b/cost "
           f"max|dH|={eHz:.2e} max|db|={ebz:.2e} cost_err={ecz:.2e}")
     ok = ok and zupt_ok
+
+    # ---- 5. absolute-velocity GAUGE anchor (vel_abs_prior) -------------- #
+    # The anchor is gated on the tight marker imu_info_weight, so build a tight
+    # baseline (info-weighted, anchor OFF) and a tight+anchor build, and compare
+    # ONLY the velocity-block H/b delta against the analytic absolute prior. The
+    # anchor adds, per KF ci, J^T J = I/sigma_vabs^2 on H[vel_ci, vel_ci] and
+    # J^T r = (v_ci - v_pred_ci)/sigma_vabs^2 on b[vel_ci], with v_pred from the
+    # inbound IMU prediction (KF1) or the KF's own velocity (anchor KF0 -> r==0).
+    sva = 1.2
+    base_iw = replace(base, imu_info_weight=True, vel_abs_prior=False, tau_nav=0.0)
+    cfg_va = replace(base_iw, vel_abs_prior=True, sigma_vabs=sva)
+    H_iw, b_iw, c_iw = _system(args, base_iw)
+    H_va, b_va, c_va = _system(args, cfg_va)
+    dHva = H_va - H_iw
+    dbva = b_va - b_iw
+    inv_va = 1.0 / (sva * sva)
+    pre = imu_factors[0][2]
+    _dR, dv_pre, _dp = pre.corrected(st.bg[0], st.ba[0])
+    v_pred1 = st.v[0] + g_world * pre.dt + st.R[0] @ dv_pre   # inbound to KF1
+    v_pred0 = st.v[0]                                          # anchor -> self
+    exp_Hva = np.zeros_like(dHva)
+    exp_Hva[v0c:v0c + 3, v0c:v0c + 3] += I3 * inv_va
+    exp_Hva[v1c:v1c + 3, v1c:v1c + 3] += I3 * inv_va
+    exp_bva = np.zeros_like(dbva)
+    exp_bva[v0c:v0c + 3] += (st.v[0] - v_pred0) * inv_va      # == 0 at anchor
+    exp_bva[v1c:v1c + 3] += (st.v[1] - v_pred1) * inv_va
+    eHva = float(np.max(np.abs(dHva - exp_Hva)))
+    ebva = float(np.max(np.abs(dbva - exp_bva)))
+    exp_cva = 0.5 * float(((st.v[0] - v_pred0) / sva) @ ((st.v[0] - v_pred0) / sva)
+                          + ((st.v[1] - v_pred1) / sva) @ ((st.v[1] - v_pred1) / sva))
+    ecva = abs((c_va - c_iw) - exp_cva)
+    # Tolerance floor: the delta subtracts two info-weighted IMU builds whose H/b
+    # blocks are ~1e7 in magnitude, so the analytic anchor delta is recovered only
+    # to ~1e7 * eps ~ 1e-9 (the anchor block itself is exact; the noise is in the
+    # large-magnitude baseline subtraction, not the prior).
+    vabs_ok = eHva < 1e-8 and ebva < 1e-8 and ecva < 1e-8
+    print(f"[{'ok' if vabs_ok else 'FAIL'}] vel_abs_prior analytic H/b/cost "
+          f"max|dH|={eHva:.2e} max|db|={ebva:.2e} cost_err={ecva:.2e}")
+    ok = ok and vabs_ok
+
+    # ---- 6. tight OFF-anchor path unchanged by the new defaults --------- #
+    # With imu_info_weight=False (loose / oracle marker) the anchor + tau_nav are
+    # NEVER assembled even though their cfg defaults are ON -- the gate is the
+    # tight marker, so the default loose build is byte-identical to a build with
+    # the new fields explicitly disabled.
+    off_default = replace(base)                              # vel_abs_prior=True default
+    off_disabled = replace(base, vel_abs_prior=False, tau_nav=0.0)
+    Ha, ba_, ca = _system(args, off_default)
+    Hb, bb, cb = _system(args, off_disabled)
+    gate_ok = (np.array_equal(Ha, Hb) and np.array_equal(ba_, bb) and ca == cb)
+    print(f"[{'ok' if gate_ok else 'FAIL'}] loose marker gate "
+          f"(vel_abs_prior/tau_nav inert when imu_info_weight=False)")
+    ok = ok and gate_ok
 
     print("\n" + ("PASS -- all Phase-4 velocity-prior unit checks hold."
                   if ok else "FAIL -- see flagged checks above."))

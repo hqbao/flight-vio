@@ -151,6 +151,17 @@ its own `depth.main` harness (see [depth/README.md](depth/README.md)).
   54×42, where features are starved by design. Both are **OPT-IN** (default = the
   loose sparse path); the offline/oracle path never sees `--direct`, so byte-parity
   stays `gap = 0`.
+- **`--tight` — the tight-coupled VIO backend (opt-in).** Swaps the loose
+  gyro-fusion BA for a Basalt-style joint window solve (pose + velocity + bias +
+  landmarks with true IMU preintegration factors). Its LM solve carries a four-link
+  optimisation chain, all ON by default inside `--tight`: an exact **landmark Schur
+  complement**, an **absolute-velocity gauge regulariser** (fixes the rank-3
+  null-space round-off chaos that made the old tight solve explode on shake), an
+  always-on **divergence guard** (bounds a diverged keyframe and raises a
+  `vio_degraded` health flag), and an **njit IMU-Jacobian kernel** (coupled to the
+  guard; `SKY_VIO_IMU_NJIT=0` to force pure-Python). Loose is the default and the
+  recommended Pi flight path; `--tight` is still slower than loose. Details in
+  [docs/TIGHT_COUPLED_PLAN.md](docs/TIGHT_COUPLED_PLAN.md) §4(g–j).
 - **`--no-ui` — the Pi / FC path.** Runs capture + vio + slam headless (once, no
   Restart loop) and starts a read-only pose logger on the VIO endpoint that prints
   the **raw pose** (position + quaternion in the gravity-aligned WORLD frame; the FC

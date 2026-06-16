@@ -156,7 +156,9 @@ def run_tight_smoke(session_dir: Path, max_frames: int = 0,
             T_cw = np.linalg.inv(tight_pose)
             # THE --tight snapshot: 6-tuple consumed by vio_step.
             engine.submit((T_cw, ids, px, f.depth_m, int(f.ts_ns), imu_seg))
-            post = engine.poll()                    # refined latest T_cw or None
+            post = engine.poll()                    # (T_cw, health) or None
+            if isinstance(post, tuple):              # tight: vio_step returns a tuple
+                post, _health = post
             if post is not None:
                 tight_pose = np.linalg.inv(post)
                 tight_fe.pose = tight_pose.copy()

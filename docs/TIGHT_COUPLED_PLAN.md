@@ -660,11 +660,253 @@ needs the accurate per-pixel **VL53 ToF** depth (see `oakd-vl53-tof-pivot`), whe
 dense clouds are trustworthy. The module + factor are kept, gap=0-safe, ready to
 re-evaluate on real ToF.
 
+#### Phase 4(g–j) — tight-solve optimisation chain (DONE 2026-06-16)
+
+A four-link chain on the `--tight` LM solve: **Schur complement** (speed),
+**gauge regularisation** (the real fix for the long-standing "tight explodes on
+shake"), **divergence guard** (a bounded-output safety net), and the **njit IMU
+Jacobian kernel** (speed, coupled to the guard). All four live on the tight path
+only; the loose / oracle build never assembles them, so byte-parity stays
+`gap = 0` (the two `backend="vio"` oracle entries were re-baselined against the
+new exact/intended tight solve). Within `--tight` all four are **ON by default**.
+
+The `run_ba` solve→detect→accept/reject flow:
+
+```mermaid
+stateDiagram-v2
+    direction TB
+    state Detect <<choice>>
+    state Fallback <<choice>>
+
+    [*] --> Seed: add_keyframe (frontend visual pose + IMU edge)
+    Seed --> Predict: capture IMU forward-prediction (R_pred, p_pred) of latest KF
+    Predict --> Solve: optimize_vio LM (Schur + gauge reg + njit)
+    Solve --> Detect: post-solve check (guard ON)
+
+    Detect --> Accept: within bounds
+    Detect --> Reject: mean_reproj > 20px OR (window_jump > bound AND reproj > 15px)
+
+    Accept --> PubOK: write refined poses/vel/bias/landmarks, re-anchor self.vo.pose
+    PubOK --> [*]: publish refined T_cw (vio_degraded = False)
+
+    Reject --> Fallback: reject window mutation (do NOT poison self.vo.pose)
+    Fallback --> DeadReckon: abs(p_pred - p_vis) <= 5 m/s * dt (IMU agrees with seed)
+    Fallback --> FrontendSeed: else (runaway velocity)
+    DeadReckon --> PubDeg
+    FrontendSeed --> PubDeg
+    PubDeg --> [*]: publish bounded T_cw (vio_degraded = True)
+```
+
+##### 4(g) — Schur complement on the tight LM dense solve
+
+**Before.** `optimize_vio` solved the FULL damped normal equations with a dense
+`np.linalg.solve` (`ndim ≈ 993` at a typical window: nav block + `3·M`
+landmarks), scaling `O(ndim³)`. The module docstring (`sky/vio/window.py` ~29–31)
+had flagged Schur as the planned optimisation; this delivers it.
+
+**Now.** The state is laid out **nav-first / landmark-last** (`optimize_vio`
+column layout, `nav_dim` contiguous then `3·M`), and the landmark Hessian block
+`All` is **block-diagonal** (3×3 per landmark — each landmark only sees its own
+reprojection/depth rows). Marginalising it gives the algebraically EXACT same
+`δ` from a reduced **nav-only** solve (`~114`):
+
+```
+[[App, Apl],[Apl.T, All]] [dp; dl] = -[gp; gl]
+  S  = App − Apl All⁻¹ Apl.T        (Schur reduced, ~nav_dim)
+  rp = gp  − Apl All⁻¹ gl
+  dp = solve(S, -rp)                 (small system)
+  dl = All⁻¹ (-gl − Apl.T dp)        (back-substitution)
+```
+
+`All⁻¹` is a batched `(M,3,3)` host-LAPACK inverse — never a dense `3M×3M`
+inverse. The reduced coupling `Apl All⁻¹ Apl.T` is formed by a **per-landmark
+scatter** (`_schur_solve`): each landmark `l` couples only to its observers' pose
+columns `k_l` (captured once at build time in `lm_nav_cols`), so its contribution
+is a tiny `(k_l × k_l)` outer product scattered into `S` — `O(Σ_l k_l²)` instead
+of `O(nav_dim² · M)`. 100% NumPy/LAPACK (scipy-free). The dense-einsum form
+`_schur_reduce_dense` is kept as the algebraic reference.
+
+**Gating.** Schur is taken only when IMU factors are present AND `M > 0`
+(`use_schur` in `optimize_vio`) — i.e. the tight VIO solve. The loose / oracle BA
+path uses `sky.backend.windowed` and never calls `optimize_vio`.
+
+**Code.** `sky/vio/window.py` `_schur_partition`, `_schur_reduce_dense`,
+`_schur_solve`; `use_schur` gate in `optimize_vio`'s LM loop.
+
+**Verification.** `vio/tests/schur_equiv_selftest.py` — the scatter reduction is
+compared against BOTH the dense Schur reference and the full
+`np.linalg.solve(A, -b)` on EVERY inner LM damping-retry solve, across 4 tight
+configs (loose-sigma / tilt-lock / covariance-weighted / tilt+infowt+ZUPT+CV).
+**PASS:** worst gap `max|δ_scatter − δ_dense| ≈ 1.7e-14` (observed up to
+`2.4e-14` over 35 inner solves) — algebraically exact to round-off, far below the
+`1e-9` gate. Measured ~1.4–1.8× on the Pi.
+
+##### 4(h) — Absolute-velocity gauge regularisation (the rank fix)
+
+**Root cause (the long-standing "tight explodes on shake").** The lone IMU
+velocity residual `r_v = R_iᵀ(v_j − v_i − g·dt) − dv` is a pure **difference
+operator**: `∂r_v/∂v_i = −R_iᵀ`, `∂r_v/∂v_j = +R_iᵀ`, so the IMU factor carries
+**zero absolute-velocity information** — the NAV information matrix has a **rank-3
+null space** in absolute velocity (eigenvalues ~3e-17). The LM **relative**
+damping `lam·diag(H)` floors that null direction only by a machine-eps-scale
+value, so a ~1e-11 round-off perturbation of `H/b` divides by `~(lam·diag) ~ 1e-6`
+and is amplified ~1.9e6× → the converged basin flips (round-off **chaos**; this is
+why njit-vs-pure used to diverge ~603 mm on shake). It is a **gauge** defect, not
+a physics one.
+
+**Fix (two paired terms, tight-only, default ON).**
+- **(A) Absolute-velocity prior** (`VioConfig.vel_abs_prior=True`, `sigma_vabs=
+  1.0` m/s): a weak absolute prior on EVERY keyframe, toward the IMU
+  forward-prediction (NOT zero, so it never suppresses a real manoeuvre):
+  `r_vabs = (v_i − v_pred_i)/σ_vabs` (3 rows/KF). `v_pred_i = v_{i−1} + g·dt +
+  R_{i−1}·dv_pre` is the inbound-edge forward-prediction, treated as a CONSTANT
+  pseudo-measurement recomputed each iteration, so the Jacobian is the simple
+  absolute self-term `∂r_vabs/∂v_i = I/σ_vabs`. The anchor keyframe (no inbound
+  edge) is pinned toward its own current velocity (a prior at the linearisation
+  point). UNLIKE the excitation-gated ZUPT this is **un-gated** — it must stay ON
+  during shake (exactly when ZUPT turns off). This is the standard VINS/Basalt
+  velocity **gauge anchor**.
+- **(B) Absolute Tikhonov floor on the nav block** (`tau_nav=1e-3`): `A = H +
+  lam·diag(H) + τ_nav·I_nav` — identity on the first `nav_dim` (pose+vel+bg+ba)
+  columns, ZERO on landmark columns (so the block-diagonal landmark Schur
+  structure is untouched; it is added to the full damped `A` BEFORE Schur
+  partitioning, so the exact Schur path consumes it unchanged). It caps the
+  round-off amplification at `~b/τ_nav` regardless of `lam`.
+- The LM damping floor was raised `min_lambda` 1e-9 → **1e-6** as the third half
+  of the same regulariser: at 1e-9 the relative damping on the pinned
+  low-curvature nav directions decayed to a machine-eps floor; 1e-6·diag(H) keeps
+  the step bounded near convergence without biasing the well-conditioned solution.
+
+**Why it invents no information (math-reviewer APPROVED).** The prior pulls toward
+the IMU prediction, not zero, and `σ_vabs = 1.0` is ~400× weaker than the IMU
+velocity tie, so it drags a real manoeuvre only ~2 mm/s — it pins the genuinely
+free gauge without fighting the IMU/vision solution.
+
+**Code.** `sky/vio/window.py`: `VioConfig.vel_abs_prior` / `sigma_vabs` /
+`tau_nav` / `min_lambda`; `_v_pred_inbound`; the `vabs_on` pre-pass + the
+analytic `I/σ_vabs²` block in `build_system`; `use_tau_nav` in the LM loop.
+
+**Verification.** Nav block `lam_min` restored **−6.45e-9 (rank-3 null) →
++7.59e-3 (full rank)**. Fixed the `lab_straight` / `quick_motion` round-off chaos
+with **no accuracy regression** on the well-conditioned sessions (re-baselined
+tight ATE unchanged to fp noise).
+
+##### 4(i) — Divergence guard (SAFETY, default ON)
+
+**Problem.** The LM window solve accepts ANY step that lowers the cost — no
+step-magnitude bound, no reprojection ceiling, no output sanity check. On a
+bad/blurred frame it can converge into a DIVERGENT basin — a one-window pose jump
+of metres (observed 4.5 m on `push_shake` ~seq95, mean reproj 71–91 px) — and
+`run_ba` would return that pose uncaught, poisoning BOTH the published pose AND
+the live VO frontend (`self.vo.pose`).
+
+**Detect (`WindowedVIOConfig`, two trip signals — EITHER rejects the window).**
+- **(a) PRIMARY: post-solve mean reprojection > `max_reproj_px=20`.** Reproj
+  directly measures whether the visual solve FIT its own measurements, and it
+  cleanly separates divergence (40+ px) from every healthy gold session (≤9.4 px)
+  → a single ceiling catches shake with ZERO false positives.
+- **(b) SECONDARY: refined latest-KF position vs the IMU forward-prediction jumps
+  by more than `max_window_jump_m=1.0` + `jump_margin_frac·|IMU displacement|`,
+  AND the solve is also visually questionable (reproj > `jump_reproj_floor_px=
+  15`).** The reproj gate on (b) is essential: when the velocity/bias estimate
+  drifts, the IMU PREDICTION itself drifts away from a perfectly good visual solve
+  (e.g. `push_fwdback` fires a 1.8→10.5 m predicted-vs-refined gap while reproj
+  stays 1–9 px); rejecting that would swap a good pose for a worse dead-reckon. A
+  genuine divergence trips BOTH together (shake).
+
+**Reject + bounded fallback.** On divergence the guard does NOT write the solver
+output back to the live keyframes/landmarks (the window stays at its pre-solve
+seed, so the NEXT solve starts clean). The latest keyframe falls back to the IMU
+dead-reckon ONLY when it AGREES with the bounded frontend visual seed to within
+`max_deadreckon_speed_mps=5 · dt` (vision-degraded-but-IMU-trustworthy →
+publish the dead-reckon); a runaway velocity → the dead-reckon disagrees → keep
+the frontend seed, so the published trajectory stays FINITE. The frontend pose
+(`self.vo.pose`) is NOT re-anchored on a rejected solve, so a transient blur
+cannot persistently poison tracking.
+
+**Health flag.** A rejected window raises `vio_degraded=True` on
+`WindowedVIOMap.last_info` (with the `vio_reproj_px` / `vio_window_jump_m`
+diagnostics). See §"Health signal" and the SAFETY note below.
+
+**Code.** `sky/vio/window.py`: `WindowedVIOConfig.divergence_guard` (+ the five
+threshold fields), `_imu_predict_pose`, the detect/reject/fallback block in
+`WindowedVIOMap.run_ba`, and the writeback gate in
+`WindowedVIORGBDOdometry.process`.
+
+**Verification.** `vio/tests/divergence_guard_selftest.py` PASS — rejects + flags
+a diverged keyframe WITHOUT poisoning the frontend, and is a bit-for-bit no-op on
+a healthy solve (published-vs-refined and frontend-vs-refined = 0.0 mm).
+Measured: shake bounded **836 → 83 cm** (no runaway), ZERO false positives on
+well-conditioned sessions.
+
+##### 4(j) — njit IMU-factor Jacobian kernel (default ON, coupled to the guard)
+
+**What.** The per-edge IMU-factor finite-difference Jacobian is ~67–72% of the
+tight solve. `sky/vio/imu_factor_numba.py` reimplements ONLY that hot loop as an
+explicit-array `@njit(cache=True, fastmath=False)` kernel — the SAME FD math
+(same `eps`, same so3 `exp`/`log`, same residual order, same 9×9 `sqrt_info`
+whitening), so `H/b` match the pure-Python build to the fp round-off floor
+(relative ~7e-11). `fastmath=False` is deliberate: the LM loop branches discretely
+on cost, so reassociated float ops would flip an accept/reject. `HAVE_NUMBA=False`
+falls back to pure-Python.
+
+**Default ON, but SAFETY-COUPLED to the guard.** njit-vs-pure was round-off
+divergent (~600 mm on shake) ONLY because the LM accepted a divergent window. With
+the divergence guard (4i) rejecting that window deterministically (regardless of
+njit-vs-pure round-off), the chaos source is gone: the full-session ATE is now
+**EQUAL (0.0 mm) on ALL 12 gold sessions including shake**. So njit-default-ON is
+validated ONLY with the guard ON. The gate (`njit_guard_ok` in `optimize_vio`):
+- `SKY_VIO_IMU_NJIT=0` → force OFF (explicit kill switch, always honoured);
+- guard OFF (`cfg.njit_guard_ok` False, set by `run_ba` from `divergence_guard`)
+  → FORCE-DISABLE the kernel and log why (safety wins even over an explicit `=1`);
+- otherwise DEFAULT ON.
+
+**Code.** `sky/vio/imu_factor_numba.py` (`imu_factor_jacobian` + so3 primitives);
+the `use_imu_njit` gate in `sky/vio/window.py` `optimize_vio`; the `njit_guard_ok`
+threading from `WindowedVIOConfig.divergence_guard` in `run_ba`.
+
+**Verification.** `verification/imu_factor_njit_ate.py` — njit-vs-pure
+full-session ATE **0.0 mm** on every gold session incl. shake (the guard makes
+shake deterministic). `verification/imu_factor_njit_equiv.py` — H/b relative
+~7e-11. Measured ~2–5× on the FD-Jacobian slice.
+
+> **DRIFT:** the `sky/vio/imu_factor_numba.py` module docstring still carries the
+> superseded **"SHIPPED DISABLED" / default-OFF / `SKY_VIO_IMU_NJIT=1`-to-enable**
+> status block (it predates the divergence guard). The runtime in
+> `sky/vio/window.py` is now default-ON gated by the guard with `=0` as the kill
+> switch. Fixed in the same change as this doc (see §"Drift found").
+
+##### Health signal — `vio_degraded` threaded end-to-end
+
+The divergence-guard verdict is now carried all the way to the published pose:
+- `vio/engine/steps.py::vio_step` returns `(T_cw, health)` (was bare `T_cw`),
+  where `health` = `_vio_health(vio_map)` = the picklable scalars
+  `{vio_degraded, vio_reproj_px, vio_window_jump_m}` from `last_info`. Both the
+  in-process and subprocess (`--worker`) engines run the same `vio_step`, so the
+  health crosses the pickle boundary as plain scalars.
+- `vio/modules/backend.py::run_ba` merges `health` into the published
+  `pose.refined` `PoseMsg.info` — alongside the existing `refined` flag and the
+  `pos_sigma_m` position-noise field the FC ESKF already reads.
+- The **loose** path (`ba_step`) returns the bare `T_cw`, so its `info` stays
+  `{"refined": True}` — the `vio_degraded` key is simply absent (loose info
+  unchanged).
+
+**PENDING (known gap).** The FC consumer of
+`pose.refined.info['vio_degraded']` (hook `launcher/main.py::_start_pose_logger
+._on_pose`) is NOT wired — the FC link itself is a separate, unbuilt item. Until
+it exists, a sustained `vio_degraded` should drive **`pos_sigma_m` inflation /
+loiter-RTH** on the FC. See the SAFETY note in `docs/PROC4_ARCHITECTURE.md` §9.
+
+---
+
 **Critical path to a usable `--tight`: Phases 0 → 1 → 2 → 2.5 → 3** (~3.5–4.5 days).
 **Status:** Phases 0, 1, 2, 2.5 DONE (2026-06-10) — `--tight` is wired + runs
 end-to-end on gold sessions (loose stays byte-identical), AND the live `pose.odom`
 now forward-propagates the IMU every frame + ZUPTs at rest (the covered-camera
-freeze fix). Phase 3 (loose-vs-tight ATE benchmark) is next.
+freeze fix). Phase 4(g–j) tight-solve optimisation chain DONE (2026-06-16):
+Schur + gauge regularisation + divergence guard + njit kernel + `vio_degraded`
+health signal, all validated, oracle re-baselined. Phase 3 (loose-vs-tight ATE
+benchmark) is next.
 
 ---
 

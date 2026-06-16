@@ -843,9 +843,16 @@ role IMU preintegration plays in a tight-coupled VIO).
    motion continues from the optimized pose. (windowed.py:`run_ba`:195-283, inject
    `:353-357`).
 
-*(Sibling tight-coupled backend `vio_window.py` swaps gyro-fusion + VO-prior for true IMU
-preintegration factors solving pose+velocity+bias jointly — `optimize_vio`:198, IMU
-residual `:144-168` — same windowed structure.)*
+*(Sibling tight-coupled backend `sky/vio/window.py` swaps gyro-fusion + VO-prior for true
+IMU preintegration factors solving pose+velocity+bias jointly — `optimize_vio`, IMU residual
+`_imu_residual` — same windowed structure. Its `--tight` LM solve carries a four-link
+optimisation chain — **landmark Schur complement** (`_schur_solve`, exact, ~1.4–1.8× on the
+Pi), an **absolute-velocity gauge regulariser** (`vel_abs_prior` + `tau_nav`, the rank-3
+null-space fix for the shake round-off chaos), a **divergence guard** (reproj/jump
+detect → reject → IMU-or-frontend bounded fallback, always-on flight invariant), and an
+**njit IMU-Jacobian kernel** (`imu_factor_numba.py`, default ON only with the guard) — all
+documented in `docs/TIGHT_COUPLED_PLAN.md` §4(g–j), all tight-only so the loose oracle stays
+`gap = 0`.)*
 
 **I/O.** In: per-KF `T_cw` + track snapshot + depth + optional accel; the f2f VO relative
 translations; carried marg prior. Out: refined KF poses + landmarks; `last_info`

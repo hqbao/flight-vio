@@ -40,6 +40,69 @@ def _reproj_err(R: np.ndarray, t: np.ndarray, obj: np.ndarray,
     return err
 
 
+def _ransac_batch(obj: np.ndarray, img: np.ndarray, K: np.ndarray,
+                  samples: np.ndarray, reproj_px: float):
+    """Vectorised minimal-sample RANSAC: score EVERY sample hypothesis at once.
+
+    ``samples`` is an ``(B, 6)`` int array of point indices (the SAME draws the
+    sequential loop made, so the considered hypotheses are identical). Builds all
+    ``B`` 6-point DLT problems, solves them with a BATCHED SVD (one call instead of
+    B), projects each onto SO(3), enforces cheirality, then reprojects all ``n``
+    points for every hypothesis (one ``einsum``) and counts inliers. Returns
+    ``(best_count, best_mask)`` -- the single hypothesis with the most inliers --
+    or ``(-1, None)`` if none is valid.
+
+    This replaces the per-iteration Python+NumPy-dispatch overhead (the profiled
+    RP5 bottleneck) with a handful of batched ops; the maths is the same 6-point
+    DLT, so the inlier set matches the sequential loop up to float ordering.
+    """
+    B = samples.shape[0]
+    Kinv = np.linalg.inv(K)
+    objS = obj[samples]                                  # (B,6,3)
+    imgS = img[samples]                                  # (B,6,2)
+    uv1 = np.concatenate([imgS, np.ones((B, 6, 1))], axis=2)
+    xy = (uv1 @ Kinv.T)[:, :, :2]                        # normalised img coords
+    X = np.concatenate([objS, np.ones((B, 6, 1))], axis=2)
+    A = np.zeros((B, 12, 12))
+    A[:, 0::2, 0:4] = X
+    A[:, 0::2, 8:12] = -xy[:, :, 0:1] * X
+    A[:, 1::2, 4:8] = X
+    A[:, 1::2, 8:12] = -xy[:, :, 1:2] * X
+    try:
+        Vh = np.linalg.svd(A)[2]                          # batched (B,12,12)
+    except np.linalg.LinAlgError:
+        return -1, None
+    Pm = Vh[:, -1, :].reshape(B, 3, 4)
+    R0 = Pm[:, :, :3]
+    U, Sg, Vt = np.linalg.svd(R0)                         # batched 3x3
+    Rs = U @ Vt
+    flip = np.linalg.det(Rs) < 0
+    Rs[flip] = -Rs[flip]
+    Pm[flip] = -Pm[flip]
+    smin = Sg[:, 2]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        scale = 3.0 / Sg.sum(axis=1)
+    ts = Pm[:, :, 3] * scale[:, None]                    # (B,3)
+    # reproject ALL points for EVERY hypothesis: (B,n,3)
+    Pc = np.einsum("bij,nj->bni", Rs, obj) + ts[:, None, :]
+    z = Pc[:, :, 2]
+    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        u = fx * Pc[:, :, 0] / z + cx
+        v = fy * Pc[:, :, 1] / z + cy
+    du = u - img[:, 0]
+    dv = v - img[:, 1]
+    err = np.sqrt(du * du + dv * dv)
+    inl = (err < reproj_px) & (z > 1e-6)
+    # invalidate degenerate hypotheses (singular DLT or majority-behind camera)
+    valid = (smin >= 1e-9) & ((z > 0).mean(axis=1) >= 0.5)
+    counts = np.where(valid, inl.sum(axis=1), -1)
+    b = int(np.argmax(counts))
+    if counts[b] < 0:
+        return -1, None
+    return int(counts[b]), inl[b]
+
+
 def _dlt(obj: np.ndarray, img: np.ndarray, K: np.ndarray):
     """Direct Linear Transform pose from >=6 correspondences. Returns R,t or None.
 
@@ -235,22 +298,22 @@ def solve_pnp_ransac(obj: np.ndarray, img: np.ndarray, K: np.ndarray,
         consider(R_init, t_seed)
 
     sample = 6
-    max_iter = int(iters)
-    it = 0
-    while it < max_iter:
-        it += 1
-        idx = rng.choice(n, size=sample, replace=False)
-        sol = _dlt(obj[idx], img[idx], K)
-        if sol is not None:
-            consider(sol[0], sol[1])
-        # adaptive stop: if current best inlier ratio is high, fewer iters needed
-        if best_cnt > 0:
-            w = best_cnt / n
-            denom = 1.0 - w ** sample
-            if denom > 1e-12:
-                need = np.log(max(1e-12, 1.0 - conf)) / np.log(max(1e-12, denom))
-                if it >= need:
-                    break
+    # Vectorised RANSAC (the RP5 speed fix): draw every minimal sample up front --
+    # the SAME RNG sequence the old sequential loop drew -- and score all
+    # hypotheses in one batched pass (:func:`_ransac_batch`). NumPy ``argmax``
+    # returns the first max, so the tie-break (and thus the selected hypothesis)
+    # matches the old loop's first-best-wins; the seed hypothesis above keeps its
+    # tie priority because the batch only replaces it on a STRICTLY larger count.
+    # The adaptive early-stop is gone: the batched solve of all ``iters``
+    # hypotheses is cheaper than the per-iteration Python/dispatch overhead it
+    # avoided, and considering every sample can only find >= as many inliers.
+    samples = np.empty((int(iters), sample), dtype=np.int64)
+    for i in range(int(iters)):
+        samples[i] = rng.choice(n, size=sample, replace=False)
+    bcnt, bmask = _ransac_batch(obj, img, K, samples, reproj_px)
+    if bmask is not None and bcnt > best_cnt:
+        best_cnt = bcnt
+        best_inl = bmask
 
     # Rescue: on marginal frames (few correspondences) a raw 6-point DLT sample
     # is too noisy to bootstrap, so plain RANSAC under-counts inliers and would

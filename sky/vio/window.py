@@ -40,6 +40,7 @@ measurements is perturbed and recovered to sub-mm / sub-mdeg.
 """
 from __future__ import annotations
 
+import os
 from collections import Counter
 from dataclasses import dataclass, field, replace
 
@@ -52,6 +53,7 @@ from sky.math import se3_from_Rp, se3_inv, se3_log_robust
 from sky.front.frontend import FrontendConfig, KLTFrontend
 from sky.depth.icp import backproject_depth, icp_p2plane_blend, imu_seed_relpose
 from .imu import ImuPreintegration, preintegrate_imu
+from .imu_factor_numba import HAVE_NUMBA, imu_factor_jacobian
 from sky.front.odometry import OdometryConfig, RGBDVisualOdometry
 
 
@@ -137,6 +139,35 @@ class VioConfig:
     sigma_vel_zupt: float = 0.5     # m/s, weak absolute anchor (>> sigma_vel_cv)
     zupt_accel_thresh: float = 0.30  # m/s^2, |dv|/dt below this == low excitation
     zupt_gyro_thresh: float = 0.20  # rad/s, |log(dR)|/dt below this == low excite
+    # --- Absolute-velocity GAUGE anchor (the real rank fix; default ON for tight)
+    # The lone IMU velocity residual r_v = R_i^T (v_j - v_i - g dt) - dv is a pure
+    # DIFFERENCE operator: d r_v / d v_i = -R_i^T, d r_v / d v_j = +R_i^T, so the
+    # IMU factor carries ZERO absolute-velocity information -- the NAV information
+    # matrix has a rank-3 null space (eigs ~3e-17) in absolute velocity. The LM
+    # relative damping ``lam*diag(H)`` floors that null direction only by a
+    # machine-eps-scale value, so a ~1e-11 round-off perturbation of H/b divides by
+    # ~(lam*diag) ~ 1e-6 and is amplified ~1e6x -> the converged basin flips
+    # (round-off CHAOS; njit-vs-pure diverges 603 mm on shake). This anchor pins
+    # the genuinely-free absolute-velocity gauge with a WEAK absolute prior on
+    # EVERY keyframe -- it restores rank without inventing information (a loose
+    # sigma so it does not fight the IMU/vision solution):
+    #
+    #     r_vabs = (v_i - v_pred_i) / sigma_vabs        (3 rows per KF)
+    #
+    # where v_pred_i is the IMU forward-prediction of v_i from the PREVIOUS
+    # keyframe's velocity along the inbound edge (i-1, i):
+    #     v_pred_i = v_{i-1} + g dt + R_{i-1} dv_pre
+    # treated as a CONSTANT pseudo-measurement recomputed each iteration from the
+    # current neighbour estimate (so the Jacobian is the simple absolute self-term
+    # d r_vabs / d v_i = I / sigma_vabs, like ZUPT). The anchor keyframe (no
+    # inbound edge) uses its own current estimate as v_pred -> a prior pulling v_0
+    # toward its linearisation point. UNLIKE vel_zupt this is NOT excitation-gated:
+    # it must be ON during shake (exactly when ZUPT turns OFF). This is the
+    # standard VINS/Basalt velocity gauge anchor. Default ON because it is read
+    # ONLY on the tight path (gated by imu_info_weight in build_system); the loose
+    # / oracle path never assembles it, so the default loose build is unchanged.
+    vel_abs_prior: bool = True
+    sigma_vabs: float = 1.0         # m/s, LOOSE -> pins the gauge, never fights IMU
     # --- Dense-ICP relative-pose factor (OPT-IN, default OFF -> oracle byte-safe)
     # At 54x42 the sparse frontend FAILS on 5-10% of frames (<6 tracks), leaving
     # the inter-keyframe TRANSLATION unobservable. A dense point-to-plane ICP
@@ -182,10 +213,50 @@ class VioConfig:
     # LM
     max_iters: int = 30
     init_lambda: float = 1e-3
-    min_lambda: float = 1e-9
+    # LM damping floor. Raised 1e-9 -> 1e-6 as the SECOND half of the gauge
+    # regulariser (paired with ``tau_nav`` + ``vel_abs_prior``): at the old 1e-9
+    # the relative damping ``lam*diag(H)`` on the (now-pinned) low-curvature nav
+    # directions decayed to a machine-eps-scale floor, so a round-off-scale H/b
+    # difference still produced a meaningfully different step on the flat
+    # directions. A 1e-6 floor keeps the LM step bounded near convergence without
+    # biasing the well-conditioned solution (1e-6 * diag(H) is negligible against
+    # the real curvature). ``optimize_vio`` is reached ONLY by the tight VIO
+    # ``run_ba`` (the loose / oracle path uses ``sky.backend.windowed`` and never
+    # calls this), so the raise is tight-only by construction.
+    min_lambda: float = 1e-6
     max_lambda: float = 1e9
     rel_tol: float = 1e-7
     fd_eps: float = 1e-6
+    # --- Absolute Tikhonov floor on the NAV block (TIGHT-ONLY, gauge regulariser)
+    # The LM damping ``A = H + lam*diag(H)`` floors the absolute-velocity null
+    # direction only RELATIVELY (by lam*diag, machine-eps-scale there), so the
+    # null-direction step ~ -b_null / (lam*diag) divides round-off by a tiny number
+    # and amplifies it ~1e6x. ``tau_nav`` adds a small ABSOLUTE floor on the NAV
+    # columns only -- ``A = H + lam*diag(H) + tau_nav * I_nav`` (identity on the
+    # first ``nav_dim`` poses+vel+bg+ba columns, ZERO on landmark columns so the
+    # block-diagonal landmark Schur structure is untouched). It is added to the
+    # FULL damped A BEFORE Schur partitioning, so the exact Schur path consumes it
+    # unchanged. With ``vel_abs_prior`` already pinning the velocity gauge, this is
+    # a belt-and-braces conditioner on the whole nav block (poses + biases too):
+    # it caps the round-off amplification at ~b/tau_nav regardless of lam, killing
+    # the LM accept/reject chaos. Applied ONLY when ``imu_info_weight`` is True
+    # (the tight marker); the loose / oracle LM solve never adds it (byte-safe).
+    # Kept small so it never biases the well-conditioned solution.
+    tau_nav: float = 1e-3
+    # --- njit IMU-factor kernel <-> divergence-guard SAFETY COUPLING --------- #
+    # The njit FD IMU-factor kernel (sky.vio.imu_factor_numba, default ON now)
+    # tracks the pure-Python build only to the fp round-off floor (~1e-11). The
+    # tight LM solve branches DISCRETELY on cost, so that round-off can flip an
+    # iteration and walk a DIVERGENT window elsewhere -- UNLESS the divergence
+    # guard rejects that window deterministically (it does: see the njit gate in
+    # ``optimize_vio`` and ``imu_factor_njit_ate.py``, ATE-equal on every gold
+    # session incl. shake ONLY with the guard ON). So njit-default-ON is validated
+    # ONLY when the divergence guard is on. ``WindowedVIOMap.run_ba`` sets this to
+    # ``WindowedVIOConfig.divergence_guard``; when it is False the njit gate
+    # force-disables the kernel and logs why. Default True so a bare ``VioConfig``
+    # (the self-tests / loose path) is not gratuitously degraded -- the loose path
+    # never enables njit anyway (``imu_info_weight`` is False there).
+    njit_guard_ok: bool = True
 
 
 @dataclass
@@ -261,6 +332,48 @@ def _bias_rw_residual(bg_i, ba_i, bg_j, ba_j, cfg) -> np.ndarray:
         (bg_j - bg_i) / cfg.sigma_bg_rw,
         (ba_j - ba_i) / cfg.sigma_ba_rw,
     ])
+
+
+def _imu_predict_pose(R_i, p_i, v_i, bg_i, ba_i, pre, g_world):
+    """IMU forward-prediction (dead-reckon) of the NEXT keyframe's ``(R, p)``.
+
+    Propagates the previous keyframe's nav-state ``(R_i, p_i, v_i)`` through the
+    cached inter-keyframe preintegration ``pre`` (bias-corrected about the
+    previous keyframe's ``bg_i/ba_i``). This is exactly the increment convention
+    of :func:`_imu_residual` -- the pose at which the IMU rotation/position
+    residuals are zero::
+
+        R_j = R_i @ dR
+        p_j = p_i + v_i dt + 0.5 g dt^2 + R_i @ dp
+
+    Used by the divergence guard as the inertial reference the refined visual
+    solve is checked against (and the fallback pose on rejection).
+    """
+    dt = pre.dt
+    dR, _dv, dp = pre.corrected(bg_i, ba_i)
+    R_pred = R_i @ dR
+    p_pred = p_i + v_i * dt + 0.5 * g_world * dt * dt + R_i @ dp
+    return R_pred, p_pred
+
+
+def _v_pred_inbound(stt, inbound, ci, g_world) -> np.ndarray:
+    """IMU forward-prediction of ``v[ci]`` from its inbound edge (i_prev -> ci).
+
+    ``v_pred = v_{i_prev} + g dt + R_{i_prev} dv`` using the CURRENT neighbour
+    estimate (the bias-corrected increment about ``bg/ba`` at ``i_prev``). When
+    ``ci`` has no inbound edge (window anchor / gap) ``inbound[ci]`` is ``None``
+    and the prediction is the keyframe's OWN current velocity -> the absolute
+    prior then pulls ``v[ci]`` toward its linearisation point (a gauge pin that
+    invents no information). The prediction is treated as a CONSTANT pseudo-
+    measurement (recomputed each iteration), so the prior's Jacobian wrt ``v[ci]``
+    is the simple absolute self-term ``I / sigma_vabs``.
+    """
+    edge = inbound[ci]
+    if edge is None:
+        return stt.v[ci]
+    i_prev, pre = edge
+    _dR, dv, _dp = pre.corrected(stt.bg[i_prev], stt.ba[i_prev])
+    return stt.v[i_prev] + g_world * pre.dt + stt.R[i_prev] @ dv
 
 
 # --------------------------------------------------------------------------- #
@@ -368,6 +481,109 @@ def _pose_perturb(R, p, d, up_axis=None):
 
 
 # --------------------------------------------------------------------------- #
+# Schur-complement linear solve.
+#
+# The damped normal-equations matrix ``A`` (== H + lam*diag, full ``ndim``) is
+# dominated by the 3*M landmark columns, yet a dense ``np.linalg.solve`` on the
+# whole window scales ~ndim^3. The state is laid out NAV-first / LANDMARK-last
+# (see the column layout in :func:`optimize_vio`), and the landmark Hessian
+# block ``All`` is BLOCK-DIAGONAL (3x3 per landmark -- each landmark only sees
+# its own reprojection/depth rows). Marginalising the landmark block out gives
+# the algebraically EXACT same ``delta`` from a solve on the small nav-only
+# system:
+#
+#     [[App, Apl],[Apl.T, All]] [dp; dl] = -[gp; gl]
+#       App - Apl All^-1 Apl.T  =: S          (Schur reduced, ~nav_dim)
+#       gp  - Apl All^-1 gl     =: rp
+#       dp  = solve(S, -rp)                    (small system)
+#       dl  = All^-1 (-gl - Apl.T dp)          (back-substitution)
+#
+# All^-1 is built from the (M,3,3) block stack via batched host-LAPACK
+# ``np.linalg.inv`` -- never a dense 3M x 3M inverse. The reduced coupling
+# ``Apl All^-1 Apl.T`` is assembled by a per-landmark SCATTER: each landmark ``l``
+# couples ONLY to the pose columns of the keyframes that observe it (a small set
+# ``k_l`` of the ~nav_dim columns -- captured at build time, see ``lm_nav_cols``),
+# so its contribution is a tiny ``(k_l x k_l)`` outer product scattered into ``S``
+# rather than a dense ``nav_dim``-wide update. That makes forming ``S`` / ``rp``
+# O(sum_l k_l^2) instead of O(nav_dim^2 * M).
+#
+# The DENSE-einsum form (``_schur_reduce_dense``) is kept as the algebraic
+# reference the Schur equivalence gate compares against.
+# --------------------------------------------------------------------------- #
+def _schur_partition(A: np.ndarray, g: np.ndarray, nav_dim: int, M: int):
+    """Split the damped system into nav/landmark blocks + batched All^-1."""
+    App = A[:nav_dim, :nav_dim]
+    Apl = A[:nav_dim, nav_dim:]                       # (nav_dim, 3M)
+    gp = g[:nav_dim]
+    gl = g[nav_dim:].reshape(M, 3)                    # (M,3)
+    # block-diagonal All -> (M,3,3) stack; batched 3x3 inverse (host LAPACK)
+    All_blk = A[nav_dim:, nav_dim:].reshape(M, 3, M, 3)
+    All_blk = All_blk[np.arange(M), :, np.arange(M), :]   # (M,3,3) diagonal
+    All_inv = np.linalg.inv(All_blk)                  # (M,3,3)
+    return App, Apl, gp, gl, All_inv
+
+
+def _schur_reduce_dense(App, Apl, gp, gl, All_inv, nav_dim, M):
+    """Dense reference reduction: S = App - Apl All^-1 Apl.T, rp = gp - ...
+
+    Operates over the full ``nav_dim``-wide ``Apl`` (the original first-cut
+    assembly). Retained as the algebraic reference for the equivalence gate.
+    """
+    Apl_blk = Apl.reshape(nav_dim, M, 3).transpose(1, 0, 2)   # (M,nav_dim,3)
+    W = np.einsum('mnk,mkj->mnj', Apl_blk, All_inv)           # (M,nav_dim,3)
+    S = App - np.einsum('mnj,mij->ni', W, Apl_blk)
+    rp = gp - np.einsum('mnj,mj->n', W, gl)
+    return S, rp
+
+
+def _schur_solve(A: np.ndarray, g: np.ndarray, nav_dim: int, M: int,
+                 lm_nav_cols: list[np.ndarray]) -> np.ndarray:
+    """Solve ``A @ delta = -g`` via landmark Schur complement (exact).
+
+    ``A`` is the FULL damped system (``ndim x ndim``), NAV block first
+    (``[0, nav_dim)``) and ``M`` landmarks last (3 cols each, block-diagonal
+    ``All``). ``lm_nav_cols[m]`` is the ascending array of nav columns landmark
+    ``m`` couples to (its observers' pose columns). Returns ``delta`` in the
+    original (nav-then-landmark) order, equal to ``np.linalg.solve(A, -g)`` up to
+    floating-point round-off.
+    """
+    App, Apl, gp, gl, All_inv = _schur_partition(A, g, nav_dim, M)
+
+    # --- reduced nav system by per-landmark scatter ------------------------ #
+    # S = App - sum_l A_pl_l All_inv_l A_pl_l.T ; rp = gp - sum_l A_pl_l All_inv_l gl_l
+    # Each landmark touches only its coupling columns k_l, so the update is a
+    # tiny (k_l x k_l) outer product scattered with np.add.at (handles columns
+    # shared by landmarks that co-observe a keyframe -- accumulation is additive).
+    S = App.copy()
+    rp = gp.copy()
+    for m in range(M):
+        k = lm_nav_cols[m]
+        if k.size == 0:
+            continue                              # landmark seen only by anchor
+        A_pl = Apl[k, 3 * m:3 * m + 3]            # (k_l, 3) coupling rows
+        WA = A_pl @ All_inv[m]                    # (k_l, 3) = A_pl_l All_inv_l
+        np.add.at(S, (k[:, None], k[None, :]), -(WA @ A_pl.T))
+        np.add.at(rp, k, -(WA @ gl[m]))
+
+    delta_p = np.linalg.solve(S, -rp)
+
+    # --- back-substitute per landmark -------------------------------------- #
+    # dl = All^-1 (-gl - Apl.T dp) ; only the coupling columns enter Apl.T dp.
+    delta_l = np.empty((M, 3))
+    for m in range(M):
+        k = lm_nav_cols[m]
+        rhs = -gl[m]
+        if k.size:
+            rhs = rhs - Apl[k, 3 * m:3 * m + 3].T @ delta_p[k]
+        delta_l[m] = All_inv[m] @ rhs
+
+    delta = np.empty(A.shape[0])
+    delta[:nav_dim] = delta_p
+    delta[nav_dim:] = delta_l.reshape(-1)
+    return delta
+
+
+# --------------------------------------------------------------------------- #
 # Main optimiser
 # --------------------------------------------------------------------------- #
 def optimize_vio(
@@ -382,6 +598,7 @@ def optimize_vio(
     cfg: VioConfig | None = None,
     anchor: int = 0,
     icp_factors: list[IcpFactor] | None = None,
+    _solve_probe=None,
 ) -> VioResult:
     """Jointly refine poses, velocities, biases and landmarks.
 
@@ -398,6 +615,10 @@ def optimize_vio(
                      Honoured only when ``cfg.icp_factor`` is True (the caller
                      sets both together); an empty list with the flag on is a
                      no-op too.
+    _solve_probe   : debug-only hook ``fn(A, b, delta)`` invoked on every inner
+                     LM damping-retry solve (used by the Schur equivalence gate
+                     to compare against the dense reference). ``None`` in
+                     production -> zero cost.
     """
     cfg = cfg or VioConfig()
     # ICP factors are honoured only when the flag is on AND the list is non-empty;
@@ -448,6 +669,24 @@ def optimize_vio(
             if a_exc < cfg.zupt_accel_thresh and w_exc < cfg.zupt_gyro_thresh:
                 zupt_on[j] = True
 
+    # --- Absolute-velocity gauge anchor pre-pass (TIGHT-ONLY, un-gated) ------ #
+    # The anchor needs each keyframe's inbound IMU edge (i_prev -> ci) so it can
+    # forward-predict ``v_pred_ci = v_{i_prev} + g dt + R_{i_prev} dv`` from the
+    # CURRENT neighbour estimate every iteration. Capture (i_prev, pre) per KF
+    # ONCE here (a function of the edge topology, not the iterate); a KF without an
+    # inbound edge (the window anchor / a gap) gets ``None`` and is pinned toward
+    # its OWN current velocity instead (a prior at the linearisation point). The
+    # prior is read ONLY on the tight path (imu_info_weight) -- the marker the
+    # --tight builder sets -- so the loose / oracle build never assembles it and
+    # stays byte-identical. (A degenerate edge with ``dt <= 0`` falls back to the
+    # self-prediction too.)
+    vabs_on = bool(cfg.vel_abs_prior and cfg.imu_info_weight and imu_factors)
+    vabs_inbound: list = [None] * nC
+    if vabs_on:
+        for (i, j, pre) in imu_factors:
+            if float(pre.dt) > 1e-9:
+                vabs_inbound[j] = (i, pre)
+
     # --- column layout -----------------------------------------------------
     # tilt-lock: pose has 4 free DoF (3 translation + 1 yaw) instead of 6, with
     # the yaw perturbation about the world-vertical (gravity) axis.
@@ -471,6 +710,11 @@ def optimize_vio(
         vel_col[i] = n; n += 3
         bg_col[i] = n; n += 3
         ba_col[i] = n; n += 3
+    # The NAV block (free poses + vel + bg + ba) is assigned FIRST and is
+    # contiguous [0, nav_dim); the LANDMARK block (3*M) is assigned LAST and is
+    # contiguous [nav_dim, ndim). The Schur complement (see ``_schur_solve``)
+    # relies on exactly this nav-then-landmark partition.
+    nav_dim = n
     lm_col = np.zeros(M, np.int64)
     for m in range(M):
         lm_col[m] = n; n += 3
@@ -480,6 +724,55 @@ def optimize_vio(
     sigma_px = cfg.sigma_px
     huber_px = cfg.huber_px
     depth_huber = cfg.depth_huber
+
+    # --- njit IMU-factor Jacobian gate (TIGHT-ONLY, DEFAULT ON) ------------- #
+    # The finite-difference IMU-factor Jacobian is the tight stage's wall, so it
+    # is hoisted into ``imu_factor_jacobian`` (sky.vio.imu_factor_numba). Enter it
+    # ONLY on the live tight config -- the defining marker is the covariance-
+    # correct IMU weight ``imu_info_weight`` (set by the --tight builder together
+    # with lock_tilt + use_imu). The loose / oracle path (imu_info_weight=False)
+    # and the no-numba build keep the UNCHANGED pure-Python FD loop.
+    #
+    # DEFAULT ON (safety-reviewer approved, 2026-06-16), COUPLED TO THE GUARD.
+    # The kernel's H/b match the pure-Python build to the fp ROUND-OFF FLOOR (rel
+    # ~7e-11). The tight LM solve branches discretely on cost, so that round-off
+    # USED to flip an iteration and walk a DIVERGENT window elsewhere (push_shake
+    # diverged ~600 mm njit-vs-pure). That chaos came ENTIRELY from the divergent
+    # window the LM accepted -- with the divergence guard (``divergence_guard``,
+    # WindowedVIOConfig) REJECTING that window DETERMINISTICALLY (regardless of
+    # njit-vs-pure round-off), the chaos source is gone: the njit-vs-pure
+    # full-session ATE is EQUAL (sub-mm) on EVERY gold session INCLUDING shake
+    # (verification/imu_factor_njit_ate.py PASS on all gold). So the kernel is
+    # validated ONLY with the guard ON.
+    #
+    # Gate (in precedence order):
+    #   * ``SKY_VIO_IMU_NJIT=0`` -> force OFF (the explicit kill switch, always
+    #     honoured: a no-numba / debug / A-B build can pin the pure-Python path).
+    #   * GUARD-COUPLING SAFETY: if the divergence guard is OFF
+    #     (``cfg.njit_guard_ok`` False, set by ``WindowedVIOMap.run_ba`` from
+    #     ``divergence_guard``), force the kernel OFF and log why -- njit
+    #     determinism is only validated WITH the guard; running it guard-off
+    #     re-opens the round-off-chaos divergence. Safety wins over the default
+    #     (and over an explicit ``=1``).
+    #   * otherwise DEFAULT ON (env unset) -- the validated production path.
+    # ``HAVE_NUMBA`` False (no-numba host) keeps the pure-Python build regardless.
+    njit_env = os.environ.get("SKY_VIO_IMU_NJIT")
+    njit_force_off = (njit_env == "0")
+    njit_guard_ok = bool(cfg.njit_guard_ok)
+    if (HAVE_NUMBA and cfg.imu_info_weight and imu_factors
+            and not njit_force_off and not njit_guard_ok):
+        import sys
+        print("[vio] njit IMU-factor kernel DISABLED: divergence_guard is OFF "
+              "(njit determinism is only validated with the guard ON; running "
+              "the pure-Python FD build instead)", file=sys.stderr)
+    use_imu_njit = bool(HAVE_NUMBA and cfg.imu_info_weight
+                        and bool(imu_factors)
+                        and not njit_force_off and njit_guard_ok)
+    # The kernel needs a concrete up-axis array even in full 6-DoF mode (where the
+    # pure-Python path passes ``up_axis=None``); a zeros(3) placeholder is never
+    # read in that branch (lock_tilt selects the full-DoF retraction).
+    up_axis_arr = (np.asarray(up_axis, np.float64) if up_axis is not None
+                   else np.zeros(3))
 
     # --- precomputed constants for the vectorised factor assembly ----------
     # The projection + depth factors used to be a scalar Python loop over every
@@ -500,6 +793,35 @@ def optimize_vio(
     lm_base_free = lm_base[free_obs]
     ar_pose = np.arange(pose_dof, dtype=np.int64)
     ar3 = np.arange(3, dtype=np.int64)
+
+    # --- Schur scatter bookkeeping -----------------------------------------
+    # Per landmark, the EXACT set of nav columns it couples to in ``Apl``: a
+    # landmark only writes the pose-landmark cross block (build_system, lines
+    # ~738) for the FREE (non-anchor) keyframes that observe it -- velocity /
+    # bias / IMU / ICP columns never touch a landmark column. So ``Apl_blk[m]``
+    # is non-zero ONLY on those keyframes' pose columns. We capture, per
+    # landmark, the sorted array of those nav-column indices ONCE here (it is a
+    # function of the observation topology + column layout, not of the iterate)
+    # and hand it to ``_schur_solve`` so the reduced system is assembled by a
+    # per-landmark SCATTER over its few coupling columns -- O(M * k^2) -- instead
+    # of a dense ``Apl @ All^-1 @ Apl.T`` over the full nav width. The DENSE
+    # einsum form stays the algebraic reference (Schur equivalence gate).
+    lm_nav_cols: list[np.ndarray] = [
+        np.empty(0, np.int64) for _ in range(M)]
+    if M and pose_base_free.size:
+        # distinct (landmark, pose-base) pairs among free observations
+        pair = np.stack([obs_lm[free_obs], pose_base_free], axis=1)
+        pair = np.unique(pair, axis=0)                  # sorted by (lm, base)
+        # expand each distinct pose base to its pose_dof contiguous columns
+        cols = (pair[:, 1, None] + ar_pose[None, :]).reshape(-1)   # (P*dof,)
+        lm_of = np.repeat(pair[:, 0], pose_dof)                    # (P*dof,)
+        # split the (already lm-sorted) column list per landmark
+        order = np.argsort(lm_of, kind="stable")
+        lm_of, cols = lm_of[order], cols[order]
+        bounds = np.searchsorted(lm_of, np.arange(M + 1))
+        for m in range(M):
+            seg = cols[bounds[m]:bounds[m + 1]]
+            lm_nav_cols[m] = np.sort(seg)               # ascending nav cols
     # Constant finite-difference rotation increments: the same pose DoF
     # perturbation is applied to every observation, so build the Exp(eps) 3x3
     # rotation(s) once (identical to the scalar _pose_perturb step).
@@ -565,6 +887,13 @@ def optimize_vio(
                 if zupt_on[ci]:
                     r_z = stt.v[ci] / cfg.sigma_vel_zupt
                     cost += 0.5 * float(r_z @ r_z)
+        if vabs_on:
+            # absolute-velocity GAUGE anchor on every KF (un-gated; tight only)
+            inv_s = 1.0 / cfg.sigma_vabs
+            for ci in range(nC):
+                v_pred = _v_pred_inbound(stt, vabs_inbound, ci, g_world)
+                r_va = (stt.v[ci] - v_pred) * inv_s
+                cost += 0.5 * float(r_va @ r_va)
         # Dense-ICP relative-pose factors (opt-in; empty list -> no contribution).
         # Factor-level Huber on the whitened residual norm so a single bad ICP
         # match cannot dominate the window cost.
@@ -695,48 +1024,92 @@ def optimize_vio(
                 return np.concatenate([ri, rb, r_cv])
             return np.concatenate([ri, rb])
 
-        for (i, j, pre) in imu_factors:
+        def _imu_factor_jac_py(pre, i, j, i_free, j_free):
+            """Pure-Python per-edge FD residual ``r0i`` + Jacobian ``Ji``.
+
+            The original scalar build, factored out so it serves both the
+            non-tight / no-numba fallback AND the degenerate (sqrt_info=None) edge
+            on the tight path. Column order matches the ``idx`` assembly above.
+            """
             base_vals = [stt.R[i], stt.p[i], stt.v[i], stt.bg[i], stt.ba[i],
                          stt.R[j], stt.p[j], stt.v[j], stt.bg[j], stt.ba[j]]
             r0i = _imu_eval(pre, *base_vals)
             rows = r0i.shape[0]
-            # local variable blocks: (kind, keyframe, col base, size)
             blocks = []
-            if pose_col[i] >= 0:
-                blocks.append(("pose", i, pose_col[i], pose_dof))
-            blocks.append(("vel", i, vel_col[i], 3))
-            blocks.append(("bg", i, bg_col[i], 3))
-            blocks.append(("ba", i, ba_col[i], 3))
-            if pose_col[j] >= 0:
-                blocks.append(("pose", j, pose_col[j], pose_dof))
-            blocks.append(("vel", j, vel_col[j], 3))
-            blocks.append(("bg", j, bg_col[j], 3))
-            blocks.append(("ba", j, ba_col[j], 3))
-
-            idx = []
-            for _, _, base, size in blocks:
-                idx.extend(range(base, base + size))
-            idx = np.asarray(idx, np.int64)
-            Ji = np.zeros((rows, idx.shape[0]))
-
-            # slot of each variable in base_vals: i-side 0..4, j-side 5..9
-            # (pose occupies the R,p pair at slots 0/1 and 5/6).
+            if i_free:
+                blocks.append(("pose", i))
+            blocks.append(("vel", i))
+            blocks.append(("bg", i))
+            blocks.append(("ba", i))
+            if j_free:
+                blocks.append(("pose", j))
+            blocks.append(("vel", j))
+            blocks.append(("bg", j))
+            blocks.append(("ba", j))
+            ncol = sum(pose_dof if k == "pose" else 3 for k, _ in blocks)
+            Ji = np.zeros((rows, ncol))
             base_slot = {i: 0, j: 5}
             kind_off = {"pose": 0, "vel": 2, "bg": 3, "ba": 4}
             col = 0
-            for kind, vi, base, size in blocks:
-                s0 = base_slot[vi]
+            for kind, vk in blocks:
+                s0 = base_slot[vk]
+                size = pose_dof if kind == "pose" else 3
                 for d in range(size):
                     vals = list(base_vals)
                     if kind == "pose":
                         dd = np.zeros(pose_dof); dd[d] = eps
                         vals[s0], vals[s0 + 1] = _pose_perturb(
-                            stt.R[vi], stt.p[vi], dd, up_axis)
+                            stt.R[vk], stt.p[vk], dd, up_axis)
                     else:
                         si = s0 + kind_off[kind]
                         v = vals[si].copy(); v[d] += eps; vals[si] = v
                     Ji[:, col] = (_imu_eval(pre, *vals) - r0i) / eps
                     col += 1
+            return r0i, Ji
+
+        for (i, j, pre) in imu_factors:
+            i_free = pose_col[i] >= 0
+            j_free = pose_col[j] >= 0
+            # Column index set in the SAME order as the FD column order: i-side
+            # [pose(if free) + vel + bg + ba] then j-side [pose(if free) + vel +
+            # bg + ba]. Identical to the pure-Python ``blocks`` ordering.
+            idx = []
+            if i_free:
+                idx.extend(range(pose_col[i], pose_col[i] + pose_dof))
+            idx.extend(range(vel_col[i], vel_col[i] + 3))
+            idx.extend(range(bg_col[i], bg_col[i] + 3))
+            idx.extend(range(ba_col[i], ba_col[i] + 3))
+            if j_free:
+                idx.extend(range(pose_col[j], pose_col[j] + pose_dof))
+            idx.extend(range(vel_col[j], vel_col[j] + 3))
+            idx.extend(range(bg_col[j], bg_col[j] + 3))
+            idx.extend(range(ba_col[j], ba_col[j] + 3))
+            idx = np.asarray(idx, np.int64)
+
+            if use_imu_njit:
+                # TIGHT-ONLY njit FD Jacobian. ``pre.sqrt_info`` is non-None on the
+                # info-weighted path (a degenerate edge with sqrt_info=None falls
+                # back to the pure-Python build below). Pack raw float64 arrays
+                # only -- no Python object crosses into the kernel.
+                if pre.sqrt_info is None:
+                    r0i, Ji = _imu_factor_jac_py(pre, i, j, i_free, j_free)
+                else:
+                    nrows = 18 if cfg.vel_cv_prior else 15
+                    r0i, Ji = imu_factor_jacobian(
+                        np.ascontiguousarray(stt.R[i]), stt.p[i], stt.v[i],
+                        stt.bg[i], stt.ba[i],
+                        np.ascontiguousarray(stt.R[j]), stt.p[j], stt.v[j],
+                        stt.bg[j], stt.ba[j],
+                        pre.dR, pre.dv, pre.dp, float(pre.dt),
+                        pre.dR_dbg, pre.dv_dbg, pre.dv_dba,
+                        pre.dp_dbg, pre.dp_dba, pre.bg, pre.ba, pre.sqrt_info,
+                        cfg.sigma_rot, cfg.sigma_vel, cfg.sigma_pos,
+                        cfg.sigma_bg_rw, cfg.sigma_ba_rw, g_world,
+                        True, bool(cfg.vel_cv_prior), cfg.sigma_vel_cv,
+                        eps, lock_tilt, up_axis_arr, pose_dof,
+                        i_free, j_free, idx.shape[0], nrows)
+            else:
+                r0i, Ji = _imu_factor_jac_py(pre, i, j, i_free, j_free)
 
             H[np.ix_(idx, idx)] += Ji.T @ Ji
             b[idx] += Ji.T @ r0i
@@ -755,6 +1128,23 @@ def optimize_vio(
                 vrange = slice(vc, vc + 3)
                 H[vrange, vrange] += np.eye(3) * inv_var_z
                 b[vc:vc + 3] += stt.v[ci] * inv_var_z
+
+        # Absolute-velocity GAUGE anchor (tight only, un-gated across KFs). The
+        # residual r_vabs = (v_ci - v_pred_ci) / sigma_vabs treats v_pred as a
+        # CONSTANT pseudo-measurement (recomputed each iteration from the current
+        # neighbour estimate), so the Jacobian wrt v_ci is the absolute self-term
+        # J = I / sigma_vabs -> the Gauss-Newton normal equations contribute
+        # J^T J = I / sigma_vabs^2 to H[vel_ci, vel_ci] and J^T r = (v_ci - v_pred)
+        # / sigma_vabs^2 to b[vel_ci]. This is the analytic, exact ZUPT-shaped
+        # block; it restores the rank-3 absolute-velocity null space.
+        if vabs_on:
+            inv_var_va = 1.0 / (cfg.sigma_vabs * cfg.sigma_vabs)
+            for ci in range(nC):
+                v_pred = _v_pred_inbound(stt, vabs_inbound, ci, g_world)
+                vc = vel_col[ci]
+                vrange = slice(vc, vc + 3)
+                H[vrange, vrange] += np.eye(3) * inv_var_va
+                b[vc:vc + 3] += (stt.v[ci] - v_pred) * inv_var_va
 
         # Dense-ICP relative-pose factors (opt-in; empty list -> nothing added).
         # POSE-ONLY: each factor differentiates only the two keyframe POSE blocks
@@ -820,6 +1210,25 @@ def optimize_vio(
         return out
 
     # --- LM loop -----------------------------------------------------------
+    # Schur gate: marginalise the landmark block ONLY on the tight VIO solve
+    # (defined by the presence of IMU factors -- the loose/oracle BA path uses
+    # ``sky.backend.windowed`` and never calls this with IMU factors). The result
+    # is algebraically identical to the dense solve; this branch only changes
+    # WHICH matrix ``np.linalg.solve`` factorises (the ~nav_dim Schur reduction
+    # vs the full ndim). ``M > 0`` guards the degenerate no-landmark window.
+    use_schur = bool(imu_factors) and M > 0
+    # Absolute Tikhonov floor on the NAV block (TIGHT-ONLY). ``tau_nav_diag`` is
+    # ``tau_nav`` on the first ``nav_dim`` (pose+vel+bg+ba) columns and ZERO on the
+    # landmark columns, so adding ``np.diag(tau_nav_diag)`` to the FULL damped A
+    # leaves the block-diagonal landmark Schur block ``All`` untouched (the exact
+    # Schur path consumes the conditioned A unchanged). Applied only on the tight
+    # marker ``imu_info_weight`` (and tau_nav>0): the loose / oracle LM solve adds
+    # nothing -> byte-identical. Built once (constant across iterations).
+    use_tau_nav = bool(cfg.imu_info_weight and cfg.tau_nav > 0.0 and nav_dim > 0)
+    tau_nav_diag = None
+    if use_tau_nav:
+        tau_nav_diag = np.zeros(ndim)
+        tau_nav_diag[:nav_dim] = cfg.tau_nav
     cost0, _ = total_cost(st)
     cost_prev = cost0
     lam = cfg.init_lambda
@@ -830,10 +1239,17 @@ def optimize_vio(
         solved = False
         for _ in range(12):                      # inner LM damping retries
             A = H + lam * np.diag(diag)
+            if use_tau_nav:
+                A = A + np.diag(tau_nav_diag)
             try:
-                delta = np.linalg.solve(A, -b)
+                if use_schur:
+                    delta = _schur_solve(A, b, nav_dim, M, lm_nav_cols)
+                else:
+                    delta = np.linalg.solve(A, -b)
             except np.linalg.LinAlgError:
                 delta = np.linalg.lstsq(A, -b, rcond=None)[0]
+            if _solve_probe is not None:
+                _solve_probe(A, b, delta)
             trial = retract(st, delta)
             cost_new, _ = total_cost(trial)
             if cost_new < cost_prev:
@@ -1030,6 +1446,81 @@ class WindowedVIOConfig:
     vio: VioConfig = field(default_factory=lambda: VioConfig(
         max_iters=12, sigma_rot=0.02, sigma_vel=0.03, sigma_pos=0.03,
         lock_tilt=True))
+    # --- Divergence guard (SAFETY, tight-only) ------------------------------ #
+    # The LM window solve accepts ANY step that lowers the cost: there is no
+    # step-magnitude bound, no reprojection ceiling, no output sanity check. On a
+    # bad frame (motion blur / feature loss) it can converge into a DIVERGENT
+    # basin -- a one-window pose jump of metres (observed 4.5 m on push_shake
+    # seq~95, mean reproj 71-91 px) -- and ``run_ba`` returns that pose
+    # unconditionally, poisoning both the published pose AND the live VO
+    # frontend (``self.vo.pose``). This guard catches a diverged solve AFTER the
+    # LM converges and falls the latest keyframe back to the IMU forward-
+    # prediction (dead-reckon from the previous accepted keyframe through the
+    # inter-KF IMU), rejecting the whole window mutation so the next solve starts
+    # from a clean seed. It is a PURE ADDITION: it fires ONLY on divergence, so a
+    # well-conditioned session is bit-identical to the pre-guard solve.
+    #
+    # WHY THE REPROJECTION ERROR IS THE PRIMARY SIGNAL (tuning evidence)
+    # -----------------------------------------------------------------
+    # The post-solve mean reprojection error directly measures whether the visual
+    # solve FIT its own measurements. On the live --tight path it cleanly
+    # separates a divergent solve from every well-conditioned gold session:
+    #     push_shake  (DIVERGENT) : up to 41 px (the catastrophic basin; the
+    #                               safety report saw 71-91 px on its reduction)
+    #     lab_straight (HEALTHY)  : <= 5.6 px
+    #     push_fwdback (HEALTHY)  : <= 9.4 px
+    #     push_straight/quick     : <= 1.3 px
+    # so a single ``max_reproj_px`` ceiling above the healthy band but far below
+    # the divergent regime catches shake with ZERO false positives.
+    #
+    # The IMU forward-prediction (dead-reckon) jump is a USEFUL second signal for
+    # a catastrophic jump that LM happened to fit -- BUT on its own it FALSE-
+    # POSITIVES: when the velocity/bias estimate drifts (the documented |v| ramp),
+    # the IMU PREDICTION itself drifts away from a perfectly good visual solve, so
+    # a raw "refined vs predicted" deviation flags a well-fit solve as divergent
+    # (measured: push_fwdback fires on a 1.8->10.5 m predicted-vs-refined gap while
+    # reproj stays ~1-9 px -- the SOLVE is fine, the PREDICTION drifted). A guard
+    # that rejected those would replace a good visual pose with the WORSE dead-
+    # reckon. So the jump test is GATED on the solve also being visually
+    # questionable (reproj > ``jump_reproj_floor_px``): a large jump only counts
+    # as divergence when the solve ALSO failed to fit -- exactly the shake case
+    # (high jump AND high reproj together), never a clean-but-drifting prediction.
+    #
+    # Two trip signals (EITHER one rejects the window):
+    #   (a) the post-solve mean reprojection error exceeds ``max_reproj_px``;
+    #   (b) the refined latest-KF position deviates from the IMU forward-
+    #       prediction by more than ``max_window_jump_m`` PLUS a margin scaled by
+    #       the IMU-implied displacement (``jump_margin_frac`` * |p_pred-p_prev|,
+    #       so a fast-but-REAL inertial motion is not flagged) AND the solve is
+    #       visually questionable (reproj > ``jump_reproj_floor_px``).
+    # Default ON: the guard is read ONLY on the tight map's ``run_ba`` (the loose
+    # WindowedBAMap / oracle path never constructs a WindowedVIOConfig), so the
+    # default loose / oracle build is unchanged regardless of this flag.
+    divergence_guard: bool = True
+    max_reproj_px: float = 20.0          # post-solve mean reproj ceiling (px):
+    #                                      well above the <=9.4 px healthy band,
+    #                                      below the divergent 40+ px regime.
+    max_window_jump_m: float = 1.0       # absolute slack on |p_refined - p_pred|
+    jump_margin_frac: float = 2.0        # + this * |IMU displacement| (scales w/
+    #                                      real motion so fast-but-real is allowed)
+    jump_reproj_floor_px: float = 15.0   # the jump test only fires when reproj
+    #                                      also exceeds this (so a clean-but-
+    #                                      drifting prediction never rejects a
+    #                                      well-fit visual solve)
+    # Physical speed bound that ARBITRATES the rejection FALLBACK pose. A diverged
+    # window is often accompanied by a runaway velocity STATE (the documented |v|
+    # ramp to 20-25 m/s on shake), so a literal IMU forward-prediction off that
+    # velocity would itself jump metres -- the dead-reckon would inherit the very
+    # divergence it is meant to escape. On rejection the guard therefore publishes
+    # the IMU dead-reckon ONLY when it AGREES with the bounded frontend visual seed
+    # to within ``max_deadreckon_speed_mps * dt`` (a physically-plausible handheld/
+    # UAV inter-keyframe travel): vision-degraded-but-IMU-trustworthy (covered
+    # camera, plausible speed) -> dead-reckon ~ gyro-seeded visual seed -> publish
+    # the dead-reckon (intended behaviour); a runaway velocity -> dead-reckon
+    # DISAGREES wildly with the bounded frontend -> keep the frontend seed so the
+    # published trajectory stays FINITE. Generous (5 m/s) so it never mistakes real
+    # motion for divergence -- it is a circuit-breaker, not a motion model.
+    max_deadreckon_speed_mps: float = 5.0
 
 
 class WindowedVIOMap:
@@ -1262,6 +1753,16 @@ class WindowedVIOMap:
         vio_cfg = self.cfg.vio
         if self.cfg.stabilize_velocity:
             vio_cfg = replace(vio_cfg, vel_cv_prior=True, vel_zupt=True)
+        # njit IMU-factor kernel <-> divergence-guard SAFETY COUPLING. The njit
+        # gate in ``optimize_vio`` reads ``cfg.njit_guard_ok``: thread THIS map's
+        # guard state into the solve config so the default-ON kernel runs only
+        # when the divergence guard is on (the only config it is validated under;
+        # guard off -> the gate force-disables it and logs why). ``replace`` keeps
+        # the loose path / oracle ``self.cfg.vio`` untouched (it never reaches
+        # here). The guard is ON by default, so this is a no-op for the shipped
+        # --tight config; it bites only an explicit divergence_guard=False A/B.
+        if vio_cfg.njit_guard_ok != self.cfg.divergence_guard:
+            vio_cfg = replace(vio_cfg, njit_guard_ok=bool(self.cfg.divergence_guard))
 
         # Phase-4 dense-ICP relative-pose factors (opt-in): one per adjacent
         # in-window KF pair whose cached clouds converge. Default OFF -> empty
@@ -1272,6 +1773,29 @@ class WindowedVIOMap:
             vio_cfg = replace(vio_cfg, icp_factor=True)
             icp_factors = self._build_icp_factors(kfs, st, vio_cfg)
 
+        # --- Divergence guard: capture the IMU forward-prediction of the latest
+        # keyframe pose BEFORE the solve mutates the window. The latest KF's
+        # inbound edge (kfs[-1]["edge"], linking kfs[-2] -> kfs[-1]) carries the
+        # inter-KF preintegration; the previous keyframe's nav-state is read from
+        # the seeded input ``st`` (the solve will overwrite the live kf dicts, so
+        # we MUST read the prediction inputs now). The prediction is the inertial
+        # reference the refined visual pose is checked against and the fallback
+        # on rejection. ``pre_pred`` stays None when there is no inbound edge (no
+        # IMU to predict from) -> the jump test is skipped for that keyframe.
+        guard = bool(self.cfg.divergence_guard)
+        R_pred = p_pred = None
+        imu_disp = 0.0
+        pred_dt = 0.0
+        if guard and len(kfs) >= 2:
+            last_edge = kfs[-1]["edge"]
+            if last_edge is not None and last_edge.pre is not None:
+                i_prev = len(kfs) - 2
+                pred_dt = float(last_edge.pre.dt)
+                R_pred, p_pred = _imu_predict_pose(
+                    st.R[i_prev], st.p[i_prev], st.v[i_prev],
+                    st.bg[i_prev], st.ba[i_prev], last_edge.pre, self.g_world)
+                imu_disp = float(np.linalg.norm(p_pred - st.p[i_prev]))
+
         res = optimize_vio(
             self.K, st,
             np.array(obs_cam), np.array(obs_lm), np.array(obs_uv),
@@ -1279,6 +1803,72 @@ class WindowedVIOMap:
             cfg=vio_cfg, anchor=0, icp_factors=icp_factors,
         )
         out = res.state
+
+        # --- Divergence detection (after LM converges, before publishing) ----
+        # Two trip signals (EITHER one rejects this window):
+        #   (a) the post-solve mean reprojection error exceeds the ceiling -- the
+        #       PRIMARY signal (a solve that did not fit its own measurements);
+        #   (b) the refined latest-KF position deviates from the IMU forward-
+        #       prediction by more than a KINEMATIC bound (absolute slack + a
+        #       margin scaled by the IMU-implied displacement, so fast-but-REAL
+        #       inertial motion is not flagged) AND the solve is ALSO visually
+        #       questionable (reproj > jump_reproj_floor_px). The reproj gate on
+        #       (b) is essential: a large refined-vs-predicted gap on a CLEAN
+        #       (low-reproj) solve means the IMU PREDICTION drifted, not the
+        #       solve -- rejecting it would swap a good pose for a worse dead-
+        #       reckon. A genuine divergence trips BOTH together (shake).
+        degraded = False
+        window_jump_m = 0.0
+        if guard:
+            if res.mean_reproj_px > self.cfg.max_reproj_px:
+                degraded = True
+            if (R_pred is not None
+                    and res.mean_reproj_px > self.cfg.jump_reproj_floor_px):
+                window_jump_m = float(np.linalg.norm(out.p[-1] - p_pred))
+                jump_bound = (self.cfg.max_window_jump_m
+                              + self.cfg.jump_margin_frac * imu_disp)
+                if window_jump_m > jump_bound:
+                    degraded = True
+
+        if degraded:
+            # REJECT the diverged window. Do NOT write back the solver output to
+            # the live keyframes/landmarks -- leave the window at its pre-solve
+            # seed so the NEXT solve starts from a clean (non-poisoned) state.
+            #
+            # FALLBACK POSE: the latest keyframe falls back to the IMU forward-
+            # prediction (dead-reckon) ONLY when it AGREES with the bounded
+            # frontend visual seed to within a physical inter-keyframe travel
+            # bound. This is the safe synthesis the live data demands:
+            #   * vision degraded but IMU trustworthy (covered camera, plausible
+            #     speed) -> the dead-reckon and the (gyro-seeded) visual seed are
+            #     close -> we publish the dead-reckon, the intended behaviour;
+            #   * a DIVERGENT solve is typically accompanied by a runaway VELOCITY
+            #     state (the documented |v|->20-25 m/s ramp on shake), so a literal
+            #     dead-reckon off that velocity jumps metres and DISAGREES with the
+            #     bounded frontend -> we keep the frontend visual seed instead, so
+            #     the published trajectory stays bounded (the frontend is the
+            #     trustworthy estimate here; we deliberately did NOT poison it).
+            # ``kfs[-1]["T_cw"]`` on entry is exactly the frontend visual seed
+            # (``inv(self.pose)`` at keyframe insertion), so the default action --
+            # leave it untouched -- already publishes the bounded frontend pose.
+            if R_pred is not None:
+                _, p_vis = T_cw_to_body_world(kfs[-1]["T_cw"])
+                max_disp = self.cfg.max_deadreckon_speed_mps * pred_dt
+                if float(np.linalg.norm(p_pred - p_vis)) <= max_disp:
+                    # dead-reckon agrees with vision within a plausible window of
+                    # travel -> trust the IMU prediction (the covered-camera case).
+                    kfs[-1]["T_cw"] = body_world_to_T_cw(R_pred, p_pred)
+                # else: keep the untouched frontend visual seed (bounded fallback).
+            self.last_info = {
+                "vio_kfs": len(kfs), "vio_lms": len(ba_tids),
+                "vio_obs": len(obs_cam), "vio_imu": len(imu_factors),
+                "vio_icp": len(icp_factors),
+                "vio_iters": res.iters, "vio_reproj_px": res.mean_reproj_px,
+                "vio_window_jump_m": window_jump_m,
+                "vio_degraded": True,
+            }
+            return kfs[-1]["T_cw"].copy()
+
         for ci, kf in enumerate(kfs):
             kf["T_cw"] = body_world_to_T_cw(out.R[ci], out.p[ci])
             kf["v"] = out.v[ci].copy()
@@ -1292,6 +1882,8 @@ class WindowedVIOMap:
             "vio_obs": len(obs_cam), "vio_imu": len(imu_factors),
             "vio_icp": len(icp_factors),
             "vio_iters": res.iters, "vio_reproj_px": res.mean_reproj_px,
+            "vio_window_jump_m": window_jump_m,
+            "vio_degraded": False,
         }
         return kfs[-1]["T_cw"].copy()
 
@@ -1396,7 +1988,17 @@ class WindowedVIORGBDOdometry:
             post = self.map.run_ba()
             if post is not None:
                 self.pose = np.linalg.inv(post)
-                self.vo.pose = self.pose.copy()
+                # Divergence guard: a diverged window solve returns the IMU
+                # dead-reckon fallback (not the diverged pose), so the PUBLISHED
+                # pose stays inertially consistent -- but we must NOT write it
+                # back into the live VO frontend (``self.vo.pose``). The frontend
+                # tracks frame-to-frame from its own pose; overwriting it with a
+                # solve we just rejected as untrustworthy would let a transient
+                # fault (one bad blur frame) persistently poison tracking. On a
+                # HEALTHY solve the frontend is re-anchored to the refined pose
+                # exactly as before (behaviour bit-unchanged).
+                if not self.map.last_info.get("vio_degraded", False):
+                    self.vo.pose = self.pose.copy()
                 self.last_info.update(self.map.last_info)
             self.last_info["is_kf"] = True
         else:

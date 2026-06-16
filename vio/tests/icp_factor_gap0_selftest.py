@@ -74,23 +74,23 @@ def _make_problem(seed: int = 0):
 
 
 def _system(args, cfg, icp_factors=None):
-    """Capture (H, b, cost0) at the input state (init_lambda=0 -> A == H)."""
+    """Capture (H, b, cost0) at the input state (init_lambda=0 -> A == H).
+
+    Uses the optimiser's ``_solve_probe`` hook, which receives the FULL damped
+    system (A, b) on every inner solve regardless of whether the Schur-complement
+    fast path is active -- so the captured (A, b) is the full ndim assembled
+    system this test asserts on, not the Schur-reduced nav-only matrix.
+    """
     captured = {}
-    orig = np.linalg.solve
 
-    def cap(A, mb):
+    def probe(A, b, _delta):
         if "b" not in captured:
-            captured["b"] = -np.asarray(mb).copy()
+            captured["b"] = np.asarray(b).copy()
             captured["A"] = np.asarray(A).copy()
-        return orig(A, mb)
 
-    np.linalg.solve = cap
-    try:
-        cfg0 = replace(cfg, max_iters=1, init_lambda=0.0)
-        res = optimize_vio(*args[:6], args[6], args[7], cfg=cfg0, anchor=0,
-                           icp_factors=icp_factors)
-    finally:
-        np.linalg.solve = orig
+    cfg0 = replace(cfg, max_iters=1, init_lambda=0.0)
+    res = optimize_vio(*args[:6], args[6], args[7], cfg=cfg0, anchor=0,
+                       icp_factors=icp_factors, _solve_probe=probe)
     return captured["A"], captured["b"], res.cost0
 
 

@@ -135,4 +135,16 @@ def run_ba(engine: Engine, tight: bool, kf: Keyframe):
     post = engine.poll()                     # refined latest T_cw, or None
     if post is None:
         return None
-    return PoseMsg(kf.seq, 0, np.linalg.inv(post), {"refined": True})
+    # The TIGHT step (``vio_step``) returns ``(T_cw, health)`` so the divergence
+    # guard's verdict reaches the published pose; the LOOSE step (``ba_step``)
+    # returns the bare ``T_cw``. Merge the tight health fields (``vio_degraded``
+    # etc.) into the SAME info dict the FC already reads (alongside ``refined``
+    # and the ``pos_sigma_m`` position-noise field), so a downstream / FC consumer
+    # sees "estimator degraded this keyframe" next to the pose it acts on. On the
+    # loose path ``post`` is a bare array -> ``info`` stays ``{"refined": True}``
+    # exactly as before (the ``vio_degraded`` key is simply absent).
+    info = {"refined": True}
+    if isinstance(post, tuple):
+        post, health = post
+        info.update(health)
+    return PoseMsg(kf.seq, 0, np.linalg.inv(post), info)
