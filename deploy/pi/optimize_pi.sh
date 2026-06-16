@@ -77,6 +77,11 @@ if [ "$ROLLBACK" -eq 1 ]; then
         u=${line#mask:}; say "unmask + enable $u"
         systemctl unmask "$u" >/dev/null 2>&1 || true
         systemctl enable "$u" >/dev/null 2>&1 || warn "could not enable $u" ;;
+      config:*)
+        rest=${line#config:}; val=${rest%%:*}; file=${rest#*:}
+        if [ -f "$file" ] && grep -q "^${val}$" "$file"; then
+          say "remove '$val' from $file"; sed -i "\|^${val}$|d" "$file"
+        fi ;;
       *)
         say "re-enable $line"
         systemctl enable "$line" >/dev/null 2>&1 || warn "could not enable $line" ;;
@@ -140,6 +145,28 @@ elif [ "$DRY" -eq 1 ]; then
 else
   touch "$CLOUD_DISABLED"; say "disabled cloud-init ($CLOUD_DISABLED)"
   printf '%s\n' "cloud-init:disabled-file" >> "${STATE}.tmp"
+fi
+
+# OAK camera USB power: the Pi5 default-caps total USB current at 600mA, which
+# browns out an OAK-D under load -- ESPECIALLY the OAK-D Lite (narrower-FOV,
+# USB-powered) running stereo+IMU -> the device firmware crashes in a loop
+# ("Device ... has crashed" / "Couldn't read data from stream (X_LINK_ERROR)").
+# usb_max_current_enable=1 lifts the cap to ~1.6A; it needs a capable 5V/5A PSU
+# (check `vcgencmd get_throttled` stays 0x0). ALSO plug the OAK into a USB3 (blue)
+# port with a USB3 cable -- a USB2 port/cable (480Mbps) starves bandwidth+power.
+# Idempotent; --rollback removes the line. Reboot to apply.
+CONFIG_TXT=/boot/firmware/config.txt
+[ -f "$CONFIG_TXT" ] || CONFIG_TXT=/boot/config.txt
+if [ ! -f "$CONFIG_TXT" ]; then
+  say "skip  usb_max_current_enable (no config.txt found)"
+elif grep -q '^usb_max_current_enable=1' "$CONFIG_TXT"; then
+  say "skip  usb_max_current_enable (already set in $CONFIG_TXT)"
+elif [ "$DRY" -eq 1 ]; then
+  say "WOULD set usb_max_current_enable=1 in $CONFIG_TXT (OAK USB power; reboot needed)"
+else
+  printf 'usb_max_current_enable=1\n' >> "$CONFIG_TXT"
+  say "set usb_max_current_enable=1 in $CONFIG_TXT (OAK USB power; reboot needed)"
+  printf '%s\n' "config:usb_max_current_enable=1:$CONFIG_TXT" >> "${STATE}.tmp"
 fi
 
 if [ "$DRY" -eq 1 ]; then

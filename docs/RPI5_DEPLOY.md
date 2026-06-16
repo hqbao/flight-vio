@@ -78,6 +78,46 @@ missing — it never runs `sudo` itself.
 
 ---
 
+## 1b. OAK-D camera on the Pi5 (USB power + Lite vs W)
+
+Two device-level gotchas that are NOT software bugs — they bite at the hardware
+boundary and look like a broken pipeline:
+
+**USB power / bandwidth — the device crashes in a loop.** Symptom in `run.log`:
+```
+[depthai][error] Device <MxId> has crashed. Crash dump logs stored in ...
+[depthai][error] Couldn't read data from stream '__x_..' (X_LINK_ERROR)
+```
+repeating every ~10 s → no frames, the UI stays empty ("it doesn't work"). The
+Pi5 **default-caps total USB current at 600 mA**, which browns out an OAK-D under
+stereo+IMU load — **especially the OAK-D Lite** (USB-powered, no barrel jack).
+Fix:
+1. Plug the OAK into a **USB3 (blue) port** with a **USB3 cable** — a USB2
+   port/cable negotiates 480 Mbps and starves bandwidth+power. (`lsusb -t` should
+   show the device at `5000M`, not `480M`.)
+2. `usb_max_current_enable=1` in `/boot/firmware/config.txt` (lifts the cap to
+   ~1.6 A; needs a capable 5V/5A PSU — `vcgencmd get_throttled` must stay `0x0`).
+   **`deploy/pi/optimize_pi.sh` sets this for you** (idempotent, `--rollback`
+   removes it); **reboot** to apply.
+
+**OAK-D Lite vs OAK-D W — fast-motion VIO.** The mono FOVs differ a lot:
+**W ≈ 97° HFOV** (the "W" = Wide, designed for VIO/SLAM) vs **Lite ≈ 70°**. On a
+**fast push** the Lite's narrower FOV whips features out of frame → the KLT/PnP
+frontend loses tracks → **loose pose stalls** ("ì lại một chỗ") and the **tight
+backend's window is under-constrained → it lurches then snaps back** ("đi một
+đoạn rồi giật ngược"). This is largely a **hardware-FOV limit**, not a regression:
+prefer the **OAK-D W for fast-motion** work; the Lite is fine for slower motion.
+
+**OAK-D Lite IMU→cam extrinsic.** The Lite's BMI270 EEPROM ships a **wrong nominal
+`Rx(90°)`** IMU→cam rotation (the W's `diag(1,−1,−1)` is correct); a wrong
+extrinsic corrupts IMU-assisted tracking. Verify/correct per device with the
+`imu_camera.tools.imu_cam_calib` pose wizard (stores a `calib_store` override that
+`live_calib` applies over the EEPROM) or an EEPROM flash. Device
+`19443010A12F157E00` here was flashed to the correct `diag(1,−1,−1)` — confirm
+with `cal.getImuToCameraExtrinsics(CAM_B)` on the live device.
+
+---
+
 ## 2. Bootstrap
 
 ### Option A — one script (recommended)
