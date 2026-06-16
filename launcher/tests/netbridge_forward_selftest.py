@@ -41,7 +41,7 @@ def _ns(**over) -> types.SimpleNamespace:
                 use_camera_calib=False, vl53l9cx=True, worker=False,
                 tight=False, stabilize_velocity=False, depth_icp=False,
                 ba_window=False, frontend_viz=False, direct=False,
-                forward=None, model=None)
+                forward=None, model=None, bridge_frames=False)
     base.update(over)
     return types.SimpleNamespace(**base)
 
@@ -69,6 +69,28 @@ def test_build_forward_args() -> None:
     print("[b] build_forward_args: listen + 3 endpoints + resolution               OK")
 
 
+def test_pose_only_default() -> None:
+    """DEFAULT (no --bridge-frames) is POSE-ONLY; --bridge-frames restores frames.
+
+    The bridge defaults to low-bandwidth so a congested WiFi link doesn't back up:
+    the heavy image topics are excluded unless the operator opts in.
+    """
+    cap, vio, slam = "oak.capture", "oak.vio", "oak.slam"
+    host, port = parse_host_port(":8787")
+    default = build_forward_args(host, port, _ns(bridge_frames=False),
+                                 cap, vio, slam)
+    frames = build_forward_args(host, port, _ns(bridge_frames=True),
+                                cap, vio, slam)
+    assert "--pose-only" in default, default
+    assert "--pose-only" not in frames, frames
+    # --bridge-frames must reproduce the EXACT pre-change argv (backward compatible).
+    assert frames == ["--listen", "0.0.0.0:8787",
+                      "--capture-endpoint", cap, "--vio-endpoint", vio,
+                      "--slam-endpoint", slam, "--width", "54",
+                      "--height", "42"], frames
+    print("[e] default => --pose-only; --bridge-frames => legacy argv (compat)      OK")
+
+
 def test_additive() -> None:
     """--forward must not leak into the capture / vio argv (additive)."""
     cap, vio, slam = "oak.capture", "oak.vio", "oak.slam"
@@ -85,18 +107,20 @@ def test_additive() -> None:
 
 
 def test_help_registers_flag() -> None:
-    """The real launcher parser must register --forward (catches action=/dest=)."""
+    """The launcher parser must register --forward AND --bridge-frames."""
     root = Path(__file__).resolve().parents[2]
     out = subprocess.run(
         [sys.executable, "-m", "launcher.main", "--help"],
         cwd=str(root), capture_output=True, text=True, check=True)
     assert "--forward" in out.stdout, out.stdout
-    print("[c] launcher --help lists --forward                                      OK")
+    assert "--bridge-frames" in out.stdout, out.stdout
+    print("[c] launcher --help lists --forward + --bridge-frames                    OK")
 
 
 if __name__ == "__main__":
     test_parse_host_port()
     test_build_forward_args()
+    test_pose_only_default()
     test_additive()
     test_help_registers_flag()
     print("\nnetbridge_forward_selftest: ALL PASS")

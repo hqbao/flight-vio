@@ -115,12 +115,15 @@ class EndpointForwarder:
     """
 
     def __init__(self, role: str, local_endpoint: str, server: TcpServer,
-                 rings: RingRegistry, *, connect_timeout_s: float = 30.0) -> None:
+                 rings: RingRegistry, *, connect_timeout_s: float = 30.0,
+                 include_images: bool = True) -> None:
         self.role = role
         self.local_endpoint = local_endpoint
         self.server = server
         self._no_rings = _NoRings()
-        all_t = allow.all_topics(role)
+        # In pose-only mode the heavy image topics are dropped here, at the single
+        # source of truth, so this forwarder NEVER subscribes/forwards them.
+        all_t = allow.all_topics(role, include_images=include_images)
         # Convertible (image + POD) topics ride the IPCSubscriber -> to_local ->
         # tap -> ref-free wire. Direct-wire (retained config) topics have NO
         # converter, so they ride a RAW IPC subscription that hands us the Wire*
@@ -292,18 +295,29 @@ def run_forward(*, host: str, port: int,
                 width: int, height: int, slots: int = 64,
                 connect_timeout_s: float = 30.0,
                 calib_timeout_s: float = 60.0,
+                pose_only: bool = False,
                 ready_event: threading.Event | None = None,
                 stop_event: threading.Event | None = None) -> None:
     """Start the TCP server + the three endpoint forwarders; block until SIGTERM.
 
     ``width`` / ``height`` size the Pi-side rings the forwarder ATTACHES to (it
     must match what capture/vio created -- the same ToF 54x42 vs 640x400 contract
-    the rest of the stack honours). ``ready_event`` (test hook) is set once the TCP
-    server is listening and all forwarders have started. ``stop_event`` (test hook)
-    lets a caller running this OFF the main thread (where SIGTERM cannot be
+    the rest of the stack honours). ``pose_only`` is the low-bandwidth mode: the
+    heavy shm-backed image topics are EXCLUDED from every forwarder (and from the
+    TcpServer's latest-wins set), so the bridge carries only the small POD + retained
+    topics the trajectory + map UI needs -- and never attaches the image rings at all
+    (there is nothing to read from them). ``ready_event`` (test hook) is set once the
+    TCP server is listening and all forwarders have started. ``stop_event`` (test
+    hook) lets a caller running this OFF the main thread (where SIGTERM cannot be
     installed) stop it cleanly; when ``None`` a fresh event is used and SIGTERM /
     Ctrl-C drive the teardown.
     """
+    include_images = not pose_only
+    if pose_only:
+        LOG.info("forward: POSE-ONLY mode (image topics NOT bridged -- camera/"
+                 "depth/keyframe frames are excluded; the trajectory + map UI is "
+                 "unaffected, only the opt-in camera Visualize windows lose frames)")
+
     # The launcher passes the RAW camera res, but under --vl53l9cx capture creates
     # its rings at the ToF grid (54x42). Await capture's retained calib.bundle (the
     # source of truth for the actual grid) and attach at THAT res -- else attach_all
@@ -315,24 +329,32 @@ def run_forward(*, host: str, port: int,
 
     # Pi-side rings the forwarders attach to (consumer side -- capture/vio own
     # them). Retry: capture/vio create these asynchronously as they boot, so a
-    # ring (esp. vio's kf_gray/kf_depth) may not exist the instant we attach.
-    cap_rings = _attach_all_retry(
-        default_capture_specs(endpoint=capture_endpoint,
+    # ring (esp. vio's kf_gray/kf_depth) may not exist the instant we attach. In
+    # pose-only mode no image topic is forwarded, so the rings would never be read;
+    # skip attaching them entirely (empty registries) -- one less startup race.
+    if pose_only:
+        cap_rings = RingRegistry()
+        vio_rings = RingRegistry()
+    else:
+        cap_rings = _attach_all_retry(
+            default_capture_specs(endpoint=capture_endpoint,
+                                  width=width, height=height, slots=slots),
+            calib_timeout_s, "capture")
+        vio_rings = _attach_all_retry(
+            default_vio_specs(endpoint=vio_endpoint,
                               width=width, height=height, slots=slots),
-        calib_timeout_s, "capture")
-    vio_rings = _attach_all_retry(
-        default_vio_specs(endpoint=vio_endpoint,
-                          width=width, height=height, slots=slots),
-        calib_timeout_s, "vio")
+            calib_timeout_s, "vio")
     # SLAM owns no rings (all its forwarded topics are POD), so an empty registry.
     slam_rings = RingRegistry()
 
     # ONE TcpServer for all three endpoints: union the image + retained sets so the
-    # latest-wins / replay policy is applied per topic regardless of role.
+    # latest-wins / replay policy is applied per topic regardless of role. In
+    # pose-only mode image_topics() returns empty, so the union is empty and the
+    # server treats every forwarded topic as reliable POD/retained.
     image_union: set[str] = set()
     retained_union: set[str] = set()
     for role in ("capture", "vio", "slam"):
-        image_union |= allow.image_topics(role)
+        image_union |= allow.image_topics(role, include_images=include_images)
         retained_union |= allow.retained_topics(role)
     server = TcpServer(host, port,
                        retain_topics=retained_union,
@@ -340,11 +362,14 @@ def run_forward(*, host: str, port: int,
 
     forwarders = [
         EndpointForwarder("capture", capture_endpoint, server, cap_rings,
-                          connect_timeout_s=connect_timeout_s),
+                          connect_timeout_s=connect_timeout_s,
+                          include_images=include_images),
         EndpointForwarder("vio", vio_endpoint, server, vio_rings,
-                          connect_timeout_s=connect_timeout_s),
+                          connect_timeout_s=connect_timeout_s,
+                          include_images=include_images),
         EndpointForwarder("slam", slam_endpoint, server, slam_rings,
-                          connect_timeout_s=connect_timeout_s),
+                          connect_timeout_s=connect_timeout_s,
+                          include_images=include_images),
     ]
 
     stop = stop_event if stop_event is not None else threading.Event()
@@ -407,6 +432,13 @@ def main() -> int:
     ap.add_argument("--slots", type=int, default=64,
                     help="ring depth (must match the producers' create slots)")
     ap.add_argument("--connect-timeout", type=float, default=30.0)
+    ap.add_argument("--pose-only", action="store_true",
+                    help="LOW-BANDWIDTH mode: do NOT bridge the heavy image topics "
+                         "(camera / depth / keyframe frames, ~51 Mbit/s). Only the "
+                         "small POD + retained topics cross the wire, so the main "
+                         "trajectory + map UI works fully over a slow WiFi link; the "
+                         "opt-in camera Visualize windows just have no frames. The "
+                         "Mac-side netbridge.receive MUST be run with --pose-only too.")
     args = ap.parse_args()
 
     host, port = _parse_hostport(args.listen)
@@ -415,7 +447,8 @@ def main() -> int:
                 vio_endpoint=args.vio_endpoint,
                 slam_endpoint=args.slam_endpoint,
                 width=args.width, height=args.height, slots=args.slots,
-                connect_timeout_s=args.connect_timeout)
+                connect_timeout_s=args.connect_timeout,
+                pose_only=args.pose_only)
     return 0
 
 

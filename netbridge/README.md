@@ -29,7 +29,7 @@ abstract endpoints the UI already consumes.
 |------|------|
 | `comms/` | The vendored comms contract — a **7th bit-identical copy** (`cp -R ui/comms`). sha256-gated by `verification/ipc_comms_selftest.py` alongside the other 6. **Never hand-edited.** netbridge is a *consumer* of comms. |
 | `tcp_transport.py` | AF_INET frame transport: `TcpServer` / `TcpClient` with an HMAC authkey (`OAKD_NETBRIDGE_KEY` if set, else a built-in **default key** so no setup is needed on a trusted LAN), a `_BYE` sentinel, and retained-topic replay on connect. The network analogue of `IPCPubSub`. |
-| `topics_allowlist.py` | The single source of truth for **which** topics cross the wire (UI-needed only), split into POD / image / retained, plus the direct-wire (retained config) set. Forward and receive both import it. |
+| `topics_allowlist.py` | The single source of truth for **which** topics cross the wire (UI-needed only), split into POD / image / retained, plus the direct-wire (retained config) set. `all_topics(role, include_images=…)` drives the pose-only switch (see **Bandwidth mode**). Forward and receive both import it. |
 | `wire_full.py` | The ref-free `Wire*` ⇄ local-dataclass converter for the four image topics — puts **full ndarrays** where the in-host wire would hold a `SharedArrayRef`. |
 | `forward.py` | Runs on the **Pi**. The local IPC → TCP pump. **The only re-encode point.** |
 | `receive.py` | Runs on the **Mac**. The TCP → local IPC re-serve. |
@@ -78,6 +78,18 @@ stall — never back-pressure capture/vio). POD + retained topics forward
 **reliably** (a one-shot calib or a pose is never silently dropped). The policy
 lives in `TcpServer` (`image_topics` set).
 
+## Bandwidth mode — pose-only by default
+
+The bridge defaults to **pose-only**: `all_topics(role, include_images=False)` omits
+the four shm-backed image topics, so only the small POD + retained topics cross the
+wire. forward gets `--pose-only` (from the launcher, unless `--bridge-frames`) and
+receive gets `--pose-only` (from `deploy/pi-ui.sh`, unless `--frames`) — **both ends
+must match**. This exists because the uncompressed camera/depth/keyframe frames the
+main trajectory + map UI never displays (~51 Mbit/s at 320×200) saturate a congested
+2.4 GHz link (~1.6 Mbit/s effective), backing up the pose stream. Pass `--frames` on
+both ends (best on 5 GHz) to include the image topics for the camera Visualize
+windows. Measured A/B: [`docs/RPI5_DEPLOY.md` §3c](../docs/RPI5_DEPLOY.md).
+
 ## Security (HONEST)
 
 `OAKD_NETBRIDGE_KEY` is a shared HMAC secret (`multiprocessing.connection`
@@ -95,15 +107,20 @@ security on an untrusted network. It is the same speed either way (one-time hand
 ## Run
 
 ```bash
-# on the Pi — additive to the normal flight launch:
+# on the Pi — additive to the normal flight launch (pose-only by default):
 ./run.sh --no-ui --vl53l9cx --direct --forward 0.0.0.0:8787   # no key -> default key
 
-# on the Mac — connects with the same default key, no setup:
+# on the Mac — connects with the same default key, no setup (pose-only by default):
 ./deploy/pi-ui.sh --connect <pi-host>:8787
 
 # OR with a real shared secret (export the SAME value on BOTH hosts):
 export OAKD_NETBRIDGE_KEY=$(openssl rand -hex 32)   # Pi  (and the same on the Mac)
 ./run.sh --no-ui --vl53l9cx --direct --forward 0.0.0.0:8787
+
+# To bridge the camera frames too (camera Visualize windows), add --bridge-frames
+# on the Pi AND --frames on the Mac (both ends must match; best on 5 GHz):
+./run.sh --no-ui --vl53l9cx --direct --forward 0.0.0.0:8787 --bridge-frames
+./deploy/pi-ui.sh --connect <pi-host>:8787 --frames
 ```
 
 ## Gate

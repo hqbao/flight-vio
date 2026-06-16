@@ -17,13 +17,21 @@
 # OAKD_NETBRIDGE_KEY is OPTIONAL: export the SAME secret on both hosts for real auth,
 # or leave it unset and both ends use a built-in default key (trusted LAN, no setup).
 #
+# Bandwidth mode: this defaults to POSE-ONLY (passes --pose-only to netbridge.receive)
+# -- only the small pose/map/overlay topics cross the WiFi, not the heavy camera/depth/
+# keyframe frames. The Pi side MUST be running the SAME way (pi-run.sh --ui defaults
+# pose-only too). The trajectory + map UI works fully; only the opt-in camera Visualize
+# windows have no frames. Pass --frames to include the camera frames -- then the Pi
+# side MUST also have been started with `./deploy/pi-run.sh --ui --frames`.
+#
 # Threat model (HONEST): the authkey AUTHENTICATES the peer but does NOT encrypt
 # the stream. For an untrusted network, tunnel it: e.g. `ssh -L 8787:localhost:8787
 # pi@<pi-host>` then `./deploy/pi-ui.sh --connect 127.0.0.1:8787` -- the SSH
 # forward provides the encryption and netbridge sees only loopback.
 #
 # Usage:
-#   ./deploy/pi-ui.sh --connect <pi-host>:8787 [extra ui.main args]
+#   ./deploy/pi-ui.sh --connect <pi-host>:8787 [extra ui.main args]   # pose-only
+#   ./deploy/pi-ui.sh --frames --connect <pi-host>:8787               # incl. frames
 #   ./deploy/pi-ui.sh --connect 192.168.1.50:8787 --ba-window
 set -e
 cd "$(dirname "$0")/.."          # deploy/pi-ui.sh -> repo root (where .venv lives)
@@ -44,13 +52,17 @@ if [ -z "${OAKD_NETBRIDGE_KEY:-}" ]; then
   echo "  both hosts for real auth on an untrusted network." >&2
 fi
 
-# --- parse --connect HOST:PORT; default to the cached Pi IP : 8787 -------------
+# --- parse --connect HOST:PORT + --frames; default to the cached Pi IP : 8787 ---
+# WANT_FRAMES default OFF -> receive runs --pose-only (low-bandwidth). --frames drops
+# it so the heavy camera/depth/keyframe topics are subscribed (Pi side must match).
 CONNECT=""
+WANT_FRAMES=0
 UI_ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --connect) CONNECT="$2"; shift 2 ;;
     --connect=*) CONNECT="${1#--connect=}"; shift ;;
+    --frames) WANT_FRAMES=1; shift ;;
     *) UI_ARGS+=("$1"); shift ;;
   esac
 done
@@ -68,7 +80,15 @@ if [ -z "$CONNECT" ]; then
   echo "  ./deploy/pi-discover.sh first so the cached IP is used automatically." >&2
   exit 2
 fi
-echo "[pi-ui.sh] connecting UI to $CONNECT"
+
+# Pose-only by default (must match the Pi side); --frames includes the camera frames.
+RECV_MODE_ARGS=()
+if [ "$WANT_FRAMES" -eq 1 ]; then
+  echo "[pi-ui.sh] connecting UI to $CONNECT  (FRAMES mode -- Pi must run pi-run.sh --ui --frames)"
+else
+  RECV_MODE_ARGS+=(--pose-only)
+  echo "[pi-ui.sh] connecting UI to $CONNECT  (pose-only -- low bandwidth; Pi defaults to match)"
+fi
 
 # Canonical endpoints the receive side re-serves + the UI connects to.
 CAP_EP="oak.capture"
@@ -83,7 +103,8 @@ echo "[pi-ui.sh] starting netbridge.receive (connect $CONNECT) ..."
     --connect "$CONNECT" \
     --capture-endpoint "$CAP_EP" \
     --vio-endpoint "$VIO_EP" \
-    --slam-endpoint "$SLAM_EP" &
+    --slam-endpoint "$SLAM_EP" \
+    "${RECV_MODE_ARGS[@]}" &
 RECV_PID=$!
 
 # Tear the receiver down whenever this script exits (clean quit OR error/Ctrl-C).

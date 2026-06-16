@@ -492,6 +492,139 @@ def test_two_hop_bit_identity() -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Test 1b: POSE-ONLY (low-bandwidth) mode -- pose round-trips, images NEVER do.
+# --------------------------------------------------------------------------- #
+def test_pose_only_excludes_images() -> bool:
+    """forward + receive both in pose-only: pose.odom round-trips bit-identically,
+    and the heavy image topic (frame.depth) is NEVER served / never arrives.
+
+    This is the bandwidth fix: the operator's default Pi deploy runs pose-only so the
+    ~51 Mbit/s image stream NEVER leaves the Pi. We prove the trajectory UI's data
+    (pose.odom) still flows AND that frame.depth is genuinely absent end-to-end.
+    """
+    print("\n[1b] pose-only mode (image topics EXCLUDED; pose.odom still flows)")
+    ok = True
+    port = _free_port()
+    suffix = f"nbpo{os.getpid() & 0xFFF:x}"
+    cap_pi, vio_pi, slam_pi = (f"oak.cap.{suffix}p", f"oak.vio.{suffix}p",
+                               f"oak.slm.{suffix}p")
+    cap_mac, vio_mac, slam_mac = (f"oak.cap.{suffix}m", f"oak.vio.{suffix}m",
+                                  f"oak.slm.{suffix}m")
+    producer = FakeProducer(cap_pi, vio_pi, slam_pi)
+    fwd_ready = threading.Event()
+    rcv_ready = threading.Event()
+    fwd_stop = threading.Event()
+    rcv_stop = threading.Event()
+    fwd_thread = recv_thread = None
+    pose_msgs: list = []
+    depth_msgs: list = []
+    pose_lock = threading.Lock()
+    cap_client = vio_client = None
+    try:
+        producer.start()
+        time.sleep(0.3)
+        # forward POSE-ONLY: the image topics must never be subscribed/forwarded, so
+        # it does NOT even attach the capture/vio image rings.
+        fwd_thread = threading.Thread(
+            target=run_forward, kwargs=dict(
+                host="127.0.0.1", port=port,
+                capture_endpoint=cap_pi, vio_endpoint=vio_pi,
+                slam_endpoint=slam_pi, width=W, height=H, slots=SLOTS,
+                connect_timeout_s=10.0, pose_only=True,
+                ready_event=fwd_ready, stop_event=fwd_stop),
+            name="nb-forward-po", daemon=True)
+        fwd_thread.start()
+        ok &= _check(fwd_ready.wait(timeout=10.0), "forward came up (pose-only)")
+
+        # receive POSE-ONLY: it must NOT allocate image rings and must still await
+        # the retained calib.bundle + re-serve pose without hanging.
+        recv_thread = threading.Thread(
+            target=run_receive, kwargs=dict(
+                host="127.0.0.1", port=port,
+                capture_endpoint=cap_mac, vio_endpoint=vio_mac,
+                slam_endpoint=slam_mac, slots=SLOTS,
+                calib_timeout_s=15.0, pose_only=True,
+                ready_event=rcv_ready, stop_event=rcv_stop),
+            name="nb-receive-po", daemon=True)
+        recv_thread.start()
+        ok &= _check(rcv_ready.wait(timeout=15.0),
+                     "receive came up (pose-only -- no image rings, did NOT hang)")
+
+        # Subscribe pose.odom (POD, on the re-served vio endpoint) + frame.depth
+        # (image, on the re-served capture endpoint). pose must arrive; depth must
+        # NOT (the bridge never subscribed it on either side). frame.depth rides
+        # rings normally, but in pose-only the receive endpoint registers no ring
+        # publisher for it, so a raw client subscription simply never fires.
+        vio_client = IPCPubSub(vio_mac, role="client", connect_timeout_s=10.0)
+
+        def _on_pose(wm) -> None:
+            if isinstance(wm, WireEnd):
+                return
+            with pose_lock:
+                pose_msgs.append(wm)
+        vio_client.subscribe(topics.POSE_ODOM, _on_pose)
+        vio_client.start()
+
+        cap_client = IPCPubSub(cap_mac, role="client", connect_timeout_s=10.0)
+
+        def _on_depth(wm) -> None:
+            if isinstance(wm, WireEnd):
+                return
+            with pose_lock:
+                depth_msgs.append(wm)
+        cap_client.subscribe(topics.FRAME_DEPTH, _on_depth)
+        cap_client.start()
+        time.sleep(0.5)
+
+        n = 5
+        sent_pose = [_make_pose(s) for s in range(n)]
+        for s in range(n):
+            producer.publish_frame(s)         # publishes BOTH depth + pose upstream
+            time.sleep(0.08)
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            with pose_lock:
+                have = len(pose_msgs) >= n
+            if have:
+                break
+            time.sleep(0.05)
+        # Give any (erroneously) forwarded depth a generous window to show up.
+        time.sleep(0.5)
+
+        with pose_lock:
+            got_pose = list(pose_msgs)
+            got_depth = list(depth_msgs)
+
+        ok &= _check(len(got_pose) == n,
+                     f"pose.odom flows in pose-only (got {len(got_pose)}/{n})")
+        pose_ok = all(np.array_equal(g.T_world_cam,
+                                     sent_pose[int(g.seq)].T_world_cam)
+                      for g in got_pose)
+        ok &= _check(pose_ok, "pose.odom T_world_cam BIT-IDENTICAL (pose-only)")
+        ok &= _check(len(got_depth) == 0,
+                     f"frame.depth NEVER arrives in pose-only (got {len(got_depth)})")
+    finally:
+        for c in (cap_client, vio_client):
+            if c is not None:
+                try:
+                    c.stop()
+                except Exception:                                  # noqa: BLE001
+                    pass
+        rcv_stop.set()
+        fwd_stop.set()
+        if recv_thread is not None:
+            recv_thread.join(timeout=5.0)
+        if fwd_thread is not None:
+            fwd_thread.join(timeout=5.0)
+        try:
+            producer.stop()
+        except Exception:                                          # noqa: BLE001
+            pass
+    return ok
+
+
+# --------------------------------------------------------------------------- #
 # Test 2: authkey enforcement (wrong key refused; no key -> built-in default key).
 # --------------------------------------------------------------------------- #
 def test_authkey_enforced() -> bool:
@@ -723,6 +856,7 @@ def main() -> int:
           "(127.0.0.1 two-hop)")
     results = {
         "two-hop bit-identity + retained replay": test_two_hop_bit_identity(),
+        "pose-only excludes images":              test_pose_only_excludes_images(),
         "authkey enforcement":                    test_authkey_enforced(),
         "offscreen ui.main smoke":                test_offscreen_ui_smoke(),
     }

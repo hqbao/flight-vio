@@ -81,10 +81,13 @@ class EndpointServer:
     """
 
     def __init__(self, role: str, endpoint: str, *,
-                 width: int, height: int, slots: int = 64) -> None:
+                 width: int, height: int, slots: int = 64,
+                 include_images: bool = True) -> None:
         self.role = role
         self.endpoint = endpoint
-        self._topics = allow.all_topics(role)
+        # In pose-only mode the image topics are excluded everywhere -- so this
+        # endpoint neither serves them nor allocates their Mac-local rings.
+        self._topics = allow.all_topics(role, include_images=include_images)
         self._retained = allow.retained_topics(role)
         # Topics that go through the publisher (image + POD = everything that is
         # NOT a direct-wire retained topic).
@@ -92,17 +95,19 @@ class EndpointServer:
                            if t not in _DIRECT_WIRE_TOPICS]
 
         # Mac-local rings the IPCPublisher writes into. Only capture + vio own
-        # rings (the four ref-bearing image topics); slam is POD-only.
-        if role == "capture":
+        # rings (the four ref-bearing image topics); slam is POD-only. In pose-only
+        # mode no image topic is published, so there is nothing to write into a ring
+        # -- skip allocating them entirely (empty registry for every role).
+        if include_images and role == "capture":
             self.rings = RingRegistry().create_all(
                 default_capture_specs(endpoint=endpoint,
                                       width=width, height=height, slots=slots))
-        elif role == "vio":
+        elif include_images and role == "vio":
             self.rings = RingRegistry().create_all(
                 default_vio_specs(endpoint=endpoint,
                                   width=width, height=height, slots=slots))
         else:
-            self.rings = RingRegistry()            # slam: no rings
+            self.rings = RingRegistry()            # slam, or pose-only: no rings
 
         # The IPCPubSub server re-serving this endpoint. retain_topics so a late
         # UI subscriber gets calib / vio.map replayed off this server.
@@ -152,7 +157,7 @@ class EndpointServer:
 
 
 # --------------------------------------------------------------------------- #
-def _topic_roles(topic: str) -> list[str]:
+def _topic_roles(topic: str, include_images: bool = True) -> list[str]:
     """Every re-served endpoint a topic belongs to (capture / vio / slam).
 
     Most topics belong to exactly ONE role, but ``calib.bundle`` is re-served on
@@ -160,23 +165,30 @@ def _topic_roles(topic: str) -> list[str]:
     it on the vio AND slam endpoints). The topic string on the wire is
     endpoint-agnostic, so receive fans such a topic out to every endpoint whose
     allowlist contains it, reproducing the in-host multi-publisher fan-out.
+
+    ``include_images`` MUST match the mode the endpoints were built with: in
+    pose-only mode the image topics are not in any allowlist, so an (unexpected)
+    image frame would not resolve to a role -- consistent with the forward never
+    sending one.
     """
     roles = [role for role in ("capture", "vio", "slam")
-             if topic in allow.all_topics(role)]
+             if topic in allow.all_topics(role, include_images=include_images)]
     if not roles:
         raise KeyError(f"receive: topic {topic!r} not in any role allowlist")
     return roles
 
 
-def _union_allowlist() -> list[str]:
+def _union_allowlist(include_images: bool = True) -> list[str]:
     """Every allowlisted topic across all three roles, de-duplicated, in order.
 
     One TcpClient carries all three endpoints' topics; the server forwards only
-    what we subscribe, so we ask for the union.
+    what we subscribe, so we ask for the union. ``include_images=False`` (pose-only
+    mode) leaves the heavy image topics OUT of the subscription, so the server never
+    even sends them -- the bandwidth never leaves the Pi.
     """
     union: list[str] = []
     for role in ("capture", "vio", "slam"):
-        for t in allow.all_topics(role):
+        for t in allow.all_topics(role, include_images=include_images):
             if t not in union:
                 union.append(t)
     return union
@@ -201,9 +213,10 @@ class _FrameRouter:
     drained) or fully routed -- never split.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, include_images: bool = True) -> None:
         self._lock = threading.Lock()
         self._live = False
+        self._include_images = include_images
         self._pending: list[tuple[str, object]] = []
         self._endpoints: dict[str, "EndpointServer"] = {}
         self.calib: WireCalibBundle | None = None
@@ -228,7 +241,7 @@ class _FrameRouter:
         # Fan out to EVERY endpoint that re-serves the topic (calib.bundle goes to
         # all three; everything else to exactly one).
         try:
-            roles = _topic_roles(topic)
+            roles = _topic_roles(topic, include_images=self._include_images)
         except KeyError as e:
             LOG.warning("receive: %s", e)
             return
@@ -257,24 +270,37 @@ class _FrameRouter:
 def run_receive(*, host: str, port: int,
                 capture_endpoint: str, vio_endpoint: str, slam_endpoint: str,
                 slots: int = 64, calib_timeout_s: float = 60.0,
+                pose_only: bool = False,
                 ready_event: threading.Event | None = None,
                 stop_event: threading.Event | None = None) -> None:
     """Connect, learn the resolution, build the Mac rings, re-serve. Block on SIGTERM.
 
-    ``ready_event`` (test hook) is set once all three endpoints are serving and the
-    buffered + live stream is flowing. ``stop_event`` (test hook) lets a caller
-    running this OFF the main thread (where SIGTERM cannot be installed) stop it
-    cleanly; when ``None`` a fresh event is used and SIGTERM / Ctrl-C drive the
-    teardown.
+    ``pose_only`` is the low-bandwidth mode and MUST match the Pi-side forward: the
+    image topics are excluded from the subscription (so the server never sends
+    them), and no image rings are allocated. receive still awaits the retained
+    ``calib.bundle`` and re-serves the pose / map / overlay POD topics normally, so
+    the main trajectory + map UI is unaffected -- only the opt-in camera Visualize
+    windows have no frames. ``ready_event`` (test hook) is set once all three
+    endpoints are serving and the buffered + live stream is flowing. ``stop_event``
+    (test hook) lets a caller running this OFF the main thread (where SIGTERM cannot
+    be installed) stop it cleanly; when ``None`` a fresh event is used and SIGTERM /
+    Ctrl-C drive the teardown.
     """
+    include_images = not pose_only
+    if pose_only:
+        LOG.info("receive: POSE-ONLY mode (image topics NOT subscribed -- the "
+                 "forward must be in --pose-only too; the trajectory + map UI works "
+                 "fully, only the camera Visualize windows have no frames)")
     # 1. Connect ONE TcpClient subscribed to the union allowlist; a single
     #    _FrameRouter buffers every inbound frame until the rings are sized. (Like
     #    ui.main awaits the bundle before building views -- we await it before
-    #    building any ring; the bundle's W/H is the ONLY thing that sizes them.)
+    #    building any ring; the bundle's W/H is the ONLY thing that sizes them.) In
+    #    pose-only mode the image topics are NOT in the union, so they are never
+    #    subscribed and never cross the wire.
     LOG.info("receive: connecting to %s:%d, awaiting calib.bundle ...", host, port)
-    router = _FrameRouter()
+    router = _FrameRouter(include_images=include_images)
     client = TcpClient(host, port, connect_timeout_s=calib_timeout_s)
-    for t in _union_allowlist():
+    for t in _union_allowlist(include_images=include_images):
         client.subscribe(t, router)
     client.start()
 
@@ -291,13 +317,17 @@ def run_receive(*, host: str, port: int,
     LOG.info("receive: calib received (%dx%d) -> sizing Mac rings", width, height)
 
     # 2. Build + start the three re-served endpoints at the LEARNED resolution.
+    #    (pose-only -> include_images False -> no image rings, no image serving.)
     endpoints = {
         "capture": EndpointServer("capture", capture_endpoint,
-                                  width=width, height=height, slots=slots),
+                                  width=width, height=height, slots=slots,
+                                  include_images=include_images),
         "vio": EndpointServer("vio", vio_endpoint,
-                              width=width, height=height, slots=slots),
+                              width=width, height=height, slots=slots,
+                              include_images=include_images),
         "slam": EndpointServer("slam", slam_endpoint,
-                               width=width, height=height, slots=slots),
+                               width=width, height=height, slots=slots,
+                               include_images=include_images),
     }
     for ep in endpoints.values():
         ep.start()
@@ -363,6 +393,12 @@ def main() -> int:
                     help="Mac ring depth (>= the IPCPubSub outbound cap)")
     ap.add_argument("--calib-timeout", type=float, default=60.0,
                     help="seconds to wait for the forwarded calib.bundle")
+    ap.add_argument("--pose-only", action="store_true",
+                    help="LOW-BANDWIDTH mode: do NOT subscribe the heavy image "
+                         "topics (camera / depth / keyframe frames). The Pi-side "
+                         "netbridge.forward MUST be run with --pose-only too. The "
+                         "main trajectory + map UI works fully; the opt-in camera "
+                         "Visualize windows just have no frames.")
     args = ap.parse_args()
 
     host, port = _parse_hostport(args.connect)
@@ -370,7 +406,8 @@ def main() -> int:
                 capture_endpoint=args.capture_endpoint,
                 vio_endpoint=args.vio_endpoint,
                 slam_endpoint=args.slam_endpoint,
-                slots=args.slots, calib_timeout_s=args.calib_timeout)
+                slots=args.slots, calib_timeout_s=args.calib_timeout,
+                pose_only=args.pose_only)
     return 0
 
 

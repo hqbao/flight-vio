@@ -104,21 +104,37 @@ DIRECT_WIRE_TOPICS: frozenset[str] = frozenset(
     CAPTURE_RETAINED + VIO_RETAINED + SLAM_RETAINED)
 
 
-def all_topics(role: str) -> list[str]:
+def all_topics(role: str, include_images: bool = True) -> list[str]:
     """Every allowlisted topic for ``role`` (pod + image + retained), in order.
 
     Order matters for retained replay: retained topics are declared so the server
     can replay calib FIRST. The full list is what forward subscribes locally and
     what receive subscribes over TCP.
+
+    ``include_images=False`` is the POSE-ONLY (low-bandwidth) bridge mode: the
+    heavy shm-backed image topics (~51 Mbit/s of uncompressed camera/depth/keyframe
+    frames) are OMITTED, leaving only the small POD + retained topics the main
+    trajectory + map UI actually consumes. retained still leads the list (the calib
+    replay ordering the server relies on is preserved either way). The opt-in camera
+    Visualize windows simply receive no frames in this mode -- a clear tradeoff.
     """
     pod, image, retained = BY_ROLE[role]
-    # retained first so calib leads the replay; then image, then the rest of POD.
-    return list(retained) + list(image) + list(pod)
+    # retained first so calib leads the replay; then image (unless excluded), then
+    # the rest of POD.
+    image_part = list(image) if include_images else []
+    return list(retained) + image_part + list(pod)
 
 
-def image_topics(role: str) -> set[str]:
-    """The image (shm-backed) topics for ``role`` -- forwarded latest-wins."""
-    return set(BY_ROLE[role][1])
+def image_topics(role: str, include_images: bool = True) -> set[str]:
+    """The image (shm-backed) topics for ``role`` -- forwarded latest-wins.
+
+    ``include_images=False`` returns the EMPTY set (pose-only mode), so callers
+    that build the TcpServer's latest-wins ``image_topics`` set, or that subscribe
+    the image topics, simply see no image topics at all -- the bridge never touches
+    them. The signature mirrors :func:`all_topics` so both share the single
+    ``include_images`` switch.
+    """
+    return set(BY_ROLE[role][1]) if include_images else set()
 
 
 def retained_topics(role: str) -> set[str]:
