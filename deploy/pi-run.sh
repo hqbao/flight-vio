@@ -75,6 +75,18 @@ if pi_ssh "test -f ~/$DEST/run.pid && kill -0 \$(cat ~/$DEST/run.pid) 2>/dev/nul
 Stop it first:  ./deploy/pi-stop.sh"
 fi
 
+# Sweep ORPHANS from a crashed/interrupted previous run. We're past the live-PID
+# guard above, so any lingering capture/vio/slam/launcher procs are orphans -- and
+# a stray capture still HOLDS the OAK USB device, so the new run opens "no OAK
+# device found" (the classic "it worked, then after a crash it stopped working").
+# pi-stop does this on teardown; do it here too so a forgotten stop never blocks.
+if pi_ssh "pgrep -f 'python -m (launcher|imu_camera|vio|slam)\\.main' >/dev/null 2>&1"; then
+  pi_warn "sweeping orphan procs from a previous run (they hold the OAK device) ..."
+  pi_ssh "pkill -TERM -f 'python -m (launcher|imu_camera|vio|slam)\\.main' 2>/dev/null || true; \
+sleep 1; pkill -KILL -f 'python -m (launcher|imu_camera|vio|slam)\\.main' 2>/dev/null || true"
+  sleep 1   # give the kernel a moment to release the USB handle
+fi
+
 # Build the remote run.sh args. --ui adds the cross-machine bridge.
 RUN_ARGS=(--no-ui)
 # On the 4-core Pi: run the heavy solves in worker processes (--worker) and cap
