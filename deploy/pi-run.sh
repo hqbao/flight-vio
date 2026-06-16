@@ -9,7 +9,23 @@
 #   ./deploy/pi-run.sh --ui [args]           # ALSO open the netbridge so you can
 #                                            #   watch live from the Mac:
 #                                            #     ./deploy/pi-ui.sh
+#   ./deploy/pi-run.sh --ui --frames [args]  # ...and ALSO bridge the camera frames
+#                                            #   (watch pi-ui.sh --frames on the Mac)
 #   ./deploy/pi-run.sh --logs                # just tail the live run.log, no start
+#
+# Pi defaults (no flag needed): --worker ON (the bursty windowed-BA solve runs in
+# its own process so it can't stall the vio/frontend core) and --cap-numba-threads
+# (per-process numba thread caps so capture+vio don't oversubscribe the 4 cores).
+#   --no-worker  keep the BA/SLAM solve in-thread (reproduce the stall / spare-core host)
+#   --viz        with --ui, keep the Frontend-Internals + BA-Window UI captures ON
+#                (OFF by default on the Pi: they drag the vio process below real-time)
+#   --frames     with --ui, ALSO bridge the heavy camera/depth/keyframe IMAGE topics
+#                (~51 Mbit/s). DEFAULT is POSE-ONLY: only the small pose+map+overlay
+#                topics cross the WiFi, because the main trajectory+map UI never shows
+#                the camera image and a congested 2.4GHz link (~1.6 Mbit/s) is easily
+#                oversubscribed by the raw frames. Use --frames only on a FAST link
+#                to feed the opt-in camera Visualize windows -- and run the Mac side
+#                with the MATCHING `./deploy/pi-ui.sh --frames` (both default pose-only).
 #
 # --ui: if OAKD_NETBRIDGE_KEY is exported on the Mac it is forwarded to the Pi run
 # (authenticated; the SAME secret pi-ui.sh needs). If it is NOT set, the bridge runs
@@ -21,13 +37,25 @@ cd "$(dirname "$0")/.."
 DEST="flight-vio"
 WANT_UI=0
 LOGS_ONLY=0
+WANT_VIZ=0
+WANT_FRAMES=0          # default OFF: the bridge is POSE-ONLY (low-bandwidth). Pass
+                       # --frames to also bridge the heavy camera/depth/keyframe
+                       # image topics (only worth it on a fast link).
+WANT_WORKER=1          # default ON: the Pi is 4-core, so move the bursty BA/SLAM
+                       # solve off the frontend core (measured: loose 320x200 vio
+                       # process drops from a 80ms 1-in-5 hitch to ~33ms/frame).
+                       # Pass --no-worker to keep it in-thread.
 PORT="8787"
 EXTRA=()
 while [ $# -gt 0 ]; do
   case "$1" in
     -h|--help) awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; exit 0 ;;
-    --ui)   WANT_UI=1; shift ;;
-    --logs) LOGS_ONLY=1; shift ;;
+    --ui)        WANT_UI=1; shift ;;
+    --logs)      LOGS_ONLY=1; shift ;;
+    --viz)       WANT_VIZ=1; shift ;;
+    --frames)    WANT_FRAMES=1; shift ;;   # bridge camera frames too (default pose-only)
+    --worker)    WANT_WORKER=1; shift ;;   # explicit (already the default)
+    --no-worker) WANT_WORKER=0; shift ;;   # keep BA/SLAM in-thread
     --port) PORT="$2"; shift 2 ;;
     *) EXTRA+=("$1"); shift ;;
   esac
@@ -49,10 +77,32 @@ fi
 
 # Build the remote run.sh args. --ui adds the cross-machine bridge.
 RUN_ARGS=(--no-ui)
+# On the 4-core Pi: run the heavy solves in worker processes (--worker) and cap
+# each child's numba pool so overlapping SGM (capture) + KLT (vio) bursts don't
+# oversubscribe the 4 cores (--cap-numba-threads -> capture=2, vio=2, slam=1).
+# Both are no-ops on a big dev host and gap-safe (no math changes).
+[ "$WANT_WORKER" -eq 1 ] && RUN_ARGS+=(--worker)
+RUN_ARGS+=(--cap-numba-threads)
 [ "${#EXTRA[@]}" -gt 0 ] && RUN_ARGS+=("${EXTRA[@]}")
 ENV_PREFIX=""
 if [ "$WANT_UI" -eq 1 ]; then
   RUN_ARGS+=(--forward "0.0.0.0:$PORT")
+  # Bandwidth mode: the bridge is POSE-ONLY by DEFAULT (launcher appends
+  # --pose-only unless --bridge-frames is set) -- only the small pose/map/overlay
+  # topics cross the WiFi, not the ~51 Mbit/s of uncompressed camera/depth/keyframe
+  # frames the main trajectory+map UI never displays. --frames opts back into
+  # bridging those image topics (for the camera Visualize windows over a fast link);
+  # the Mac side must then run `pi-ui.sh --frames` to match.
+  [ "$WANT_FRAMES" -eq 1 ] && RUN_ARGS+=(--bridge-frames)
+  # The UI's "Frontend Internals" + "BA Window" diagnostic CAPTURES run in the VIO
+  # process and measurably drag it BELOW real-time on the Pi (measured 160x100:
+  # pose.odom 24.6 fps without them vs 16.6 with -> the difference between keeping
+  # up with a 20 fps camera and lagging). They are deep-debug views, not needed to
+  # watch the live trajectory/image/depth, so the Pi defaults them OFF; pass --viz
+  # to keep them (e.g. when debugging on a fast host).
+  if [ "$WANT_VIZ" -eq 0 ]; then
+    RUN_ARGS+=(--no-frontend-viz --no-ba-window)
+  fi
   if [ -n "${OAKD_NETBRIDGE_KEY:-}" ]; then
     # Custom secret: forward it to the Pi run's environment (both ends authenticate
     # with it). Run pi-ui.sh on the Mac with the SAME secret exported.
@@ -89,6 +139,10 @@ fi
 if [ "$WANT_UI" -eq 1 ]; then
   pi_rule
   pi_say "when the stack has data (camera attached or --session), watch from the Mac:"
-  pi_say "    ./deploy/pi-ui.sh --connect $PI_IP:$PORT     (or just ./deploy/pi-ui.sh)"
+  if [ "$WANT_FRAMES" -eq 1 ]; then
+    pi_say "    ./deploy/pi-ui.sh --frames --connect $PI_IP:$PORT   (frames bridged -> Mac must match)"
+  else
+    pi_say "    ./deploy/pi-ui.sh --connect $PI_IP:$PORT     (or just ./deploy/pi-ui.sh; pose-only)"
+  fi
   pi_rule
 fi

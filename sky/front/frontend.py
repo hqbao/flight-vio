@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from .corners import good_features_to_track, _shi_tomasi_response
-from .klt import calc_optical_flow_pyr_lk
+from .klt import _calc_flow_with_pyramids, build_pyramid
 
 
 @dataclass
@@ -81,10 +81,32 @@ class KLTFrontend:
         self._prev_gray: np.ndarray | None = None
         self._state = TrackState()
         self._next_id = 0
+        # Across-frame pyramid cache: the Gaussian pyramid built for the LAST
+        # frame's ``gray``. Next frame that same array becomes ``prev_gray`` (see
+        # :meth:`process`, which sets ``self._prev_gray = gray``), so its pyramid
+        # can be reused instead of rebuilt. Stored alongside the EXACT array it
+        # was built for so we can identity-check (``is``) before trusting it --
+        # the cache must NEVER serve a stale pyramid for a different image.
+        self._cached_gray: np.ndarray | None = None
+        self._cached_pyr: list[np.ndarray] | None = None
 
     @property
     def tracks(self) -> TrackState:
         return self._state
+
+    def _pyramid_for(self, img: np.ndarray) -> list[np.ndarray]:
+        """Gaussian pyramid for ``img`` at the instance ``max_level``.
+
+        Reuses the across-frame cache when ``img`` IS (by array identity) the
+        image the cached pyramid was built for; otherwise builds fresh. Identity
+        (not value) is the key on purpose: :meth:`process` feeds back the exact
+        same array as ``prev_gray`` next frame, so ``is`` is sound and can never
+        serve a stale pyramid for a different image. ``build_pyramid`` is
+        deterministic, so reuse is byte-identical to rebuilding.
+        """
+        if self._cached_pyr is not None and self._cached_gray is img:
+            return self._cached_pyr
+        return build_pyramid(img, self.cfg.max_level)
 
     def _track_full(self, prev_gray: np.ndarray, gray: np.ndarray,
                     prev_pts: np.ndarray
@@ -96,15 +118,27 @@ class KLTFrontend:
         base path returns and the extra ``fb_err`` (per-point forward-backward
         error, used ONLY for the visualisation colouring) come from the EXACT
         same computation -- there is no parallel re-derivation that could drift.
-        Uses our own library-free :func:`calc_optical_flow_pyr_lk`, returning the
+
+        Pyramid reuse (bit-exact, pure recompute elimination): the prev/cur
+        Gaussian pyramids are built ONCE here and shared by both the forward
+        (prev->cur) and backward (cur->prev, pyramids swapped) LK passes -- and
+        ``gray``'s pyramid is cached so next frame, where ``gray`` becomes
+        ``prev_gray``, it is reused instead of rebuilt (4 builds/frame -> 1).
+        Uses our own library-free :func:`_calc_flow_with_pyramids`, returning the
         ``(N, 2) float32`` next points + ``(N,) bool`` status + ``(N,) float64``
         fb-error contract.
         """
-        nxt, st = calc_optical_flow_pyr_lk(
-            prev_gray, gray, prev_pts,
+        pyr_prev = self._pyramid_for(prev_gray)
+        pyr_cur = build_pyramid(gray, self.cfg.max_level)
+        # Cache cur's pyramid for next frame (where this ``gray`` is prev_gray).
+        self._cached_gray = gray
+        self._cached_pyr = pyr_cur
+
+        nxt, st = _calc_flow_with_pyramids(
+            pyr_prev, pyr_cur, prev_pts,
             win_size=self.cfg.win_size, max_level=self.cfg.max_level)
-        back, st2 = calc_optical_flow_pyr_lk(
-            gray, prev_gray, nxt,
+        back, st2 = _calc_flow_with_pyramids(
+            pyr_cur, pyr_prev, nxt,
             win_size=self.cfg.win_size, max_level=self.cfg.max_level)
         fb_err = np.linalg.norm(prev_pts - back, axis=1)
         st = st.reshape(-1).astype(bool)

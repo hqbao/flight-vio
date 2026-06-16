@@ -306,6 +306,39 @@ def build_vio_args(args, cap_ep: str, vio_ep: str, slam_ep: str,
 
 
 # --------------------------------------------------------------------------- #
+def _numba_thread_caps(cap: bool) -> dict[str, int]:
+    """Per-role numba thread budget when ``--cap-numba-threads`` is set.
+
+    The flight stack runs capture / vio / slam as SEPARATE OS processes, and
+    nothing sets ``NUMBA_NUM_THREADS`` -- so by default EVERY process spins a
+    numba pool of all cores. When capture's SGM burst and vio's KLT burst
+    overlap (they pipeline), that is 2x ncores runnable threads fighting over
+    ncores cores: oversubscription thrash, which on the Pi5 reads as "cores look
+    cool" (idle between bursts, thrashing during them) while wall-clock is set by
+    serial glue. Capping each hot process to ~half the cores keeps two
+    overlapping bursts at <= ncores total. SLAM is off the per-frame path, so it
+    gets the remainder. Returns {} when capping is off (full cores, dev hosts).
+    """
+    if not cap:
+        return {}
+    n = os.cpu_count() or 4
+    half = max(1, n // 2)
+    return {"imu_camera": half, "vio": half, "slam": max(1, n // 4)}
+
+
+def _role_env(base_env: dict[str, str], threads: int | None) -> dict[str, str]:
+    """A child env with NUMBA_NUM_THREADS pinned to ``threads`` for this role.
+
+    A user-set NUMBA_NUM_THREADS always wins (never override an explicit choice);
+    ``threads`` None / 0 leaves the env untouched.
+    """
+    if not threads or "NUMBA_NUM_THREADS" in os.environ:
+        return base_env
+    e = dict(base_env)
+    e["NUMBA_NUM_THREADS"] = str(threads)
+    return e
+
+
 def _spawn(py: str, mod: str, args: list[str], *, env: dict[str, str],
            name: str) -> subprocess.Popen:
     """Spawn a child python process; stdout / stderr inherited from launcher."""
@@ -405,13 +438,25 @@ def build_forward_args(host: str, port: int, args, cap_ep: str, vio_ep: str,
     the launcher's ``--width`` / ``--height`` (and the ToF override they imply) are
     forwarded verbatim. The endpoints are the launcher's resolved (possibly
     suffixed) names so a ``--auto-suffix`` run still bridges the right sockets.
+
+    Bandwidth mode: the bridge is POSE-ONLY by DEFAULT (low-bandwidth -- the heavy
+    uncompressed camera/depth/keyframe image topics, ~51 Mbit/s at 320x200, are NOT
+    bridged), because the main trajectory + map UI never displays the camera image,
+    and a congested 2.4 GHz WiFi link delivers only ~1.6 Mbit/s. ``--bridge-frames``
+    opts back into forwarding the image topics (full behaviour as before), for an
+    operator who wants the camera Visualize windows over a fast link. So we append
+    ``--pose-only`` UNLESS ``args.bridge_frames`` is set; the Mac-side receive must
+    be run with the MATCHING intent (``deploy/pi-ui.sh --frames`` to keep frames).
     """
-    return ["--listen", f"{host}:{port}",
-            "--capture-endpoint", cap_ep,
-            "--vio-endpoint", vio_ep,
-            "--slam-endpoint", slam_ep,
-            "--width", str(args.width),
-            "--height", str(args.height)]
+    forward_args = ["--listen", f"{host}:{port}",
+                    "--capture-endpoint", cap_ep,
+                    "--vio-endpoint", vio_ep,
+                    "--slam-endpoint", slam_ep,
+                    "--width", str(args.width),
+                    "--height", str(args.height)]
+    if not args.bridge_frames:
+        forward_args += ["--pose-only"]
+    return forward_args
 
 
 def parse_host_port(s: str, *, default_host: str = "0.0.0.0") -> tuple[str, int]:
@@ -464,6 +509,14 @@ def main() -> int:
                     help="run the heavy BA/SLAM solves in worker subprocesses "
                          "(GIL-free). Off by default -- SLAM already stays "
                          "responsive via its latest-only in-process inbox.")
+    ap.add_argument("--cap-numba-threads", action="store_true",
+                    help="cap each child's numba thread pool so the per-stage "
+                         "parallel bursts don't oversubscribe a small core count "
+                         "(e.g. on the 4-core Pi5: capture=2, vio=2, slam=1 "
+                         "instead of every process grabbing all 4 cores and "
+                         "thrashing). Derived from os.cpu_count(); a user-set "
+                         "NUMBA_NUM_THREADS in the environment always wins. "
+                         "Off by default (full cores) for big dev hosts.")
     ap.add_argument("--endpoint-suffix", default="",
                     help="append SUFFIX to canonical endpoint names so two "
                          "launchers can co-exist (e.g. 'dev', 'ci')")
@@ -478,7 +531,18 @@ def main() -> int:
                          "TCP/WiFi (run `deploy/pi-ui.sh` there). Additive -- the "
                          "local UI / --no-ui path is unaffected. Authenticates with "
                          "OAKD_NETBRIDGE_KEY if set, else a built-in default key "
-                         "(no setup needed on a trusted LAN).")
+                         "(no setup needed on a trusted LAN). DEFAULT = pose-only "
+                         "(low-bandwidth); see --bridge-frames.")
+    ap.add_argument("--bridge-frames", action="store_true",
+                    help="with --forward, ALSO bridge the heavy camera/depth/"
+                         "keyframe IMAGE topics (~51 Mbit/s uncompressed). OFF by "
+                         "default: the bridge is POSE-ONLY (only the small pose + "
+                         "map + overlay topics cross the wire), because the main "
+                         "trajectory + map UI never shows the camera image and a "
+                         "congested WiFi link is easily oversubscribed by the raw "
+                         "frames. Use this only to feed the opt-in camera Visualize "
+                         "windows over a FAST link -- and run the Mac side with the "
+                         "matching `deploy/pi-ui.sh --frames`.")
     ap.add_argument("--vl53l9cx", action="store_true",
                     help="simulate a VL53L9CX-class ToF camera in the capture "
                          "process: compute depth at the source resolution then "
@@ -566,6 +630,11 @@ def main() -> int:
 
     py = sys.executable
     env = dict(os.environ)
+    # Per-role numba thread budget (--cap-numba-threads). Empty -> full cores.
+    caps = _numba_thread_caps(args.cap_numba_threads)
+    if caps:
+        LOG.info("launcher: capping numba threads per process %s "
+                 "(ncores=%d, --cap-numba-threads)", caps, os.cpu_count() or 0)
 
     # ---- Cross-machine bridge (--forward) --------------------------------
     # Resolve + validate the forward endpoint ONCE, before spawning, so a bad
@@ -674,16 +743,18 @@ def main() -> int:
         """
         _cleanup_orphans()
         procs.clear()
-        cap_proc = _spawn(py, "imu_camera.main", capture_args, env=env,
+        cap_proc = _spawn(py, "imu_camera.main", capture_args,
+                          env=_role_env(env, caps.get("imu_camera")),
                           name="imu_camera")
         procs.append(cap_proc)
         # tiny sleep so capture's IPC server is listening before vio / slam
         # try their first connect (vio retries so this is cosmetic, but it
         # gives a clean first-attempt success in the log).
         time.sleep(0.2)
-        procs.append(_spawn(py, "vio.main", vio_args, env=env, name="vio"))
-        procs.append(_spawn(py, "slam.main", slam_args, env=env,
-                            name="slam"))
+        procs.append(_spawn(py, "vio.main", vio_args,
+                            env=_role_env(env, caps.get("vio")), name="vio"))
+        procs.append(_spawn(py, "slam.main", slam_args,
+                            env=_role_env(env, caps.get("slam")), name="slam"))
         # Cross-machine bridge: spawn netbridge.forward LAST (it connects to the
         # capture/vio/slam IPC servers, which retry, so order is cosmetic) when
         # --forward is set. It joins `procs`, so _terminate tears it down with the

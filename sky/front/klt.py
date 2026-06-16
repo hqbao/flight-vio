@@ -117,6 +117,37 @@ def calc_optical_flow_pyr_lk(
     path. ``None`` (default) auto-picks Numba when it is installed -- same
     algorithm and (to floating-point tolerance) same result, just ~10x faster.
     """
+    pyr_p = build_pyramid(prev_gray, max_level)
+    pyr_c = build_pyramid(cur_gray, max_level)
+    return _calc_flow_with_pyramids(
+        pyr_p, pyr_c, prev_pts, win_size=win_size, max_level=max_level,
+        iters=iters, eps=eps, min_eig=min_eig, use_numba=use_numba)
+
+
+def _calc_flow_with_pyramids(
+    pyr_p: list[np.ndarray],
+    pyr_c: list[np.ndarray],
+    prev_pts: np.ndarray,
+    win_size: int = 21,
+    max_level: int = 3,
+    iters: int = 30,
+    eps: float = 0.01,
+    min_eig: float = 1e-4,
+    use_numba: bool | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Pyramidal LK from PREBUILT image pyramids (the arithmetic core).
+
+    Identical in result to :func:`calc_optical_flow_pyr_lk` but takes the
+    already-built ``pyr_p`` / ``pyr_c`` Gaussian pyramids (level 0 = full res)
+    instead of the raw images, so a caller that tracks both directions of a
+    frame pair -- or reuses a pyramid across frames -- can build each distinct
+    image's pyramid exactly ONCE. The public wrapper above is just
+    ``build_pyramid`` x2 then this; routing prebuilt pyramids in is therefore
+    bit-exact, only eliminating redundant pyramid recomputation.
+
+    ``pyr_p[lvl]`` / ``pyr_c[lvl]`` must have been built at ``max_level`` (the
+    caller's responsibility -- they index ``range(max_level, -1, -1)``).
+    """
     if use_numba is None:
         use_numba = HAVE_NUMBA
     use_numba = use_numba and HAVE_NUMBA
@@ -126,13 +157,11 @@ def calc_optical_flow_pyr_lk(
     if N == 0:
         return prev_pts.copy(), np.zeros((0,), np.uint8)
 
-    pyr_p = build_pyramid(prev_gray, max_level)
-    pyr_c = build_pyramid(cur_gray, max_level)
     hw = win_size // 2
 
     if use_numba:
         return _calc_flow_numba(pyr_p, pyr_c, prev_pts, hw, max_level,
-                                iters, eps, min_eig, prev_gray.shape)
+                                iters, eps, min_eig, pyr_p[0].shape)
 
     off = np.arange(-hw, hw + 1, dtype=np.float32)
     ox, oy = np.meshgrid(off, off)
@@ -198,7 +227,7 @@ def calc_optical_flow_pyr_lk(
         guess = g / scale                          # carry to next finer level
 
     nxt = prev_pts + guess
-    H, W = prev_gray.shape
+    H, W = pyr_p[0].shape           # level 0 = full-res previous image
     in_bounds = ((nxt[:, 0] >= 0) & (nxt[:, 0] < W)
                  & (nxt[:, 1] >= 0) & (nxt[:, 1] < H))
     status = (~bad) & in_bounds

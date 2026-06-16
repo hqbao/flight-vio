@@ -196,6 +196,18 @@ subprocess (torn down with the rest). On the Mac, `deploy/pi-ui.sh` starts
 54×42 ToF run is re-served at 54×42, not 640×400), waits for the re-served
 sockets, then runs the unchanged `ui.main`.
 
+**Bandwidth mode — pose-only by default.** The bridge defaults to **pose-only**:
+only the small pose/map/overlay POD + retained topics cross the WiFi, NOT the heavy
+camera/depth/keyframe image topics. The launcher's `build_forward_args`
+(`launcher/main.py`) appends `--pose-only` to `netbridge.forward` unless
+`--bridge-frames` is set; `deploy/pi-ui.sh` passes `--pose-only` to
+`netbridge.receive` to match. Both ends select the topic set via
+`netbridge/topics_allowlist.py` `all_topics(role, include_images=False)`. The
+trajectory + map UI works fully; only the opt-in camera Visualize windows have no
+frames in this mode. Pass `--bridge-frames` (raw `run.sh`) / `--frames`
+(`pi-run.sh` and `pi-ui.sh`) on **both** ends to include the camera frames — see
+§3c.
+
 **Security (HONEST):** `OAKD_NETBRIDGE_KEY` is a shared HMAC secret that
 **authenticates** the peer at connect time (one-time handshake, not per frame) — a
 wrong key is refused. If it is **unset**, both ends use a built-in **default key**
@@ -208,6 +220,108 @@ provides the encryption and netbridge sees only loopback.
 
 See `netbridge/README.md` for the full design + the gate
 (`verification/netbridge_loopback_selftest.py`).
+
+### 3c. Lean-Pi run defaults (what `pi-run.sh` adds for you)
+
+`deploy/pi-run.sh` is the host-driven wrapper around `run.sh --no-ui`; it injects
+a few 4-core-Pi defaults so the operator doesn't have to. None change the math
+(the byte-parity oracle stays `gap=0`); they only affect process scheduling and
+which diagnostic captures run.
+
+| `pi-run.sh` injects | default on the Pi | opt out | why |
+|---|---|---|---|
+| `--worker` | **on** | `--no-worker` | move the bursty windowed-BA solve into its own process |
+| `--cap-numba-threads` | **on** (always passed) | — | per-process numba thread caps so capture+vio don't oversubscribe 4 cores |
+| `--no-frontend-viz --no-ba-window` | on (with `--ui`) | `--viz` | the UI diagnostic captures run in the vio process and drag it below real-time |
+| pose-only bridge | **on** (with `--ui`) | `--frames` | only the small pose/map/overlay topics cross the WiFi — the heavy uncompressed camera/depth/keyframe frames the main UI never displays would saturate the 2.4 GHz link |
+
+- **`--worker` defaults ON.** The loose windowed BA is a bursty ~48 ms/keyframe
+  solve (`verification/STAGE_PROFILE_RESULTS.md`, loose 320×200). Run in-thread it
+  shares the vio/frontend core, so every 5th frame the vio process takes an ~80 ms
+  hitch (frontend ~32 ms **+** the BA burst on the same GIL-bound core) — a visible
+  1-in-5 stutter. `--worker` runs BA in its own process; the vio process then holds
+  ~33 ms/frame (frontend + IMU) and the BA worker keeps up concurrently. Pass
+  **`--no-worker`** to keep BA in-thread (e.g. to reproduce the stall, or on a host
+  with spare cores).
+
+- **`--cap-numba-threads` is always passed.** The flight stack runs capture / vio /
+  slam as separate OS processes; with nothing set, **each** spins a numba pool of
+  all cores, so an overlapping SGM (capture) + KLT (vio) burst puts ~2× the core
+  count of runnable threads on 4 cores → oversubscription thrash. The flag pins
+  `NUMBA_NUM_THREADS` per process, derived from `os.cpu_count()`
+  (`_numba_thread_caps` in `launcher/main.py`): on the 4-core Pi5 **capture=2,
+  vio=2, slam=1**. The launcher logs it on boot:
+  ```
+  launcher: capping numba threads per process {'imu_camera': 2, 'vio': 2, 'slam': 1} (ncores=4, --cap-numba-threads)
+  ```
+  A **user-set `NUMBA_NUM_THREADS` in the environment always wins** (the cap never
+  overrides an explicit choice). The flag is a no-op / off by default on big dev
+  hosts (full cores) — it is only injected by `pi-run.sh`.
+
+- **Pose-only bridge defaults ON (with `--ui`).** The Mac↔Pi 2.4 GHz WiFi link
+  (ch6, congested) delivers only **~1.6 Mbit/s** effective, but bridging the
+  uncompressed 320×200 camera/depth/keyframe frames pushes **~51 Mbit/s** — frames
+  the main 3D UI never shows (it draws only the trajectory + SLAM map). Forwarding
+  them saturates the link, the pose stream backs up, and the UI lags. So
+  `pi-run.sh --ui` defaults to **pose-only**: it drops the image topics
+  (`frame.depth` / `cam.sync` / `imucam.sample` / `keyframe`) from the bridge and
+  forwards only the small pose/map/overlay POD + retained topics. **Both ends must
+  match** — run `pi-ui.sh` (default pose-only) against `pi-run.sh --ui` (default
+  pose-only), or `pi-ui.sh --frames` against `pi-run.sh --ui --frames`.
+
+  Measured on the real Pi 5 @320×200 (HIL A/B, single Mac consumer, `wlan0` TX
+  deltas):
+
+  | mode | WiFi TX | `pose.odom` | `slam.map` | UI |
+  |---|---|---|---|---|
+  | **pose-only** (default) | 0.38–0.87 Mbit/s (scene-dependent) | 19.9 Hz steady (real-time) | 4 Hz | trajectory + map fully work; 45–75% link headroom |
+  | `--frames` | 13.9 Mbit/s burst + **4.1 MB TCP send-Q backlog** | 9.3 Hz (halved / backed up) | — | live camera image, but the weak link is saturated |
+
+  To watch the live camera image remotely, run **both** `pi-run.sh --frames` and
+  `pi-ui.sh --frames` — best on 5 GHz / a clear channel, where the ~51 Mbit/s fits.
+
+### 3d. Profiling — where the time goes
+
+Per-stage wall-clock was measured on the real Pi 5 with
+`verification/stage_profile.py` (lean numpy+numba runtime, session
+`sessions/gold/push_straight_fast_15s`); the full table is in
+`verification/STAGE_PROFILE_RESULTS.md`. Headline findings:
+
+- **The frontend (KLT track + RGB-D PnP) is the per-frame wall** — 58–62% of the
+  loose serial budget at every resolution, and the single bottleneck of the vio
+  process. At loose 320×200 it is ~29 ms (after the KLT pyramid-reuse change in
+  `sky/front/klt.py`/`frontend.py`: one pyramid build/frame instead of four).
+- **The live frame rate is the busiest PROCESS, not the serial sum.** With
+  `--worker`, loose 320×200 is set by the vio process (~33 ms/frame → ~30 fps);
+  capture (SGM ~9 ms) and the BA worker run concurrently.
+- **Tight `--tight` on the Pi (optimisation chain, 2026-06-16).** The tight
+  `optimize_vio` solve now ships the four-link chain — **landmark Schur complement**
+  (exact, ~1.4–1.8×), an **absolute-velocity gauge regulariser**, an always-on
+  **divergence guard**, and the **njit IMU-Jacobian kernel** (default ON, coupled to
+  the guard). All four are ON by default inside `--tight`. This makes `--tight`
+  **bounded** (the guard caps a diverged keyframe instead of letting it run away) and
+  faster than the pre-chain pure-Python solve. **It is still slower than loose** and
+  does **not** reach 20 fps @ 320 — the keyframe solve was a design-estimate ~6–9 fps,
+  and the real Pi `--tight` fps measurement is improved but load-noisy. **Loose is
+  still the recommended Pi flight path; `--tight` is opt-in.**
+  - **`divergence_guard` is an always-on flight invariant** (`WindowedVIOConfig`,
+    default True). Do NOT disable it on a flight build: it is what keeps the published
+    tight pose bounded on a bad/blurred frame, and the njit kernel is validated ONLY
+    with it on.
+  - **njit ↔ guard coupling + override.** The njit IMU-Jacobian kernel is default ON
+    only when the guard is on; if the guard is off the kernel force-disables itself and
+    logs why. `SKY_VIO_IMU_NJIT=0` always forces the pure-Python FD build (the explicit
+    kill switch — use it for an A/B or a no-numba host); the env is otherwise unset on a
+    normal run. A host without numba (`HAVE_NUMBA=False`) silently runs pure-Python.
+
+> **Replay-vs-live caveat (read before quoting 320×200 numbers).** The launcher
+> **replay** path forces capture to the session's *native* resolution
+> (`imu_camera/main.py` overrides `--width`/`--height`), so you **cannot** get a
+> deterministic 320×200 replay of a 640×400 gold session. The 320×200 figures above
+> come from the `stage_profile.py` harness (which models capture-at-resolution by
+> area-downsampling). The live 320×200 win from `--worker` + `--cap-numba-threads`
+> must be confirmed with a **live camera run** at that resolution
+> (`./deploy/pi-run.sh --width 320 --height 200`), not a replay.
 
 ---
 
@@ -290,6 +404,20 @@ on the actual Pi 5.
 ---
 
 ## 5. Troubleshooting
+
+**"no OAK device found" on the Pi even though the camera is plugged in.**
+On Linux, depthai needs a **udev rule** for the login user to access the OAK over
+USB — without it the device is visible only to `root` (`sudo python -c "import
+depthai; print(depthai.Device.getAllAvailableDevices())"` sees it, the normal user
+sees `[]`). `pi-deploy.sh` installs the rule automatically; to do it by hand:
+```bash
+echo 'SUBSYSTEM=="usb", ATTRS{idVendor}=="03e7", MODE="0666"' | \
+  sudo tee /etc/udev/rules.d/80-movidius.rules
+sudo udevadm control --reload-rules && sudo udevadm trigger   # (or just re-plug the OAK)
+```
+Verify the USB enumeration first with `lsusb | grep 03e7` (`03e7` = the Movidius
+vendor). If `lsusb` shows nothing, it is a cable/power issue, not udev (the OAK-D
+Lite especially needs a USB3 data cable + enough power — a Y-cable on a weak port).
 
 **depthai has no aarch64 wheel / fails to install.**
 > Note: `depthai 3.7.1` **does** ship a prebuilt aarch64 (py3.13) wheel — confirmed

@@ -38,6 +38,19 @@ pi_sudo "apt-get install -y python3.13-venv python3.13-dev build-essential rsync
   || pi_warn "apt install reported an issue -- setup_pi.sh will flag any genuinely \
 missing prereq below."
 
+# 1b. OAK udev rules (Linux-only, and the reason a fresh Pi reports "no OAK device
+#     found" even with the camera plugged in): without a rule granting the login
+#     user access to the Movidius USB device (vendor 03e7), depthai only sees it as
+#     root. Install + reload; idempotent. The rule body is PIPED (no remote quoting),
+#     and the cp+reload+trigger run under ONE `sudo bash -c` (pi_sudo only elevates
+#     the first word of a chain).
+pi_say "[1b/3] ensuring OAK udev rules (depthai USB access as the login user) ..."
+printf 'SUBSYSTEM=="usb", ATTRS{idVendor}=="03e7", MODE="0666"\n' \
+  | pi_ssh "cat > /tmp/80-movidius.rules"
+pi_sudo "bash -c 'cp /tmp/80-movidius.rules /etc/udev/rules.d/80-movidius.rules && \
+udevadm control --reload-rules && udevadm trigger'" \
+  || pi_warn "could not install the OAK udev rule -- live capture may need 'sudo'."
+
 # 2. rsync the repo (lean: code only -- NOT venv/git/cache/logs/baseline, and NOT
 #    sessions/: those are multi-GB recorded replays the LIVE flight Pi never needs).
 pi_say "[2/3] rsync repo (code only, no sessions) -> ~/$DEST ..."
