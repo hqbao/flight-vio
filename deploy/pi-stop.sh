@@ -33,8 +33,10 @@ pi_ssh "
     echo '  no run.pid'
   fi
   # Sweep any leftover stack processes (e.g. from a crash that left no pid file).
-  left=\$(pgrep -f 'python -m (launcher|imu_camera|vio|slam)\\.main' || true)
-  if [ -n \"\$left\" ]; then echo '  sweeping leftover procs:' \$left; pkill -TERM -f 'python -m (launcher|imu_camera|vio|slam)\\.main' || true; fi
+  # Include netbridge.forward: a stale forward keeps holding port 8787, so the next
+  # run's forward can't bind and pi-ui ends up on the DEAD one (UI shows no pose).
+  left=\$(pgrep -f 'python -m ((launcher|imu_camera|vio|slam)\\.main|netbridge\\.forward)' || true)
+  if [ -n \"\$left\" ]; then echo '  sweeping leftover procs:' \$left; pkill -TERM -f 'python -m ((launcher|imu_camera|vio|slam)\\.main|netbridge\\.forward)' || true; fi
   echo '  stopped.'
 "
 pi_say "done."

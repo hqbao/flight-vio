@@ -80,11 +80,14 @@ fi
 # a stray capture still HOLDS the OAK USB device, so the new run opens "no OAK
 # device found" (the classic "it worked, then after a crash it stopped working").
 # pi-stop does this on teardown; do it here too so a forgotten stop never blocks.
-if pi_ssh "pgrep -f 'python -m (launcher|imu_camera|vio|slam)\\.main' >/dev/null 2>&1"; then
-  pi_warn "sweeping orphan procs from a previous run (they hold the OAK device) ..."
-  pi_ssh "pkill -TERM -f 'python -m (launcher|imu_camera|vio|slam)\\.main' 2>/dev/null || true; \
-sleep 1; pkill -KILL -f 'python -m (launcher|imu_camera|vio|slam)\\.main' 2>/dev/null || true"
-  sleep 1   # give the kernel a moment to release the USB handle
+# Include netbridge.forward in the sweep: a stale forward keeps holding port 8787,
+# so this run's forward can't bind and pi-ui connects to the DEAD one (UI shows no
+# pose / "samples 0") even though the live stack publishes fine.
+_ORPH='python -m ((launcher|imu_camera|vio|slam)\\.main|netbridge\\.forward)'
+if pi_ssh "pgrep -f '$_ORPH' >/dev/null 2>&1"; then
+  pi_warn "sweeping orphan procs from a previous run (they hold the OAK device / port 8787) ..."
+  pi_ssh "pkill -TERM -f '$_ORPH' 2>/dev/null || true; sleep 1; pkill -KILL -f '$_ORPH' 2>/dev/null || true"
+  sleep 1   # give the kernel a moment to release the USB handle + the 8787 socket
 fi
 
 # Build the remote run.sh args. --ui adds the cross-machine bridge.
