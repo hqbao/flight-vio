@@ -25,4 +25,10 @@ pyserial>=3.5
 
 # OAK-D / camera device driver -- needed for `--live` on the actual board (the
 # real ToF/stereo source). Omit it if the Pi only ever replays recorded sessions.
-depthai>=3.6
+# PIN <3.7: depthai 3.7.x ships a device-firmware regression in the MIPI camera
+# source plugin that CRASHES the OAK-D Lite on stream start (RTEMS_FATAL_SOURCE_
+# INVALID_HEAP_FREE in PlgSrcMipi.cpp -> repeated X_LINK_ERROR / "Device crashed",
+# at ANY resolution). 3.6.x streams the Lite fine. NOT a power/cable issue (the
+# device idles + bare-opens stable; only camera streaming trips it). See
+# docs/RPI5_DEPLOY.md §1b. Revisit when depthai fixes the 3.7 firmware.
+depthai>=3.6,<3.7

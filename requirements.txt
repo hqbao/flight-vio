@@ -1,4 +1,4 @@
-depthai>=3.6
+depthai>=3.6,<3.7   # 3.7.x firmware crashes the OAK-D Lite MIPI stream (PlgSrcMipi heap-free); see requirements-flight.txt + docs/RPI5_DEPLOY.md §1b
 numpy>=2.0
 # cv2 is NOT in the FLIGHT runtime any more -- the whole imu_camera -> vio -> slam
 # path (incl. --vl53l9cx ToF + --direct dense VO + ORB loop closure) runs with

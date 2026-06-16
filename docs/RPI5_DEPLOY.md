@@ -78,27 +78,35 @@ missing — it never runs `sudo` itself.
 
 ---
 
-## 1b. OAK-D camera on the Pi5 (USB power + Lite vs W)
+## 1b. OAK-D camera on the Pi5 (depthai pin + power + Lite vs W)
 
-Two device-level gotchas that are NOT software bugs — they bite at the hardware
-boundary and look like a broken pipeline:
-
-**USB power / bandwidth — the device crashes in a loop.** Symptom in `run.log`:
+**⚠️ OAK-D Lite crash-loop = depthai 3.7.x firmware bug — pin `depthai<3.7`.**
+Symptom in `run.log` (the Lite "doesn't work", UI stays empty):
 ```
-[depthai][error] Device <MxId> has crashed. Crash dump logs stored in ...
 [depthai][error] Couldn't read data from stream '__x_..' (X_LINK_ERROR)
+[depthai][error] Device <MxId> has crashed. Crash dump stored in ...
 ```
-repeating every ~10 s → no frames, the UI stays empty ("it doesn't work"). The
-Pi5 **default-caps total USB current at 600 mA**, which browns out an OAK-D under
-stereo+IMU load — **especially the OAK-D Lite** (USB-powered, no barrel jack).
-Fix:
-1. Plug the OAK into a **USB3 (blue) port** with a **USB3 cable** — a USB2
-   port/cable negotiates 480 Mbps and starves bandwidth+power. (`lsusb -t` should
-   show the device at `5000M`, not `480M`.)
-2. `usb_max_current_enable=1` in `/boot/firmware/config.txt` (lifts the cap to
-   ~1.6 A; needs a capable 5V/5A PSU — `vcgencmd get_throttled` must stay `0x0`).
-   **`deploy/pi/optimize_pi.sh` sets this for you** (idempotent, `--rollback`
-   removes it); **reboot** to apply.
+right after `live src=... pub=...`, repeating. The crash dump's real cause is a
+device-FIRMWARE fault:
+```
+RTEMS_FATAL_SOURCE_INVALID_HEAP_FREE  in  PlgSrcMipi.cpp (the MIPI camera source plugin)
+```
+**depthai 3.7.x ships a firmware regression that crashes the OAK-D Lite's
+OV7251 camera stream on start, at ANY resolution.** It is **NOT** a power/cable/USB
+issue — proven: the device idles stable (0 disconnects), a bare `dai.Device()`
+open holds for 10 s, and only **camera streaming** trips it. **depthai 3.6.x
+streams the Lite fine** (the OAK-D **W** happens to survive 3.7.x — this bites the
+Lite specifically). `requirements*.txt` pin `depthai>=3.6,<3.7`; if a board already
+got 3.7: `.venv/bin/pip install 'depthai==3.6.1'`. Confirm the fix: `imu_camera.main
+--live` should print `live src=...@20` with **no** `X_LINK_ERROR` / crash.
+
+**USB power (separate good-practice, not the crash above).** The Pi5 default-caps
+total USB current at 600 mA; an OAK under load is happier with the cap lifted and a
+USB3 link. `deploy/pi/optimize_pi.sh` sets `usb_max_current_enable=1` in
+`/boot/firmware/config.txt` (idempotent, `--rollback` removes it; needs a 5V/5A PSU,
+keep `vcgencmd get_throttled`=`0x0`); prefer a **USB3 (blue) port + USB3 cable**
+(`lsusb -t` shows `5000M`, not `480M`). Reboot to apply. (This did **not** fix the
+Lite crash — that was the depthai pin above.)
 
 **OAK-D Lite vs OAK-D W — fast-motion VIO.** The mono FOVs differ a lot:
 **W ≈ 97° HFOV** (the "W" = Wide, designed for VIO/SLAM) vs **Lite ≈ 70°**. On a
