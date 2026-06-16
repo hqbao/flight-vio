@@ -36,6 +36,23 @@ from dataclasses import dataclass
 
 import numpy as np
 
+try:
+    from numba import njit, prange  # type: ignore
+    HAVE_NUMBA = True
+except Exception:  # pragma: no cover - exercised only when numba is absent
+    HAVE_NUMBA = False
+
+    def njit(*args, **kwargs):  # type: ignore
+        """No-op fallback so the module imports without numba installed."""
+        def wrap(fn):
+            return fn
+        # support both @njit and @njit(...) forms
+        if len(args) == 1 and callable(args[0]) and not kwargs:
+            return args[0]
+        return wrap
+
+    prange = range  # type: ignore
+
 
 # ---------------------------------------------------------------------------
 # FAST-9 corner test on the radius-3 Bresenham circle (16 pixels, clockwise).
@@ -299,14 +316,45 @@ def _resize_area(img: np.ndarray, new_h: int, new_w: int) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # Hamming brute-force kNN matcher (cv2.BFMatcher(NORM_HAMMING) stand-in).
 # ---------------------------------------------------------------------------
+@njit(parallel=True, cache=True)
+def _hamming_njit(a, b, pop):
+    """Pairwise Hamming distance via per-pair XOR + 8-bit popcount table.
+
+    ``prange`` over the rows of ``a``; for each pair XOR the 32 descriptor bytes
+    and accumulate the table popcounts into an int16 result, so the
+    ``(Na,Nb,32)`` XOR/popcount tensors are NEVER materialised. Integer ops only
+    -> bit-exact with the NumPy lookup path (popcount of a 256-bit code fits in
+    int16). ``pop`` is the uint8 ``_POPCOUNT8`` table passed in for numba.
+    """
+    na = a.shape[0]
+    nb = b.shape[0]
+    nbytes = a.shape[1]
+    D = np.empty((na, nb), np.int16)
+    for i in prange(na):
+        for j in range(nb):
+            acc = 0
+            for k in range(nbytes):
+                acc += pop[a[i, k] ^ b[j, k]]
+            D[i, j] = acc
+    return D
+
+
 def _hamming_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """Pairwise Hamming distance between (Na,32) and (Nb,32) uint8 descriptors.
 
-    Returns an (Na, Nb) int16 matrix. XOR every pair then sum the per-byte
-    popcounts from the lookup table.
+    Returns an (Na, Nb) int16 matrix. With numba present this dispatches to the
+    parallel per-pair :func:`_hamming_njit` kernel (no big-tensor allocation);
+    otherwise it falls back to the pure-NumPy XOR-tensor + table-popcount path.
+    Both produce bit-identical results.
     """
     if len(a) == 0 or len(b) == 0:
         return np.zeros((len(a), len(b)), np.int16)
+    if HAVE_NUMBA:
+        return _hamming_njit(
+            np.ascontiguousarray(a, np.uint8),
+            np.ascontiguousarray(b, np.uint8),
+            _POPCOUNT8,
+        )
     # (Na,1,32) ^ (1,Nb,32) -> (Na,Nb,32), table-lookup popcount, sum bytes.
     xor = np.bitwise_xor(a[:, None, :], b[None, :, :])
     return _POPCOUNT8[xor].sum(axis=2).astype(np.int16)

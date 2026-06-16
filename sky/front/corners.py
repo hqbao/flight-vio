@@ -58,15 +58,17 @@ def _box_sum(img: np.ndarray, block: int) -> np.ndarray:
     r = block // 2
     p = np.pad(img, ((r + 1, r), (r + 1, r)), mode="edge")
     ii = np.cumsum(np.cumsum(p, axis=0), axis=1)
-    # window [y-r, y+r] x [x-r, x+r] sum via the integral image corners
+    # window [y-r, y+r] x [x-r, x+r] sum via the integral image corners.
+    # The old gather used np.ix_(arange(H), arange(W)[+block]); because those
+    # index ranges are contiguous aranges, the four corner reads are exactly
+    # equivalent contiguous slices of ``ii`` -- same elements, same order, same
+    # float32 values (bit-exact), but with no fancy-index overhead.
     H, W = img.shape
-    y0 = np.arange(H)
-    x0 = np.arange(W)
     # indices into ii (padded by r+1 on top/left)
-    a = ii[np.ix_(y0, x0)]                       # top-left  (exclusive)
-    b = ii[np.ix_(y0, x0 + block)]               # top-right
-    c = ii[np.ix_(y0 + block, x0)]               # bottom-left
-    d = ii[np.ix_(y0 + block, x0 + block)]       # bottom-right
+    a = ii[0:H, 0:W]                             # top-left  (exclusive)
+    b = ii[0:H, block:block + W]                 # top-right
+    c = ii[block:block + H, 0:W]                 # bottom-left
+    d = ii[block:block + H, block:block + W]     # bottom-right
     return d - b - c + a
 
 
