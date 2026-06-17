@@ -897,6 +897,81 @@ The divergence-guard verdict is now carried all the way to the published pose:
 it exists, a sustained `vio_degraded` should drive **`pos_sigma_m` inflation /
 loiter-RTH** on the FC. See the SAFETY note in `docs/PROC4_ARCHITECTURE.md` §9.
 
+#### Phase 4(k) — fast-rotation "giật về" (snap-back) fix · DONE (2026-06-17, CONFIRMED LIVE)
+
+**The symptom.** On `--tight`, sweeping the camera in a FAST arc (or a fast straight
+push) the live `pose.odom` tracked the motion outward, then **snapped back** toward the
+start ("giật về"). Most visible on the OAK-D **Lite** (narrow FOV loses tracks sooner),
+but reproducible on the W at extreme speed. The user reads `pose.odom` (the green "VIO"
+line). After this fix the user confirms it "phản ứng giệt hệt BasaltVIO".
+
+**Root cause — pinned by a corrections-OFF decomposition (not a guess).** The snap is the
+**per-frame complementary VISION CORRECTION**, not the IMU and not SLAM / window-BA:
+- With ALL correction off, the pure IMU dead-reckon is **smooth** — it drifts, but never
+  snaps. IMU **+ correction** is what goes spiky.
+- The frame-to-frame RGB-D PnP **under-estimates arc translation** under fast rotation
+  (optical flow is rotation-dominated — "ghì lại"): on the arc `pose.vo` reaches only
+  ~0.83 m while the true sweep is larger. The every-frame complementary pull then **yanks
+  the IMU-tracked arc back** to that under-estimate → the snap.
+- **Ruled OUT:** the SLAM `loop.correction` (disabled with `--no-live-loop-correct` →
+  STILL snaps; it is the ONLY external feedback into `pose.odom`, gated on `loop_correct`
+  in `vio/modules/pipeline.py`) and the windowed BA `pose.refined` (independent,
+  output-only — `OdometryModule._downstream = [POSE_ODOM, …]`, `BackendModule._downstream
+  = [POSE_REFINED]`; `pose.refined` never feeds back into `pose.odom`).
+
+**The fix — `vio/modules/propagate_imu.py`, `--tight` + LIVE only (gated on `retain_imu`
+→ loose / oracle never run it → `gap = 0` regardless).**
+1. **Track-continuity signal (free).** `sky/front/odometry.py::estimate` stamps
+   `info["track_overlap_ratio"]` = (# previous-frame track IDs that SURVIVED into this
+   frame) / (# previous IDs). A fast frame that loses most tracks → low ratio. Both id
+   sets are already held, so it costs nothing; the loose / oracle path just ignores the
+   extra field (byte-parity preserved).
+2. **Overlap gate.** `overlap_scale ∈ [0,1]` (linear ramp between env `OAKD_OVERLAP_MIN`
+   = 0.3 and `OAKD_OVERLAP_FULL` = 0.6) scales DOWN the **translation** correction gains
+   (`_K_POS`, `_K_VEL`) as tracks are lost. The **rotation** correction (`_K_ROT`) stays
+   at full — gyro-fused vision yaw is trustworthy through a fast sweep.
+3. **Re-anchor offset** (`nav["vis_offset"]`, env `OAKD_REANCHOR`, on by default). Updated
+   EVERY frame: it tracks the accumulated `(nav − p_vis)` gap while vision is UNRELIABLE
+   (low scale → the IMU-vs-vision gap is forgiven) and FREEZES while reliable (high scale).
+   So when vision re-engages after the sweep, the correction target is `p_vis +
+   frozen_offset ≈ nav` — the pull re-centres on where the IMU already is instead of
+   yanking back to the under-estimated vision absolute. This removes the residual snap on
+   re-lock.
+
+**Gate simplification (data-driven, same session).** The correction is now gated by
+exactly TWO things: `overlap_scale` (track continuity) × `info["ok"]` (PnP actually
+produced a translation fix). The earlier **inlier-COUNT gate (`n_inliers ≥ 8`) was
+REMOVED** as redundant — (a) lost tracks → low overlap → the pull already fades; (b) the
+frontend's own `low_inliers_frozen` path freezes translation and returns `ok == False`,
+so the `ok` gate already excludes it; (c) covered / textureless frames FAIL PnP
+(`too_few_points` / `pnp_failed` → `ok == False`) — caught by `ok`, never by an inlier
+count. `vis_ok` (= `ok` AND `n_inliers ≥ 8`) is retained ONLY for the UI "inertial DR"
+badge and the degenerate no-IMU-samples branch.
+
+**Test — PASS.**
+- Deterministic live driver `verification/_arc_live_driver.py` (drives the REAL
+  `OdometryModule`, single-process, no frame drops, seq-aligned): jitter ratio
+  (path / max-dist) **14.5 → 5.8**, max-dist-from-start **preserved 2.06 → 3.94 m** (the
+  arc is TRACKED, not ghì-lài), and the largest single-frame steps now **match the
+  (locally-valid) Basalt steps at the same seqs** → real motion, not spurious yanks.
+- `gap = 0` oracle PASS; all four propagate_imu selftests PASS (`imu_propagate_selftest`,
+  `imu_push_response_selftest`, `tight_live_pose_selftest` — covered-camera still DRs
+  51.4 cm with NO freeze — `tight_live_regression_selftest`).
+- **Confirmed LIVE by the user** on the Lite + W: "hết bị giật lại … phản ứng giệt hệt
+  BasaltVIO".
+
+**Scope.** `--tight` + live `pose.odom` only. Loose path / oracle / comms wire contract /
+baselines / tight backend solve (`pose.refined`) all unchanged. (Also re-added the
+`--no-live-loop-correct` flag, plumbed `launcher/main.py` → `vio/main.py`, to isolate the
+SLAM loop during this decomposition.)
+
+**Remaining (deferred, separate issue).** One ~49 cm single-frame spike at the hardest
+fast-rotation frames = centripetal / lever-arm accel double-integrated by `predict_state`
+as phantom translation. Smaller and distinct from the snap; it also shows up in the Basalt
+steps, so it is mostly REAL motion. Fix direction if pursued: rotation-gated translation in
+the IMU PREDICT (mirror odometry's `rot_damp_gate_deg` — when the gyro rate is high the
+true translation is ≈ 0, so freeze the accel double-integral through the burst).
+
 ---
 
 **Critical path to a usable `--tight`: Phases 0 → 1 → 2 → 2.5 → 3** (~3.5–4.5 days).
@@ -905,8 +980,10 @@ end-to-end on gold sessions (loose stays byte-identical), AND the live `pose.odo
 now forward-propagates the IMU every frame + ZUPTs at rest (the covered-camera
 freeze fix). Phase 4(g–j) tight-solve optimisation chain DONE (2026-06-16):
 Schur + gauge regularisation + divergence guard + njit kernel + `vio_degraded`
-health signal, all validated, oracle re-baselined. Phase 3 (loose-vs-tight ATE
-benchmark) is next.
+health signal, all validated, oracle re-baselined. **Phase 4(k) DONE (2026-06-17,
+confirmed live):** the fast-rotation "giật về" snap-back is fixed (overlap gate +
+re-anchor offset on the live correction; inlier gate removed). Phase 3 (loose-vs-tight
+ATE benchmark) is next.
 
 ---
 

@@ -133,6 +133,7 @@ def run_vio(*,
             backend_window: int = 6,
             backend_iters: int = 5,
             tight: bool = False,
+            no_live_loop_correct: bool = False,
             stabilize_velocity: bool = False,
             depth_icp: bool = False,
             ba_window: bool = False,
@@ -199,7 +200,9 @@ def run_vio(*,
     # Closed-loop feedback is --tight + LIVE only: a slam endpoint must be wired
     # AND the tight nav-state must exist (retain_imu, set by tight). The loose /
     # oracle path never reaches here with both, so it stays byte-identical.
-    loop_correct = bool(tight and slam_endpoint)
+    # Opt-out: keep the SLAM endpoint wired (map still built) but disable the
+    # SLAM->live-pose loop-correction feedback (a diagnostic / Lite escape hatch).
+    loop_correct = bool(tight and slam_endpoint and not no_live_loop_correct)
     # 1. Block until capture publishes its calibration bundle.
     LOG.info("vio: waiting for calib.bundle on %s ...", capture_endpoint)
     bundle = _await_calib_bundle(capture_endpoint, calib_timeout_s)
@@ -455,6 +458,10 @@ def main() -> int:
                          "IMU window optimiser, imu_info_weight=True) instead of "
                          "the default LOOSE windowed-BA backend. Opt-in; the "
                          "default (loose) path is byte-identical to before.")
+    ap.add_argument("--no-live-loop-correct", action="store_true",
+                    help="tight only: DISABLE feeding the SLAM loop-correction into "
+                         "the live pose (the SLAM map is still built). Diagnostic / "
+                         "escape hatch; default keeps closed-loop ON.")
     ap.add_argument("--stabilize-velocity", action="store_true",
                     help="tight only: enable Phase-4 velocity regularisation "
                          "(CV prior + gated ZUPT) to curb 54x42/shake velocity "
@@ -498,6 +505,7 @@ def main() -> int:
         backend_window=args.backend_window,
         backend_iters=args.backend_iters,
         tight=args.tight,
+        no_live_loop_correct=args.no_live_loop_correct,
         stabilize_velocity=args.stabilize_velocity,
         depth_icp=args.depth_icp,
         ba_window=args.ba_window,

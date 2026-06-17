@@ -432,6 +432,18 @@ class RGBDVisualOdometry:
                 "ok": False, "reason": "",
                 "inlier_ids": np.empty((0,), dtype=np.int64)}
 
+        # Track-continuity signal: the fraction of the PREVIOUS frame's tracks that
+        # SURVIVED into this frame (same persistent id). A sharp drop means fast
+        # motion lost most tracks -> the few survivors are suspect (KLT slip) and
+        # the vision fix is unreliable EVEN if it still has >= min_pnp inliers. The
+        # count gates (n_pnp / n_inliers) cannot see this; the survival RATIO can,
+        # and it is free (we already hold both id sets). Consumed by the live
+        # propagate_imu correction gate; offline/oracle just ignore the extra field.
+        n_prev = len(self._prev_obs)
+        n_common = sum(1 for tid in cur_obs if tid in self._prev_obs)
+        info["track_overlap"] = n_common
+        info["track_overlap_ratio"] = (n_common / n_prev) if n_prev > 0 else 1.0
+
         if self._prev_depth is not None and self._prev_obs:
             obj_pts, img_pts, id_list = [], [], []
             h, w = self._prev_depth.shape

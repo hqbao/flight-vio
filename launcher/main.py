@@ -270,6 +270,10 @@ def build_vio_args(args, cap_ep: str, vio_ep: str, slam_ep: str,
         # correction is fed back into the live pose (drift bounded on revisits).
         # Only on the --tight path; the loose pipeline never wires it.
         vio_args += ["--slam-endpoint", slam_ep]
+        # Opt-out: keep the slam endpoint wired (map still built) but disable the
+        # SLAM->live-pose loop pull (diagnostic / Lite escape hatch).
+        if args.no_live_loop_correct:
+            vio_args += ["--no-live-loop-correct"]
         # Phase-4 velocity regularisation: tight-only, opt-in. Forwarded ONLY when
         # BOTH --tight AND --stabilize-velocity are set, so the default end-to-end
         # path (and the oracle) never see it.
@@ -560,6 +564,10 @@ def main() -> int:
                          "vio.main --direct. Opt-in (default OFF); meant to pair "
                          "with --vl53l9cx (the 54x42 ToF recipe where the sparse "
                          "VIO scale-collapses). Oracle byte-identical (gap=0).")
+    ap.add_argument("--no-live-loop-correct", action="store_true",
+                    help="tight only: DISABLE feeding the SLAM loop-correction into "
+                         "the live pose (the SLAM map is still built). Diagnostic / "
+                         "escape hatch; forwarded to vio.main only with --tight.")
     ap.add_argument("--stabilize-velocity", action="store_true",
                     help="tight only: enable Phase-4 velocity regularisation "
                          "(CV prior + gated ZUPT) to curb 54x42/shake velocity "

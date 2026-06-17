@@ -117,6 +117,7 @@ not duplicate the cadence (single source of truth).
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 import numpy as np
@@ -172,6 +173,22 @@ _K_ROT = 0.25
 # this (covered camera / textureless wall) vision is treated as ABSENT and the
 # pose pure-dead-reckons from the IMU (the covered-camera-keeps-moving win).
 _MIN_VIS_INLIERS = 8
+
+# --- track-continuity gate + re-anchor (fast-motion "giật về" fix) ----------
+# The per-frame track-overlap RATIO (survivors/prev, from odometry.estimate)
+# scales the TRANSLATION correction gain: full when tracks persist, -> 0 when a
+# fast frame loses most tracks (survivors are KLT-slip-suspect). Rotation
+# correction is untouched (vision yaw is reliable). MORE IMPORTANT: a re-anchor
+# OFFSET forgives the IMU-vs-vision position gap that accumulates while vision is
+# unreliable -- so when vision re-engages it does NOT yank the (correctly
+# IMU-tracked) arc back to the under-estimated ("ghì lại") vision absolute (THE
+# snap). The offset tracks (nav - p_vis) when unreliable and FREEZES when
+# reliable, so the live pose keeps the IMU's real translation and vision only
+# corrects NEW drift relative to the re-anchor. LIVE + --tight only -> gap=0
+# untouched. Env knobs for live tuning; inf/0 disable.
+_OVERLAP_FULL = float(os.environ.get("OAKD_OVERLAP_FULL", "0.6"))  # >= -> full
+_OVERLAP_MIN = float(os.environ.get("OAKD_OVERLAP_MIN", "0.3"))    # <= -> none
+_REANCHOR = os.environ.get("OAKD_REANCHOR", "1") != "0"            # re-anchor on
 
 # --- closed-loop SLAM correction blend (LIVE + --tight only) --------------- #
 # A loop closure rewrites the keyframe poses; the world-frame SE(3) delta between
@@ -406,8 +423,39 @@ def propagate_imu(ctx: Any, step: Step) -> Step:
     # drift continuously (no snap, no overshoot). On a covered / failed-vision
     # frame this is skipped, so the pose pure-dead-reckons through the blind
     # interval (keeps moving) until vision re-locks and pulls it back.
-    if vis_ok:
-        _vision_correct(nav, R_vis, p_vis)
+    # Track-continuity reliability scale (0..1) from the overlap ratio: full pull
+    # when most tracks survived, fading to 0 as a fast frame loses them.
+    ratio = float(info.get("track_overlap_ratio", 1.0))
+    overlap_scale = (1.0 if _OVERLAP_FULL <= _OVERLAP_MIN else float(
+        np.clip((ratio - _OVERLAP_MIN) / (_OVERLAP_FULL - _OVERLAP_MIN),
+                0.0, 1.0)))
+    # Gate the POSITION pull on info["ok"] ONLY -- a frame where PnP actually
+    # produced a vision translation fix. The inlier-COUNT gate (n_inliers >= 8) is
+    # dropped on purpose: it is redundant with (a) the overlap gate above (lost
+    # tracks -> low overlap -> the pull fades) and (b) the frontend's own
+    # low_inliers_frozen freeze, which returns ok == False with translation held,
+    # so this gate already excludes it. All the count threshold added was blocking
+    # good few-inlier frames the overlap gate already trusts. On the degenerate
+    # vision paths (too_few_points / pnp_failed / low_inliers_frozen) p_vis is the
+    # gyro-propagated / frozen pose, NOT a position fix, so pulling DR toward it
+    # would yank the IMU-tracked arc back -- exactly the "giật về" snap we removed.
+    vis_scale = overlap_scale if bool(info.get("ok", True)) else 0.0
+    # Re-anchor offset, updated EVERY frame: tracks (nav - p_vis) while vision is
+    # unreliable (vis_scale low -> the accumulated IMU-vs-vision gap is forgiven),
+    # FREEZES while reliable (vis_scale high). So when vision re-engages after a
+    # fast sweep the target is p_vis + frozen_offset ~ nav -- NO yank back to the
+    # under-estimated vision absolute (the "giật về" snap).
+    p_target = p_vis
+    if _REANCHOR:
+        gap = nav["p"] - p_vis
+        off = nav.get("vis_offset")
+        off = (gap.copy() if off is None
+               else off * vis_scale + gap * (1.0 - vis_scale))
+        nav["vis_offset"] = off
+        p_target = p_vis + off
+    if vis_scale > 0.0:
+        _vision_correct(nav, R_vis, p_target,
+                        k_pos=_K_POS * vis_scale, k_vel=_K_VEL * vis_scale)
 
     # Replace the published live pose with the IMU-propagated one (camera->world),
     # AFTER the smooth closed-loop SLAM correction is bled in (no-op when no
@@ -416,18 +464,21 @@ def propagate_imu(ctx: Any, step: Step) -> Step:
     return step
 
 
-def _vision_correct(nav: dict, R_vis: np.ndarray, p_vis: np.ndarray) -> None:
+def _vision_correct(nav: dict, R_vis: np.ndarray, p_vis: np.ndarray,
+                    k_pos: float = _K_POS, k_vel: float = _K_VEL) -> None:
     """Pull the live nav-state a bounded fraction toward the vision fix.
 
     Smooth complementary correction (NOT a hard ``p = p_vis`` snap): closes a
     per-frame fraction of the position/velocity/attitude error toward the
     fresh vision pose, then resets the anchor-interval accumulator so the next
     velocity-feedback term is scaled by the next inter-correction interval.
-    Mutates ``nav`` in place.
+    Mutates ``nav`` in place. ``k_pos`` / ``k_vel`` default to the full gains;
+    the track-continuity gate passes overlap-scaled translation gains (rotation
+    ``_K_ROT`` is always full -- vision yaw is reliable).
     """
     R_new, p_new, v_new = complementary_correct(
         nav["R"], nav["p"], nav["v"], R_vis, p_vis,
-        float(nav.get("anchor_dt", 0.0)), _K_POS, _K_VEL, _K_ROT)
+        float(nav.get("anchor_dt", 0.0)), k_pos, k_vel, _K_ROT)
     nav["R"], nav["p"], nav["v"] = R_new, p_new, v_new
     nav["anchor_dt"] = 0.0
 
