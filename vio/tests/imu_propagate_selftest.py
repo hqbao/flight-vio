@@ -299,6 +299,65 @@ def test_static_camera_dynamic_object_no_drift() -> None:
           "(vision-translation pull suppressed); gate-OFF drifts (contrast)")
 
 
+def test_backend_bias_feedforward() -> None:
+    """PLAN P2: the tight backend's optimised bias, fed on ``backend.state``, is
+    adopted into the live dead-reckon bias via a HEALTH-GATED per-keyframe low-pass.
+    Verifies: (1) a healthy, fresh, hysteresis-satisfied stream converges the live
+    bias toward the backend's; (2) a DEGRADED stream is NOT adopted; (3) fewer than
+    the hysteresis count is NOT adopted; (4) a STALE (older-seq) state is dropped."""
+    import vio.modules.propagate_imu as _pim
+    from vio.modules.loop_inbox import BackendStateInbox
+
+    BA_BE = np.array([0.0, 0.0, 0.30])     # the backend's optimised accel bias
+    rest = np.array([0.0, -G, 0.0])
+
+    def _drive(states) -> np.ndarray:
+        """Run one frame per entry in ``states`` (a backend.state dict or None),
+        pushing it to the inbox; return the final live nav accel-bias."""
+        ctx = _make_ctx()
+        ctx.state["backend_inbox"] = binbox = BackendStateInbox()
+        seq = 0
+        for st in states:
+            if st is not None:
+                binbox.push(st)
+            seg = _accel_seg(seq, rest, np.zeros(3), 5)
+            ctx.state["imu_segs"][seq] = seg
+            _pim.propagate_imu(ctx, _Step(_Frame(seq, int(seg[0][-1])),
+                                          np.eye(4), {"ok": True, "n_inliers": 50}))
+            seq += 1
+        return ctx.state["live_nav"]["ba"].copy()
+
+    def _msgs(n, ba=BA_BE, degraded=False, seq0=0):
+        return [{"seq": seq0 + i, "bg": np.zeros(3), "ba": ba,
+                 "degraded": degraded} for i in range(n)]
+
+    # (1) healthy + fresh + hysteresis met -> bias converges toward the backend's.
+    ba_fed = _drive(_msgs(12))
+    assert ba_fed[2] > 0.20, f"healthy backend bias not adopted: ba={ba_fed}"
+    assert np.linalg.norm(ba_fed - BA_BE) < 0.1, f"did not converge: {ba_fed}"
+
+    # (2) DEGRADED -> never adopted (the safety gate): bias stays ~0.
+    ba_deg = _drive(_msgs(12, degraded=True))
+    assert np.linalg.norm(ba_deg) < 1e-9, f"degraded bias WAS adopted: {ba_deg}"
+
+    # (3) hysteresis: fewer than _BACKEND_HEALTHY_HOLD healthy -> not yet adopted.
+    ba_few = _drive(_msgs(_pim._BACKEND_HEALTHY_HOLD - 1))
+    assert np.linalg.norm(ba_few) < 1e-9, f"adopted before hysteresis: {ba_few}"
+
+    # (4) STALE: after adopting up to seq=20, an older seq=10 (5x bias) is dropped.
+    ba_stale = _drive(_msgs(21) + _msgs(5, ba=BA_BE * 5.0, seq0=10))
+    assert ba_stale[2] < 0.45, f"stale older-seq bias was adopted (should drop): {ba_stale}"
+
+    # (5) sustained DEGRADE after adopting -> the held bias DECAYS toward the zero
+    # seed (safety-reviewer FMEA: a frozen stale bias must not contaminate forever).
+    ba_decay = _drive(_msgs(21) + _msgs(20, degraded=True, seq0=21))
+    assert np.linalg.norm(ba_decay) < 0.5 * np.linalg.norm(BA_BE), \
+        f"adopted bias did NOT decay on sustained degrade: {ba_decay}"
+
+    print(f"backend bias feed-forward: healthy adopted (ba_z={ba_fed[2]:.3f}->{BA_BE[2]}), "
+          "degraded gated, hysteresis honored, stale dropped, sustained-degrade decays  OK")
+
+
 def test_empty_imu_segment_held() -> None:
     """Regression (caught live): a frame whose retained IMU segment is EMPTY
     (size-0 arrays, as PreintegratePrior stores for a no-sample packet) must NOT
@@ -344,6 +403,7 @@ def main() -> int:
     test_inertial_dr_flag_vision_ok()
     test_stationary_zupt_no_drift()
     test_static_camera_dynamic_object_no_drift()
+    test_backend_bias_feedforward()
     print()
     test_empty_imu_segment_held()
     test_loose_path_passthrough()

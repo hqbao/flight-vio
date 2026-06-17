@@ -1,4 +1,5 @@
-"""Thread-safe inbox for SLAM ``loop.correction`` messages (LIVE + --tight only).
+"""Thread-safe inboxes for the live ``--tight`` cross-thread feedback paths
+(SLAM ``loop.correction`` + the tight backend's ``backend.state`` bias).
 
 The closed-loop feedback ``slam -> vio`` crosses a thread boundary: the
 ``loop.correction`` arrives on the VIO process's slam-endpoint IPC subscriber
@@ -58,3 +59,31 @@ class LoopCorrectionInbox:
             items = list(self._q)
             self._q.clear()
         return items
+
+
+class BackendStateInbox:
+    """Latest-wins holder for ``backend.state`` (the tight BA's optimised bias).
+
+    Unlike :class:`LoopCorrectionInbox` (which stacks a burst of loop closures so
+    they all fold into the pending delta), only the FRESHEST bias matters -- a
+    single current value, not a sequence -- so this COALESCES to the latest. Same
+    thread handoff: the local-bus subscriber thread :meth:`push`es, the odometry
+    thread :meth:`take`s once per frame and adopts it. LIVE + --tight only.
+    """
+
+    __slots__ = ("_lock", "_latest")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._latest: Any = None
+
+    def push(self, state: Any) -> None:
+        """Store the newest ``backend.state`` from the subscriber thread (latest-wins)."""
+        with self._lock:
+            self._latest = state
+
+    def take(self) -> Any:
+        """Return + clear the freshest ``backend.state`` (odometry thread), or ``None``."""
+        with self._lock:
+            s, self._latest = self._latest, None
+        return s

@@ -65,6 +65,23 @@ pose/velocity re-base.** Key corrections folded in:
   delta (not blend-toward-absolute → 250mm lag proof); lift by `loop_applied` (else
   re-inject 50cm loop drift); pose-only no velocity (gauge 1111–10000× too weak);
   bias low-pass τ≈0.5s (BIBO-stable, kink-smoothing). Bias-only P2 = clean consistent update.
+- **safety-reviewer: BLOCK → RESOLVED.** Caught a REAL bug: `_backend_bias` read
+  `vio_map.bg` (non-existent attr) → the feed-forward was DEAD CODE (never published),
+  masked by the unit test (it pushed dicts straight into the inbox). FIXED: read
+  `keyframes[-1]["bg"]/["ba"]`. Also folded: integration test (`tight_smoke` asserts
+  `n_bias>0` — the real source path), DECAY of the held bias on sustained degrade (FMEA),
+  env CLAMPS (`_K_BIAS≤0.6`, `HOLD≥2`). FMEA/HIL note: the Pi flight build should default
+  `OAKD_BACKEND_FEEDBACK=0` until HIL evidence.
+
+## Status: P1 + P2 DONE + verified (2026-06-17)
+- **P1** (`8f7c7cd`, committed) — backend publishes `backend.state` (was INERT due to the
+  `_backend_bias` bug above; the fix lands in the P2 commit).
+- **P2** (uncommitted) — the `_backend_bias` FIX + the live bias adoption (low-pass,
+  health-gated, hysteresis, staleness, sustained-degrade decay, clamps).
+- Verify: gap=0 PASS; `tight_smoke` `n_bias>0` PASS (real source path live); imu_propagate
+  5 sub-checks PASS (adopt / degraded-gate / hysteresis / stale-drop / decay);
+  tight_live_regression PASS; live `--tight --worker` clean; pyflakes 0.
+- NEXT (deferred): tester HIL/SIL protocol (the safety-reviewer's 6 cases); P3 (#4a slip).
 
 ## Go-list for developer (P1 → P2, bias-only)
 1. `vio_step` → `(T_cw, health, (kf.seq, bg, ba))`, plain float64 across `out_q`.

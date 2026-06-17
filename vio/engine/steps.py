@@ -69,11 +69,19 @@ def _backend_bias(vio_map):
     backend->live feed-forward (PLAN P1/P2). TIGHT path only; a copy so the
     worker map's state is never aliased across the boundary.
     """
-    bg = getattr(vio_map, "bg", None)
-    ba = getattr(vio_map, "ba", None)
-    if bg is None or ba is None or len(bg) == 0 or len(ba) == 0:
+    # The optimised per-keyframe bias lives in the WindowedVIOMap's keyframe dicts
+    # (``keyframes[-1]["bg"]/["ba"]``, written back after a HEALTHY solve --
+    # ``sky/vio/window.py``; a degraded solve returns before the write-back so the
+    # latest keyframe keeps the last-healthy bias, which the ``degraded`` flag gates
+    # downstream). NOT ``vio_map.bg`` -- the map only has the ``bg0``/``ba0`` seeds.
+    kfs = getattr(vio_map, "keyframes", None)
+    if not kfs:
         return None
-    return (bg[-1].copy(), ba[-1].copy())
+    kf = kfs[-1]
+    bg, ba = kf.get("bg"), kf.get("ba")
+    if bg is None or ba is None:
+        return None
+    return (bg.copy(), ba.copy())
 
 
 def vio_step(vio_map, snap: Any):

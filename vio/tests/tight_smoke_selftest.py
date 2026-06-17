@@ -126,6 +126,7 @@ def run_tight_smoke(session_dir: Path, max_frames: int = 0,
     last_kf_ts = None
     n_kf = 0
     n_refined = 0
+    n_bias = 0           # keyframes where the REAL backend bias was extracted (P1)
     last_info: dict = {}
 
     for i in range(n):
@@ -158,7 +159,9 @@ def run_tight_smoke(session_dir: Path, max_frames: int = 0,
             engine.submit((T_cw, ids, px, f.depth_m, int(f.ts_ns), imu_seg))
             post = engine.poll()                    # (T_cw, health, bias) or None
             if isinstance(post, tuple):              # tight: vio_step returns a tuple
-                post, _health, *_ = post             # *_ tolerates the new bias element
+                post, _health, *_rest = post         # _rest[0] = backend_bias (bg, ba)
+                if _rest and _rest[0] is not None:   # the REAL source->extract path
+                    n_bias += 1                      # (P1 feed-forward; not dead code)
             if post is not None:
                 tight_pose = np.linalg.inv(post)
                 tight_fe.pose = tight_pose.copy()
@@ -197,6 +200,13 @@ def run_tight_smoke(session_dir: Path, max_frames: int = 0,
         fails.append(f"too few tight poses ({st_tight['n']})")
     if n_refined == 0:
         fails.append("the tight window NEVER refined a keyframe (no poses out)")
+    # P1 feed-forward INTEGRATION (closes the safety-review coverage gap): the
+    # backend's optimised bias MUST flow through the REAL vio_step source path
+    # (keyframes[-1]["bg"]/["ba"]) on at least one keyframe -- else BACKEND_STATE
+    # would never publish and the live feed-forward would be inert dead code.
+    if n_bias == 0:
+        fails.append("backend_bias NEVER extracted from the real map "
+                     "(_backend_bias dead -> feed-forward inert)")
     if st_tight["span"] < 1e-4:
         fails.append("tight trajectory is degenerate (zero spatial span)")
     # "not exploding": no single inter-frame jump beyond a generous bound (the

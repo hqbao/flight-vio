@@ -193,6 +193,26 @@ _REANCHOR = os.environ.get("OAKD_REANCHOR", "1") != "0"            # re-anchor o
 # waved past a static camera) makes PnP report a spurious translation that the
 # vision pull would otherwise drag the position along with. Default ON; 0 disables.
 _ZUPT_FREEZE_TRANS = os.environ.get("OAKD_ZUPT_FREEZE_TRANS", "1") != "0"
+# Backend->live BIAS feed-forward (PLAN P2, LIVE + --tight only). The tight BA's
+# optimised (bg, ba) arrive on backend.state; the dead-reckon adopts them via a
+# per-keyframe LOW-PASS (_K_BIAS ~0.4 -> tau ~0.5s at ~4Hz keyframes), HEALTH-
+# GATED: only when the solve is NOT vio_degraded AND has held healthy for
+# _BACKEND_HEALTHY_HOLD keyframes (hysteresis: fast to distrust, slow to trust)
+# AND the seq is fresh. So a diverging BA is NEVER fed (decoupled fallback). The
+# pose/velocity re-base is deliberately NOT done here (math/arch review: redundant
+# with the vision pull + staleness lag); bias is the unambiguous win. 0 disables.
+_BACKEND_FEEDBACK = os.environ.get("OAKD_BACKEND_FEEDBACK", "1") != "0"
+# CLAMP so a mis-set env can't defeat the two safety properties (safety-reviewer):
+# _K_BIAS in [0, 0.6] (never a hard set -> always a low-pass), HOLD >= 2 (never
+# no hysteresis).
+_K_BIAS = float(np.clip(float(os.environ.get("OAKD_K_BIAS", "0.4")), 0.0, 0.6))
+_BACKEND_HEALTHY_HOLD = max(2, int(os.environ.get("OAKD_BACKEND_HEALTHY_HOLD", "3")))
+# Sustained-divergence DECAY (FMEA: a held last-good bias is a stale contaminant if
+# the BA stays degraded while the true bias drifts). After this many CONSECUTIVE
+# degraded keyframes, leak the adopted bias back toward the zero seed (the decoupled
+# fallback's assumption) by _BACKEND_DECAY per keyframe.
+_BACKEND_DECAY_HOLD = max(1, int(os.environ.get("OAKD_BACKEND_DECAY_HOLD", "3")))
+_BACKEND_DECAY = float(np.clip(float(os.environ.get("OAKD_BACKEND_DECAY", "0.1")), 0.0, 1.0))
 
 # --- closed-loop SLAM correction blend (LIVE + --tight only) --------------- #
 # A loop closure rewrites the keyframe poses; the world-frame SE(3) delta between
@@ -316,6 +336,12 @@ def propagate_imu(ctx: Any, step: Step) -> Step:
         nav = {
             "R": R_vis, "p": p_vis, "v": np.zeros(3),
             "bg": np.zeros(3), "ba": np.zeros(3),
+            # backend-bias feed-forward tracking (PLAN P2): last adopted keyframe
+            # seq (staleness gate, -1 = none yet) + consecutive-healthy keyframe
+            # count (hysteresis before trusting the BA's bias).
+            "backend_bias_seq": -1,
+            "backend_healthy_run": 0,
+            "backend_degraded_run": 0,
             # anchor_dt accumulates wall time since the last vision
             # correction (used to scale the velocity-feedback term).
             "anchor_dt": 0.0,
@@ -388,6 +414,12 @@ def propagate_imu(ctx: Any, step: Step) -> Step:
             _vision_correct(nav, R_vis, p_vis)
         step.pose = _finalize(state, nav, step.frame.seq, is_kf)
         return step
+
+    # Tight backend -> live BIAS feed-forward (PLAN P2): fold the backend's latest
+    # optimised (bg, ba) into the dead-reckon bias BEFORE this frame's predict,
+    # health-gated (a diverging BA is never fed). No-op until a fresh, trusted
+    # backend.state arrives; LIVE + --tight only.
+    _adopt_backend_bias(state, nav)
 
     # --- (2) velocity-gated ZUPT: only freeze when GENUINELY at rest --------
     # imu_at_rest uses raw |gyro|/|accel| magnitudes (frame-invariant), so the
@@ -542,6 +574,54 @@ def _record_kf_pose(state: dict, nav: dict, seq: int) -> None:
         # past any plausible loop-correction latency.
         for old in sorted(store)[:len(store) - _LOOP_KF_POSE_KEEP]:
             del store[old]
+
+
+def _adopt_backend_bias(state: dict, nav: dict) -> None:
+    """Fold the tight backend's optimised ``(bg, ba)`` into the live dead-reckon bias.
+
+    The BackendWorker republishes its latest optimised bias on ``backend.state``;
+    the odometry thread takes the freshest one here (latest-wins inbox) and folds
+    it into ``nav["bg"]``/``nav["ba"]`` via a bounded per-keyframe LOW-PASS
+    (``_K_BIAS``), so a single noisy solve cannot step the dead-reckon. HEALTH-
+    GATED: adopt ONLY when the solve is NOT ``vio_degraded`` AND has held healthy
+    for ``_BACKEND_HEALTHY_HOLD`` keyframes (hysteresis -- fast to distrust, slow
+    to trust) AND the ``seq`` is fresh (newer than the last adopted; the backend
+    worker drains latest-wins, so a stale state can arrive). A diverging BA is
+    therefore NEVER fed and the live pose falls back to the decoupled behaviour.
+    LIVE + --tight only -- the loose / oracle path never wires the inbox.
+    """
+    if not _BACKEND_FEEDBACK:
+        return
+    inbox = state.get("backend_inbox")
+    if inbox is None:
+        return
+    msg = inbox.take()
+    if msg is None:
+        return
+    seq = int(msg.get("seq", -1))
+    if seq <= nav["backend_bias_seq"]:        # stale / already adopted -> drop
+        return
+    nav["backend_bias_seq"] = seq
+    if msg.get("degraded", False):
+        nav["backend_healthy_run"] = 0        # distrust immediately on a bad solve
+        nav["backend_degraded_run"] += 1
+        # Sustained divergence: the held last-good bias may now be stale (thermal
+        # drift, with no backend correcting it). Leak it back toward the zero seed
+        # -- the same state the decoupled fallback assumes -- so it cannot quietly
+        # contaminate the dead-reckon. (safety-reviewer FMEA)
+        if nav["backend_degraded_run"] >= _BACKEND_DECAY_HOLD:
+            nav["bg"] = nav["bg"] * (1.0 - _BACKEND_DECAY)
+            nav["ba"] = nav["ba"] * (1.0 - _BACKEND_DECAY)
+        return
+    nav["backend_degraded_run"] = 0
+    nav["backend_healthy_run"] += 1
+    if nav["backend_healthy_run"] < _BACKEND_HEALTHY_HOLD:
+        return                                # not yet trusted (hysteresis)
+    bg, ba = msg.get("bg"), msg.get("ba")
+    if bg is None or ba is None:
+        return
+    nav["bg"] = nav["bg"] + _K_BIAS * (np.asarray(bg, dtype=np.float64) - nav["bg"])
+    nav["ba"] = nav["ba"] + _K_BIAS * (np.asarray(ba, dtype=np.float64) - nav["ba"])
 
 
 def _drain_loop_inbox(state: dict, nav: dict) -> None:

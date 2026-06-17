@@ -71,7 +71,7 @@ from .publishers import (
     publish_ba_window, publish_frontend_viz, publish_gyrofuse, publish_inliers,
     publish_pose, publish_refined, publish_tracks, publish_vo)
 from .propagate_imu import propagate_imu
-from .loop_inbox import LoopCorrectionInbox
+from .loop_inbox import BackendStateInbox, LoopCorrectionInbox
 
 LOG = logging.getLogger("vio.pipeline")
 
@@ -349,6 +349,18 @@ class OdometryWorker(threading.Thread):
                 topics.LOOP_CORRECTION,
                 lambda m: inbox.push(m) if m is not None and m is not END
                 else None)
+        # Tight backend -> live BIAS feed-forward (PLAN P2): the BackendWorker
+        # republishes its latest optimised (bg, ba) on backend.state (same LOCAL
+        # bus). A latest-wins inbox hands it to the odometry thread; propagate_imu
+        # adopts the bias (low-pass, health-gated) per frame. Gated on retain_imu
+        # (--tight) so the loose / oracle path never wires it -> pose.odom
+        # byte-identical (the offline path also never publishes backend.state).
+        if retain_imu:
+            binbox = BackendStateInbox()
+            state["backend_inbox"] = binbox
+            bus.subscribe(
+                topics.BACKEND_STATE,
+                lambda m: binbox.push(m) if isinstance(m, dict) else None)
         state["R_imu_cam"] = (
             None if R_imu_cam is None else np.asarray(R_imu_cam, dtype=np.float64))
         if accel_align is not None:
