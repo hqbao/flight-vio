@@ -601,6 +601,12 @@ def main() -> int:
     ap.add_argument("--no-frontend-viz", action="store_true",
                     help="force the Frontend Internals capture OFF even when the UI "
                          "is shown (skip its small per-frame snapshot/publish cost).")
+    ap.add_argument("--corrected-vio", action="store_true",
+                    help="UI: enable the SLAM-corrected VIO overlay (the dense VIO "
+                         "trail rubber-sheeted to the SLAM graph). OFF by default -- "
+                         "its warp is recomputed EVERY GUI tick even when the line "
+                         "is hidden, so it is opt-in for a lighter UI. Forwarded to "
+                         "ui.main; needs SLAM running to be non-empty.")
     args = ap.parse_args()
 
     args.ba_window = resolve_ba_window(args)
@@ -706,6 +712,10 @@ def main() -> int:
     # tight (the frontend is identical), so it is NOT gated on --tight.
     if args.frontend_viz:
         ui_args += ["--frontend-viz"]
+    # SLAM-corrected VIO overlay: opt-in (its rubber-sheet warp runs every GUI tick
+    # even when hidden). Default OFF for a lighter UI; needs SLAM running to show.
+    if args.corrected_vio:
+        ui_args += ["--corrected-vio"]
 
     # ---- SIGTERM handler (registered ONCE) -------------------------------
     # `kill <launcher_pid>` from outside must clean up the whole tree, not just

@@ -1042,25 +1042,38 @@ def _try_build_qt(vio_ep: str, slam_ep: str) -> None:
         win.setStyleSheet(theme.QSS)
         win.setCentralWidget(central)
 
-        # Build the 5 toggles EXACTLY as run_ui does and assert labels + wiring.
+        # Build the toggles EXACTLY as run_ui does. The "SLAM-corrected VIO" line is
+        # OPT-IN (--corrected-vio): its rubber-sheet warp runs every GUI tick even
+        # when hidden, so the button is OMITTED unless enabled -> default 4, opt-in 5.
+        def _build_toggles(viewer, corrected_vio):
+            out = []
+            for label, setter in (("VO", viewer.set_vo_visible),
+                                  ("VIO", viewer.set_vio_visible),
+                                  ("VIO-BA", viewer.set_ba_visible),
+                                  ("SLAM-corrected VIO", viewer.set_corrected_visible),
+                                  ("SLAM", viewer.set_slam_visible)):
+                if label == "SLAM-corrected VIO" and not corrected_vio:
+                    continue
+                btn = QPushButton(label)
+                btn.setCheckable(True)
+                btn.setChecked(True)
+                btn.toggled.connect(setter)
+                out.append(btn)
+            return out
+        # DEFAULT (no --corrected-vio): 4 toggles, the orange line omitted.
+        _off = [b.text() for b in _build_toggles(viewer, False)]
+        _check(_off == ["VO", "VIO", "VIO-BA", "SLAM"],
+               f"default: 4 toggles, 'SLAM-corrected VIO' omitted (got {_off})")
+        # --corrected-vio ON: all 5. Use these for the wiring test below.
         tb = QToolBar("Controls")
         win.addToolBar(tb)
-        toggles = []
-        for label, setter in (("VO", viewer.set_vo_visible),
-                              ("VIO", viewer.set_vio_visible),
-                              ("VIO-BA", viewer.set_ba_visible),
-                              ("SLAM-corrected VIO", viewer.set_corrected_visible),
-                              ("SLAM", viewer.set_slam_visible)):
-            btn = QPushButton(label)
-            btn.setCheckable(True)
-            btn.setChecked(True)
-            btn.toggled.connect(setter)
-            tb.addWidget(btn)
-            toggles.append(btn)
+        toggles = _build_toggles(viewer, True)
+        for b in toggles:
+            tb.addWidget(b)
         labels = [b.text() for b in toggles]
         want = ["VO", "VIO", "VIO-BA", "SLAM-corrected VIO", "SLAM"]
         _check(labels == want,
-               f"5 toggle buttons with exact labels (got {labels}, want {want})")
+               f"--corrected-vio ON: 5 toggle buttons (got {labels}, want {want})")
         _check(all(b.isCheckable() and b.isChecked() for b in toggles),
                "all 5 toggles are checkable and start CHECKED (visible)")
 

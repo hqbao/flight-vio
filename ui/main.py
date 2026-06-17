@@ -615,7 +615,8 @@ def run_ui(*, vio_endpoint: str = DEFAULT_VIO_ENDPOINT,
            calib_timeout_s: float = 60.0,
            default_view: str = "TOP",
            ba_window: bool = False,
-           frontend_viz: bool = False) -> int:
+           frontend_viz: bool = False,
+           corrected_vio: bool = False) -> int:
     """Open the single-view Qt UI (5 trajectories) and block on the Qt event loop."""
     # Import Qt lazily so a headless smoke / CI run that doesn't need the GUI
     # can import this module without pulling PyQt6.
@@ -688,7 +689,11 @@ def run_ui(*, vio_endpoint: str = DEFAULT_VIO_ENDPOINT,
     # live marker come from `history`, fed by vio_source.start below).
     viewer.set_vo_path_source(tracker.vo_snapshot)               # 1. VO (grey)
     viewer.set_ba_path_source(tracker.ba_snapshot)               # 3. VIO-BA (blue)
-    viewer.set_corrected_path_source(tracker.corrected_vio_snapshot)  # 4. orange
+    if corrected_vio:                                            # 4. orange (opt-in)
+        # The rubber-sheet warp runs EVERY GUI tick even when the line is hidden,
+        # so leaving the source UNREGISTERED (getter stays None) makes
+        # _refresh_corrected a no-op -> a lighter UI by default.
+        viewer.set_corrected_path_source(tracker.corrected_vio_snapshot)
     viewer.set_refined_path_source(tracker.refined_path_snapshot)     # 5. cyan
     viewer.set_overlay_source(tracker.slam_overlay_snapshot)          # 5. kf dots
 
@@ -755,6 +760,9 @@ def run_ui(*, vio_endpoint: str = DEFAULT_VIO_ENDPOINT,
                                  ("SLAM-corrected VIO",
                                   viewer.set_corrected_visible, False),
                                  ("SLAM", viewer.set_slam_visible, False)):
+        if _label == "SLAM-corrected VIO" and not corrected_vio:
+            continue                         # opt-in only (--corrected-vio); else
+            # no button (its source is unregistered, the line is always empty).
         _btn = QPushButton(_label)
         _btn.setCheckable(True)
         _btn.setChecked(_on)
@@ -1215,6 +1223,11 @@ def main() -> int:
                          "must run with --frontend-viz so it publishes "
                          "frame.frontend). Off => the menu item is shown but "
                          "disabled.")
+    ap.add_argument("--corrected-vio", action="store_true",
+                    help="enable the SLAM-corrected VIO overlay (the dense VIO "
+                         "trail rubber-sheeted to the SLAM graph). OFF by default: "
+                         "the warp is recomputed EVERY GUI tick even when the line "
+                         "is hidden, so it is opt-in for a lighter UI. Needs SLAM.")
     args = ap.parse_args()
     return run_ui(
         vio_endpoint=args.vio_endpoint,
@@ -1224,6 +1237,7 @@ def main() -> int:
         default_view=args.default_view,
         ba_window=args.ba_window,
         frontend_viz=args.frontend_viz,
+        corrected_vio=args.corrected_vio,
     )
 
 
