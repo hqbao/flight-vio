@@ -106,8 +106,8 @@ def _run_tight(reader, n, kf_every, force_njit):
                 T_cw = np.linalg.inv(tight_pose)
                 engine.submit((T_cw, ids, px, f.depth_m, int(f.ts_ns), imu_seg))
                 post = engine.poll()
-                if isinstance(post, tuple):       # tight: vio_step returns a tuple
-                    post, _health = post
+                if isinstance(post, tuple):       # tight: vio_step returns (T_cw, health, bias)
+                    post, _health, *_ = post       # *_ tolerates the new bias element
                 if post is not None:
                     tight_pose = np.linalg.inv(post)
                     tight_fe.pose = tight_pose.copy()

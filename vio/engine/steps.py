@@ -60,6 +60,22 @@ def _vio_health(vio_map) -> dict:
     return info
 
 
+def _backend_bias(vio_map):
+    """Latest keyframe's optimised ``(bg, ba)`` as plain ndarrays, or ``None``.
+
+    Crosses the subprocess ``out_q`` with the step result (mirror ``_vio_health``'s
+    plain-data discipline -- numpy arrays pickle cleanly). The live
+    ``propagate_imu`` adopts these into its dead-reckoning bias: the tight
+    backend->live feed-forward (PLAN P1/P2). TIGHT path only; a copy so the
+    worker map's state is never aliased across the boundary.
+    """
+    bg = getattr(vio_map, "bg", None)
+    ba = getattr(vio_map, "ba", None)
+    if bg is None or ba is None or len(bg) == 0 or len(ba) == 0:
+        return None
+    return (bg[-1].copy(), ba[-1].copy())
+
+
 def vio_step(vio_map, snap: Any):
     """One tight-coupled VIO keyframe: add the track snapshot + IMU block, solve.
 
@@ -73,15 +89,16 @@ def vio_step(vio_map, snap: Any):
     where ``imu_seg`` is ``(ts_ns, gyro_cam, accel_cam)`` in the camera optical
     frame (or ``None`` -> the map slices its stored stream, empty live).
 
-    Returns ``(T_cw, health)`` -- the refined latest ``T_cw`` (``4x4``) PLUS the
-    tight health fields the map stamped on ``last_info`` (at least
-    ``vio_degraded``; see :func:`_vio_health`) -- or ``None`` when the window has
-    not yet enough structure / IMU to optimise. The health dict is what carries
-    the divergence-guard verdict end-to-end to the published pose / FC; without
-    it ``vio_degraded`` would be computed at the map and DROPPED at this boundary
-    (a detected fault with no consumer). The loose :func:`ba_step` deliberately
-    returns the bare ``T_cw`` (no tuple), so the loose published pose info is
-    untouched.
+    Returns ``(T_cw, health, backend_bias)`` -- the refined latest ``T_cw``
+    (``4x4``) PLUS the tight health fields the map stamped on ``last_info`` (at
+    least ``vio_degraded``; see :func:`_vio_health`) PLUS the latest keyframe's
+    optimised ``(bg, ba)`` for the live feed-forward (see :func:`_backend_bias`;
+    ``None`` when no bias yet) -- or ``None`` when the window has not yet enough
+    structure / IMU to optimise. The health dict carries the divergence-guard
+    verdict end-to-end to the published pose / FC; without it ``vio_degraded``
+    would be computed at the map and DROPPED at this boundary (a detected fault
+    with no consumer). The loose :func:`ba_step` deliberately returns the bare
+    ``T_cw`` (no tuple), so the loose published pose info is untouched.
     """
     T_cw, ids, pts, depth_m, ts_ns, imu_seg = snap
     if ids is None or pts is None:
@@ -90,7 +107,7 @@ def vio_step(vio_map, snap: Any):
     T_cw = vio_map.run_ba()                     # refined latest T_cw, or None
     if T_cw is None:
         return None
-    return (T_cw, _vio_health(vio_map))
+    return (T_cw, _vio_health(vio_map), _backend_bias(vio_map))
 
 
 # --------------------------------------------------------------------------- #

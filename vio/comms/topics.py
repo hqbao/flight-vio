@@ -50,6 +50,13 @@ POSE_VO = "pose.vo"
 KEYFRAME = "keyframe"
 POSE_REFINED = "pose.refined"
 LOOP_CORRECTION = "loop.correction"
+# Tight backend -> live feed-forward (LIVE + --tight only). The BackendWorker
+# republishes its latest optimised bias {"seq", "bg", "ba", "degraded"} on this
+# LOCAL bus (intra-process: OdometryWorker + BackendWorker share it) so
+# propagate_imu can adopt the bias into its dead-reckoning (PLAN P1/P2). It NEVER
+# crosses IPC (no wire/converter, not in the other comms copies) and nothing on
+# the loose / oracle path reads it -> gap = 0 unaffected.
+BACKEND_STATE = "backend.state"
 # Continuous SLAM keyframe-map overlay (live-only; loop.correction stays the loop-event correction).
 SLAM_MAP = "slam.map"
 

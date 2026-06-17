@@ -115,8 +115,10 @@ def run_ba(engine: Engine, tight: bool, kf: Keyframe):
 
     Was ``RunBA(Step)``; the engine + the ``tight`` snapshot selector (was
     ``ctx.state["engine"]`` / ``ctx.state["tight"]``) are passed explicitly.
-    Returns ``None`` (chain short-circuit) when the keyframe has no tracks or the
-    engine has no refined pose yet.
+    Returns ``(PoseMsg, backend_state)`` -- the refined pose + the TIGHT backend's
+    latest optimised ``(bg, ba)`` for the live feed-forward (``backend_state`` is
+    ``None`` on the loose path) -- or bare ``None`` (chain short-circuit) when the
+    keyframe has no tracks or the engine has no refined pose yet.
     """
     if kf.track_ids is None or kf.track_px is None:
         return None
@@ -144,7 +146,13 @@ def run_ba(engine: Engine, tight: bool, kf: Keyframe):
     # loose path ``post`` is a bare array -> ``info`` stays ``{"refined": True}``
     # exactly as before (the ``vio_degraded`` key is simply absent).
     info = {"refined": True}
+    backend_state = None
     if isinstance(post, tuple):
-        post, health = post
+        # TIGHT ``vio_step`` returns (T_cw, health, backend_bias); the LOOSE
+        # ``ba_step`` returns a bare array. Unpack defensively (a 2-tuple still
+        # works). ``backend_state`` = the latest keyframe's optimised (bg, ba)
+        # for the live feed-forward (PLAN P1) -- None on the loose path.
+        backend_state = post[2] if len(post) >= 3 else None
+        post, health = post[0], post[1]
         info.update(health)
-    return PoseMsg(kf.seq, 0, np.linalg.inv(post), info)
+    return PoseMsg(kf.seq, 0, np.linalg.inv(post), info), backend_state

@@ -457,17 +457,29 @@ def process_kf(engine, bus: LocalPubSub, tight: bool, capture_window: bool,
 
     Byte-identical order to the old reactive chain. ``run_ba`` submits the
     keyframe's snapshot (loose 5-tuple / tight 6-tuple) to the engine and returns
-    the refined pose (or ``None`` -> chain short-circuit). With capture on,
-    ``publish_ba_window`` runs between ``run_ba`` and ``publish_refined`` (it
-    forwards the pose UNCHANGED, so ``pose.refined`` is byte-identical to the
-    no-capture chain).
+    ``(refined PoseMsg, backend_state)`` (or ``None`` -> chain short-circuit). With
+    capture on, ``publish_ba_window`` runs between ``run_ba`` and
+    ``publish_refined`` (it forwards the pose UNCHANGED, so ``pose.refined`` is
+    byte-identical to the no-capture chain).
+
+    TIGHT feed-forward (PLAN P1): when the tight backend returns its latest
+    optimised bias, republish it on the LOCAL-bus ``backend.state`` topic for the
+    live ``propagate_imu`` to adopt. The topic is intra-process (OdometryWorker +
+    BackendWorker share this bus), NEVER crosses IPC, and is read by nothing on the
+    loose / oracle path -> ``pose.refined`` byte-parity (gap = 0) is unaffected.
     """
-    msg = run_ba(engine, tight, kf)
-    if msg is None:                  # no tracks this kf / no refined pose yet
+    result = run_ba(engine, tight, kf)
+    if result is None:               # no tracks this kf / no refined pose yet
         return
+    msg, backend_state = result
     if capture_window:
         msg = publish_ba_window(engine, bus, msg)
     publish_refined(bus, msg)
+    if tight and backend_state is not None:
+        bg, ba = backend_state
+        bus.publish(topics.BACKEND_STATE,
+                    {"seq": int(kf.seq), "bg": bg, "ba": ba,
+                     "degraded": bool(msg.info.get("vio_degraded", False))})
 
 
 class BackendWorker(threading.Thread):

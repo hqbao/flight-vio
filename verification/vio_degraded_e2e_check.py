@@ -75,7 +75,7 @@ def _publish_tight(last_info) -> dict:
     """Push one tight keyframe through the REAL engine + backend ``run_ba``."""
     T_cw = np.linalg.inv(np.eye(4))
     engine = InProcessEngine(lambda: _StubVioMap(T_cw, last_info), vio_step)
-    pose = run_ba(engine, tight=True, kf=_kf(tight=True))
+    pose, _ = run_ba(engine, tight=True, kf=_kf(tight=True))   # (PoseMsg, backend_state)
     engine.close()
     assert pose is not None, "tight run_ba returned None for a valid keyframe"
     return pose.info
@@ -84,7 +84,7 @@ def _publish_tight(last_info) -> dict:
 def _publish_loose() -> dict:
     T_cw = np.linalg.inv(np.eye(4))
     engine = InProcessEngine(lambda: _StubBaMap(T_cw), ba_step)
-    pose = run_ba(engine, tight=False, kf=_kf(tight=False))
+    pose, _ = run_ba(engine, tight=False, kf=_kf(tight=False))  # (PoseMsg, backend_state)
     engine.close()
     assert pose is not None, "loose run_ba returned None for a valid keyframe"
     return pose.info
