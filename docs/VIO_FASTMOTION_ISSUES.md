@@ -67,6 +67,20 @@ be trustworthy before the FC link consumes it. Two known causes:
   `docs/TIGHT_COUPLED_PLAN.md` Phase 4(e), velocity-divergence stabilisation). Fix:
   absolute-velocity prior + Tikhonov nav floor.
 
+### #5 — Dynamic object drags the pose at rest (hand-wave) · ✅ FIXED (ZUPT gate)
+A moving object in view of a STATIC camera (e.g. a hand waved in front) makes the
+frame-to-frame PnP report a spurious translation (it assumes a static scene); the
+per-frame vision correction then dragged `pose.odom` along with it. The predict-side
+ZUPT already froze the IMU translation at rest but did NOT gate the vision pull.
+Fix (`propagate_imu`, LIVE + `--tight`, gap=0): when `zupt` holds, zero the vision
+TRANSLATION pull (`k_pos`/`k_vel` → 0) and freeze the re-anchor offset; ROTATION is
+still corrected (gyro-anchored yaw, robust to the dynamic object). Env
+`OAKD_ZUPT_FREEZE_TRANS=0` disables. Selftest contrast: 0 cm (gate ON) vs 22.45 cm
+(OFF); confirmed live ("quơ tay nó ko chạy theo nữa"). SCOPE: only fires at genuine
+rest (ZUPT hysteresis) — the camera-MOVING + dynamic-object case still needs a
+general IMU↔vision disagreement gate (the coast-gate that was reverted for fast
+motion; see below), kept out of the fast path on purpose.
+
 ## Tried + reverted (did NOT work — do not retry blindly)
 IMU-aided KLT seed · nav-state clamp · disagreement coast-gate · fast-rotation
 translation-damp gate + velocity clamp · higher/lower correction gain. All

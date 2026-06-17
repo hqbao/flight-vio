@@ -189,6 +189,10 @@ _MIN_VIS_INLIERS = 8
 _OVERLAP_FULL = float(os.environ.get("OAKD_OVERLAP_FULL", "0.6"))  # >= -> full
 _OVERLAP_MIN = float(os.environ.get("OAKD_OVERLAP_MIN", "0.3"))    # <= -> none
 _REANCHOR = os.environ.get("OAKD_REANCHOR", "1") != "0"            # re-anchor on
+# At genuine rest (ZUPT) the IMU OWNS translation: a moving object in view (a hand
+# waved past a static camera) makes PnP report a spurious translation that the
+# vision pull would otherwise drag the position along with. Default ON; 0 disables.
+_ZUPT_FREEZE_TRANS = os.environ.get("OAKD_ZUPT_FREEZE_TRANS", "1") != "0"
 
 # --- closed-loop SLAM correction blend (LIVE + --tight only) --------------- #
 # A loop closure rewrites the keyframe poses; the world-frame SE(3) delta between
@@ -440,22 +444,32 @@ def propagate_imu(ctx: Any, step: Step) -> Step:
     # gyro-propagated / frozen pose, NOT a position fix, so pulling DR toward it
     # would yank the IMU-tracked arc back -- exactly the "giật về" snap we removed.
     vis_scale = overlap_scale if bool(info.get("ok", True)) else 0.0
-    # Re-anchor offset, updated EVERY frame: tracks (nav - p_vis) while vision is
-    # unreliable (vis_scale low -> the accumulated IMU-vs-vision gap is forgiven),
-    # FREEZES while reliable (vis_scale high). So when vision re-engages after a
-    # fast sweep the target is p_vis + frozen_offset ~ nav -- NO yank back to the
-    # under-estimated vision absolute (the "giật về" snap).
+    # ZUPT owns translation at genuine rest: zero the vision TRANSLATION pull (and
+    # freeze the re-anchor offset) so a moving object in view -- e.g. a hand waved
+    # in front of a STATIC camera -- cannot drag the position. The predict-side
+    # ZUPT already froze the IMU translation but did NOT gate this vision pull
+    # (that was the hand-wave drift). ROTATION is still corrected below (the
+    # gyro-anchored vision yaw stays good, robust to the dynamic object).
+    freeze_trans = bool(zupt and _ZUPT_FREEZE_TRANS)
+    trans_scale = 0.0 if freeze_trans else vis_scale
+    # Re-anchor offset, updated EVERY frame EXCEPT while ZUPT freezes translation:
+    # tracks (nav - p_vis) when vision is unreliable (low scale -> the accumulated
+    # IMU-vs-vision gap is forgiven), FREEZES while reliable (or at rest). So when
+    # vision re-engages after a fast sweep the target is p_vis + frozen_offset ~ nav
+    # -- NO yank back to the under-estimated vision absolute (the "giật về" snap).
     p_target = p_vis
     if _REANCHOR:
-        gap = nav["p"] - p_vis
         off = nav.get("vis_offset")
-        off = (gap.copy() if off is None
-               else off * vis_scale + gap * (1.0 - vis_scale))
+        if off is None:
+            off = (nav["p"] - p_vis).copy()
+        elif not freeze_trans:
+            gap = nav["p"] - p_vis
+            off = off * vis_scale + gap * (1.0 - vis_scale)
         nav["vis_offset"] = off
         p_target = p_vis + off
     if vis_scale > 0.0:
         _vision_correct(nav, R_vis, p_target,
-                        k_pos=_K_POS * vis_scale, k_vel=_K_VEL * vis_scale)
+                        k_pos=_K_POS * trans_scale, k_vel=_K_VEL * trans_scale)
 
     # Replace the published live pose with the IMU-propagated one (camera->world),
     # AFTER the smooth closed-loop SLAM correction is bled in (no-op when no

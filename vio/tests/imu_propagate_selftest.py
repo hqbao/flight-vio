@@ -248,6 +248,57 @@ def test_stationary_zupt_no_drift() -> None:
     print("  OK -- stationary: ZUPT holds the pose still (static-drift win kept)")
 
 
+def test_static_camera_dynamic_object_no_drift() -> None:
+    """A hand waved in front of a STATIC camera: IMU at rest (ZUPT) but vision
+    reports a spurious MOVING pose (a dynamic object dominates PnP). With the ZUPT
+    translation gate ON the live pose must NOT follow it; with the gate OFF (the
+    old behaviour) it drifts after the object -- the contrast proves the fix."""
+    import vio.modules.propagate_imu as _pim
+
+    def _run(freeze: bool) -> float:
+        _pim._ZUPT_FREEZE_TRANS = freeze
+        ctx = _make_ctx()
+        rest = np.array([0.0, -G, 0.0])
+        good = {"ok": True, "n_inliers": 50, "track_overlap_ratio": 1.0}
+        seq = 0
+        # Phase 1: settle ZUPT with a STATIC vision pose (> _ZUPT_HOLD frames).
+        for _ in range(8):
+            seg = _accel_seg(seq, rest, np.zeros(3), 5)
+            ctx.state["imu_segs"][seq] = seg
+            _pim.propagate_imu(ctx, _Step(_Frame(seq, int(seg[0][-1])),
+                                          np.eye(4), dict(good)))
+            seq += 1
+        # Phase 2: the object waves +/-30 cm in x (a spurious vision translation)
+        # while the IMU stays at rest. Capture the published position excursion.
+        poses = []
+        for k in range(24):
+            seg = _accel_seg(seq, rest, np.zeros(3), 5)
+            ctx.state["imu_segs"][seq] = seg
+            vis = np.eye(4)
+            vis[0, 3] = 0.30 * np.sin(k * 0.5)
+            out = _pim.propagate_imu(ctx, _Step(_Frame(seq, int(seg[0][-1])),
+                                                vis, dict(good)))
+            poses.append(out.pose[:3, 3].copy())
+            seq += 1
+        pos = np.array(poses)
+        return float(np.max(np.linalg.norm(pos - pos[0], axis=1)))
+
+    try:
+        exc_on = _run(True)
+        exc_off = _run(False)
+    finally:
+        _pim._ZUPT_FREEZE_TRANS = True       # restore default for the other tests
+    print(f"static cam + dynamic object: max pose excursion  "
+          f"gate ON = {exc_on*100:.2f} cm   gate OFF = {exc_off*100:.2f} cm")
+    assert exc_on < 0.02, \
+        f"ZUPT gate FAILED: static-cam pose followed the object {exc_on*100:.1f} cm"
+    assert exc_off > 0.05, \
+        f"contrast weak: gate-OFF should follow the object (got {exc_off*100:.1f} cm)"
+    assert np.isfinite(exc_off), "gate-OFF excursion non-finite"
+    print("  OK -- static camera + moving object: ZUPT holds position "
+          "(vision-translation pull suppressed); gate-OFF drifts (contrast)")
+
+
 def test_empty_imu_segment_held() -> None:
     """Regression (caught live): a frame whose retained IMU segment is EMPTY
     (size-0 arrays, as PreintegratePrior stores for a no-sample packet) must NOT
@@ -292,6 +343,7 @@ def main() -> int:
     test_covered_camera_dead_reckons()
     test_inertial_dr_flag_vision_ok()
     test_stationary_zupt_no_drift()
+    test_static_camera_dynamic_object_no_drift()
     print()
     test_empty_imu_segment_held()
     test_loose_path_passthrough()
