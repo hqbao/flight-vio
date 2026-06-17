@@ -50,6 +50,15 @@ POSE_VO = "pose.vo"
 KEYFRAME = "keyframe"
 POSE_REFINED = "pose.refined"
 LOOP_CORRECTION = "loop.correction"
+# Tight backend -> live feed-forward over IPC (LIVE + --tight only). The ``ba``
+# process publishes its latest optimised bias here -- seq (int64), bg/ba (float64
+# [3]), degraded (bool) -- and the ``vio`` process opens a read-only client on the
+# ba endpoint, drains it into propagate_imu's dead-reckoning bias (PLAN P1/P2). The
+# IPC analog of slam's ``loop.correction``: a POD feedback topic (no shared-memory
+# ring). Additive + LIVE-only (the offline/oracle path never publishes or reads it),
+# so pose math + the byte-parity oracle are UNAFFECTED. It is a real IPC topic, so
+# it lives byte-identically in every comms copy.
+BA_STATE = "ba.state"
 # Continuous SLAM keyframe-map overlay (live-only; loop.correction stays the loop-event correction).
 SLAM_MAP = "slam.map"
 

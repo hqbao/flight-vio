@@ -300,19 +300,25 @@ def test_static_camera_dynamic_object_no_drift() -> None:
 
 
 def test_backend_bias_feedforward() -> None:
-    """PLAN P2: the tight backend's optimised bias, fed on ``backend.state``, is
+    """PLAN P2: the BA backend's optimised bias, fed on the IPC ``ba.state`` topic
+    (a :class:`~vio.comms.messages.BackendState` DATACLASS, after the ba-split), is
     adopted into the live dead-reckon bias via a HEALTH-GATED per-keyframe low-pass.
     Verifies: (1) a healthy, fresh, hysteresis-satisfied stream converges the live
     bias toward the backend's; (2) a DEGRADED stream is NOT adopted; (3) fewer than
-    the hysteresis count is NOT adopted; (4) a STALE (older-seq) state is dropped."""
+    the hysteresis count is NOT adopted; (4) a STALE (older-seq) state is dropped --
+    the seq staleness gate that makes the async IPC hop tolerable; (5) a sustained
+    degrade decays the held bias. The inbox is fed the SAME ``BackendState`` dataclass
+    the vio ba-endpoint bridge re-hydrates off the wire, so this exercises the exact
+    dataclass-vs-dict reconcile the consumer (``_adopt_backend_bias``) does."""
     import vio.modules.propagate_imu as _pim
     from vio.modules.loop_inbox import BackendStateInbox
+    from vio.comms.messages import BackendState
 
     BA_BE = np.array([0.0, 0.0, 0.30])     # the backend's optimised accel bias
     rest = np.array([0.0, -G, 0.0])
 
     def _drive(states) -> np.ndarray:
-        """Run one frame per entry in ``states`` (a backend.state dict or None),
+        """Run one frame per entry in ``states`` (a BackendState dataclass or None),
         pushing it to the inbox; return the final live nav accel-bias."""
         ctx = _make_ctx()
         ctx.state["backend_inbox"] = binbox = BackendStateInbox()
@@ -328,8 +334,10 @@ def test_backend_bias_feedforward() -> None:
         return ctx.state["live_nav"]["ba"].copy()
 
     def _msgs(n, ba=BA_BE, degraded=False, seq0=0):
-        return [{"seq": seq0 + i, "bg": np.zeros(3), "ba": ba,
-                 "degraded": degraded} for i in range(n)]
+        # The IPC dataclass off ``ba.state`` -- NOT the old in-vio local-bus dict.
+        return [BackendState(seq=seq0 + i, bg=np.zeros(3),
+                             ba=np.asarray(ba, dtype=np.float64),
+                             degraded=degraded) for i in range(n)]
 
     # (1) healthy + fresh + hysteresis met -> bias converges toward the backend's.
     ba_fed = _drive(_msgs(12))

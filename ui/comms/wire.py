@@ -263,6 +263,27 @@ class WireVioMap:
     kf_positions: np.ndarray                      # (K, 3) float64, optical frame
 
 
+@dataclass(frozen=True)
+class WireBackendState:
+    """Wire form of :class:`comms.messages.BackendState` (topic ``ba.state``).
+
+    The tight backend's latest optimised bias, published by the ``ba`` process
+    (``--tight`` only) for the ``vio`` process's live feed-forward. Pure POD -- two
+    ``(3,)`` bias vectors + a seq + a flag, so it rides the message itself (no
+    shared-memory ring), the IPC analog of :class:`WireLoopCorrection`. The codec
+    ships every ndarray by ``dtype.name`` and every bool / int by its tag, so the
+    int64 seq / float64 biases / bool round-trip exactly.
+
+    Field ORDER is the FROZEN codec contract (see module docstring): it MUST match
+    :class:`comms.messages.BackendState` field-for-field, name + order + dtype.
+    """
+
+    seq: int
+    bg: np.ndarray                                # (3,) float64 gyro bias
+    ba: np.ndarray                                # (3,) float64 accel bias
+    degraded: bool
+
+
 # --------------------------------------------------------------------------- #
 # SLAM outputs: slam --> UI (and optionally back to VIO for closed-loop)
 # --------------------------------------------------------------------------- #
@@ -444,6 +465,7 @@ TOPIC_WIRE: dict[str, type] = {
     topics.POSE_REFINED:    WirePoseMsg,
     topics.KEYFRAME:        WireKeyframe,
     topics.LOOP_CORRECTION: WireLoopCorrection,
+    topics.BA_STATE:        WireBackendState,
     topics.SLAM_MAP:        WireSlamMap,
     topics.SLAM_LOOP:       WireLoopMatch,
     topics.BA_WINDOW:       WireBaWindow,

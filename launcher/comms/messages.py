@@ -223,6 +223,30 @@ class LoopCorrection:
 
 
 @dataclass(frozen=True)
+class BackendState:
+    """The tight backend's latest optimised bias for the live feed-forward.
+
+    Published on ``topics.BA_STATE`` by the ``ba`` process (``--tight`` only) and
+    consumed by the ``vio`` process's propagate_imu dead-reckoning (PLAN P1/P2).
+    The IPC analog of :class:`LoopCorrection`: pure POD, no shared-memory ring.
+
+    * ``seq`` -- the source frame seq the keyframe was emitted under (``kf.seq``),
+      NOT the window index. The consumer's staleness gate drops any state whose
+      ``seq`` is not newer than the last adopted one, which makes the async IPC hop
+      tolerable.
+    * ``bg`` / ``ba`` -- ``(3,)`` float64 optimised gyro / accel bias (rad/s,
+      m/s^2). The consumer adopts these via a bounded low-pass, health-gated.
+    * ``degraded`` -- the keyframe's divergence-guard verdict (``vio_degraded``);
+      when True the consumer stops adopting the bias (fast to distrust).
+    """
+
+    seq: int
+    bg: np.ndarray
+    ba: np.ndarray
+    degraded: bool
+
+
+@dataclass(frozen=True)
 class SlamOverlay:
     """Continuous SLAM keyframe-map snapshot for the live overlay (slam.map).
 

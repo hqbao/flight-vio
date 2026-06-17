@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """End-to-end PNG proof for the "BA Window" visualiser.
 
-Boots the SPLIT 2-process stack (imu_camera replay + vio with ``--ba-window``) on
-a gold session, drives the REAL
-:class:`~ui.modules.ipc_sources.IpcBaWindowSource` (it subscribes VIO's
-``ba.window`` solve snapshots over IPC and buffers them in its slider deque),
-renders the window's 2D top-down image with the REAL
+Boots the SPLIT 3-process stack (imu_camera replay + vio ``--ba-endpoint`` + ba
+``--ba-window``) on a gold session, drives the REAL
+:class:`~ui.modules.ipc_sources.IpcBaWindowSource` (it subscribes the
+``ba.window`` solve snapshots over IPC on the VIO endpoint -- ``ba`` publishes them
+on ITS endpoint and ``vio`` re-emits them on the VIO endpoint via the
+``--ba-endpoint`` pass-through, so the UI keeps a single endpoint -- and buffers
+them in its slider deque), renders the window's 2D top-down image with the REAL
 :func:`~ui.viz.ba_render.render_ba_window`, and writes it to a PNG. No OpenGL is
 involved (the BA view is pure 2D), so this runs headless.
+
+The windowed-BA backend (and so the BA-window capture) moved to the ``ba`` process
+in the ``ba/`` extraction; this test follows it -- ``--ba-window`` is now a ``ba``
+flag and vio bridges ``ba.window`` back onto the VIO endpoint the UI reads.
 
 Asserts the captured snapshots are real (a non-trivial keyframe window, shared
 landmarks, observation rays, a finite reprojection error), that the source's
@@ -73,6 +79,7 @@ def main() -> int:
     pid = os.getpid()
     cap_ep = f"oak.cap.bw{pid & 0xFFF:x}"
     vio_ep = f"oak.vio.bw{pid & 0xFFF:x}"
+    ba_ep = f"oak.ba.bw{pid & 0xFFF:x}"
     py = sys.executable
     env = dict(os.environ)
     env.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -81,16 +88,22 @@ def main() -> int:
     print("ba_window_png")
     print(f"  session={args.session} max-frames={args.max_frames}")
 
+    # 3-process stack: vio (--ba-endpoint bridges ba.window back onto the VIO
+    # endpoint) + ba (--ba-window publishes the solve snapshots) + capture (replay).
+    # The UI source reads ba.window off the VIO endpoint exactly as before the split.
     vio_proc = subprocess.Popen(
         [py, "-m", "vio.main", "--capture-endpoint", cap_ep,
-         "--endpoint", vio_ep, "--kf-every", str(args.kf_every),
-         "--ba-window"], env=env, **lk)
+         "--endpoint", vio_ep, "--ba-endpoint", ba_ep,
+         "--kf-every", str(args.kf_every)], env=env, **lk)
+    ba_proc = subprocess.Popen(
+        [py, "-m", "ba.main", "--vio-endpoint", vio_ep,
+         "--endpoint", ba_ep, "--ba-window"], env=env, **lk)
     time.sleep(0.3)
     cap_proc = subprocess.Popen(
         [py, "-m", "imu_camera.main", "--endpoint", cap_ep,
          "--session", args.session, "--max-frames", str(args.max_frames)],
         env=env, **lk)
-    procs = (cap_proc, vio_proc)
+    procs = (cap_proc, vio_proc, ba_proc)
 
     snaps: list = []
     lock = threading.Lock()
@@ -108,8 +121,12 @@ def main() -> int:
         src = IpcBaWindowSource(vio_ep, connect_timeout_s=25.0)
         src.start(on_snap)
 
+        # Drain the whole replay: capture exits at end-of-session; vio + ba exit when
+        # END propagates (cap -> vio -> ba). The source reads ba.window off the VIO
+        # endpoint (ba publishes on its endpoint, vio re-emits via --ba-endpoint).
         cap_proc.wait(timeout=180.0)
         vio_proc.wait(timeout=180.0)
+        ba_proc.wait(timeout=180.0)
         time.sleep(1.0)                            # drain in-flight snapshots
 
         _check(src.error is None, f"source has no connect error ({src.error})")

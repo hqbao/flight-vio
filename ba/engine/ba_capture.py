@@ -1,6 +1,6 @@
 """BA-window VISUALIZER capture (opt-in ``--ba-window``).
 
-A RICHER sibling of the core per-keyframe solve (:mod:`vio.engine.steps`'s
+A RICHER sibling of the core per-keyframe solve (:mod:`ba.engine.steps`'s
 ``ba_step`` / ``ba_overlay``) that snapshots the FULL windowed-BA solve state
 (window keyframe poses + shared 3D landmarks + observation rays + per-observation
 reprojection error + the PRE-solve state for a before/after toggle).

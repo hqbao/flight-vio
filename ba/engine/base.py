@@ -9,11 +9,11 @@ never care *where* the solve runs:
   no real-time constraint: ``submit`` does the whole solve, ``poll`` returns its
   one result. This keeps the offline numbers byte-identical to the old in-thread
   flow.
-* :class:`~vio.engine.subprocess.SubprocessEngine` -- ships each keyframe to
+* :class:`~ba.engine.subprocess.SubprocessEngine` -- ships each keyframe to
   a separate process and reads the result back asynchronously. Used by the LIVE
   path so the mostly-pure-Python solve never holds the GIL of the camera read
   loop (the cause of the fast-push stall / undershoot -- see
-  ``vio/engine/subprocess.py``).
+  ``ba/engine/subprocess.py``).
 
 Both implement the same four methods, so a flow picks one with a single ``worker``
 flag and nothing else changes.

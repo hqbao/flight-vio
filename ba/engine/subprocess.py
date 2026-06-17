@@ -22,7 +22,7 @@ Discipline
   sentinel) so the UI "clear keyframes" can never be dropped by latest-wins.
 * The child imports the heavy map **lazily inside the worker function** (so the
   child bootstrap stays light) and only via direct module paths, never depthai/Qt
-  (``import vio.engine`` is depthai-free by invariant, so spawn is safe).
+  (``import ba.engine`` is depthai-free by invariant, so spawn is safe).
 
 Teardown is the important part under a long-lived Qt parent: ``close`` sets the
 stop event, pushes the ``None`` sentinel, ``join``s, and -- if the child is wedged
@@ -105,7 +105,7 @@ def _ba_capture_worker_main(K, cfg, in_q, out_q, ov_q, stop_evt, reset_evt) -> N
 
     Identical to :func:`_ba_worker_main` (same ``WindowedBAMap`` + same frozen
     ``run_ba``) except it runs ``ba_step_capture`` and the ``ba_window_overlay``,
-    so ``ov_q`` carries a :class:`~vio.engine.ba_capture.BaWindowSnap` (picklable
+    so ``ov_q`` carries a :class:`~ba.engine.ba_capture.BaWindowSnap` (picklable
     under spawn) instead of the ``{kf_id: pos}`` dict. Module-level => picklable.
     """
     from sky.backend.windowed import WindowedBAMap

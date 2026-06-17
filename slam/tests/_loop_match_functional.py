@@ -65,6 +65,8 @@ def main() -> int:
     ap.add_argument("--session", default="sessions/gold/lab_loop_30s")
     ap.add_argument("--max-frames", type=int, default=600)
     ap.add_argument("--kf-every", type=int, default=5)
+    ap.add_argument("--loop-search-radius", type=float, default=0.0,
+                    help="forward to slam.main to A/B the spatial loop-search gate")
     args = ap.parse_args()
 
     pid = os.getpid()
@@ -82,9 +84,11 @@ def main() -> int:
     vio_proc = subprocess.Popen(
         [py, "-m", "vio.main", "--capture-endpoint", cap_ep,
          "--endpoint", vio_ep, "--kf-every", str(args.kf_every)], env=env, **lk)
+    slam_extra = (["--loop-search-radius", str(args.loop_search_radius)]
+                  if args.loop_search_radius > 0 else [])
     slam_proc = subprocess.Popen(
         [py, "-m", "slam.main", "--vio-endpoint", vio_ep,
-         "--endpoint", slam_ep], env=env, **lk)
+         "--endpoint", slam_ep, *slam_extra], env=env, **lk)
     time.sleep(0.3)
     cap_proc = subprocess.Popen(
         [py, "-m", "imu_camera.main", "--endpoint", cap_ep,

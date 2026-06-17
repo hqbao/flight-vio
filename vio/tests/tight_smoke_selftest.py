@@ -43,7 +43,7 @@ from sky.front.odometry import (                          # noqa: E402
 from sky.backend.windowed import (                           # noqa: E402
     WindowedConfig, WindowedRGBDOdometry)
 from sky.vio.window import WindowedVIOConfig         # noqa: E402
-from vio.engine import make_vi_engine                        # noqa: E402
+from ba.engine import make_vi_engine                         # noqa: E402
 
 
 def _slice_imu_seg(ts_all: np.ndarray, gyro_cam: np.ndarray,
@@ -202,8 +202,9 @@ def run_tight_smoke(session_dir: Path, max_frames: int = 0,
         fails.append("the tight window NEVER refined a keyframe (no poses out)")
     # P1 feed-forward INTEGRATION (closes the safety-review coverage gap): the
     # backend's optimised bias MUST flow through the REAL vio_step source path
-    # (keyframes[-1]["bg"]/["ba"]) on at least one keyframe -- else BACKEND_STATE
-    # would never publish and the live feed-forward would be inert dead code.
+    # (keyframes[-1]["bg"]/["ba"]) on at least one keyframe -- else ba.state (the
+    # IPC feed-forward the ba process publishes) would never carry a bias and the
+    # live feed-forward would be inert dead code.
     if n_bias == 0:
         fails.append("backend_bias NEVER extracted from the real map "
                      "(_backend_bias dead -> feed-forward inert)")

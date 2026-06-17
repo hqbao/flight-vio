@@ -5,9 +5,8 @@ message), publishes one message on a bus topic, and forwards the carrier UNCHANG
 so the chain continues. They hold no state and never re-derive anything -- each is
 a faithful tap of a REAL pipeline output for the UI / downstream subscribers.
 
-Grouped by where they fire in the pipeline:
+Grouped by where they fire in the pipeline (all on the odometry worker):
 
-Frontend / per-frame (odometry worker)
     * :func:`publish_tracks`        -> ``frame.tracks``   (after track_features)
     * :func:`publish_frontend_viz`  -> ``frame.frontend`` (OPT-IN --frontend-viz)
     * :func:`publish_inliers`       -> ``frame.inliers``  (after estimate_motion)
@@ -15,12 +14,10 @@ Frontend / per-frame (odometry worker)
     * :func:`publish_pose`          -> ``pose.odom``      (the VIO pose, per frame)
     * :func:`publish_vo`            -> ``pose.vo``        (pure vision, LIVE-only)
 
-Back end
-    * :func:`publish_refined`       -> ``pose.refined``   (BA-refined pose, terminal)
-    * :func:`publish_ba_window`     -> ``ba.window``      (OPT-IN --ba-window)
-
-OPT-IN publishers (``publish_frontend_viz`` / ``publish_ba_window``) are never
-wired on the default / oracle path, so the byte-parity oracle is UNAFFECTED.
+The back-end publishers (``pose.refined`` / ``ba.window``) moved to the ``ba``
+process (:mod:`ba.modules.publishers`) with the windowed BA. The OPT-IN
+``publish_frontend_viz`` is never wired on the default / oracle path, so the
+byte-parity oracle is UNAFFECTED.
 """
 from __future__ import annotations
 
@@ -33,9 +30,7 @@ from sky.front.odometry import RGBDVisualOdometry
 
 from vio.comms import LocalPubSub, topics
 from vio.comms.messages import (
-    BaWindow, FrameFrontend, FrameGyroFuse, FrameInliers, FrameTracks, PoseMsg)
-from vio.engine import Engine
-from vio.engine.ba_capture import BaWindowSnap
+    FrameFrontend, FrameGyroFuse, FrameInliers, FrameTracks, PoseMsg)
 from .carriers import Step, Tracked
 
 #: Max flow vectors put on the wire per frame by ``publish_frontend_viz``. The
@@ -212,37 +207,3 @@ def publish_vo(vo: RGBDVisualOdometry, bus: LocalPubSub, step: Step) -> Step:
                 PoseMsg(step.frame.seq, step.frame.ts_ns,
                         vo.pose_vo.copy(), step.info))
     return step
-
-
-def publish_refined(bus: LocalPubSub, msg: PoseMsg) -> None:
-    """Publish the BA-refined pose on ``pose.refined`` (terminal step).
-
-    Was ``PublishRefined(Step)``; identical publish, the bus passed explicitly.
-    """
-    bus.publish(topics.POSE_REFINED, msg)
-    return None
-
-
-def publish_ba_window(engine: Engine, bus: LocalPubSub, msg: PoseMsg) -> PoseMsg:
-    """Publish the BA-window solve snapshot on ``ba.window``; forward the pose.
-
-    Was ``PublishBaWindow(Step)``; the engine + bus are passed explicitly. The
-    refined pose carrier is forwarded UNCHANGED so ``publish_refined`` emits it
-    identically to the no-capture path.
-    """
-    snap = engine.poll_overlay()
-    # The overlay is a BaWindowSnap ONLY on the capture engine + a keyframe
-    # whose solve ran; anything else (None on warmup) is simply skipped.
-    if isinstance(snap, BaWindowSnap):
-        bus.publish(topics.BA_WINDOW, BaWindow(
-            seq=int(snap.seq), ts_ns=int(snap.ts_ns),
-            kf_ids=snap.kf_ids, kf_quat=snap.kf_quat, kf_pos=snap.kf_pos,
-            lm_ids=snap.lm_ids, lm_xyz=snap.lm_xyz,
-            obs_kf=snap.obs_kf, obs_lm=snap.obs_lm, obs_uv=snap.obs_uv,
-            obs_reproj_px=snap.obs_reproj_px,
-            ba_reproj_px=float(snap.ba_reproj_px),
-            kf_quat_pre=snap.kf_quat_pre, kf_pos_pre=snap.kf_pos_pre,
-            lm_xyz_pre=snap.lm_xyz_pre,
-            n_kf=int(snap.n_kf), n_lm=int(snap.n_lm)))
-    # Forward the refined pose UNCHANGED so publish_refined emits it identically.
-    return msg

@@ -46,9 +46,13 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
 ANCHOR = "imu_camera"
-# The 5 split projects + ``netbridge`` (the cross-machine TCP bridge, which
-# vendors comms as a 7th copy). Every copy must be byte-identical to the anchor.
-COPIES = ("imu_camera", "vio", "slam", "ui", "launcher", "netbridge")
+# The 6 split projects (imu_camera / vio / slam / ui / launcher / ba) + ``netbridge``
+# (the cross-machine TCP bridge, which vendors comms as a further copy). Every copy
+# must be byte-identical to the anchor -- source parity is now FULLY CLEAN (the
+# transitional vio-only ``BACKEND_STATE`` exception was retired when the in-vio
+# local-bus feed-forward moved to the IPC ``ba.state`` topic, present byte-identically
+# in every copy).
+COPIES = ("imu_camera", "vio", "slam", "ui", "launcher", "ba", "netbridge")
 
 
 def _check(cond: bool, msg: str) -> bool:
@@ -63,9 +67,9 @@ def test_source_parity() -> bool:
     print("\n[1] comms/ source parity (diff -r --exclude=__pycache__)")
     ok = True
     anchor_dir = REPO / ANCHOR / "comms"
-    # Every non-anchor copy (the 5 split projects + ``netbridge``) must dir-diff
-    # EMPTY against the anchor. Derived from COPIES so a new copy is covered here
-    # the moment it's added to the tuple above.
+    # Every non-anchor copy (the 6 split projects + ``netbridge``) must dir-diff
+    # EMPTY against the anchor -- no exceptions. Derived from COPIES so a new copy is
+    # covered here the moment it's added to the tuple above.
     for proj in (c for c in COPIES if c != ANCHOR):
         proj_dir = REPO / proj / "comms"
         res = subprocess.run(
@@ -145,6 +149,12 @@ def _build_vectors(mod):
                         accel=accel[0], inlier_ids=ids)),
         (w.topics.LOOP_CORRECTION,
          w.WireLoopCorrection(seq=21, kf_poses=kf_poses, n_loops=3)),
+        (w.topics.BA_STATE,
+         w.WireBackendState(
+             seq=22,
+             bg=np.array([-0.001, 0.002, -0.003], dtype=np.float64),
+             ba=np.array([0.04, -0.05, 0.06], dtype=np.float64),
+             degraded=True)),
         (w.topics.SLAM_MAP,
          w.WireSlamMap(kf_ids=ids, kf_positions=pts[:, :1].repeat(3, axis=1),
                        n_loops=2, last_match=None)),

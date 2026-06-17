@@ -274,11 +274,12 @@ class SlamMapTracker(threading.Thread):
     """
 
     def __init__(self, endpoint: str, *, vio_endpoint: str,
-                 connect_timeout_s: float = 30.0) -> None:
+                 connect_timeout_s: float = 30.0, no_slam: bool = False) -> None:
         super().__init__(name=f"slam-map-{endpoint}", daemon=True)
         self.endpoint = endpoint
         self.vio_endpoint = vio_endpoint
         self._connect_timeout_s = float(connect_timeout_s)
+        self._no_slam = bool(no_slam)   # --no-slam: skip the slam.map client
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._client: IPCPubSub | None = None
@@ -493,9 +494,14 @@ class SlamMapTracker(threading.Thread):
 
     # ------------------------------------------------------------------ #
     def run(self) -> None:
-        client = IPCPubSub(self.endpoint, role="client",
-                           connect_timeout_s=self._connect_timeout_s)
-        client.subscribe(topics.SLAM_MAP, self._on_slammap)
+        # --no-slam: no SLAM process runs, so SKIP the slam.map client entirely (no
+        # connect -> no connect-timeout, no crash). VO / VIO-BA + the dense trail
+        # still come from the VIO endpoint; the SLAM dots + corrected line stay empty.
+        client = None
+        if not self._no_slam:
+            client = IPCPubSub(self.endpoint, role="client",
+                               connect_timeout_s=self._connect_timeout_s)
+            client.subscribe(topics.SLAM_MAP, self._on_slammap)
         # SECOND client: VIO's pose.odom feeds the dense trail for the deform;
         # pose.vo + pose.refined feed the VO + VIO-BA trajectory lines.
         vio_client = IPCPubSub(self.vio_endpoint, role="client",
@@ -504,18 +510,17 @@ class SlamMapTracker(threading.Thread):
         vio_client.subscribe(topics.POSE_VO, self._on_vo)
         vio_client.subscribe(topics.POSE_REFINED, self._on_refined)
         try:
-            client.start()
+            if client is not None:
+                client.start()
             vio_client.start()
         except (TimeoutError, ConnectionError) as e:
             LOG.error("slam-map-tracker: connect failed: %s", e)
-            try:
-                client.stop()
-            except Exception:                                      # noqa: BLE001
-                pass
-            try:
-                vio_client.stop()
-            except Exception:                                      # noqa: BLE001
-                pass
+            for c in (client, vio_client):
+                if c is not None:
+                    try:
+                        c.stop()
+                    except Exception:                              # noqa: BLE001
+                        pass
             return
         self._client = client
         self._vio_client = vio_client
@@ -523,10 +528,11 @@ class SlamMapTracker(threading.Thread):
             self._stop.wait()
         finally:
             for c in (client, vio_client):
-                try:
-                    c.stop()
-                except Exception:                                  # noqa: BLE001
-                    pass
+                if c is not None:
+                    try:
+                        c.stop()
+                    except Exception:                              # noqa: BLE001
+                        pass
             self._client = None
             self._vio_client = None
 
@@ -616,7 +622,8 @@ def run_ui(*, vio_endpoint: str = DEFAULT_VIO_ENDPOINT,
            default_view: str = "TOP",
            ba_window: bool = False,
            frontend_viz: bool = False,
-           corrected_vio: bool = False) -> int:
+           corrected_vio: bool = False,
+           no_slam: bool = False) -> int:
     """Open the single-view Qt UI (5 trajectories) and block on the Qt event loop."""
     # Import Qt lazily so a headless smoke / CI run that doesn't need the GUI
     # can import this module without pulling PyQt6.
@@ -654,9 +661,15 @@ def run_ui(*, vio_endpoint: str = DEFAULT_VIO_ENDPOINT,
     LOG.info("ui: waiting for calib.bundle on %s ...", vio_endpoint)
     vio_bundle = _await_calib_bundle(vio_endpoint, calib_timeout_s)
     LOG.info("ui: vio ready (%dx%d)", vio_bundle.width, vio_bundle.height)
-    LOG.info("ui: waiting for calib.bundle on %s ...", slam_endpoint)
-    slam_bundle = _await_calib_bundle(slam_endpoint, calib_timeout_s)
-    LOG.info("ui: slam ready (%dx%d)", slam_bundle.width, slam_bundle.height)
+    if no_slam:
+        # --no-slam: the SLAM process was never spawned, so its endpoint never
+        # opens. Do NOT block waiting for its calib.bundle (would time out + crash).
+        # The SLAM dots + corrected line stay empty; VO/VIO/VIO-BA are unaffected.
+        LOG.info("ui: --no-slam -> skipping the SLAM endpoint (no map / dots)")
+    else:
+        LOG.info("ui: waiting for calib.bundle on %s ...", slam_endpoint)
+        slam_bundle = _await_calib_bundle(slam_endpoint, calib_timeout_s)
+        LOG.info("ui: slam ready (%dx%d)", slam_bundle.width, slam_bundle.height)
 
     # 2. Qt app. Share GL contexts across windows: the main Viewer3D and the
     # SLAM-Map room view are each a pyqtgraph GLViewWidget = a separate GL
@@ -682,7 +695,7 @@ def run_ui(*, vio_endpoint: str = DEFAULT_VIO_ENDPOINT,
     # The single tracker owns the other 4 lines' data (VO / VIO-BA / corrected /
     # SLAM) across its two IPC clients.
     tracker = SlamMapTracker(slam_endpoint, vio_endpoint=vio_endpoint,
-                             connect_timeout_s=calib_timeout_s)
+                             connect_timeout_s=calib_timeout_s, no_slam=no_slam)
     tracker.start()
 
     # Wire each viewer line to its tracker snapshot getter (green VIO line + the
@@ -1228,6 +1241,11 @@ def main() -> int:
                          "trail rubber-sheeted to the SLAM graph). OFF by default: "
                          "the warp is recomputed EVERY GUI tick even when the line "
                          "is hidden, so it is opt-in for a lighter UI. Needs SLAM.")
+    ap.add_argument("--no-slam", action="store_true",
+                    help="the SLAM process is not running (lean flight): skip the "
+                         "slam endpoint entirely -- no calib wait, no slam.map "
+                         "client. The SLAM dots + corrected line stay empty; "
+                         "VO/VIO/VIO-BA are unaffected.")
     args = ap.parse_args()
     return run_ui(
         vio_endpoint=args.vio_endpoint,
@@ -1238,6 +1256,7 @@ def main() -> int:
         ba_window=args.ba_window,
         frontend_viz=args.frontend_viz,
         corrected_vio=args.corrected_vio,
+        no_slam=args.no_slam,
     )
 
 

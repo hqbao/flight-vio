@@ -5,7 +5,7 @@ This is the OFFLINE / deterministic engine. ``submit`` runs the *whole* step
 that one result back and clears it. Because the back-end flow's FIFO inbox calls
 ``submit`` then ``poll`` inside the *same* task invocation per keyframe, the
 behaviour is identical to the old in-thread ``RunBA`` / ``RunVIO`` -- zero
-latency, byte-identical replay output. See :mod:`vio.engine.base` for why
+latency, byte-identical replay output. See :mod:`ba.engine.base` for why
 ``poll`` must be one-shot (not latest-wins).
 """
 from __future__ import annotations

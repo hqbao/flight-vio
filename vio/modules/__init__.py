@@ -18,21 +18,21 @@ Files (read in pipeline order)
 * :mod:`imu_prior`     -- IMU prior + gravity chain: preintegrate the per-frame
                           prior, one-shot gravity align, IMU<->vision join, at-rest
                           tilt correction.
-* :mod:`backend`       -- keyframe emission + windowed bundle adjustment.
+* :mod:`backend`       -- keyframe EMISSION (``emit_keyframe``, on the odometry
+                          thread). The windowed BA itself moved to the ``ba`` process.
 * :mod:`publishers`    -- the thin "emit one result on a bus topic" steps.
-* :mod:`pipeline`      -- the orchestration: the two worker threads
+* :mod:`pipeline`      -- the orchestration: the odometry worker thread
                           (:class:`~vio.modules.pipeline.OdometryWorker` joins the
-                          IMU + depth edges and runs the per-frame chain;
-                          :class:`~vio.modules.pipeline.BackendWorker` runs the
-                          sliding-window BA). THE ENTRY POINT.
+                          IMU + depth edges and runs the per-frame chain). THE ENTRY
+                          POINT.
 * :mod:`direct_odometry` -- the ``--direct`` ALT odometry (dense direct RGB-D VO).
 * :mod:`propagate_imu` -- the live per-frame IMU dead-reckoning (nav state).
-* :mod:`loop_inbox`    -- the SLAM loop-closure correction feedback inbox.
+* :mod:`loop_inbox`    -- the SLAM loop-closure + ba.state bias feedback inboxes.
 
-``OdometryModule`` / ``BackendModule`` are kept as public aliases for the workers
-(``vio.main`` + the vio/verification selftests import them).
+``OdometryModule`` is kept as a public alias for the worker (``vio.main`` + the
+vio/verification selftests import it). The windowed-BA worker now lives in the
+``ba`` project (``ba.modules``).
 """
-from .pipeline import (
-    BackendModule, BackendWorker, OdometryModule, OdometryWorker)
+from .pipeline import OdometryModule, OdometryWorker
 
-__all__ = ["OdometryModule", "OdometryWorker", "BackendModule", "BackendWorker"]
+__all__ = ["OdometryModule", "OdometryWorker"]

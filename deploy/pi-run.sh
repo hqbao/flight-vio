@@ -83,7 +83,7 @@ fi
 # Include netbridge.forward in the sweep: a stale forward keeps holding port 8787,
 # so this run's forward can't bind and pi-ui connects to the DEAD one (UI shows no
 # pose / "samples 0") even though the live stack publishes fine.
-_ORPH='python -m ((launcher|imu_camera|vio|slam)\\.main|netbridge\\.forward)'
+_ORPH='python -m ((launcher|imu_camera|vio|ba|slam)\\.main|netbridge\\.forward)'
 if pi_ssh "pgrep -f '$_ORPH' >/dev/null 2>&1"; then
   pi_warn "sweeping orphan procs from a previous run (they hold the OAK device / port 8787) ..."
   pi_ssh "pkill -TERM -f '$_ORPH' 2>/dev/null || true; sleep 1; pkill -KILL -f '$_ORPH' 2>/dev/null || true"

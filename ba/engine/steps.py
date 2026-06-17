@@ -5,14 +5,14 @@ Each ``*_step`` takes a live map object + one keyframe snapshot and returns the
 solve result (or ``None`` when there is nothing to publish for that keyframe).
 These are pure functions of (map, snapshot): no threads, no queues, no flow/bus
 knowledge -- they receive the map instance so the same function drives both the
-synchronous :class:`~vio.engine.inprocess.InProcessEngine` and the child of
-:class:`~vio.engine.subprocess.SubprocessEngine`.
+synchronous :class:`~ba.engine.inprocess.InProcessEngine` and the child of
+:class:`~ba.engine.subprocess.SubprocessEngine`.
 
 The logic is lifted verbatim from the old in-thread ``RunBA`` task so the offline
 path stays identical.
 
 The opt-in ``--ba-window`` capture variant (a richer sibling that snapshots the
-full solve state for the visualizer) lives in :mod:`vio.engine.ba_capture`.
+full solve state for the visualizer) lives in :mod:`ba.engine.ba_capture`.
 """
 from __future__ import annotations
 

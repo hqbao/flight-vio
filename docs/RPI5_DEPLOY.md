@@ -1,7 +1,7 @@
 # RPi5 Deploy Runbook — flight-vio FLIGHT runtime
 
 Deploy the from-scratch RGB-D VIO/SLAM flight stack
-(`imu_camera → vio → slam`) on a **Raspberry Pi 5 (Debian, aarch64)**, headless.
+(`imu_camera → vio → ba → slam`) on a **Raspberry Pi 5 (Debian, aarch64)**, headless.
 
 > **Honesty contract.** Everything below the **"✅ validated on mac dev"** line
 > was proven on the macOS development box and is reproduced by named gates in
@@ -176,9 +176,13 @@ remotely on a dev box (it consumes the same abstract IPC topics).
 ./run.sh --no-ui --vl53l9cx
 ```
 
-`--no-ui` spawns exactly the three flight processes
-(`imu_camera.main`, `vio.main`, `slam.main`) and **never** the Qt UI — verified
-in the gate below. `--vl53l9cx` selects the VL53-class ToF source (downsample to
+`--no-ui` spawns the flight processes
+(`imu_camera.main`, `vio.main`, `ba.main`, `slam.main`) and **never** the Qt UI —
+verified in the gate below. The windowed bundle adjustment is its own `ba`
+process (`pose.refined`/`ba.state` are re-emitted onto the VIO endpoint via the
+pass-through, so the UI is unchanged). `--no-ba` drops the `ba` process and
+`--no-slam` drops `slam` — the **lean flight config** for the 4-core Pi (see the
+saturation note below). `--vl53l9cx` selects the VL53-class ToF source (downsample to
 54×42); `--direct` selects the dense direct photometric VO front-end tuned for
 that low-res ToF recipe.
 
@@ -278,19 +282,25 @@ which diagnostic captures run.
 
 | `pi-run.sh` injects | default on the Pi | opt out | why |
 |---|---|---|---|
-| `--worker` | **on** | `--no-worker` | move the bursty windowed-BA solve into its own process |
+| `--worker` | **on** | `--no-worker` | run SLAM's loop-closure solve GIL-free in a child process (the windowed BA is already its own `ba` process, so `--worker` is a no-op for it now) |
 | `--cap-numba-threads` | **on** (always passed) | — | per-process numba thread caps so capture+vio don't oversubscribe 4 cores |
 | `--no-frontend-viz --no-ba-window` | on (with `--ui`) | `--viz` | the UI diagnostic captures run in the vio process and drag it below real-time |
 | pose-only bridge | **on** (with `--ui`) | `--frames` | only the small pose/map/overlay topics cross the WiFi — the heavy uncompressed camera/depth/keyframe frames the main UI never displays would saturate the 2.4 GHz link |
 
-- **`--worker` defaults ON.** The loose windowed BA is a bursty ~48 ms/keyframe
-  solve (`verification/STAGE_PROFILE_RESULTS.md`, loose 320×200). Run in-thread it
-  shares the vio/frontend core, so every 5th frame the vio process takes an ~80 ms
-  hitch (frontend ~32 ms **+** the BA burst on the same GIL-bound core) — a visible
-  1-in-5 stutter. `--worker` runs BA in its own process; the vio process then holds
-  ~33 ms/frame (frontend + IMU) and the BA worker keeps up concurrently. Pass
-  **`--no-worker`** to keep BA in-thread (e.g. to reproduce the stall, or on a host
-  with spare cores).
+- **The windowed BA runs in its own `ba` process (always).** The bursty
+  ~48 ms/keyframe BA solve used to share the vio/frontend core (a 1-in-5 ~80 ms
+  stutter); it is now the standalone `ba` project, GIL-isolated from the frontend
+  by construction, so `--worker` no longer applies to it — `--worker` now only
+  offloads SLAM's loop-closure solve. Pass **`--no-worker`** to keep SLAM in-thread.
+
+- **Lean flight config on the 4-core Pi.** HIL (2026-06-18): the FULL stack
+  `capture + vio + ba + slam` at **640×400 `--tight`** saturates the Pi (load ~4.2,
+  `ba` ~135 % CPU, live `pose.odom` throttled to ~5 Hz) — the split correctly keeps
+  the slow BA off the frontend (vio runs free; `pose.refined` flows at ~1 Hz via the
+  pass-through), but four heavy processes still oversubscribe four cores. For flight
+  use **320×200** and drop what the mission does not need: `--no-ba` (no
+  pose.refined / no bias feed-forward) and/or `--no-slam` (no loop closure) — both
+  are launcher spawn gates, so the dropped process is simply never started.
 
 - **`--cap-numba-threads` is always passed.** The flight stack runs capture / vio /
   slam as separate OS processes; with nothing set, **each** spins a numba pool of

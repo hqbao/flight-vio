@@ -1,22 +1,26 @@
-"""The VIO pipeline -- odometry (RGB-D VO + gyro prior) and the windowed
-bundle-adjustment backend, as PROCEDURAL Python.
+"""The VIO odometry pipeline -- RGB-D VO + gyro prior + live dead-reckon, as
+PROCEDURAL Python.
 
-This replaces the old reactive ``OdometryModule(Module)`` /
-``BackendModule(Module)`` + ``Step`` chains. The per-message work is now plain
-functions (:func:`process_imucam` / :func:`process_frame` / :func:`process_kf`)
-that call the step functions in the EXACT same order the reactive chains ran -- so
-every output stream (``pose.odom`` / ``keyframe`` / ``pose.refined`` / the opt-in
-viz topics) stays byte-identical and BOTH gates hold:
+This replaces the old reactive ``OdometryModule(Module)`` + ``Step`` chains. The
+per-message work is now plain functions (:func:`process_imucam` /
+:func:`process_frame`) that call the step functions in the EXACT same order the
+reactive chain ran -- so every output stream (``pose.odom`` / ``keyframe`` / the
+opt-in viz topics) stays byte-identical and BOTH gates hold:
 
 * the LOOSE path IS the frozen gap=0 oracle (the offline replay runs through this
   odometry worker), and
 * the TIGHT path's live regression (``propagate_imu`` nav-state + the closed-loop
-  loop-correction blend) is unchanged.
+  loop-correction blend + the ``ba.state`` bias feed-forward) is unchanged.
+
+The windowed-BA BACKEND used to live here too (``BackendWorker`` / ``process_kf``);
+it has moved to the ``ba`` process (``ba.modules.pipeline``). VIO still EMITS the
+keyframe (``emit_keyframe``, on the odometry thread) which ``ba`` and ``slam``
+consume over IPC -- VIO just no longer runs the solve.
 
 The framework indirection (``Module.on`` / ``_routes`` / ``_run_chain``
 short-circuit-on-None / ``ctx.state[...]`` lookups inside every step) is gone; the
 data flow reads as straight-line code. What did NOT vanish, and is replicated
-EXPLICITLY in the two worker threads:
+EXPLICITLY in the worker thread:
 
 * :class:`OdometryWorker` -- the **2-input multi-END join**. The reactive module
   registered TWO routes (``.on(IMUCAM_SAMPLE, ...)`` + ``.on(FRAME_DEPTH, ...)``)
@@ -26,9 +30,6 @@ EXPLICITLY in the two worker threads:
   counter forwards END downstream + sets :attr:`done` only once both
   ``imucam.sample`` AND ``frame.depth`` have ENDed. This is the load-bearing
   concurrency the ``Module`` gave for free.
-* :class:`BackendWorker` -- the single ``keyframe`` input, the ``worker=True``
-  subprocess-engine boundary, the ``tight`` engine switch, and the END-forward to
-  ``pose.refined`` (+ ``ba.window`` when the capture engine is built).
 
 The step functions own no module state; the odometry worker holds a
 :class:`~vio.comms.module.ModuleContext` (a plain ``(bus, name, state)`` holder --
@@ -37,12 +38,11 @@ NOT the reactive substrate) so the per-run state the steps thread through
 lives in ONE place, and the selftests that reach into ``odom.ctx.state`` keep
 working byte-for-byte.
 
-``OdometryModule`` / ``BackendModule`` are kept as public aliases for the
-procedural workers (``vio.main`` + the vio/verification selftests import them).
+``OdometryModule`` is kept as a public alias for the procedural worker (``vio.main``
++ the vio/verification selftests import it).
 """
 from __future__ import annotations
 
-import logging
 import queue
 import threading
 from dataclasses import replace
@@ -51,29 +51,23 @@ from typing import Any
 import numpy as np
 
 from vio.comms import LocalPubSub, topics
-from vio.comms.messages import END
+from vio.comms.messages import (
+    BackendState, END, FrameInliers, FrameTracks, Keyframe, PoseMsg)
 from vio.comms.module import ModuleContext
 
 from sky.front.frontend import CaptureKLTFrontend, FrontendConfig, KLTFrontend
 from sky.front.odometry import OdometryConfig, RGBDVisualOdometry
 from sky.front.direct import DirectConfig
-from sky.backend.bundle import BAConfig
-from sky.backend.windowed import WindowedConfig
-from sky.vio.window import WindowedVIOConfig
-from vio.engine import make_ba_engine, make_vi_engine
-from vio.comms.messages import FrameInliers, FrameTracks, Keyframe, PoseMsg
 from .direct_odometry import DirectOdometryEngine
 from .frontend import estimate_motion, track_features
 from .imu_prior import (
     align_gravity, correct_tilt, preintegrate_prior, pull_prior)
-from .backend import emit_keyframe, run_ba
+from .backend import emit_keyframe
 from .publishers import (
-    publish_ba_window, publish_frontend_viz, publish_gyrofuse, publish_inliers,
-    publish_pose, publish_refined, publish_tracks, publish_vo)
+    publish_frontend_viz, publish_gyrofuse, publish_inliers,
+    publish_pose, publish_tracks, publish_vo)
 from .propagate_imu import propagate_imu
 from .loop_inbox import BackendStateInbox, LoopCorrectionInbox
-
-LOG = logging.getLogger("vio.pipeline")
 
 #: Inbox sentinel to unblock ``queue.get`` on ``stop()``. Mirrors ``Module._SENTINEL``.
 _SENTINEL = object()
@@ -349,18 +343,21 @@ class OdometryWorker(threading.Thread):
                 topics.LOOP_CORRECTION,
                 lambda m: inbox.push(m) if m is not None and m is not END
                 else None)
-        # Tight backend -> live BIAS feed-forward (PLAN P2): the BackendWorker
-        # republishes its latest optimised (bg, ba) on backend.state (same LOCAL
-        # bus). A latest-wins inbox hands it to the odometry thread; propagate_imu
-        # adopts the bias (low-pass, health-gated) per frame. Gated on retain_imu
-        # (--tight) so the loose / oracle path never wires it -> pose.odom
-        # byte-identical (the offline path also never publishes backend.state).
+        # BA backend -> live BIAS feed-forward (PLAN P2): the ba process publishes
+        # its latest optimised (bg, ba) as a BackendState on the IPC ``ba.state``
+        # topic; vio.main's ba-endpoint bridge re-hydrates it onto THIS local bus. A
+        # latest-wins inbox hands it to the odometry thread; propagate_imu adopts the
+        # bias (low-pass, health-gated) per frame. Gated on retain_imu (--tight) so
+        # the loose / oracle path never wires it -> pose.odom byte-identical (the
+        # offline path also never publishes ba.state). The bridge also forwards END;
+        # filter to the dataclass so only a real bias is pushed.
         if retain_imu:
             binbox = BackendStateInbox()
             state["backend_inbox"] = binbox
             bus.subscribe(
-                topics.BACKEND_STATE,
-                lambda m: binbox.push(m) if isinstance(m, dict) else None)
+                topics.BA_STATE,
+                lambda m: binbox.push(m) if isinstance(m, BackendState)
+                else None)
         state["R_imu_cam"] = (
             None if R_imu_cam is None else np.asarray(R_imu_cam, dtype=np.float64))
         if accel_align is not None:
@@ -460,192 +457,7 @@ class OdometryWorker(threading.Thread):
             self.done.set()
 
 
-# =========================================================================== #
-# Backend: the windowed bundle-adjustment sink over `keyframe`
-# =========================================================================== #
-def process_kf(engine, bus: LocalPubSub, tight: bool, capture_window: bool,
-               kf) -> None:
-    """Run the backend chain for one keyframe.
-
-    Byte-identical order to the old reactive chain. ``run_ba`` submits the
-    keyframe's snapshot (loose 5-tuple / tight 6-tuple) to the engine and returns
-    ``(refined PoseMsg, backend_state)`` (or ``None`` -> chain short-circuit). With
-    capture on, ``publish_ba_window`` runs between ``run_ba`` and
-    ``publish_refined`` (it forwards the pose UNCHANGED, so ``pose.refined`` is
-    byte-identical to the no-capture chain).
-
-    TIGHT feed-forward (PLAN P1): when the tight backend returns its latest
-    optimised bias, republish it on the LOCAL-bus ``backend.state`` topic for the
-    live ``propagate_imu`` to adopt. The topic is intra-process (OdometryWorker +
-    BackendWorker share this bus), NEVER crosses IPC, and is read by nothing on the
-    loose / oracle path -> ``pose.refined`` byte-parity (gap = 0) is unaffected.
-    """
-    result = run_ba(engine, tight, kf)
-    if result is None:               # no tracks this kf / no refined pose yet
-        return
-    msg, backend_state = result
-    if capture_window:
-        msg = publish_ba_window(engine, bus, msg)
-    publish_refined(bus, msg)
-    if tight and backend_state is not None:
-        bg, ba = backend_state
-        bus.publish(topics.BACKEND_STATE,
-                    {"seq": int(kf.seq), "bg": bg, "ba": ba,
-                     "degraded": bool(msg.info.get("vio_degraded", False))})
-
-
-class BackendWorker(threading.Thread):
-    """The windowed back-end over the ``keyframe`` stream: a plain thread.
-
-    A procedural replacement for the old reactive ``BackendModule(Module)``. Two
-    selectable backends, picked by ``tight`` (a clean engine switch, NOT a
-    pipeline fork):
-
-    * ``tight=False`` (default, LOOSE) -- :func:`make_ba_engine` builds the
-      vision-only ``WindowedBAMap`` (reproj + depth + optional VO/gravity priors).
-      Byte-identical to the pre-tight build; the offline oracle relies on this.
-    * ``tight=True`` (``--tight``, opt-in) -- :func:`make_vi_engine` builds the
-      tight-coupled ``WindowedVIOMap`` (joint visual + IMU window optimiser). The
-      IMU factor is weighted by the per-edge information square root
-      (``imu_info_weight=True``); ``run_ba`` then submits the SUPERSET snapshot
-      (keyframe ts + raw inter-keyframe IMU block).
-
-    The heavy solve runs behind an :class:`~vio.engine.base.Engine`:
-    ``worker=False`` (default, offline) runs it synchronously in-thread --
-    byte-identical to the old path; ``worker=True`` (live) runs it in a separate
-    process so it cannot hold the read loop's GIL (the fast-push undershoot fix).
-    The engine is closed on THIS thread when the loop exits, so a subprocess
-    worker is reaped without a cross-thread race.
-
-    Single ``keyframe`` input, so the first END is terminal (no join). END is
-    forwarded to ``pose.refined`` (+ ``ba.window`` when the capture engine built).
-    """
-
-    def __init__(self, bus: LocalPubSub, K: np.ndarray,
-                 window: int = 6, iters: int = 5,
-                 latest_only: bool = False, worker: bool = False,
-                 tight: bool = False, stabilize_velocity: bool = False,
-                 depth_icp: bool = False, capture_window: bool = False) -> None:
-        super().__init__(name="backend", daemon=True)
-        self.bus = bus
-        self.tight = bool(tight)
-        # BA-window capture (opt-in, --ba-window) is a LOOSE-backend-only viz: the
-        # capture-aware ``WindowedBAMap`` engine snapshots each solve for the UI's
-        # "BA Window". Ignored on the tight path + OFF by default so the oracle
-        # stays byte-identical.
-        self.capture_window = bool(capture_window) and not tight
-        if tight:
-            # Tight backend: enable the covariance-correct IMU weight (Phase 1's
-            # opt-in flag) on a copy of WindowedVIOConfig's validated defaults.
-            # ``imu_info_weight`` is the only baseline override -- everything else
-            # (window, lock_tilt, tight vel/pos sigmas, kf_every) keeps the values
-            # the vio_ba_selftest / vio oracle entries were tuned against.
-            vio_cfg = WindowedVIOConfig()
-            vio_cfg.vio.imu_info_weight = True
-            # Phase-4 velocity regularisation (opt-in, LIVE --tight only): the
-            # single ``stabilize_velocity`` knob makes ``run_ba`` flip on BOTH
-            # the CV smoothness prior and the excitation-gated ZUPT for every
-            # solve, curbing the 54x42 / shake window-velocity divergence. Left
-            # OFF by default so the tight-without-flag path -- and the oracle --
-            # stay byte-identical; only the operator's --stabilize-velocity sets it.
-            if stabilize_velocity:
-                vio_cfg.stabilize_velocity = True
-                LOG.info("vio: tight velocity-stabilize ON "
-                         "(CV prior + gated ZUPT)")
-            # Phase-4 dense-ICP relative-pose factor (opt-in, LIVE --tight only):
-            # ``depth_icp`` makes ``run_ba`` add an IMU-seeded point-to-plane ICP
-            # relative-pose factor between adjacent in-window keyframes, anchoring
-            # the inter-keyframe TRANSLATION the feature-starved 54x42 frontend
-            # leaves unobservable. OFF by default so the tight-without-flag path
-            # and the oracle stay byte-identical; only --depth-icp sets it.
-            if depth_icp:
-                vio_cfg.depth_icp = True
-                LOG.info("vio: tight dense-ICP relative-pose factor ON "
-                         "(translation anchor for feature-starved frames)")
-            self.engine = make_vi_engine(K, vio_cfg, worker=worker)
-        else:
-            cfg = WindowedConfig(window=window, ba=BAConfig(max_iters=iters))
-            self.engine = make_ba_engine(K, cfg, worker=worker,
-                                         capture_window=self.capture_window)
-            if self.capture_window:
-                LOG.info("vio: BA-window capture ON (--ba-window) -- publishing "
-                         "ba.window solve snapshots for the UI visualiser")
-
-        # END is forwarded to whatever this worker publishes (was forwards_to):
-        # pose.refined always, ba.window when the capture engine is built.
-        self._downstream = [topics.POSE_REFINED]
-        if self.capture_window:
-            self._downstream.append(topics.BA_WINDOW)
-
-        self._latest_only = bool(latest_only)
-        self._inbox: "queue.Queue" = queue.Queue()
-        self._latest: Any = _SENTINEL          # single-slot newest unprocessed kf
-        self._latest_lock = threading.Lock()
-        self._stop = threading.Event()
-        self.done = threading.Event()          #: set after END is handled
-        self._emitted_end = False
-
-        # Subscribe the inbox feeder to keyframe in __init__ (old Module.on timing).
-        self.bus.subscribe(topics.KEYFRAME, self._on_keyframe)
-
-    # -- inbox feeder (runs on the PUBLISHER's thread, kept cheap) ----------- #
-    def _on_keyframe(self, msg: Any) -> None:
-        """Bus handler for ``keyframe``: enqueue (coalescing or strict FIFO)."""
-        if not self._latest_only:
-            self._inbox.put(msg)
-            return
-        # Coalescing (LIVE visualiser-fed graphs): keep only the newest
-        # unprocessed keyframe; enqueue a token only when nothing pending -- EXCEPT
-        # END, which always enqueues. Byte-for-byte the old Module._coalesce,
-        # specialised to this worker's single keyframe topic.
-        with self._latest_lock:
-            pending = self._latest is not _SENTINEL
-            self._latest = msg
-            enqueue = (not pending) or (msg is END)
-        if enqueue:
-            self._inbox.put(_LATEST)
-
-    # -- thread body -------------------------------------------------------- #
-    def stop(self) -> None:
-        self._stop.set()
-        self._inbox.put(_SENTINEL)             # unblock the queue.get
-
-    def run(self) -> None:
-        # Close the engine on THIS thread when the loop exits (stop sentinel or
-        # _stop), so a subprocess worker is reaped without a cross-thread race.
-        try:
-            self._loop()
-        finally:
-            self.engine.close()
-
-    def _loop(self) -> None:
-        while not self._stop.is_set():
-            item = self._inbox.get()
-            if item is _SENTINEL:
-                break
-            if item is _LATEST:
-                with self._latest_lock:
-                    msg, self._latest = self._latest, _SENTINEL
-                if msg is _SENTINEL:
-                    continue
-            else:
-                msg = item                      # strict-FIFO payload
-            if msg is END:
-                self._handle_end()
-                continue
-            process_kf(self.engine, self.bus, self.tight,
-                       self.capture_window, msg)
-
-    def _handle_end(self) -> None:
-        # Single-input sink (one keyframe topic), so the first END is terminal.
-        if not self._emitted_end:
-            self._emitted_end = True
-            for t in self._downstream:
-                self.bus.publish(t, END)
-        self.done.set()
-
-
-#: Public names kept for vio.main + the vio/verification selftests. They are now
-#: the procedural workers, not reactive Modules.
+#: Public name kept for vio.main + the vio/verification selftests. It is now the
+#: procedural worker, not a reactive Module. (The BackendWorker moved to the ``ba``
+#: process -- ``ba.modules.pipeline`` -- so vio exports only the odometry worker.)
 OdometryModule = OdometryWorker
-BackendModule = BackendWorker

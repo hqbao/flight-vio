@@ -1,12 +1,26 @@
-"""vio process: subscribe to capture, run odometry + windowed BA, republish.
+"""vio process: subscribe to capture, run odometry, republish.
 
 Subscribes (over IPC) to the ``capture`` endpoint for ``calib.bundle``,
-``imucam.sample`` and ``frame.depth``; runs the same
-:class:`~vio.modules.pipeline.OdometryModule` +
-:class:`~vio.modules.pipeline.BackendModule` the pre-split in-process graph built;
-then mirrors ``pose.odom``, ``pose.vo`` (pure-vision f2f line), ``keyframe``,
-``frame.tracks``, ``frame.inliers`` and ``pose.refined`` onto its own
-:class:`~vio.comms.IPCPubSub` endpoint ``"oak.vio"`` for SLAM / UI / tools.
+``imucam.sample`` and ``frame.depth``; runs the
+:class:`~vio.modules.pipeline.OdometryModule` front-end (the pre-split in-process
+graph's odometry half) -- the windowed-BA backend now lives in its OWN ``ba``
+process, which consumes vio's ``keyframe`` over IPC and publishes ``pose.refined``.
+VIO mirrors ``pose.odom``, ``pose.vo`` (pure-vision f2f line), ``keyframe``,
+``frame.tracks`` and ``frame.inliers`` onto its own
+:class:`~vio.comms.IPCPubSub` endpoint ``"oak.vio"`` for BA / SLAM / UI / tools.
+
+Backend pass-through (``--ba-endpoint``)
+---------------------------------------
+The ``ba`` process publishes ``pose.refined`` (the windowed-BA line) on ITS OWN
+endpoint. To keep the UI + netbridge UNCHANGED (no 4th UI endpoint), VIO opens a
+read-only client on ``--ba-endpoint`` and BRIDGES two topics back onto its local
+bus (mirror of the slam ``loop.correction`` re-hydrate): ``pose.refined`` is
+re-published so VIO's existing IPCPublisher re-emits it on the VIO endpoint, and --
+under ``--tight`` -- ``ba.state`` (the optimised-bias feed-forward) is handed to
+``propagate_imu`` via the existing :class:`~vio.modules.loop_inbox.BackendStateInbox`.
+When ``--ba-endpoint`` is unset (e.g. the lean ``--no-ba`` launcher path spawns no
+``ba``) VIO runs with no refined pose + an inert bias feed -- the live ``pose.odom``
+is unaffected (it never consumed the backend).
 
 Calibration handshake
 ---------------------
@@ -16,18 +30,13 @@ seeds BEFORE it can build the odometry module. Two-client startup:
 1. Open a **calib client** subscribed to the retained ``calib.bundle`` topic;
    wait (with timeout) for the first bundle (retained, so a late VIO boot still
    gets it instantly).
-2. Build the local odometry / backend graph with the bundle.
+2. Build the local odometry graph with the bundle.
 3. Open a **data client** subscribed to ``imucam.sample`` + ``frame.depth`` and
    the bridge subscriber, then start everything.
 
 Each client is one :class:`~vio.comms.IPCPubSub` connection -- the IPC API
 requires every subscription to be registered BEFORE ``start``, so a single client
 cannot mix the "wait for calib" + "subscribe to data" phases.
-
-The worker-engine subprocess boundary (``BackendModule(worker=True)``) stays on
-stdlib pickle (``multiprocessing.Queue`` over same-project classes) and is NOT
-routed through the class-path-independent codec -- the codec is only for the
-cross-process IPC wire contract.
 
 Run::
 
@@ -54,7 +63,7 @@ from vio.comms.wire import WireCalibBundle                         # noqa: E402
 from vio.comms.ring_registry import (                              # noqa: E402
     default_capture_specs, default_vio_specs,
 )
-from vio.modules import BackendModule, OdometryModule              # noqa: E402
+from vio.modules import OdometryModule                            # noqa: E402
 from sky.front.odometry import OdometryConfig           # noqa: E402
 from vio.comms.lib.config.resolution import ResolutionProfile     # noqa: E402
 from vio.resolution_build import frontend_config          # noqa: E402
@@ -73,14 +82,26 @@ _INPUT_TOPICS = [topics.IMUCAM_SAMPLE, topics.FRAME_DEPTH]
 #: accumulated drift is BOUNDED on revisits (Basalt's realtime VIO has none).
 _SLAM_FEEDBACK_TOPICS = [topics.LOOP_CORRECTION]
 
-#: Topics VIO republishes (downstream is SLAM + UI). POSE_VO is the pure-vision
+#: Topics VIO subscribes to from the BA process (``--ba-endpoint``): the BA-refined
+#: pose + the opt-in ``ba.window`` solve snapshot (both re-published onto the VIO
+#: endpoint so the UI keeps a single endpoint) and -- LIVE + --tight only -- the
+#: optimised-bias feed-forward fed to propagate_imu. Mirror of the slam feedback
+#: bridge; ``ba.state`` is dropped on the local bus only and never re-emitted on the
+#: VIO endpoint (it is vio<->ba-local, off-bridge). ``ba.window`` is emitted by ba
+#: ONLY under loose + ``--ba-window``, so on every other path it simply never arrives.
+_BA_FEEDBACK_TOPICS = [topics.POSE_REFINED, topics.BA_STATE, topics.BA_WINDOW]
+
+#: Topics VIO republishes (downstream is BA + SLAM + UI). POSE_VO is the pure-vision
 #: frame-to-frame trajectory (live "VO" line) -- pure POD pose, no ring, like
-#: POSE_ODOM / POSE_REFINED.
+#: POSE_ODOM. POSE_REFINED (and the opt-in BA_WINDOW solve snapshot) are NOT produced
+#: here any more -- they are a PASS-THROUGH of the BA process's output, re-emitted on
+#: the VIO endpoint (see ``--ba-endpoint``) so the UI keeps a single endpoint.
 _OUTPUT_TOPICS = [
     topics.POSE_ODOM,
     topics.POSE_VO,
     topics.KEYFRAME,
     topics.POSE_REFINED,
+    topics.BA_WINDOW,
     topics.FRAME_TRACKS,
     topics.FRAME_INLIERS,
     topics.FRAME_GYROFUSE,
@@ -126,27 +147,32 @@ def run_vio(*,
             capture_endpoint: str = DEFAULT_CAPTURE_ENDPOINT,
             endpoint: str = DEFAULT_VIO_ENDPOINT,
             slam_endpoint: str | None = None,
+            ba_endpoint: str | None = None,
             kf_every: int = 5,
             use_gyro: bool = True,
             worker: bool = False,
             calib_timeout_s: float = 30.0,
-            backend_window: int = 6,
-            backend_iters: int = 5,
             tight: bool = False,
             no_live_loop_correct: bool = False,
-            stabilize_velocity: bool = False,
-            depth_icp: bool = False,
-            ba_window: bool = False,
             frontend_viz: bool = False,
             direct: bool = False) -> int:
     """Run the VIO process until END / SIGTERM / Ctrl-C.
 
-    ``tight`` selects the TIGHT-coupled VIO backend (the joint visual + IMU
-    window optimiser, ``imu_info_weight=True``) instead of the default LOOSE
-    windowed-BA backend. Opt-in: when False the path is byte-identical to before
-    -- the front-end stops retaining raw IMU and the back-end builds the loose
-    engine. When True the odometry module retains the per-frame raw IMU so each
-    keyframe carries the inter-keyframe IMU block the tight backend preintegrates.
+    ``tight`` selects the TIGHT-coupled VIO path: the front-end RETAINS the
+    per-frame raw IMU so each keyframe carries the inter-keyframe IMU block the
+    tight backend preintegrates, AND it turns on the live ``propagate_imu``
+    nav-state. Opt-in: when False the path is byte-identical to before (the
+    front-end stops retaining raw IMU). The tight/loose BACKEND choice itself now
+    lives in the ``ba`` process (``ba.main --tight``); VIO only produces the
+    keyframe + runs the live dead-reckoning.
+
+    ``ba_endpoint`` enables the BACKEND PASS-THROUGH (``ba -> vio``): when set, VIO
+    opens a read-only client on the ``ba`` endpoint and bridges two topics back
+    onto its local bus -- ``pose.refined`` (re-emitted on the VIO endpoint so the
+    UI keeps a single endpoint) and, LIVE + ``--tight`` only, ``ba.state`` (the
+    optimised-bias feed-forward, handed to ``propagate_imu``). When unset (e.g. the
+    lean ``--no-ba`` launcher path spawns no ``ba``) VIO runs with no refined pose +
+    an inert bias feed -- ``pose.odom`` is unaffected (it never consumed the backend).
 
     ``slam_endpoint`` enables the CLOSED-LOOP feedback (``slam -> vio``): when set
     AND ``tight`` is True, VIO opens a read-only client on the SLAM endpoint,
@@ -157,20 +183,14 @@ def run_vio(*,
     loose path never sets it, so those paths are byte-identical. Drift bounding is
     SMOOTH (the correction is bled over a few frames, never a hard snap).
 
-    ``stabilize_velocity`` enables the Phase-4 velocity regularisation on the
-    tight backend (the CV smoothness prior + excitation-gated ZUPT) to curb the
-    54x42 / shake window-velocity divergence. Opt-in and ``--tight`` ONLY: it is
-    forwarded straight to :class:`~vio.modules.pipeline.BackendModule`, which only
-    honours it inside its ``tight`` branch. When False the tight config is the
-    untouched (oracle-tuned) default and the loose path is unaffected -- so the
-    byte-parity oracle stays gap=0.
-
-    ``depth_icp`` enables the Phase-4 dense-ICP relative-pose factor on the tight
-    backend: an IMU-seeded point-to-plane ICP between adjacent in-window keyframe
-    depth clouds adds a measured TRANSLATION constraint, anchoring the
-    inter-keyframe Delta-p that the feature-starved 54x42 frontend cannot observe.
-    Opt-in and ``--tight`` ONLY (same contract as ``stabilize_velocity``); OFF
-    leaves the tight config + oracle byte-identical.
+    ``worker`` is INERT in VIO (the windowed-BA backend moved to the ``ba`` process,
+    which always solves in-process; the in-VIO ``--worker`` existed only to free the
+    camera read loop's GIL). It is accepted only so the launcher's existing VIO
+    forward keeps working (the launcher's ``--worker`` is still live for ``slam``).
+    The windowed-BA backend knobs themselves (window / iters / stabilize_velocity /
+    depth_icp / the ``--ba-window`` viz) NO LONGER live on VIO: they were removed and
+    route directly to ``ba.main`` (``launcher.build_ba_args``). None of them ever
+    affected ``pose.odom`` (the live VIO), so the byte-parity oracle is unchanged.
 
     ``direct`` selects the opt-in DENSE DIRECT RGB-D VO odometry mode
     (``--direct``): the front-end's sparse corner/KLT track -> PnP path is replaced
@@ -183,19 +203,10 @@ def run_vio(*,
     fine. A THIRD mode selected ONLY by this flag: when off the loose default +
     ``--tight`` path is byte-identical to before, so the byte-parity oracle stays
     gap=0. ``direct`` is independent of ``tight`` (it owns its own IMU seed); if
-    both are set, direct's front-end wins and the tight backend still windows on the
-    direct keyframes. The published topics (``pose.odom`` / ``pose.vo`` /
+    both are set, direct's front-end wins and the ``ba`` tight backend still windows
+    on the direct keyframes. The published topics (``pose.odom`` / ``pose.vo`` /
     ``keyframe`` / ``frame.tracks`` / ``frame.inliers``) are unchanged, so comms /
     the UI / SLAM are untouched.
-
-    ``ba_window`` enables the BA-window visualiser snapshot stream (``--ba-window``):
-    the LOOSE backend builds the capture-aware engine and republishes one
-    ``ba.window`` :class:`~vio.comms.messages.BaWindow` per keyframe solve (the
-    window keyframe poses + shared 3D landmarks + observation rays + reprojection
-    error + the PRE-solve state) for the UI's "BA Window" view. Opt-in and
-    LOOSE-only (ignored on ``--tight``); OFF by default and never set by the
-    oracle, so the byte-parity oracle stays gap=0 (the capture step runs the SAME
-    frozen solve; the snapshot only rides the existing overlay channel).
     """
     # Closed-loop feedback is --tight + LIVE only: a slam endpoint must be wired
     # AND the tight nav-state must exist (retain_imu, set by tight). The loose /
@@ -259,20 +270,24 @@ def run_vio(*,
                  "-- dense photometric frame-to-keyframe + IMU seed + guard "
                  "(pair with --vl53l9cx for the 54x42 ToF recipe)")
     if tight:
-        LOG.info("vio: TIGHT-coupled VIO backend selected (--tight) "
-                 "[imu_info_weight=True]")
+        LOG.info("vio: TIGHT-coupled VIO path selected (--tight) -- retaining "
+                 "per-frame IMU + live dead-reckon; the tight backend runs in ba")
     if loop_correct:
         LOG.info("vio: CLOSED-LOOP SLAM correction ENABLED (slam=%s -> live "
                  "pose.odom) -- drift bounded on revisits", slam_endpoint)
-    backend = BackendModule(local, bundle.K,
-                            window=backend_window, iters=backend_iters,
-                            latest_only=False, worker=worker, tight=tight,
-                            stabilize_velocity=stabilize_velocity,
-                            depth_icp=depth_icp, capture_window=ba_window)
-    # BA-window capture is LOOSE-only; --tight overrides it (the tight map has no
-    # capture overlay). Publish ba.window only when the capture engine is actually
-    # built, so a consumer never waits on a topic that will never emit.
-    ba_window_on = bool(ba_window and not tight)
+    if ba_endpoint:
+        LOG.info("vio: BA pass-through ENABLED (ba=%s -> pose.refined re-emitted "
+                 "on the VIO endpoint%s)", ba_endpoint,
+                 "; ba.state -> live bias feed-forward" if tight else "")
+    # The windowed-BA backend now lives in the ``ba`` process -- VIO produces the
+    # keyframe (still) but no longer runs a backend. ``--worker`` is therefore INERT
+    # in VIO (it is still live for slam, hence accepted, not removed); warn once so a
+    # forwarded flag is not silently lost. The other backend knobs were removed from
+    # VIO outright and route straight to ba.main (launcher.build_ba_args).
+    if worker:
+        LOG.warning("vio: --worker is INERT in VIO (the windowed-BA backend now "
+                    "runs in the ba process, always in-process); it is still live "
+                    "for slam, so it is accepted but has no effect here")
     # Frontend-internals capture is NOT tight-only: the KLT frontend is identical
     # on the loose and tight paths, so --frontend-viz works on both. The
     # CaptureKLTFrontend returns byte-identical tracks, so the oracle is
@@ -295,14 +310,17 @@ def run_vio(*,
     pub_kf = IPCPublisher(local, server, vio_rings, [topics.KEYFRAME],
                           endpoint=endpoint, ring_endpoint=endpoint)
     # Pure-POD republished topics (poses + per-frame ids / pixels -- no ring
-    # slots). ``ba.window`` (the opt-in BA-window solve snapshot) is also pure POD
-    # (window poses + landmarks + observation rays, no images), so it rides this
-    # same publisher; appended ONLY when the capture engine is built.
+    # slots). ``pose.refined`` AND ``ba.window`` are here as a PASS-THROUGH: the BA
+    # process produces them, the ba-endpoint bridge re-publishes them onto THIS local
+    # bus, and this publisher then re-emits them on the VIO endpoint (so the UI keeps
+    # one endpoint -- the BA-window source reads ba.window off the VIO endpoint
+    # exactly as before the split). ``ba.window`` is pure POD too (window poses +
+    # landmarks + observation rays, no images); it only ever arrives under
+    # loose + ``--ba-window``, so on every other path it is simply never re-emitted.
     _pose_topics = [topics.POSE_ODOM, topics.POSE_VO, topics.POSE_REFINED,
+                    topics.BA_WINDOW,
                     topics.FRAME_TRACKS, topics.FRAME_INLIERS,
                     topics.FRAME_GYROFUSE]
-    if ba_window_on:
-        _pose_topics.append(topics.BA_WINDOW)
     # frame.frontend (the opt-in frontend-internals snapshot) is also pure POD
     # (quantised heatmap + capped flow arrays, no images), so it rides this same
     # publisher; appended ONLY when the capture frontend is built.
@@ -319,7 +337,7 @@ def run_vio(*,
     server.publish("calib.bundle", bundle)
 
     # 6. Open the INPUT IPCPubSub client + subscriber bridge: capture topics ->
-    #    local bus. Other modules (odom, backend) consume from the local bus.
+    #    local bus. The odometry module consumes from the local bus.
     in_client = IPCPubSub(capture_endpoint, role="client")
     in_bridge = IPCSubscriber(local, in_client, cap_rings, _INPUT_TOPICS)
 
@@ -346,6 +364,31 @@ def run_vio(*,
             loop_bridge = None
             loop_client = None
 
+    # 6c. BACKEND PASS-THROUGH bridge (set only when --ba-endpoint is wired):
+    #     subscribe the ba process's pose.refined + ba.state on the ba endpoint and
+    #     re-hydrate them onto THIS local bus. pose.refined is then re-emitted on the
+    #     VIO endpoint by pub_pose (so the UI keeps a single endpoint); ba.state is
+    #     handed to propagate_imu via the OdometryWorker's BackendStateInbox (LIVE +
+    #     --tight only -- on the loose path the inbox is not even allocated, so the
+    #     dataclass is simply dropped). Both topics are POD (no rings). ba boots AFTER
+    #     VIO, so its endpoint may not exist yet -- the client retries on a generous
+    #     timeout, and a failed connect is non-fatal (VIO still runs; no refined pose,
+    #     inert bias feed). Mirror of the slam loop bridge above.
+    ba_bridge = None
+    ba_client = None
+    if ba_endpoint:
+        try:
+            ba_client = IPCPubSub(ba_endpoint, role="client",
+                                  connect_timeout_s=calib_timeout_s)
+            ba_bridge = IPCSubscriber(local, ba_client, vio_rings,
+                                      _BA_FEEDBACK_TOPICS)
+        except (TimeoutError, ConnectionError) as e:
+            LOG.warning("vio: BA pass-through DISABLED -- could not connect to ba "
+                        "endpoint %s (%s); VIO runs with no refined pose",
+                        ba_endpoint, e)
+            ba_bridge = None
+            ba_client = None
+
     # 7. END-detection sink: when capture finishes the replay session it
     #    publishes WireEnd on its data topics; the bridge translates it to the
     #    local-bus END. We want to know when both data topics have ENDed so we
@@ -366,14 +409,17 @@ def run_vio(*,
              capture_endpoint, len(_OUTPUT_TOPICS))
 
     # 8. Start everything. Order matters: bridge consumers first (so messages
-    #    published while odom/backend boot are not lost on the local bus).
+    #    published while odom boots are not lost on the local bus).
     odom.start()
-    backend.start()
     in_bridge.start()
     # Closed-loop feedback bridge last (its connect retries until SLAM is up; a
     # failed connect logs + exits its thread without affecting the rest of VIO).
     if loop_bridge is not None:
         loop_bridge.start()
+    # BA pass-through bridge (its connect retries until ba is up; a failed connect
+    # logs + exits its thread without affecting the rest of VIO).
+    if ba_bridge is not None:
+        ba_bridge.start()
 
     stop = [False]
     def _on_sigterm(_signo, _frame):
@@ -392,12 +438,12 @@ def run_vio(*,
             time.sleep(0.1)
     finally:
         # Drain order: stop input bridge so no more messages arrive, then wait
-        # for odom + backend to finish their inboxes (END is already in flight),
-        # then forward END on every output topic so downstream procs (SLAM, UI)
-        # drain. NB: the wait must be long enough that even a full inbox of
-        # buffered replay frames drains -- 30 frames at ~100 ms / frame can
-        # easily take 3-5 s; allow a generous ceiling here, and let SIGTERM
-        # short-circuit if the operator gives up.
+        # for odom to finish its inbox (END is already in flight), then forward END
+        # on every output topic so downstream procs (BA, SLAM, UI) drain. NB: the
+        # wait must be long enough that even a full inbox of buffered replay frames
+        # drains -- 30 frames at ~100 ms / frame can easily take 3-5 s; allow a
+        # generous ceiling here, and let SIGTERM short-circuit if the operator gives
+        # up.
         #
         # On interrupt the operator wants a fast exit. Capture is also shutting
         # down so END will never arrive on imucam.sample / frame.depth -- waiting
@@ -405,18 +451,18 @@ def run_vio(*,
         # leaking every vio_rings slot. `_drain_wait` polls stop[0], so a late
         # SIGINT/SIGTERM during a natural-END drain short-circuits the wait and
         # `.stop()` forces the worker out. Natural END (no interrupt) keeps the
-        # generous 120 s ceiling so a busy backend can finish.
+        # generous 120 s ceiling so a busy odometry inbox can finish.
         in_bridge.stop()
-        # Stop the closed-loop feedback bridge too (no more corrections needed
-        # once we're tearing down). Idempotent + safe if its connect never
-        # succeeded (the thread already exited).
+        # Stop the feedback bridges too (no more corrections / refined poses needed
+        # once we're tearing down). Idempotent + safe if a connect never succeeded
+        # (the thread already exited).
         if loop_bridge is not None:
             loop_bridge.stop()
+        if ba_bridge is not None:
+            ba_bridge.stop()
         drain_timeout = 2.0 if stop[0] else 120.0
         _drain_wait(odom.done, drain_timeout, stop)
         odom.stop()
-        _drain_wait(backend.done, drain_timeout, stop)
-        backend.stop()
         # The modules already forward END on their declared downstream topics
         # via `_emit_end` (see `Module._handle_end`), but those go onto the
         # LOCAL bus -- the publisher bridge then mirrors them onto the IPC
@@ -445,38 +491,30 @@ def main() -> int:
                     help="SLAM IPC endpoint to subscribe loop.correction from for "
                          "the CLOSED-LOOP feedback (slam->vio). Only takes effect "
                          "with --tight; off when unset (open-loop, like before).")
+    ap.add_argument("--ba-endpoint", default=None,
+                    help="ba IPC endpoint to subscribe pose.refined (+ ba.state under "
+                         "--tight) from for the BACKEND PASS-THROUGH (ba->vio): "
+                         "pose.refined is re-emitted on the VIO endpoint (UI keeps "
+                         "one endpoint) and ba.state feeds the live bias forward. "
+                         "Off when unset (no refined pose; inert bias feed).")
     ap.add_argument("--kf-every", type=int, default=5)
     ap.add_argument("--no-gyro", action="store_true")
     ap.add_argument("--worker", action="store_true",
-                    help="run windowed BA solve in a child process (release GIL)")
+                    help="INERT in VIO (the windowed-BA backend moved to the ba "
+                         "process, which always solves in-process); accepted only "
+                         "for the launcher's forward (--worker is still live for "
+                         "slam). Has no effect on VIO.")
     ap.add_argument("--calib-timeout", type=float, default=30.0,
                     help="seconds to wait for the calib.bundle on boot")
-    ap.add_argument("--backend-window", type=int, default=6)
-    ap.add_argument("--backend-iters", type=int, default=5)
     ap.add_argument("--tight", action="store_true",
-                    help="select the TIGHT-coupled VIO backend (joint visual + "
-                         "IMU window optimiser, imu_info_weight=True) instead of "
-                         "the default LOOSE windowed-BA backend. Opt-in; the "
+                    help="select the TIGHT-coupled VIO path: retain per-frame IMU + "
+                         "run the live dead-reckon nav-state. The tight/loose BACKEND "
+                         "choice itself is ba.main's (ba runs --tight). Opt-in; the "
                          "default (loose) path is byte-identical to before.")
     ap.add_argument("--no-live-loop-correct", action="store_true",
                     help="tight only: DISABLE feeding the SLAM loop-correction into "
                          "the live pose (the SLAM map is still built). Diagnostic / "
                          "escape hatch; default keeps closed-loop ON.")
-    ap.add_argument("--stabilize-velocity", action="store_true",
-                    help="tight only: enable Phase-4 velocity regularisation "
-                         "(CV prior + gated ZUPT) to curb 54x42/shake velocity "
-                         "divergence. Opt-in; ignored without --tight.")
-    ap.add_argument("--depth-icp", action="store_true",
-                    help="tight only: enable the Phase-4 dense-ICP relative-pose "
-                         "factor (IMU-seeded point-to-plane ICP between keyframe "
-                         "depth clouds) to anchor inter-keyframe translation at "
-                         "54x42. Opt-in; ignored without --tight.")
-    ap.add_argument("--ba-window", action="store_true",
-                    help="loose only: publish ba.window solve snapshots (window "
-                         "keyframe poses + 3D landmarks + observation rays + "
-                         "reprojection error) for the UI's BA Window visualiser. "
-                         "Opt-in; OFF by default (oracle byte-identical); ignored "
-                         "with --tight.")
     ap.add_argument("--direct", action="store_true",
                     help="select the DENSE DIRECT RGB-D VO odometry mode: replace "
                          "the sparse corner/KLT->PnP front-end with dense direct "
@@ -498,17 +536,13 @@ def main() -> int:
         capture_endpoint=args.capture_endpoint,
         endpoint=args.endpoint,
         slam_endpoint=args.slam_endpoint,
+        ba_endpoint=args.ba_endpoint,
         kf_every=args.kf_every,
         use_gyro=not args.no_gyro,
         worker=args.worker,
         calib_timeout_s=args.calib_timeout,
-        backend_window=args.backend_window,
-        backend_iters=args.backend_iters,
         tight=args.tight,
         no_live_loop_correct=args.no_live_loop_correct,
-        stabilize_velocity=args.stabilize_velocity,
-        depth_icp=args.depth_icp,
-        ba_window=args.ba_window,
         frontend_viz=args.frontend_viz,
         direct=args.direct,
     )
@@ -516,10 +550,9 @@ def main() -> int:
 
 if __name__ == "__main__":
     # Use os._exit (not SystemExit / return-from-main) so a lingering non-daemon
-    # thread -- IPCSubscriber's recv loop, the InProcessEngine worker, a numba
-    # thread pool, etc -- cannot keep the process alive past
-    # `vio: shutdown complete`. Without this the launcher waits its full 10 s
-    # deadline and SIGKILLs us. Mirrors the same pattern in `imu_camera.main`.
+    # thread -- IPCSubscriber's recv loop, a numba thread pool, etc -- cannot keep
+    # the process alive past `vio: shutdown complete`. Without this the launcher
+    # waits its full 10 s deadline and SIGKILLs us. Mirrors `imu_camera.main`.
     import os as _os
     _rc = main()
     LOG.info("vio: main returned, calling os._exit(%d)", int(_rc))

@@ -116,7 +116,8 @@ def run_slam(*,
              vio_endpoint: str = DEFAULT_VIO_ENDPOINT,
              endpoint: str = DEFAULT_SLAM_ENDPOINT,
              worker: bool = False,
-             calib_timeout_s: float = 30.0) -> int:
+             calib_timeout_s: float = 30.0,
+             loop_search_radius_m: float = 0.0) -> int:
     """Run the SLAM process until END / SIGTERM / Ctrl-C."""
     # 1. Block until VIO's retained calib bundle arrives. VIO republishes the
     #    same calib it got from capture AFTER allocating its kf_* rings, so
@@ -150,9 +151,19 @@ def run_slam(*,
     # near-identical redundant keyframes (the main driver of unbounded memory and
     # the O(N^3) PGO cost on long live sessions). The odometry edge is still
     # taken between consecutive INSERTED keyframes, so the chain stays exact.
+    # Spatial gate for loop candidates (live opt-in, --loop-search-radius): only run
+    # the expensive ORB+PnP loop verification against older keyframes whose pose is
+    # within this radius of the incoming one, instead of brute-force against ALL of
+    # them. This caps the otherwise O(N)-growing per-keyframe loop search -- the main
+    # live SLAM CPU hog on the Pi. 0 = exact (check all); a generous radius (>
+    # expected odometry drift) keeps real loops while bounding the search.
+    if loop_search_radius_m > 0.0:
+        LOG.info("slam: loop-search SPATIAL GATE on, radius=%.1f m "
+                 "(O(N) brute-force loop search capped)", loop_search_radius_m)
     slam = SlamWorker(local, bundle.K,
                       SlamConfig(loop_max_odom_rot_deg=30.0,
-                                 kf_min_trans_m=0.1, kf_min_rot_deg=5.0),
+                                 kf_min_trans_m=0.1, kf_min_rot_deg=5.0,
+                                 loop_search_radius_m=loop_search_radius_m),
                       latest_only=True, worker=worker, publish_map=True)
 
     # 4. Open output IPCPubSub server + publisher for the loop corrections.
@@ -237,6 +248,15 @@ def main() -> int:
                     help="run pose-graph solve in a child process (release GIL)")
     ap.add_argument("--calib-timeout", type=float, default=30.0,
                     help="seconds to wait for the calib.bundle on boot")
+    ap.add_argument("--loop-search-radius", type=float, nargs="?", const=5.0,
+                    default=0.0,
+                    help="metres: SPATIAL-GATE the loop-closure search to older "
+                         "keyframes within this radius of the current pose, instead "
+                         "of brute-force against ALL of them. Caps the O(N)-growing "
+                         "per-keyframe cost (the live SLAM CPU hog on the Pi). "
+                         "0 = exact (check all); the bare flag = 5m, or pass a value. "
+                         "A generous radius (> expected odometry drift, e.g. 5) keeps "
+                         "real loops while bounding it.")
     args = ap.parse_args()
 
     return run_slam(
@@ -244,6 +264,7 @@ def main() -> int:
         endpoint=args.endpoint,
         worker=args.worker,
         calib_timeout_s=args.calib_timeout,
+        loop_search_radius_m=args.loop_search_radius,
     )
 
 

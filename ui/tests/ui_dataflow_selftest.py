@@ -79,7 +79,10 @@ def _check(cond: bool, msg: str) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--session", default="sessions/gold/lab_loop_30s")
-    ap.add_argument("--max-frames", type=int, default=20)
+    # 80 (not 20): pose.refined now arrives via the cap->vio->ba->vio-passthrough
+    # chain (the windowed BA is its own ``ba`` process), whose multi-hop startup
+    # needs more keyframes to observe than the old in-vio backend did.
+    ap.add_argument("--max-frames", type=int, default=80)
     ap.add_argument("--kf-every", type=int, default=5)
     ap.add_argument("--no-qt", action="store_true",
                     help="skip the Qt MainWindow construction test")
@@ -90,6 +93,7 @@ def main() -> int:
     pid = os.getpid()
     cap_ep = f"oak.cap.u{pid & 0xFFF:x}"
     vio_ep = f"oak.vio.u{pid & 0xFFF:x}"
+    ba_ep = f"oak.ba.u{pid & 0xFFF:x}"
     slam_ep = f"oak.slm.u{pid & 0xFFF:x}"
 
     py = sys.executable
@@ -99,10 +103,17 @@ def main() -> int:
     print("ui_dataflow_selftest")
     print(f"  session={args.session} max-frames={args.max_frames}")
 
+    # 4-process stack (capture->vio->ba->slam): the windowed BA is its own ``ba``
+    # process now, so pose.refined comes from ``ba`` and VIO re-emits it on its
+    # endpoint via the --ba-endpoint pass-through (the UI contract is unchanged).
     vio_proc = subprocess.Popen(
         [py, "-m", "vio.main",
          "--capture-endpoint", cap_ep, "--endpoint", vio_ep,
-         "--kf-every", str(args.kf_every)],
+         "--ba-endpoint", ba_ep, "--kf-every", str(args.kf_every)],
+        env=base_env, **log_kwargs)
+    ba_proc = subprocess.Popen(
+        [py, "-m", "ba.main",
+         "--vio-endpoint", vio_ep, "--endpoint", ba_ep],
         env=base_env, **log_kwargs)
     slam_proc = subprocess.Popen(
         [py, "-m", "slam.main",
@@ -115,7 +126,7 @@ def main() -> int:
          "--max-frames", str(args.max_frames)],
         env=base_env, **log_kwargs)
 
-    procs = (cap_proc, vio_proc, slam_proc)
+    procs = (cap_proc, vio_proc, ba_proc, slam_proc)
 
     try:
         # Wait for VIO + SLAM to be ready (their retained calib.bundle).
@@ -138,6 +149,7 @@ def main() -> int:
         # its replay ends; vio + slam exit when their END propagates).
         cap_proc.wait(timeout=60.0)
         vio_proc.wait(timeout=60.0)
+        ba_proc.wait(timeout=60.0)
         slam_proc.wait(timeout=60.0)
 
         # Give the source's recv thread a moment to drain any in-flight wire
@@ -167,6 +179,8 @@ def main() -> int:
                f"capture exited 0 (got {cap_proc.returncode})")
         _check(vio_proc.returncode == 0,
                f"vio exited 0 (got {vio_proc.returncode})")
+        _check(ba_proc.returncode == 0,
+               f"ba exited 0 (got {ba_proc.returncode})")
         _check(slam_proc.returncode == 0,
                f"slam exited 0 (got {slam_proc.returncode})")
         _check(pos.shape[0] == n_frames,
@@ -240,7 +254,7 @@ def main() -> int:
         _terminate_all(*procs)
         # Surface failure context if anything went wrong.
         for name, proc in (("capture", cap_proc), ("vio", vio_proc),
-                           ("slam", slam_proc)):
+                           ("ba", ba_proc), ("slam", slam_proc)):
             try:
                 _out, err = proc.communicate(timeout=2.0)
             except Exception:                                      # noqa: BLE001

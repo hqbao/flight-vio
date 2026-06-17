@@ -25,8 +25,11 @@ product-name substring like `lite`, or an exact `deviceId`).
 > ```
 
 The from-scratch VIO/SLAM pipeline (formerly the `ours/` monolith) is now split
-into **five independent projects** + a launcher + a verification harness. The
-DepthAI/Basalt reference (`baseline/`) is kept for ATE comparison.
+into **six independent projects** + a launcher + a verification harness. The
+windowed-BA backend was extracted from `vio` into its own `ba` process (ADR 0001:
+[docs/adr/0001-extract-windowed-ba-into-ba-process.md](docs/adr/0001-extract-windowed-ba-into-ba-process.md));
+the topology is **capture → vio → ba → slam → ui**. The DepthAI/Basalt reference
+(`baseline/`) is kept for ATE comparison.
 
 ```
 flight-vio/
@@ -38,10 +41,19 @@ flight-vio/
                 (cam.sync -> frame.depth). The SGM stereo math is the shared
                 sky.depth.stereo (imu_camera runs the same matcher inline); depth/ a
                 future 5th process graduates from.
-  vio/          KLT frontend + RGB-D PnP (+ gyro fusion) + windowed bundle
-                adjustment. main.py = the VIO process.
-                publishes: pose.odom, pose.vo, pose.refined, keyframe,
-                           frame.tracks, frame.inliers
+  vio/          KLT frontend + RGB-D PnP (+ gyro fusion) + live IMU dead-reckon.
+                The windowed-BA backend moved to ba/; vio now opens a read-only
+                --ba-endpoint client and re-emits ba's pose.refined / ba.window on
+                its own endpoint (pass-through, so the UI reads one endpoint) +
+                feeds ba.state (--tight bias) into propagate_imu. main.py = VIO proc.
+                publishes: pose.odom, pose.vo, keyframe, frame.tracks, frame.inliers,
+                           pose.refined + ba.window (re-emitted from ba)
+  ba/           the windowed-BA backend (loose WindowedBAMap / tight WindowedVIOMap,
+                --tight) as its OWN process; a PURE VIO consumer (subscribes VIO's
+                keyframes, never closes back except the bias feed-forward).
+                main.py = the BA process. 7th vendored comms/ copy.
+                publishes: pose.refined, ba.window (--ba-window, loose-only),
+                           ba.state (--tight bias feed-forward)
   slam/         ORB loop closure + SE(3) pose-graph optimisation; a PURE VIO
                 consumer (subscribes VIO's keyframes, never closes back into VIO).
                 main.py = the SLAM process.
@@ -50,17 +62,19 @@ flight-vio/
                 (VO / VIO / VIO-BA / SLAM-corrected VIO / SLAM) + per-line toggles
                 + Restart, plus Visualize / Calibration windows fed over IPC.
                 main.py = the UI process.
-  launcher/     process lifecycle only: spawns imu_camera + vio + slam (background)
-                and ui (foreground); restart loop + orphan SHM/socket cleanup.
+  launcher/     process lifecycle only: spawns imu_camera + vio + ba + slam
+                (background) and ui (foreground); restart loop + orphan SHM/socket
+                cleanup. --no-ba / --no-slam are spawn gates.
                 ./run.sh (--proc) -> python -m launcher.main
   verification/ in-process byte-parity oracle (vs the frozen baseline_metrics.json)
                 + cross-copy comms parity gate + selftests.
   netbridge/    OPTIONAL cross-machine TCP bridge: runs the flight stack on a Pi
-                (capture + vio + slam) and the UI on a Mac, live over WiFi.
+                (capture + vio + ba + slam) and the UI on a Mac, live over WiFi.
                 forward.py (Pi: local IPC -> TCP) + receive.py (Mac: TCP -> local
                 IPC re-serve) + tcp_transport.py (HMAC-authed AF_INET transport).
-                Vendors comms/ as a 7TH byte-identical copy; the UI is byte-for-byte
-                unchanged. See netbridge/README.md + docs/RPI5_DEPLOY.md §3a.
+                Vendors comms/ as another byte-identical copy (ba/ added a 7th, so
+                netbridge is now the 8th on disk); the UI is byte-for-byte unchanged.
+                See netbridge/README.md + docs/RPI5_DEPLOY.md §3a.
   baseline/     DepthAI library pipeline (BasaltVIO + RTABMapSLAM); ATE baseline.
     frames.py            NED/ENU/quat math
     pose.py              Pose + PoseHistory
@@ -74,12 +88,12 @@ flight-vio/
       pngio.py             PNG codec
     ui/                  baseline-only Qt UI (theme, viewer3d, mainwindow, panels)
     tools/               live viewer, recorder, offline replay, ATE/RPE compare
-  run.sh                 5-project live pipeline launcher
+  run.sh                 6-project live pipeline launcher
   run-baseline.sh        DepthAI/Basalt reference launcher
   requirements.txt
 ```
 
-Each of the five projects **vendors a byte-identical `comms/` package** (the
+Each of the six projects **vendors a byte-identical `comms/` package** (the
 cross-project contract). One project = one self-contained, independently portable
 Python package. See [The `comms/` contract](#the-comms-contract) below.
 
@@ -106,28 +120,31 @@ This gives camera-frame axes (right-handed, OpenCV convention):
 
 ## Quick start
 
-`run.sh` launches the **5-project live pipeline** through the launcher:
+`run.sh` launches the **6-project live pipeline** through the launcher:
 
 ```bash
-./run.sh                                          # live: imu_camera + vio + slam + ui
+./run.sh                                          # live: imu_camera + vio + ba + slam + ui
 ./run.sh --proc                                   # explicit; identical to the default
-./run.sh --no-ui                                  # headless: imu_camera + vio + slam, no GUI
+./run.sh --no-ui                                  # headless: imu_camera + vio + ba + slam, no GUI
+./run.sh --no-ba                                  # lean: skip the BA process (no pose.refined / bias feed)
 ./run.sh --session sessions/gold/lab_loop_30s     # replay a recorded session through the pipeline
 ./run.sh --width 320 --height 200                 # lower capture resolution (see "Resolution presets")
 ```
 
 `run.sh` forwards to `python -m launcher.main --auto-suffix "$@"`. The launcher
-spawns `imu_camera` (capture), then `vio`, then `slam` in the background (each
-subscriber boots after its publisher's endpoint exists), and runs `ui` in the
-foreground so the Qt event loop owns GUI focus and a clean Ctrl-C / window-close
-tears the whole pipeline down. `imu_camera.main` **defaults to replay** and takes
-an explicit `--live` for hardware; the launcher's live branch passes `--live`, the
-replay branch passes `--session`.
+spawns `imu_camera` (capture), then `vio`, then `ba`, then `slam` in the background
+(each subscriber boots after its publisher's endpoint exists — `ba` and `slam` both
+consume vio's `keyframe`), and runs `ui` in the foreground so the Qt event loop owns
+GUI focus and a clean Ctrl-C / window-close tears the whole pipeline down.
+`imu_camera.main` **defaults to replay** and takes an explicit `--live` for hardware;
+the launcher's live branch passes `--live`, the replay branch passes `--session`.
 
-Runtime = **4 processes** (`imu_camera`, `vio`, `slam`, `ui`); depth runs INLINE
-on the capture process's `imu_cam` thread, so the launcher never spawns a depth
-process. `depth/` is an independent SOURCE TREE — promotable to a 5th process via
-its own `depth.main` harness (see [depth/README.md](depth/README.md)).
+Runtime = **5 processes** (`imu_camera`, `vio`, `ba`, `slam`, `ui`); the windowed BA
+runs in its own `ba` process and `vio` re-emits its `pose.refined` on the VIO endpoint
+(pass-through, so the UI reads one endpoint — see ADR 0001). Depth runs INLINE on the
+capture process's `imu_cam` thread, so the launcher never spawns a depth process.
+`depth/` is an independent SOURCE TREE — promotable to its own process via a
+`depth.main` harness (see [depth/README.md](depth/README.md)).
 
 ### Key live recipes
 
@@ -162,8 +179,9 @@ its own `depth.main` harness (see [depth/README.md](depth/README.md)).
   guard; `SKY_VIO_IMU_NJIT=0` to force pure-Python). Loose is the default and the
   recommended Pi flight path; `--tight` is still slower than loose. Details in
   [docs/TIGHT_COUPLED_PLAN.md](docs/TIGHT_COUPLED_PLAN.md) §4(g–j).
-- **`--no-ui` — the Pi / FC path.** Runs capture + vio + slam headless (once, no
-  Restart loop) and starts a read-only pose logger on the VIO endpoint that prints
+- **`--no-ui` — the Pi / FC path.** Runs capture + vio + ba + slam headless (once, no
+  Restart loop; pair with `--no-ba` / `--no-slam` for the leanest stack) and starts a
+  read-only pose logger on the VIO endpoint that prints
   the **raw pose** (position + quaternion in the gravity-aligned WORLD frame; the FC
   derives heading itself), throttled to ~2 Hz. This is the **FC-output hook** — the
   single place a real MAVLink `VISION_POSITION_ESTIMATE` send will go
@@ -219,9 +237,10 @@ What auto-scales with width (for reference — **not** CLI knobs):
 | 160×100  | 32  | 100 | 7px / 1lvl  | 200  | ~0.30 m |
 
 Tips:
-- **`--worker`** runs the heavy windowed-BA / SLAM solves in subprocesses
-  (GIL-free, latest-wins) — worth it at 640+; below that the in-process
-  latest-only SLAM is already responsive. It prints one benign
+- **`--worker`** now applies to the **SLAM** solve only (GIL-free, latest-wins) —
+  worth it at 640+; below that the in-process latest-only SLAM is already responsive.
+  The windowed BA already runs in its own `ba` process (its own GIL escape), so
+  `--worker` is a logged no-op there. It prints one benign
   `resource_tracker: leaked semaphore` line at shutdown (stdlib self-cleans).
 - **Watch `src fps`** in the UI telemetry panel — if it sits well below `--fps`,
   the CPU is not keeping up; drop the resolution or the fps.
@@ -277,7 +296,7 @@ are all at 54×42 and consistent (K is scaled **anisotropically**: `fx,cx ×54/W
 > at this resolution is expected and not a regression.
 
 The **baseline** (DepthAI/Basalt) reference pipeline has its own launcher,
-`run-baseline.sh`, the sibling of `run.sh` (run.sh = the 5-project from-scratch
+`run-baseline.sh`, the sibling of `run.sh` (run.sh = the 6-project from-scratch
 pipeline; run-baseline.sh = the DepthAI/Basalt reference). It opens the OAK-D
 directly, so run it only when the live pipeline is not holding the device.
 Runs on any OAK-D-class device with a stereo pair **and an IMU** — verified on the
@@ -332,29 +351,31 @@ That fixes BasaltVIO AND the from-scratch stack, since both read the device EEPR
 python3.13 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 # Lean FLIGHT install for the Pi -- NO OpenCV (numpy + numba + pyserial +
-# depthai). The whole imu_camera -> vio -> slam runtime runs with cv2
+# depthai). The whole imu_camera -> vio -> ba -> slam runtime runs with cv2
 # uninstalled; proven by `python -m verification.cv2_absent_flight_litmus`:
 .venv/bin/pip install -r requirements-flight.txt
 ```
 
-## The five projects
+## The six projects
 
 Each project is a standalone Python package with its own `main.py` (the process),
 `comms/` (the vendored contract), `modules/` (its pipeline), and its
 process-coupled glue organised **by concern** at the project root — e.g.
-`imu_camera/device/` (the OAK-D driver), `vio/engine/` and `slam/engine/` (the
-swappable solve runners), `<proj>/resolution_build.py` + `<proj>/warmup.py` (the
-math-coupled config builders + JIT warmup), and `ui/calib/` (the UI calib math).
+`imu_camera/device/` (the OAK-D driver), `ba/engine/` and `slam/engine/` (the
+swappable solve runners — `vio/engine/` was removed when the BA backend left for
+`ba/`), `<proj>/resolution_build.py` + `<proj>/warmup.py` (the math-coupled config
+builders + JIT warmup), and `ui/calib/` (the UI calib math).
 The shared algorithm code those processes call lives once in the top-level
 [`sky/`](#the-sky-shared-library) library (`sky.math` primitives + `sky.depth` SGM
 stereo + `sky.front` / `sky.backend` / `sky.vio` / `sky.slam` / `sky.imu` /
 `sky.sensors` / `sky.calib`). The data flow between processes is fixed by the
-topic strings on the `comms` bus:
+topic strings on the `comms` bus (`vio` produces `keyframe`, consumed by BOTH `ba`
+and `slam`; `ba`'s `pose.refined` is re-emitted on the VIO endpoint, see ADR 0001):
 
 ```
-imu_camera.main ──(oak.capture)──▶ vio.main ──(oak.vio)──▶ slam.main ──(oak.slam)──▶ ui.main
-   capture proc        IPC          VIO proc      IPC        SLAM proc      IPC        UI proc
-                                                               (depth runs INLINE inside imu_camera)
+imu_camera.main ─(oak.capture)─▶ vio.main ─(oak.vio)─┬─▶ ba.main   ─(oak.ba)─┐
+   capture proc       IPC         VIO proc     IPC    └─▶ slam.main ─(oak.slam)┴─▶ ui.main
+                                  (depth runs INLINE inside imu_camera)   ba.pose.refined re-emitted on oak.vio
 ```
 
 ```mermaid
@@ -365,7 +386,10 @@ flowchart LR
         SYNC --> DEPTH["depth steps (SGM, INLINE)"]
     end
     subgraph vio["vio  ·  endpoint oak.vio"]
-        ODOM[KLT + RGB-D PnP + gyro fuse] --> BA[windowed BA]
+        ODOM[KLT + RGB-D PnP + gyro fuse + live IMU dead-reckon]
+    end
+    subgraph ba["ba  ·  endpoint oak.ba"]
+        BACK[windowed BA: loose / tight --tight]
     end
     subgraph slam["slam  ·  endpoint oak.slam"]
         LOOP[ORB loop closure] --> PGO[SE3 pose graph]
@@ -375,8 +399,11 @@ flowchart LR
     end
 
     cap -- "imucam.sample · frame.depth · calib.bundle" --> vio
+    vio -- "keyframe · calib.bundle" --> ba
     vio -- "keyframe · calib.bundle" --> slam
-    vio -- "pose.odom · pose.vo · pose.refined · calib.bundle" --> ui
+    ba == "pose.refined · ba.window (pass-through) · ba.state (--tight bias)" ==> vio
+    slam == "loop.correction (LIVE + --tight only)" ==> vio
+    vio -- "pose.odom · pose.vo · pose.refined · ba.window · calib.bundle" --> ui
     slam -- "slam.map · calib.bundle" --> ui
     cap -. "imu.raw · imucam.sample · frame.depth (on-demand: Visualize/Calibration)" .-> ui
     vio -. "frame.tracks · frame.inliers (on-demand: keypoint tracker)" .-> ui
@@ -385,10 +412,11 @@ flowchart LR
 | Project | main.py owns | Subscribes (IPC) | Publishes (IPC) |
 |---|---|---|---|
 | `imu_camera` | OAK-D (or session replay), cam+IMU sync, IMU calibration, **inline SGM depth** | — | `cam.sync`, `imu.raw`, `imucam.sample`, `frame.depth`, `calib.bundle` |
-| `vio` | RGB-D visual odometry (+ gyro prior) + windowed BA | `imucam.sample`, `frame.depth`, `calib.bundle` | `pose.odom`, `pose.vo` (live-only), `pose.refined`, `keyframe`, `frame.tracks`, `frame.inliers` |
+| `vio` | RGB-D visual odometry (+ gyro prior) + live IMU dead-reckon (NO backend) | `imucam.sample`, `frame.depth`, `calib.bundle` (capture); `loop.correction` (slam); `pose.refined`/`ba.window`/`ba.state` (ba, `--ba-endpoint`) | `pose.odom`, `pose.vo` (live-only), `keyframe`, `frame.tracks`, `frame.inliers`, + re-emitted `pose.refined`/`ba.window` |
+| `ba` | windowed BA — loose `WindowedBAMap` / tight `WindowedVIOMap` (`--tight`) | `keyframe`, `calib.bundle` (from VIO) | `pose.refined`, `ba.window` (`--ba-window`, loose-only), `ba.state` (`--tight` bias) |
 | `slam` | ORB loop closure + SE(3) pose-graph (the SLAM map) | `keyframe`, `calib.bundle` (from VIO) | `loop.correction`, `slam.map` (live-only) |
-| `ui` | Qt `MainWindow`, one 5-line `Viewer3D`, Visualize/Calibration windows | `pose.odom`/`pose.vo`/`pose.refined`/`calib.bundle` (vio); `slam.map`/`calib.bundle` (slam); on-demand `imu.raw`/`imucam.sample`/`frame.depth` (capture) + `frame.tracks`/`frame.inliers`/`keyframe` (vio) + `slam.map` (slam, SLAM Map window) | — (sink) |
-| `launcher` | process lifecycle (spawn / restart loop / orphan cleanup) | — | — |
+| `ui` | Qt `MainWindow`, one 5-line `Viewer3D`, Visualize/Calibration windows | `pose.odom`/`pose.vo`/`pose.refined`/`ba.window`/`calib.bundle` (vio); `slam.map`/`calib.bundle` (slam); on-demand `imu.raw`/`imucam.sample`/`frame.depth` (capture) + `frame.tracks`/`frame.inliers`/`keyframe` (vio) | — (sink) |
+| `launcher` | process lifecycle (spawn / restart loop / orphan cleanup; `--no-ba`/`--no-slam` spawn gates) | — | — |
 | `depth` | standalone SGM depth-as-a-process harness | `cam.sync`, `calib.bundle` (capture) | `frame.depth` |
 
 The architecture, endpoints, invariants, and byte-parity story are in
@@ -544,9 +572,9 @@ graph grows. The heavy BA/SLAM solves run **in-process by default**; `--worker`
 
 The **Controls toolbar** carries the five per-line toggle buttons (all checkable,
 default visible), then **Clear Trail** (clears the live trajectory trail) and
-**Restart**. The IPC bus is one-way (server→client), so the UI can't reset vio/slam
-in place; Restart quits with `RESTART_EXIT_CODE = 42` and the launcher's restart
-loop cleans up and respawns `imu_camera + vio + slam + ui` from scratch.
+**Restart**. The IPC bus is one-way (server→client), so the UI can't reset
+vio/ba/slam in place; Restart quits with `RESTART_EXIT_CODE = 42` and the launcher's
+restart loop cleans up and respawns `imu_camera + vio + ba + slam + ui` from scratch.
 
 The menu bar renders **in-window on every platform** (`setNativeMenuBar(False)`):
 
@@ -875,15 +903,18 @@ clobber each other, and `imu_camera/device/camera_calib_store.py`
       the last flight-path cv2 calls are now pure-NumPy and bit-exact vs OpenCV —
       `tof_downsample` area-resize (`INTER_AREA`), `sky.front.direct` Sobel +
       pyrDown, `sky.depth.stereo` median (numba fallback for `medianBlur`). The
-      full `--vl53l9cx --direct` replay (imu_camera → vio → slam) runs at rc=0
+      full `--vl53l9cx --direct` replay (imu_camera → vio → ba → slam) runs at rc=0
       with cv2 unimportable; proven by `verification/cv2_absent_flight_litmus.py`
 - [x] Logging + offline replay (`baseline/tools/record_session.py` +
       `baseline/tools/viz_session.py`)
 - [x] Gold regression suite (see `docs/GOLD_SESSIONS.md`)
-- [x] **5-project split**: `imu_camera` / `depth` / `vio` / `slam` / `ui` + launcher,
-      each vendoring a byte-identical `comms/` (codec replaces pickle); 4-process
-      live runtime (depth inline); UI fault never kills capture; VIO and SLAM each
-      own their own map; `./run.sh`, see [docs/PROC4_ARCHITECTURE.md](docs/PROC4_ARCHITECTURE.md)
+- [x] **6-project split**: `imu_camera` / `depth` / `vio` / `ba` / `slam` / `ui` +
+      launcher, each vendoring a byte-identical `comms/` (codec replaces pickle);
+      5-process live runtime (capture → vio → ba → slam → ui; depth inline); the
+      windowed BA runs in its own `ba` process (ADR 0001), `vio` re-emits its
+      `pose.refined` on the VIO endpoint; UI fault never kills capture; `ba` and
+      `slam` each own their own map; `./run.sh`, see
+      [docs/PROC4_ARCHITECTURE.md](docs/PROC4_ARCHITECTURE.md)
 - [x] End-to-end byte-parity vs the pre-split baseline (gap = 0), verified live on
       a real OAK-D; harness in `verification/`
 - [~] Link to flight-controller — the `--no-ui` headless path logs the raw pose

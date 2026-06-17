@@ -1,14 +1,17 @@
-"""4-process launcher: boot imu_camera + vio + slam in background, run ui foreground.
+"""Multi-process launcher: boot imu_camera + vio + ba + slam in background, run ui
+foreground.
 
 The launcher's only job is process lifecycle management:
 
 1. Spawn ``imu_camera`` (capture) in background (it owns the OAK-D, or replays a
    session).
-2. Spawn ``vio`` and ``slam`` in background (they connect to capture's retained
-   ``calib.bundle`` over IPC, then start their own IPC endpoints).
+2. Spawn ``vio``, ``ba`` and ``slam`` in background (they connect to capture's /
+   vio's retained ``calib.bundle`` over IPC, then start their own IPC endpoints).
+   ``ba`` (the windowed-BA backend) consumes vio's keyframe + publishes
+   ``pose.refined``, which vio re-emits on its endpoint (UI keeps one endpoint).
 3. Run the ``ui`` process in the FOREGROUND so the Qt event loop has the GUI
    focus and Ctrl-C / window-close cleanly tears everything down.
-4. On UI exit (clean or crash), send SIGTERM to capture / vio / slam, wait for
+4. On UI exit (clean or crash), send SIGTERM to capture / vio / ba / slam, wait for
    them to drain (each has a SIGTERM handler that runs the same finally block
    the replay-end path uses), then SIGKILL stragglers.
 
@@ -71,6 +74,7 @@ _RING_NAMES_BY_ROLE = {
     "cap": ("gray_left", "gray_right", "depth_m"),
     "vio": ("kf_gray", "kf_depth"),
     "slm": (),
+    "ba": (),
 }
 _RING_SLOTS = 64
 
@@ -243,19 +247,28 @@ def resolve_frontend_viz(args) -> bool:
 
 
 def build_vio_args(args, cap_ep: str, vio_ep: str, slam_ep: str,
-                   use_worker: bool) -> list[str]:
+                   use_worker: bool, ba_ep: str | None = None,
+                   ba_spawned: bool = False) -> list[str]:
     """Build the ``vio.main`` argv from the parsed launcher ``args``.
 
     Pure (no I/O, no spawning) so the flag-forwarding contract is unit-testable
     without launching subprocesses -- the same discipline as ``build_capture_args``.
 
-    ``--tight`` selects the tight-coupled backend; only on that path do we wire the
-    ``--slam-endpoint`` (closed-loop SLAM->VIO feedback) and forward
-    ``--stabilize-velocity`` (Phase-4 velocity regularisation -- CV prior + gated
-    ZUPT). Both are OPT-IN and tight-only: ``--stabilize-velocity`` is appended ONLY
-    when ``args.tight AND args.stabilize_velocity``, so the loose path and the
-    tight-without-flag path are unchanged (the offline oracle stays byte-identical).
-    A ``--stabilize-velocity`` without ``--tight`` is dropped here (the caller warns).
+    ``--tight`` selects the tight-coupled VIO path; only on that path do we wire the
+    ``--slam-endpoint`` (closed-loop SLAM->VIO feedback). The windowed-BA backend
+    knobs (``--stabilize-velocity`` / ``--depth-icp`` / ``--backend-window`` /
+    ``--backend-iters`` / ``--ba-window``) are NO LONGER forwarded here -- the backend
+    moved to the ``ba`` process, so :func:`build_ba_args` routes them to ``ba.main``
+    instead (they were inert on VIO once the backend left). VIO keeps only the
+    front-end + live-dead-reckon flags.
+
+    ``ba_ep`` / ``ba_spawned``: when the launcher spawns the ``ba`` process (NOT
+    ``--no-ba``), pass ``--ba-endpoint ba_ep`` so VIO opens the read-only backend
+    pass-through client (pose.refined + ba.window re-emit + ba.state bias feed). Under
+    ``--no-ba`` no ``ba`` is spawned, so ``ba_spawned`` is False and ``--ba-endpoint``
+    is omitted -- VIO runs with no refined pose + inert bias feed. The windowed-BA
+    backend now lives in the ``ba`` process, so ``--no-ba`` is a launcher SPAWN gate
+    (mirror ``--no-slam``), NOT a vio flag any more.
     """
     vio_args: list[str] = ["--capture-endpoint", cap_ep, "--endpoint", vio_ep,
                            "--kf-every", str(args.kf_every)]
@@ -263,34 +276,26 @@ def build_vio_args(args, cap_ep: str, vio_ep: str, slam_ep: str,
         vio_args += ["--no-gyro"]
     if use_worker:
         vio_args += ["--worker"]
+    # BACKEND PASS-THROUGH: VIO subscribes the ba endpoint's pose.refined + ba.window
+    # (both re-emitted on the VIO endpoint) + ba.state (the --tight bias feed). Only
+    # when the launcher actually spawned ba (not --no-ba); else omit it (no refined
+    # pose, inert feed).
+    if ba_spawned and ba_ep:
+        vio_args += ["--ba-endpoint", ba_ep]
     if args.tight:
         vio_args += ["--tight"]
         # CLOSED-LOOP feedback (slam -> vio): give VIO the slam endpoint so its
         # --tight live pose subscribes loop.correction and the SLAM pose-graph
         # correction is fed back into the live pose (drift bounded on revisits).
-        # Only on the --tight path; the loose pipeline never wires it.
-        vio_args += ["--slam-endpoint", slam_ep]
+        # Only on the --tight path; the loose pipeline never wires it. And NOT under
+        # --no-slam (no SLAM process is spawned -> nothing to subscribe; loop_correct
+        # stays off in VIO).
+        if not getattr(args, "no_slam", False):
+            vio_args += ["--slam-endpoint", slam_ep]
         # Opt-out: keep the slam endpoint wired (map still built) but disable the
         # SLAM->live-pose loop pull (diagnostic / Lite escape hatch).
-        if args.no_live_loop_correct:
+        if getattr(args, "no_live_loop_correct", False):
             vio_args += ["--no-live-loop-correct"]
-        # Phase-4 velocity regularisation: tight-only, opt-in. Forwarded ONLY when
-        # BOTH --tight AND --stabilize-velocity are set, so the default end-to-end
-        # path (and the oracle) never see it.
-        if args.stabilize_velocity:
-            vio_args += ["--stabilize-velocity"]
-        # Phase-4 dense-ICP relative-pose factor: tight-only, opt-in. Same
-        # contract -- forwarded ONLY with BOTH --tight AND --depth-icp set.
-        if args.depth_icp:
-            vio_args += ["--depth-icp"]
-    # BA-window visualiser snapshot stream: opt-in, LOOSE-only. Unlike the
-    # tight-only flags above, this is forwarded on BOTH the live AND replay paths
-    # (the BA Window scrubs a replay segment too) -- it is oracle-safe because the
-    # offline byte-parity harness (oracle_replay_selftest) never passes --ba-window,
-    # and vio.main ignores it under --tight. The capture step runs the SAME frozen
-    # solve, so even a live --ba-window run keeps pose.refined byte-identical.
-    if args.ba_window:
-        vio_args += ["--ba-window"]
     # Dense DIRECT RGB-D VO odometry mode: opt-in, default OFF. Forwarded ONLY when
     # --direct is set, on BOTH live AND replay (direct is a real odometry mode, not
     # a viz, and is exercised on replay too -- the target recipe is the replay
@@ -309,6 +314,55 @@ def build_vio_args(args, cap_ep: str, vio_ep: str, slam_ep: str,
     return vio_args
 
 
+def build_ba_args(args, vio_ep: str, ba_ep: str) -> list[str]:
+    """Build the ``ba.main`` argv from the parsed launcher ``args`` (pure).
+
+    The ``ba`` process is a pure CONSUMER of VIO's keyframe output: it subscribes the
+    VIO endpoint (``--vio-endpoint``), runs the windowed BA, and publishes
+    ``pose.refined`` (+ ``ba.state`` under ``--tight``, + ``ba.window`` under
+    ``--ba-window``) on its own endpoint (``--endpoint``). ``--tight`` selects the
+    tight-coupled backend, mirroring ``vio.main --tight`` -- forwarded ONLY when set.
+
+    The windowed-BA backend knobs route HERE (the backend lives in ``ba`` now), with
+    the SAME gating the pre-split in-VIO forward used:
+
+    * ``--stabilize-velocity`` / ``--depth-icp`` -- the Phase-4 tight knobs, appended
+      ONLY when ``args.tight AND <flag>`` (the loose backend has no velocity / window
+      factor to regularise, so they are dropped off the tight path -- the caller warns).
+    * ``--ba-window`` -- the LOOSE-only visualiser. ``args.ba_window`` is already the
+      RESOLVED effective state by the time we run (``main`` sets it via
+      :func:`resolve_ba_window`, which is False under ``--tight`` / ``--no-ui`` /
+      ``--no-ba-window``), so we forward it verbatim.
+    * ``--backend-window`` / ``--backend-iters`` -- the loose solve size; forwarded
+      only when non-default so the common argv stays minimal.
+
+    ``--worker`` is deliberately NOT forwarded: it is a NO-OP for ``ba`` (the solve
+    already runs in-process in ``ba``'s own process; the in-VIO ``--worker`` existed
+    only to free the camera read loop's GIL, which ``ba`` does not share).
+    """
+    ba_args: list[str] = ["--vio-endpoint", vio_ep, "--endpoint", ba_ep]
+    if args.tight:
+        ba_args += ["--tight"]
+        # Phase-4 tight knobs: tight-only, opt-in (same contract as the old in-VIO
+        # forward). The loose backend has no velocity / window factor to regularise.
+        if getattr(args, "stabilize_velocity", False):
+            ba_args += ["--stabilize-velocity"]
+        if getattr(args, "depth_icp", False):
+            ba_args += ["--depth-icp"]
+    # BA-window visualiser: LOOSE-only, opt-in. args.ba_window is the resolved
+    # effective state (resolve_ba_window already returns False under --tight), so this
+    # is never both --tight and --ba-window.
+    if getattr(args, "ba_window", False):
+        ba_args += ["--ba-window"]
+    # Loose windowed-BA solve size: forward only when the operator overrode the
+    # default (keeps the argv minimal; ba.main defaults match these).
+    if getattr(args, "backend_window", 6) != 6:
+        ba_args += ["--backend-window", str(args.backend_window)]
+    if getattr(args, "backend_iters", 5) != 5:
+        ba_args += ["--backend-iters", str(args.backend_iters)]
+    return ba_args
+
+
 # --------------------------------------------------------------------------- #
 def _numba_thread_caps(cap: bool) -> dict[str, int]:
     """Per-role numba thread budget when ``--cap-numba-threads`` is set.
@@ -320,14 +374,16 @@ def _numba_thread_caps(cap: bool) -> dict[str, int]:
     ncores cores: oversubscription thrash, which on the Pi5 reads as "cores look
     cool" (idle between bursts, thrashing during them) while wall-clock is set by
     serial glue. Capping each hot process to ~half the cores keeps two
-    overlapping bursts at <= ncores total. SLAM is off the per-frame path, so it
-    gets the remainder. Returns {} when capping is off (full cores, dev hosts).
+    overlapping bursts at <= ncores total. SLAM + BA are off the per-frame path
+    (they run on the keyframe cadence), so they get the remainder. Returns {} when
+    capping is off (full cores, dev hosts).
     """
     if not cap:
         return {}
     n = os.cpu_count() or 4
     half = max(1, n // 2)
-    return {"imu_camera": half, "vio": half, "slam": max(1, n // 4)}
+    rest = max(1, n // 4)
+    return {"imu_camera": half, "vio": half, "slam": rest, "ba": rest}
 
 
 def _role_env(base_env: dict[str, str], threads: int | None) -> dict[str, str]:
@@ -556,6 +612,27 @@ def main() -> int:
                          "(joint visual + IMU window optimiser) instead of the "
                          "default loose windowed-BA backend. Forwarded to "
                          "vio.main --tight; loose stays the default.")
+    ap.add_argument("--no-ba", action="store_true",
+                    help="LEAN flight: don't spawn the BA process (the windowed-BA "
+                         "backend) -- no pose.refined (the VIO-BA line) + no "
+                         "backend->live bias feed-forward. pose.odom (live VIO) is "
+                         "unaffected; VIO is also not given --ba-endpoint. A launcher "
+                         "SPAWN gate (mirror --no-slam). Frees a process on the Pi.")
+    ap.add_argument("--no-slam", action="store_true",
+                    help="LEAN flight: don't spawn the SLAM process -- no map, no "
+                         "loop-closure (so no loop-correction feedback into "
+                         "pose.odom; bounded-on-revisit drift is forgone). For a "
+                         "one-way flight that never revisits. Pairs with --no-ba "
+                         "for the lightest stack.")
+    ap.add_argument("--loop-search-radius", type=float, nargs="?", const=5.0,
+                    default=0.0,
+                    help="metres: make SLAM LIGHTER while KEEPING loop-closure -- "
+                         "spatial-gate the loop search to keyframes within this "
+                         "radius of the current pose instead of brute-force against "
+                         "ALL of them (the O(N)-growing per-keyframe cost that is "
+                         "the live SLAM CPU hog on the Pi). 0 = exact (default); the "
+                         "bare flag = 5m, or pass a value (e.g. --loop-search-radius "
+                         "3). Forwarded to slam.main. Alternative to --no-slam.")
     ap.add_argument("--direct", action="store_true",
                     help="run the VIO process in DENSE DIRECT RGB-D VO odometry "
                          "mode: replace the sparse corner/KLT->PnP front-end with "
@@ -568,24 +645,32 @@ def main() -> int:
                     help="tight only: DISABLE feeding the SLAM loop-correction into "
                          "the live pose (the SLAM map is still built). Diagnostic / "
                          "escape hatch; forwarded to vio.main only with --tight.")
+    ap.add_argument("--backend-window", type=int, default=6,
+                    help="LOOSE windowed-BA sliding-window size (keyframes). "
+                         "Forwarded to ba.main (the windowed-BA backend lives in the "
+                         "ba process); inert on the tight path. Default 6.")
+    ap.add_argument("--backend-iters", type=int, default=5,
+                    help="LOOSE windowed-BA max Gauss-Newton iterations per solve. "
+                         "Forwarded to ba.main; inert on the tight path. Default 5.")
     ap.add_argument("--stabilize-velocity", action="store_true",
                     help="tight only: enable Phase-4 velocity regularisation "
                          "(CV prior + gated ZUPT) to curb 54x42/shake velocity "
-                         "divergence. Forwarded to vio.main --stabilize-velocity "
+                         "divergence. Forwarded to ba.main --stabilize-velocity "
                          "only with --tight; ignored (warned) on the loose path.")
     ap.add_argument("--depth-icp", action="store_true",
                     help="tight only: enable the Phase-4 dense-ICP relative-pose "
                          "factor (anchors inter-keyframe translation at 54x42). "
-                         "Forwarded to vio.main --depth-icp only with --tight; "
+                         "Forwarded to ba.main --depth-icp only with --tight; "
                          "ignored (warned) on the loose path.")
     ap.add_argument("--ba-window", action="store_true",
-                    help="force the BA Window visualiser ON (VIO publishes ba.window "
+                    help="force the BA Window visualiser ON (ba publishes ba.window "
                          "solve snapshots: window keyframe poses + 3D landmarks + "
-                         "observation rays + reprojection error; UI exposes "
-                         "Visualize > BA Window). It is a UI tool, so it is ALREADY ON "
-                         "by default whenever the UI runs on the loose path -- this "
-                         "flag only forces it on headless (e.g. for the PNG smoke). "
-                         "Loose-only; ignored under --tight; oracle byte-identical.")
+                         "observation rays + reprojection error, which vio re-emits on "
+                         "the VIO endpoint; UI exposes Visualize > BA Window). It is a "
+                         "UI tool, so it is ALREADY ON by default whenever the UI runs "
+                         "on the loose path -- this flag only forces it on headless "
+                         "(e.g. for the PNG smoke). Loose-only; ignored under --tight; "
+                         "oracle byte-identical.")
     ap.add_argument("--no-ba-window", action="store_true",
                     help="force the BA Window capture OFF even when the UI is shown "
                          "(skip its small per-keyframe snapshot/publish cost).")
@@ -636,11 +721,14 @@ def main() -> int:
     cap_ep = f"oak.cap{suffix}" if suffix else "oak.capture"
     vio_ep = f"oak.vio{suffix}" if suffix else "oak.vio"
     slam_ep = f"oak.slm{suffix}" if suffix else "oak.slam"
-    LOG.info("launcher: endpoints cap=%r vio=%r slam=%r",
-             cap_ep, vio_ep, slam_ep)
+    # ``ba`` owns no rings (it ATTACHES to vio's kf_* rings), so its endpoint name
+    # has no shm-name length constraint -- one form for both suffixed + default.
+    ba_ep = f"oak.ba{suffix}"
+    LOG.info("launcher: endpoints cap=%r vio=%r ba=%r slam=%r",
+             cap_ep, vio_ep, ba_ep, slam_ep)
     # Persist our endpoints so the NEXT launcher's `_cleanup_orphans` can
     # recover them even if our sock files are deleted between runs.
-    _record_endpoints([cap_ep, vio_ep, slam_ep])
+    _record_endpoints([cap_ep, vio_ep, ba_ep, slam_ep])
 
     py = sys.executable
     env = dict(os.environ)
@@ -669,22 +757,34 @@ def main() -> int:
     # the contract is unit-testable without spawning subprocesses.
     capture_args = build_capture_args(args, cap_ep)
 
-    # VIO argv (flag forwarding, incl. --tight / --slam-endpoint /
-    # --stabilize-velocity) lives in build_vio_args so the contract is
-    # unit-testable without spawning subprocesses.
+    # VIO argv (front-end + live dead-reckon flags: --tight / --slam-endpoint /
+    # --direct / --frontend-viz) lives in build_vio_args. The windowed-BA backend
+    # knobs route to ba.main via build_ba_args (the backend moved to the ba process).
     if args.stabilize_velocity and not args.tight:
         # --stabilize-velocity only affects the tight backend's velocity state;
-        # the loose path has no velocity to regularise, so warn + drop it (the
-        # builder already gates it behind --tight, this just tells the operator).
+        # the loose path has no velocity to regularise, so warn + drop it
+        # (build_ba_args gates it behind --tight; this just tells the operator).
         LOG.warning("launcher: --stabilize-velocity has no effect without "
                     "--tight (loose path has no velocity state); ignoring it")
     if args.depth_icp and not args.tight:
         # --depth-icp only affects the tight backend's window solve; the loose
-        # path has no relative-pose factor, so warn + drop it (the builder gates
-        # it behind --tight, this just tells the operator).
+        # path has no relative-pose factor, so warn + drop it (build_ba_args gates
+        # it behind --tight; this just tells the operator).
         LOG.warning("launcher: --depth-icp has no effect without --tight "
                     "(loose path has no window factor graph); ignoring it")
-    vio_args = build_vio_args(args, cap_ep, vio_ep, slam_ep, use_worker)
+    # --no-ba is a launcher SPAWN gate (mirror --no-slam): the windowed-BA backend
+    # now lives in the ``ba`` process, so --no-ba simply skips spawning it (no
+    # pose.refined / no backend->live bias feed-forward; pose.odom is unaffected).
+    spawn_ba = not getattr(args, "no_ba", False)
+    # VIO gets --ba-endpoint only when ba is actually spawned (else no refined pose,
+    # inert bias feed -- exactly the old --no-ba behaviour, now launcher-gated).
+    vio_args = build_vio_args(args, cap_ep, vio_ep, slam_ep, use_worker,
+                              ba_ep=ba_ep, ba_spawned=spawn_ba)
+
+    # BA argv (a pure consumer of VIO's keyframe output) lives in build_ba_args so
+    # the contract is unit-testable without spawning. --worker is NOT forwarded (it
+    # is a no-op for ba -- the solve already runs in-process in ba's own process).
+    ba_args = build_ba_args(args, vio_ep, ba_ep)
 
     # NB: the new `slam.main` is a PURE consumer of VIO's output and -- unlike the
     # pre-split `ours.proc.slam` -- intentionally DROPPED `--capture-endpoint`
@@ -695,6 +795,10 @@ def main() -> int:
                  "--endpoint", slam_ep]
     if use_worker:
         slam_args += ["--worker"]
+    # Spatial-gate the loop search (caps the O(N) per-keyframe SLAM cost -- the live
+    # CPU hog on the Pi). 0 = exact (default); forwarded to slam.main.
+    if getattr(args, "loop_search_radius", 0.0) and args.loop_search_radius > 0.0:
+        slam_args += ["--loop-search-radius", str(args.loop_search_radius)]
 
     # The UI's calib + visualise windows subscribe capture directly (IMU /
     # imucam.sample / frame.depth), so it must know the suffixed live endpoint
@@ -702,9 +806,10 @@ def main() -> int:
     ui_args = ["--capture-endpoint", cap_ep,
                "--vio-endpoint", vio_ep, "--slam-endpoint", slam_ep]
     # BA Window: tell the UI to expose Visualize > BA Window (live follow-latest)
-    # only when the operator asked for it (and not under --tight, where VIO never
-    # publishes ba.window). The action is harmless if absent, but gating it keeps
-    # the menu honest about what the running pipeline actually emits.
+    # only when the operator asked for it (and not under --tight, where ba never
+    # publishes ba.window). args.ba_window is the RESOLVED effective state (False
+    # under --tight already), so the menu is honest about what the pipeline emits:
+    # ba publishes ba.window and vio re-emits it on the VIO endpoint the UI reads.
     if args.ba_window and not args.tight:
         ui_args += ["--ba-window"]
     # Frontend Internals: tell the UI to expose Visualize > Frontend Internals
@@ -716,6 +821,10 @@ def main() -> int:
     # even when hidden). Default OFF for a lighter UI; needs SLAM running to show.
     if args.corrected_vio:
         ui_args += ["--corrected-vio"]
+    # --no-slam: tell the UI the SLAM endpoint won't open, so it doesn't block
+    # waiting for its calib.bundle (would time out + crash the UI).
+    if args.no_slam:
+        ui_args += ["--no-slam"]
 
     # ---- SIGTERM handler (registered ONCE) -------------------------------
     # `kill <launcher_pid>` from outside must clean up the whole tree, not just
@@ -734,6 +843,11 @@ def main() -> int:
     # process-group signal anyway) and `os._exit` immediately; children either
     # finish their own shutdown or get reaped by init when launcher dies.
     procs: list[subprocess.Popen] = []
+    # Named handles for the procs the --no-ui drain path needs by ROLE (not by a
+    # fragile procs[] index -- ba spawns BETWEEN vio and slam, so positional
+    # indexing of slam would shift). _spawn_pipeline clears + repopulates this each
+    # generation alongside `procs`.
+    named: dict[str, subprocess.Popen] = {}
 
     def _on_sigterm(_signo, _frame):
         LOG.info("launcher: SIGTERM -> forwarding to children + exiting")
@@ -747,32 +861,53 @@ def main() -> int:
 
     # ---- Boot order ------------------------------------------------------
     # capture FIRST so the retained `calib.bundle` is published as soon as it
-    # builds the frontend. vio + slam connect with retried `IpcClientBus.start`
-    # so booting them after capture is fine; this just minimises the connect
-    # retry noise in the log.
+    # builds the frontend. vio / ba / slam connect with retried `IpcClientBus.start`
+    # so booting them after capture is fine; this just minimises the connect retry
+    # noise in the log. Order: capture -> vio -> ba -> slam (ba + slam both consume
+    # vio's keyframe; vio's BA pass-through client + slam's loop-correction client
+    # retry until ba / vio are up, so the exact order is cosmetic).
     def _spawn_pipeline() -> None:
-        """Clear `procs` in place and spawn a fresh capture+vio+slam generation.
+        """Clear `procs` in place and spawn a fresh capture+vio+ba+slam generation.
 
-        Mutates the SHARED `procs` holder (clear + append) so the once-registered
-        SIGTERM handler always sees the live generation. Best-effort SHM cleanup
-        runs FIRST so the prior generation's segments are reclaimed before the
-        same-named rings are re-created (macOS POSIX shm persists past SIGKILL;
-        a stale namespace eventually trips capture's shm_open() with EMFILE).
+        Mutates the SHARED `procs` holder (clear + append) + the `named` role map so
+        the once-registered SIGTERM handler always sees the live generation. Best-
+        effort SHM cleanup runs FIRST so the prior generation's segments are reclaimed
+        before the same-named rings are re-created (macOS POSIX shm persists past
+        SIGKILL; a stale namespace eventually trips capture's shm_open() with EMFILE).
         """
         _cleanup_orphans()
         procs.clear()
+        named.clear()
         cap_proc = _spawn(py, "imu_camera.main", capture_args,
                           env=_role_env(env, caps.get("imu_camera")),
                           name="imu_camera")
         procs.append(cap_proc)
-        # tiny sleep so capture's IPC server is listening before vio / slam
+        named["capture"] = cap_proc
+        # tiny sleep so capture's IPC server is listening before vio / ba / slam
         # try their first connect (vio retries so this is cosmetic, but it
         # gives a clean first-attempt success in the log).
         time.sleep(0.2)
-        procs.append(_spawn(py, "vio.main", vio_args,
-                            env=_role_env(env, caps.get("vio")), name="vio"))
-        procs.append(_spawn(py, "slam.main", slam_args,
-                            env=_role_env(env, caps.get("slam")), name="slam"))
+        vio_proc = _spawn(py, "vio.main", vio_args,
+                          env=_role_env(env, caps.get("vio")), name="vio")
+        procs.append(vio_proc)
+        named["vio"] = vio_proc
+        # --no-ba (lean flight): skip the BA process entirely (no pose.refined, no
+        # backend->live bias feed-forward). pose.odom (live VIO) runs unaffected;
+        # build_vio_args also omits --ba-endpoint so VIO never wires the pass-through.
+        # Spawn ba AFTER vio (it subscribes vio's keyframe) + BEFORE slam.
+        if spawn_ba:
+            ba_proc = _spawn(py, "ba.main", ba_args,
+                             env=_role_env(env, caps.get("ba")), name="ba")
+            procs.append(ba_proc)
+            named["ba"] = ba_proc
+        # --no-slam (lean flight): skip the SLAM process entirely (no map, no
+        # loop-closure). pose.odom (live VIO) runs unaffected; build_vio_args also
+        # omits --slam-endpoint so VIO never wires the loop-correction feedback.
+        if not args.no_slam:
+            slam_proc = _spawn(py, "slam.main", slam_args,
+                               env=_role_env(env, caps.get("slam")), name="slam")
+            procs.append(slam_proc)
+            named["slam"] = slam_proc
         # Cross-machine bridge: spawn netbridge.forward LAST (it connects to the
         # capture/vio/slam IPC servers, which retry, so order is cosmetic) when
         # --forward is set. It joins `procs`, so _terminate tears it down with the
@@ -790,8 +925,13 @@ def main() -> int:
         pose_client = None
         try:
             _spawn_pipeline()
-            cap_proc = procs[0]
-            vio_proc, slam_proc = procs[1], procs[2]
+            # Resolve the procs the drain needs by ROLE, not a fragile procs[] index
+            # (ba spawns between vio and slam). capture + vio always exist; ba / slam
+            # are absent under --no-ba / --no-slam (named.get -> None).
+            cap_proc = named["capture"]
+            vio_proc = named["vio"]
+            ba_proc = named.get("ba")
+            slam_proc = named.get("slam")
             # FC-output preview: print the live pose (pos + quat) to the log.
             pose_client = _start_pose_logger(vio_ep)
             LOG.info("launcher: --no-ui set; waiting for capture to exit "
@@ -803,16 +943,18 @@ def main() -> int:
                 LOG.info("launcher: SIGINT -> stopping")
                 interrupted = True
             rc = cap_proc.returncode if cap_proc.returncode is not None else 0
-            # After capture exits NATURALLY, vio + slam see END on their inputs
+            # After capture exits NATURALLY, vio + ba + slam see END on their inputs
             # (capture's publisher bridge converts each Flow's `_emit_end` to a
-            # wire END then drains them onto the socket before close). Give them a
-            # natural-exit window BEFORE `_terminate` SIGKILLs them: each one has
-            # its own 120 s drain ceiling so a busy back-end won't lose data. On
-            # Ctrl-C, skip this wait -- END never arrives, so `_terminate`'s
-            # SIGTERM (which the children fast-teardown on) is the clean path.
+            # wire END then drains them onto the socket before close; vio re-emits END
+            # so ba + slam drain in turn). Give them a natural-exit window BEFORE
+            # `_terminate` SIGKILLs them: each one has its own 120 s drain ceiling so a
+            # busy back-end won't lose data. On Ctrl-C, skip this wait -- END never
+            # arrives, so `_terminate`'s SIGTERM (fast teardown) is the clean path.
             if not interrupted:
-                LOG.info("launcher: waiting for vio + slam to drain naturally ...")
-                for child in (vio_proc, slam_proc):
+                LOG.info("launcher: waiting for vio + ba + slam to drain "
+                         "naturally ...")
+                for child in (p for p in (vio_proc, ba_proc, slam_proc)
+                              if p is not None):
                     try:
                         child.wait(timeout=30.0)
                     except subprocess.TimeoutExpired:
@@ -839,9 +981,9 @@ def main() -> int:
         return int(rc)
 
     # ---- Restart loop ----------------------------------------------------
-    # Each iteration spawns a FRESH capture+vio+slam+ui generation, blocks on the
+    # Each iteration spawns a FRESH capture+vio+ba+slam+ui generation, blocks on the
     # UI, then tears that generation down. The IPC bus is one-way (server->client)
-    # so the UI cannot reset vio/slam in place; the robust "chay lai tu dau" is a
+    # so the UI cannot reset vio/ba/slam in place; the robust "chay lai tu dau" is a
     # full respawn, which the UI requests via the RESTART_EXIT_CODE return code.
     rc = 0
     try:

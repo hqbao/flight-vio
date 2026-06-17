@@ -24,14 +24,15 @@ import numpy as np
 
 from . import topics
 from .messages import (
-    BaWindow, CamSync, DepthFrame, FrameFrontend, FrameGyroFuse, FrameInliers,
-    FrameTracks, ImuCamPacket, ImuRaw, Keyframe, LoopCorrection, LoopMatch,
-    PoseMsg, SlamOverlay, END,
+    BackendState, BaWindow, CamSync, DepthFrame, FrameFrontend, FrameGyroFuse,
+    FrameInliers, FrameTracks, ImuCamPacket, ImuRaw, Keyframe, LoopCorrection,
+    LoopMatch, PoseMsg, SlamOverlay, END,
 )
 from .wire import (
-    WireBaWindow, WireCamSync, WireDepthFrame, WireEnd, WireFrameFrontend,
-    WireFrameInliers, WireFrameTracks, WireGyroFuse, WireImuCamPacket, WireImuRaw,
-    WireKeyframe, WireLoopCorrection, WireLoopMatch, WirePoseMsg, WireSlamMap,
+    WireBackendState, WireBaWindow, WireCamSync, WireDepthFrame, WireEnd,
+    WireFrameFrontend, WireFrameInliers, WireFrameTracks, WireGyroFuse,
+    WireImuCamPacket, WireImuRaw, WireKeyframe, WireLoopCorrection, WireLoopMatch,
+    WirePoseMsg, WireSlamMap,
 )
 from .ring_registry import RingRegistry
 
@@ -200,6 +201,28 @@ def _loop_corr_to_wire(msg: LoopCorrection, rings: RingRegistry, endpoint: str):
 def _loop_corr_to_local(wm: WireLoopCorrection, rings: RingRegistry) -> LoopCorrection:
     return LoopCorrection(seq=int(wm.seq), kf_poses=dict(wm.kf_poses),
                           n_loops=int(wm.n_loops))
+
+
+def _backend_state_to_wire(msg: BackendState, rings: RingRegistry, endpoint: str):
+    # Pure POD: two (3,) bias vectors + a seq + a flag, so the message rides itself
+    # (no shared-memory ring), the IPC analog of _loop_corr_to_wire. Force the
+    # canonical dtypes (the codec keys off dtype.name) so the bytes are stable
+    # across hosts.
+    del rings, endpoint                                # pure POD, no ring slot
+    return WireBackendState(
+        seq=int(msg.seq),
+        bg=np.asarray(msg.bg, dtype=np.float64).reshape(-1),
+        ba=np.asarray(msg.ba, dtype=np.float64).reshape(-1),
+        degraded=bool(msg.degraded))
+
+
+def _backend_state_to_local(wm: WireBackendState, rings: RingRegistry) -> BackendState:
+    del rings                                          # pure POD, no ring slot
+    return BackendState(
+        seq=int(wm.seq),
+        bg=np.asarray(wm.bg, dtype=np.float64).reshape(-1),
+        ba=np.asarray(wm.ba, dtype=np.float64).reshape(-1),
+        degraded=bool(wm.degraded))
 
 
 def _slam_overlay_to_wire(msg: SlamOverlay, rings: RingRegistry, endpoint: str):
@@ -371,6 +394,7 @@ CONVERTERS: dict[str, tuple[ToWire, ToLocal]] = {
     topics.POSE_REFINED:    (_pose_to_wire,     _pose_to_local),
     topics.KEYFRAME:        (_keyframe_to_wire, _keyframe_to_local),
     topics.LOOP_CORRECTION: (_loop_corr_to_wire, _loop_corr_to_local),
+    topics.BA_STATE:        (_backend_state_to_wire, _backend_state_to_local),
     topics.SLAM_MAP:        (_slam_overlay_to_wire, _slam_map_to_local),
     topics.SLAM_LOOP:       (_loop_match_to_wire, _loop_match_to_local),
     topics.BA_WINDOW:       (_ba_window_to_wire, _ba_window_to_local),

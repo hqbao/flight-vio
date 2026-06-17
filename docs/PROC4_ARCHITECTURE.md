@@ -1,20 +1,24 @@
-# Live Architecture — the 5-project split (4 live processes)
+# Live Architecture — the 6-project split (5 live processes)
 
-> **Status:** shipped. The single-process `ours/` monolith was split into FIVE
-> independent projects (`imu_camera`, `depth`, `vio`, `slam`, `ui`) + a `launcher`
-> + a `verification` harness. The DepthAI/Basalt reference (`baseline/`) is kept
-> for ATE comparison. End-to-end byte-parity vs the pre-split baseline is
+> **Status:** shipped. The single-process `ours/` monolith was split into
+> independent projects (`imu_camera`, `depth`, `vio`, `ba`, `slam`, `ui`) + a
+> `launcher` + a `verification` harness. The DepthAI/Basalt reference (`baseline/`)
+> is kept for ATE comparison. End-to-end byte-parity vs the pre-split baseline is
 > `gap = 0`, verified live on a real OAK-D.
 >
-> **Runtime = 4 processes** (`imu_camera`, `vio`, `slam`, `ui`). Depth runs INLINE
-> on the capture process's `imu_cam` thread, so the launcher never spawns a depth
-> process; `depth/` is an independent SOURCE TREE, promotable to a 5th process via
-> its own `depth.main` harness.
+> **Runtime = 5 processes** (`imu_camera`, `vio`, `ba`, `slam`, `ui`). The windowed
+> BA backend was extracted from `vio` into its own `ba` process (ADR 0001:
+> `docs/adr/0001-extract-windowed-ba-into-ba-process.md`); the topology is now
+> **capture → vio → ba → slam → ui**. Depth runs INLINE on the capture process's
+> `imu_cam` thread, so the launcher never spawns a depth process; `depth/` is an
+> independent SOURCE TREE, promotable to its own process via a `depth.main` harness.
 >
 > The OFFLINE / replay byte-parity oracle is **in-process** (single `LocalPubSub`,
 > no `IPCPubSub`) and lives in `verification/` — determinism + byte-identical
-> output depend on it staying single-process. (The filename keeps the historical
-> "PROC4" name; the architecture is the 5-project split.)
+> output depend on it staying single-process. It drives `sky.*` (incl. the windowed
+> BA) DIRECTLY and never imported the live engine, so extracting `ba` left it
+> untouched. (The filename keeps the historical "PROC4" name; the architecture is
+> the 6-project split.)
 
 ## 1. Motivation
 
@@ -34,17 +38,26 @@ The pre-split single-process live graph already worked, but it had three limits:
 
 ## 2. Process layout (the decisions)
 
-Four long-lived processes, plus transient tool processes that come and go:
+Five long-lived processes, plus transient tool processes that come and go:
 
 | Process      | Owns                                          | Subscribes (IPC)               | Publishes (IPC) |
 |---           |---                                            |---                             |---|
 | `imu_camera` | OAK-D device + cam/IMU sync + IMU calib + **inline SGM depth** | —              | `cam.sync`, `imu.raw`, `imucam.sample`, `frame.depth`, `calib.bundle` |
-| `vio`        | RGB-D PnP odometry + windowed BA              | `imucam.sample`, `frame.depth`, `calib.bundle`; **`loop.correction` from `slam` (LIVE + `--tight` only — closed-loop)** | `pose.odom`, `pose.vo` (pure-vision, LIVE-only), `keyframe`, `frame.tracks`, `frame.inliers`, `pose.refined` **and** `ba.window` (windowed-BA solve snapshot for the BA Window, opt-in `--ba-window`) |
+| `vio`        | RGB-D PnP odometry + live IMU dead-reckon (NO backend) | `imucam.sample`, `frame.depth`, `calib.bundle` (capture); **`loop.correction` from `slam`** + **`pose.refined` / `ba.window` / `ba.state` from `ba`** (the backend pass-through, see below) | `pose.odom`, `pose.vo` (pure-vision, LIVE-only), `keyframe`, `frame.tracks`, `frame.inliers`, **and (re-emitted from `ba` over `--ba-endpoint`)** `pose.refined` + `ba.window` |
+| `ba`         | the windowed-BA backend — loose `WindowedBAMap` or tight `WindowedVIOMap` (`--tight`) | `keyframe`, `calib.bundle` (from VIO) | `pose.refined` (the VIO-BA line) **and** `ba.window` (solve snapshot, opt-in `--ba-window`, loose-only) **and** `ba.state` (optimised bias feed-forward, `--tight` only) |
 | `slam`       | ORB loop closure + SE(3) pose graph          | `keyframe`, `calib.bundle` (from VIO) | `loop.correction` (loop-event rewrite), `slam.map` (continuous keyframe overlay, LIVE-only) **and** `slam.loop` (per-candidate loop-match funnel for the Loop-Closure window, LIVE-only) |
-| `ui`         | Qt `MainWindow`, single 5-trajectory Viewer3D + View/Visualize/Calibration menus | `pose.odom`, `pose.vo`, `pose.refined`, `calib.bundle` (vio); `slam.map`, `slam.loop`, `calib.bundle` (slam); on-demand: `imucam.sample`, `frame.depth`, `imu.raw` (capture) + `frame.tracks`, `frame.inliers`, `keyframe`, `ba.window` (vio, BA Window opt-in) | — (sink) |
+| `ui`         | Qt `MainWindow`, single 5-trajectory Viewer3D + View/Visualize/Calibration menus | `pose.odom`, `pose.vo`, `pose.refined`, `ba.window`, `calib.bundle` (vio); `slam.map`, `slam.loop`, `calib.bundle` (slam); on-demand: `imucam.sample`, `frame.depth`, `imu.raw` (capture) + `frame.tracks`, `frame.inliers`, `keyframe` (vio) | — (sink) |
 
 > The capture process is named `imu_camera`; its endpoint is `oak.capture` and its
 > entrypoint is `imu_camera.main`. Throughout this doc "capture" = `imu_camera`.
+>
+> **Backend pass-through (the UI reads ONE endpoint).** `ba` publishes `pose.refined`
+> / `ba.window` / `ba.state` on its own endpoint `oak.ba`, but the UI subscribes only
+> the VIO endpoint. `vio` opens a read-only client on `--ba-endpoint` and re-emits
+> `pose.refined` + `ba.window` on the VIO endpoint (mirror of the SLAM
+> `loop.correction` re-hydrate), and feeds `ba.state` (the `--tight` bias) into
+> `propagate_imu` via `BackendStateInbox`. So the UI + netbridge are UNCHANGED across
+> the split — no 4th endpoint. See ADR 0001 and §5.2a.
 
 ```mermaid
 flowchart LR
@@ -53,7 +66,10 @@ flowchart LR
         SYNC --> DEPTH["depth steps (SGM, INLINE)"]
     end
     subgraph vio["vio · oak.vio"]
-        ODOM[OdometryModule: KLT + RGB-D PnP + gyro] --> BA[BackendModule: windowed BA]
+        ODOM[OdometryModule: KLT + RGB-D PnP + gyro + live IMU dead-reckon]
+    end
+    subgraph ba["ba · oak.ba"]
+        BACK["BackendWorker: windowed BA (loose) / VIO window (--tight)"]
     end
     subgraph slam["slam · oak.slam"]
         SLM[SlamModule: ORB loop closure + SE3 PGO]
@@ -63,10 +79,12 @@ flowchart LR
     end
 
     cap -- "imucam.sample · frame.depth · calib.bundle" --> vio
+    vio -- "keyframe · calib.bundle" --> ba
     vio -- "keyframe · calib.bundle" --> slam
-    vio -- "pose.odom · pose.vo · pose.refined · calib.bundle" --> ui
-    slam -- "slam.map · slam.loop · calib.bundle" --> ui
+    ba == "pose.refined · ba.window (pass-through) · ba.state (--tight bias)" ==> vio
     slam == "loop.correction (closed-loop, LIVE + --tight only)" ==> vio
+    vio -- "pose.odom · pose.vo · pose.refined · ba.window · calib.bundle" --> ui
+    slam -- "slam.map · slam.loop · calib.bundle" --> ui
     cap -. "imu.raw · imucam.sample · frame.depth (on-demand)" .-> ui
     vio -. "frame.tracks · frame.inliers · keyframe (on-demand)" .-> ui
 ```
@@ -99,7 +117,7 @@ device-agnostic by contract.
 | Question | Decision |
 |---|---|
 | Who owns the device? | Dedicated `imu_camera` (capture) process. |
-| What is "VIO's own map"? | VIO = frame-to-frame PnP + windowed BA (`BackendModule`). |
+| What is "VIO's own map"? | The frame-to-frame PnP front-end (`vio`) feeds the windowed BA, which now runs in its OWN `ba` process (`BackendWorker`); `ba` owns the sliding window of keyframe poses + landmarks (ADR 0001). |
 | IPC mechanism? | `IPCPubSub` over a Unix-domain socket for metadata + `SharedArrayRing` shared memory for images. The wire is the class-path-independent `comms.codec`, NOT pickle. |
 | UI display modes? | A SINGLE `Viewer3D` (no tabs) drawing 5 toggleable trajectory lines: VO / VIO / VIO-BA / SLAM-corrected VIO / SLAM. |
 | Calib / visualise tools? | Subscribe to capture's stream via IPC; don't open the device. |
@@ -202,8 +220,9 @@ class:
   them on the local in-proc `LocalPubSub`. Other modules in this process consume
   from the local bus exactly as before.
 
-The whole IPC layer is therefore invisible to `OdometryModule`, `BackendModule`,
-`SlamModule`, the UI sinks, and every existing self-test.
+The whole IPC layer is therefore invisible to `OdometryModule` (vio),
+`BackendWorker` (ba), `SlamModule` (slam), the UI sinks, and every existing
+self-test.
 
 ## 5. Process entry points — `<project>/main.py`
 
@@ -235,20 +254,23 @@ Re-published on device re-open.
 IPCPubSub(endpoint="oak.capture", role="client")
   └── IPCSubscriber → LocalPubSub
         ├── OdometryModule(publish_vo=True, level_tilt=True, OdometryConfig(gyro_fuse=…))
-        ├── BackendModule (worker=False — solve in-process here; this process is already off-main)
+        ├── (LIVE + --ba-endpoint) IPCPubSub(endpoint="oak.ba", role="client")
+        │     └── IPCSubscriber → LocalPubSub  [pose.refined · ba.window · ba.state]
         └── IPCPublisher → IPCPubSub(endpoint="oak.vio", role="server")
               └── publishes: pose.odom, pose.vo, keyframe, frame.tracks,
-                             frame.inliers, pose.refined
+                             frame.inliers,  AND (re-emitted from ba): pose.refined,
+                             ba.window
 ```
 
 `OdometryModule` joins `imucam.sample` (IMU prior) + `frame.depth` (KLT track →
-RGB-D PnP → gyro fusion → pose). Two-client startup: a **calib client** blocks on
-the retained `calib.bundle`, then a **data client** for `imucam.sample` +
+RGB-D PnP → gyro fusion → pose). **The windowed-BA backend is no longer here** — it
+moved to the `ba` process (§5.2a, ADR 0001); `vio` now runs only the front-end + the
+live IMU dead-reckon (`PropagateImu`). Two-client startup: a **calib client** blocks
+on the retained `calib.bundle`, then a **data client** for `imucam.sample` +
 `frame.depth`. VIO re-broadcasts the retained `calib.bundle` on its own endpoint
-AFTER allocating its `kf_*` rings (readiness barrier, §9 invariant 10). The
-worker-engine subprocess boundary (`--worker`) stays on stdlib pickle
-(`multiprocessing.Queue`, same-project classes) — it is **not** routed through the
-cross-process codec.
+AFTER allocating its `kf_*` rings (readiness barrier, §9 invariant 10) — this is also
+the barrier `ba` and `slam` block on. `--worker` is no longer a `vio` backend lever
+(the backend left); it is forwarded to `slam` only.
 
 `pose.vo` (`topics.POSE_VO`) is the PURE-VISION frame-to-frame trajectory — raw PnP
 R/t only, **no gyro fusion, no tilt leveling, no BA**. It is accumulated by
@@ -278,6 +300,59 @@ This is **LIVE + `--tight` ONLY**: the offline / oracle / loose path never sets
 `lab_loop_30s` loop session the revisit drift drops ~50 % (43 cm → 22 cm) vs the
 open-loop (Basalt-like) run, applied smoothly with no teleport
 (`vio/tests/closed_loop_drift_selftest.py`).
+
+### 5.2a `ba/main.py` (windowed BA · `oak.ba`)
+
+The windowed-BA backend runs in its OWN process (ADR 0001:
+`docs/adr/0001-extract-windowed-ba-into-ba-process.md`). It is a PURE CONSUMER of
+VIO's `keyframe`, mirroring SLAM's relationship to VIO.
+
+```
+IPCPubSub(endpoint="oak.vio", role="client")
+  └── IPCSubscriber → LocalPubSub
+        ├── BackendWorker(window, iters, tight, stabilize_velocity, depth_icp,
+        │                 capture_window)   # loose WindowedBAMap / tight WindowedVIOMap
+        └── IPCPublisher → IPCPubSub(endpoint="oak.ba", role="server")
+              └── publishes: pose.refined  (+ ba.state under --tight,
+                             + ba.window under --ba-window [loose-only])
+```
+
+- **Calib handshake (same as SLAM):** a dedicated calib client blocks until VIO's
+  retained `calib.bundle` arrives on the VIO endpoint. VIO re-publishes calib AFTER
+  allocating its `kf_*` rings, so receiving it proves (a) VIO is up, (b) intrinsics
+  are known, (c) the `kf_gray` / `kf_depth` rings `ba` attaches to exist. `ba`
+  deliberately does NOT subscribe to capture — it is a pure consumer of VIO's output.
+- **Strict-FIFO solve (`latest_only=False`):** every keyframe is solved in order so
+  the refined-pose output matches the pre-split in-VIO path. `ba` runs the solve
+  **in-process** (it IS its own process → the GIL is already escaped); `--worker` is
+  accepted but is a **logged no-op** (the in-VIO `--worker` existed only to free the
+  camera read loop's GIL, which `ba` does not share).
+- **Backend knobs route here.** `--tight` selects the tight `WindowedVIOMap`;
+  `--backend-window` / `--backend-iters` size the loose solve; `--stabilize-velocity`
+  / `--depth-icp` are the tight-only Phase-4 knobs; `--ba-window` is the loose-only
+  visualiser. All are forwarded by `launcher.build_ba_args` (see §7).
+
+**Backend pass-through (`ba --> vio`, keeps the UI + netbridge UNCHANGED).** `ba`
+publishes on its own endpoint, but the UI subscribes only the VIO endpoint, so `vio`
+re-emits the backend's output (mirror of the SLAM `loop.correction` re-hydrate). When
+the launcher spawns `ba` it passes `--ba-endpoint oak.ba` to `vio.main`; VIO opens a
+read-only client there and bridges three topics onto its local bus:
+
+- **`pose.refined`** — re-published so VIO's existing `IPCPublisher` re-emits it on
+  the VIO endpoint → the UI's blue VIO-BA line is unchanged; netbridge keeps
+  `pose.refined` in `VIO_POD` (no BA_POD).
+- **`ba.window`** — the opt-in `--ba-window` solve snapshot, re-emitted the same way.
+- **`ba.state`** (`--tight` only) — the optimised bias (`seq`, `bg`, `ba`,
+  `degraded`). Fed to `PropagateImu` via the existing `BackendStateInbox`
+  (`vio/modules/loop_inbox.py`): the tight bias **feed-forward**, an IPC analog of the
+  `loop.correction` feedback. The carried `seq` survives the wire so the consumer's
+  staleness gate makes the async hop tolerable; it is health-gated (a `degraded` /
+  stale / unhealthy solve is never adopted) and the bias is adopted via a bounded
+  low-pass (never a hard set).
+
+Under the lean `--no-ba` launcher path no `ba` is spawned and `--ba-endpoint` is
+omitted: `vio` runs with no refined pose + an inert bias feed; `pose.odom` (live VIO)
+is unaffected because it never consumed the backend.
 
 ### 5.3 `slam/main.py` (SLAM · `oak.slam`)
 
@@ -365,17 +440,18 @@ The Qt main thread sees only the local `LocalPubSub`, so the existing UI sinks a
 the `ui/qt` calib dialogs are reused unchanged — the adapters republish the IPC
 topics onto the very same local bus those sinks already read.
 
-### 5.5 Two different optimisers: VIO = windowed BA, SLAM = PGO
+### 5.5 Two different optimisers: BA = windowed BA, SLAM = PGO
 
-VIO and SLAM run **two distinct optimisers** — this is the key fact behind the five
-UI lines:
+The `ba` and `slam` processes run **two distinct optimisers** — this is the key fact
+behind the five UI lines:
 
-- **VIO runs windowed Bundle Adjustment (BA).** `BackendModule` (`run_ba` step)
-  solves a sliding window jointly over **keyframe poses AND landmarks** (3D points),
-  minimising reprojection error — analytic Schur in `sky.backend`. Output:
-  `pose.refined`, the blue **VIO-BA** line. BA refines the *local* geometry of the
-  recent window.
-- **SLAM runs Pose-Graph Optimization (PGO).** `SlamModule` (`slam_step`) runs ORB
+- **`ba` runs windowed Bundle Adjustment (BA).** `BackendWorker` (`run_ba`) solves a
+  sliding window jointly over **keyframe poses AND landmarks** (3D points), minimising
+  reprojection error — analytic Schur in `sky.backend` (loose) / `sky.vio.window`
+  (tight). Output: `pose.refined`, the blue **VIO-BA** line (re-emitted on the VIO
+  endpoint via the pass-through, §5.2a). BA refines the *local* geometry of the recent
+  window.
+- **`slam` runs Pose-Graph Optimization (PGO).** `SlamModule` (`slam_step`) runs ORB
   loop detection, then on a confirmed loop optimises a graph of **poses only — no
   landmarks** (`sky.slam`). The graph has odometry edges (relative motion
   between consecutive keyframes) + loop-closure edges (the relative motion implied by
@@ -385,7 +461,8 @@ UI lines:
   **SLAM** line).
 
 So BA ≠ PGO: BA is a local windowed landmark+pose solve (metric refinement); PGO is
-a global pose-only solve fired by loop closure (drift redistribution).
+a global pose-only solve fired by loop closure (drift redistribution). They are
+independent processes, each a pure consumer of VIO's `keyframe`.
 
 ## 6. UI — `ui/main.py` + `ui/modules/ipc_sources.py`
 
@@ -723,11 +800,14 @@ follow this one pattern:
 
 ## 7. Launcher — `launcher/main.py` + `run.sh`
 
-`launcher.main` spawns the three background processes (capture → vio → slam, in that
-order so each subscriber boots after its publisher's endpoint exists), waits a few
-hundred ms between each, then runs the UI process in the foreground. On UI exit it
-sends `SIGTERM` to the three background processes and joins them; on any of them
-dying it shuts the others down with a clear diagnostic.
+`launcher.main` spawns the background processes (capture → vio → ba → slam, in that
+order so each subscriber boots after its publisher's endpoint exists — `ba` and `slam`
+both consume vio's `keyframe`), waits a few hundred ms between each, then runs the UI
+process in the foreground. On UI exit it sends `SIGTERM` to the background processes
+and joins them; on any of them dying it shuts the others down with a clear diagnostic.
+`--no-ba` / `--no-slam` are **launcher spawn gates** (skip spawning that process); when
+`ba` is spawned the launcher also passes `--ba-endpoint oak.ba` to `vio` so the backend
+pass-through (§5.2a) wires up.
 
 `launcher.main` stays **Qt-free**: it imports only `RESTART_EXIT_CODE` from
 `ui.main` (which lazy-imports PyQt6 inside `run_ui`). It vendors `launcher/comms/`
@@ -735,7 +815,7 @@ dying it shuts the others down with a clear diagnostic.
 `ring_registry` it needs for orphan reclaim.
 
 **Restart loop.** The spawn → run-UI → teardown sequence is a **loop**. Each
-iteration `_spawn_pipeline()`s a fresh capture + vio + slam generation, blocks on
+iteration `_spawn_pipeline()`s a fresh capture + vio + ba + slam generation, blocks on
 `ui_proc.wait()`, then `_terminate()`s that generation on the main thread (no
 waitpid race — the UI is already reaped by `wait()`). If the UI returned
 `RESTART_EXIT_CODE` (42) the loop `_cleanup_orphans()`es and respawns the whole
@@ -744,11 +824,13 @@ endpoint names are computed ONCE (`--auto-suffix` derives them from the launcher
 PID), so each restart re-creates the same-named endpoints + rings;
 `_cleanup_orphans()` reclaims the prior generation's stale SHM/sockets each
 iteration. `_RING_NAMES_BY_ROLE` is cap=`gray_left`/`gray_right`/`depth_m`,
-vio=`kf_gray`/`kf_depth`, slm=none.
+vio=`kf_gray`/`kf_depth`, ba=none (it ATTACHES vio's rings), slm=none. The launcher
+tracks procs by ROLE in a `named` dict (not a positional `procs[]` index) because `ba`
+spawns BETWEEN vio and slam.
 
 The **`--no-ui`** path runs the pipeline exactly **once** (no Restart button without
-a UI): it spawns capture + vio + slam, waits for capture to exit, lets vio + slam
-drain, then tears them down.
+a UI): it spawns capture + vio + ba + slam, waits for capture to exit, lets vio + ba +
+slam drain (each propagates END in turn), then tears them down.
 
 The launcher's **SIGTERM handler** (registered once) forwards SIGTERM to the current
 generation's children and `os._exit(143)` immediately. It deliberately does **not**
@@ -756,35 +838,41 @@ call `_terminate()` — `_terminate` polls `os.waitpid(pid, WNOHANG)` on the sam
 the main thread is blocked in `ui_proc.wait()` on, and the two waitpid callers would
 race for the single reap event.
 
-**`--worker` is an opt-in (default off).** With it off, vio + slam run their heavy
-BA/SLAM solves **in-process** and SLAM stays responsive via its latest-only inbox
-(§5.3) — no worker subprocess, no `resource_tracker` noise. Passing `--worker`
-propagates `--worker` to both the vio and slam children.
+**`--worker` is an opt-in (default off).** It is now forwarded to **`slam` only** —
+the windowed BA left `vio` for its own `ba` process, which always solves in-process
+(it IS its own process → the GIL is already escaped; `ba` accepts `--worker` but logs
+it as a no-op). With `--worker` off, SLAM runs its solve in-process and stays
+responsive via its latest-only inbox (§5.3) — no worker subprocess, no
+`resource_tracker` noise.
 
 **Process-parallelism → the bottleneck is the busiest PROCESS, not the serial sum.**
-Because capture / vio / slam are separate `Popen` processes, the achievable frame
-rate is `1000 / (busiest process ms/frame)`, not the sum of all stages. On the Pi5
-(loose 320×200) the vio process is the wall — frontend KLT+PnP (~29 ms after the
-KLT pyramid-reuse change) + IMU (~1 ms) — while capture's SGM (~9 ms) and, under
-`--worker`, the BA solve run concurrently. The bursty windowed BA (~48 ms/keyframe)
-is precisely why `deploy/pi-run.sh` defaults `--worker` ON: in-thread it shares the
-vio core and adds an ~80 ms 1-in-5 hitch. Full per-stage numbers:
-`verification/STAGE_PROFILE_RESULTS.md` (harness `verification/stage_profile.py`).
+Because capture / vio / ba / slam are separate `Popen` processes, the achievable
+frame rate is `1000 / (busiest process ms/frame)`, not the sum of all stages. On the
+Pi5 (loose 320×200) the vio process is the wall — frontend KLT+PnP (~29 ms after the
+KLT pyramid-reuse change) + IMU (~1 ms) — while capture's SGM (~9 ms) runs
+concurrently. The windowed BA now runs in its OWN `ba` process (its own core), so the
+bursty ~48 ms/keyframe solve no longer shares the vio core at all — the in-VIO
+`--worker` subprocess that used to escape that hitch is therefore retired for BA (the
+`ba` process IS the GIL escape). `ba` runs on the keyframe cadence, off the per-frame
+path. Full per-stage numbers: `verification/STAGE_PROFILE_RESULTS.md` (harness
+`verification/stage_profile.py`).
 
 **`--cap-numba-threads` (opt-in, default off; on under `pi-run.sh`).** Each process
 otherwise spins a numba pool of all cores, so an overlapping SGM (capture) + KLT
 (vio) burst puts ~2× the core count of runnable threads on a small SBC →
 oversubscription thrash. The flag pins `NUMBA_NUM_THREADS` per process, derived
 from `os.cpu_count()` by `_numba_thread_caps` (`launcher/main.py`) and applied at
-the `_spawn` sites via `_role_env`: on the 4-core Pi5 **capture=2, vio=2, slam=1**.
-A user-set `NUMBA_NUM_THREADS` in the environment always wins. It changes no math —
-the oracle stays `gap=0`.
+the `_spawn` sites via `_role_env`. `slam` + `ba` are off the per-frame path (they run
+on the keyframe cadence), so they get the remainder: on the 4-core Pi5 **capture=2,
+vio=2, slam=1, ba=1**. A user-set `NUMBA_NUM_THREADS` in the environment always wins.
+It changes no math — the oracle stays `gap=0`.
 
 `run.sh` forwards to `python -m launcher.main --auto-suffix "$@"`:
-- `./run.sh ...` — the live 4-process pipeline (default).
+- `./run.sh ...` — the live 5-process pipeline (default: capture + vio + ba + slam + ui).
 - `./run.sh --proc ...` — explicit alias for the same pipeline (the flag is stripped).
 - `./run.sh --session PATH ...` — replay a recorded session through the pipeline.
-- `./run.sh --no-ui ...` — headless capture + vio + slam (runs once).
+- `./run.sh --no-ui ...` — headless capture + vio + ba + slam (runs once).
+- `./run.sh --no-ba ...` — lean: skip the `ba` process (no `pose.refined`, no bias feed).
 
 Two intentional differences from the pre-split launcher, forced by the new projects'
 argparse:
@@ -801,31 +889,44 @@ On the **`--tight` branch** the launcher ALSO passes `--slam-endpoint <slam_ep>`
 §5.2 / §9 invariant 17): VIO subscribes to SLAM's loop correction and feeds it back
 into the live pose so drift is bounded on revisits. Loose (default) never wires it.
 
-The launcher's `build_vio_args` builder (pure, unit-tested by
-`launcher/tests/stabilize_velocity_forward_selftest.py`) ALSO forwards
-`--stabilize-velocity` to `vio.main` — but ONLY when `--tight` **and**
-`--stabilize-velocity` are both set. This is the LIVE knob for the **Phase-4
-velocity regularisation**: it flips `WindowedVIOConfig.stabilize_velocity = True`
-in the tight backend (`vio/modules/pipeline.py`), which makes `run_ba` enable both
-the constant-velocity smoothness prior (`vel_cv_prior`) and the excitation-gated
-ZUPT (`vel_zupt`) on every solve to curb the 54×42 / shake window-velocity
-divergence (the priors themselves live in `sky/vio/window.py`). It
-is **OPT-IN and tight-only**: the default path never sets it, so the loose path and
-the tight-without-flag path are unchanged and the byte-parity oracle stays `gap=0`.
-Passing `--stabilize-velocity` WITHOUT `--tight` logs a warning and is dropped (the
-loose path has no velocity state to regularise). When active, the tight backend logs
-`vio: tight velocity-stabilize ON (CV prior + gated ZUPT)` on startup.
+**Backend knobs route to `ba` via `build_ba_args`.** The windowed-BA backend moved
+to the `ba` process (ADR 0001), so its tuning flags — `--stabilize-velocity` /
+`--depth-icp` / `--backend-window` / `--backend-iters` / `--ba-window` — are forwarded
+by the launcher's pure `build_ba_args` builder to `ba.main`, NOT to `vio.main` (they
+were inert on VIO once the backend left, and were removed from `build_vio_args`). The
+forwarding contracts are unit-tested per knob (e.g.
+`launcher/tests/stabilize_velocity_forward_selftest.py` now asserts the flag is in the
+BA argv and NOT the vio argv).
+
+`--stabilize-velocity` is the LIVE knob for the **Phase-4 velocity regularisation**:
+under `--tight` it flips `WindowedVIOConfig.stabilize_velocity = True` in the tight
+backend, which makes `run_ba` (in `ba`) enable both the constant-velocity smoothness
+prior (`vel_cv_prior`) and the excitation-gated ZUPT (`vel_zupt`) on every solve to
+curb the 54×42 / shake window-velocity divergence (the priors live in
+`sky/vio/window.py`). It is **OPT-IN and tight-only**: `build_ba_args` appends it only
+when `--tight` AND `--stabilize-velocity` are both set, so the loose path and the
+tight-without-flag path are unchanged and the byte-parity oracle stays `gap=0`. Passing
+`--stabilize-velocity` WITHOUT `--tight` logs a launcher warning and is dropped (the
+loose path has no velocity state to regularise). When active, the `ba` process logs
+`ba: tight velocity-stabilize ON (CV prior + gated ZUPT)` on startup.
+
+> **Operator-reachability fix (found during the split):** `--backend-window` /
+> `--backend-iters` were never launcher-forwarded pre-split (the flags lived only on
+> `vio.main`'s argparse, which the launcher never set → dead end-to-end). They are now
+> on the launcher argparse + `build_ba_args`, so they reach `ba` for the first time.
 
 ## 7a. Optional cross-machine transport — `netbridge`
 
-Everything above describes the runtime as it actually runs: **4 local processes on
+Everything above describes the runtime as it actually runs: **5 local processes on
 ONE host**, wired by `IPCPubSub` over AF_UNIX sockets + POSIX shared-memory rings
 (`SharedArrayRing`). That layout depends on a shared kernel — a `SharedArrayRef`
 published by capture is `read_copy`-ed straight out of shared memory by the UI.
 
 `netbridge` is an **OPTIONAL** layer that lifts that boundary across the network so
-the **Pi** runs the whole flight stack (capture + vio + slam) and a **Mac** runs
-only the UI, live over TCP/WiFi. It is **off by default** and changes nothing about
+the **Pi** runs the whole flight stack (capture + vio + ba + slam) and a **Mac** runs
+only the UI, live over TCP/WiFi. (`pose.refined` reaches the Mac UI unchanged because
+`vio` re-emits it on the VIO endpoint — netbridge still bridges only the capture / vio
+/ slam endpoints; the `ba` endpoint stays Pi-local.) It is **off by default** and changes nothing about
 the local runtime; it is enabled by the launcher's `--forward HOST:PORT` (§7), which
 spawns `netbridge.forward` as one more managed flight subprocess.
 
@@ -936,9 +1037,9 @@ proven (see [`verification/README.md`](../verification/README.md)):
 ## 9. Invariants
 
 1. The IPC layer is stdlib-only (sockets + shared memory). No new pip deps.
-2. The reactive modules (`OdometryModule`, `BackendModule`, `SlamModule`, every UI
-   sink) are reused unchanged. The bridge (`IPCPublisher` / `IPCSubscriber`) is the
-   only IPC-aware glue.
+2. The reactive workers (`OdometryModule` in vio, `BackendWorker` in ba, `SlamModule`
+   in slam, every UI sink) are reused unchanged. The bridge (`IPCPublisher` /
+   `IPCSubscriber`) is the only IPC-aware glue.
 3. The offline replay path (the `verification/` oracle) stays byte-identical and
    in-process (single `LocalPubSub`).
 4. Tools never open the OAK-D. `imu_camera` is the only owner of the device.

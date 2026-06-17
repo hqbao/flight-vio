@@ -1,15 +1,13 @@
-"""Keyframe emission + windowed bundle adjustment.
-
-The keyframe / back-end steps that bridge the odometry worker to the BA engine:
+"""Keyframe emission (on the odometry thread).
 
 * :func:`emit_keyframe` -- on the odometry thread, every ``kf_every`` frames,
   publish a ``keyframe`` (pose + image + depth + track snapshot, plus the gravity
   accel and -- tight path -- the inter-keyframe IMU block). Helper
   :func:`_collect_imu_seg` concatenates the retained per-frame IMU segments.
-* :func:`run_ba` -- on the back-end thread, submit a keyframe's snapshot to the
-  swappable :class:`~vio.engine.base.Engine` and forward any refined pose. Offline
-  the engine solves synchronously; live it is async (the responsive marker rides
-  ``pose.odom`` and never waits on the refined pose here).
+
+The windowed bundle adjustment that consumed the keyframe (``run_ba``) MOVED to the
+``ba`` process (:mod:`ba.modules.backend`); VIO is now a pure PRODUCER of the
+keyframe (``ba`` and ``slam`` consume it over IPC).
 """
 from __future__ import annotations
 
@@ -18,8 +16,7 @@ import numpy as np
 from sky.front.odometry import RGBDVisualOdometry
 
 from vio.comms import LocalPubSub, topics
-from vio.comms.messages import Keyframe, PoseMsg
-from vio.engine import Engine
+from vio.comms.messages import Keyframe
 from .carriers import Step
 
 
@@ -108,51 +105,3 @@ def _collect_imu_seg(state: dict, kf_seq: int):
     if ts.size < 2:
         return None
     return (ts, gyro, accel)
-
-
-def run_ba(engine: Engine, tight: bool, kf: Keyframe):
-    """Submit the keyframe's snapshot to the BA engine; return the refined pose.
-
-    Was ``RunBA(Step)``; the engine + the ``tight`` snapshot selector (was
-    ``ctx.state["engine"]`` / ``ctx.state["tight"]``) are passed explicitly.
-    Returns ``(PoseMsg, backend_state)`` -- the refined pose + the TIGHT backend's
-    latest optimised ``(bg, ba)`` for the live feed-forward (``backend_state`` is
-    ``None`` on the loose path) -- or bare ``None`` (chain short-circuit) when the
-    keyframe has no tracks or the engine has no refined pose yet.
-    """
-    if kf.track_ids is None or kf.track_px is None:
-        return None
-    T_cw = np.linalg.inv(kf.T_world_cam)
-    # Submit the snapshot shaped for whichever backend the worker built.
-    # LOOSE (default): the historical 5-tuple ``ba_step`` consumes -- the
-    # keyframe's at-rest gravity accel. TIGHT (``--tight``): the SUPERSET
-    # 6-tuple ``vio_step`` consumes -- the keyframe timestamp + the raw
-    # inter-keyframe IMU block (camera optical frame) for preintegration.
-    if tight:
-        engine.submit((T_cw, kf.track_ids, kf.track_px, kf.depth_m,
-                       kf.ts_ns, kf.imu_seg))
-    else:
-        engine.submit((T_cw, kf.track_ids, kf.track_px, kf.depth_m,
-                       kf.accel))
-    post = engine.poll()                     # refined latest T_cw, or None
-    if post is None:
-        return None
-    # The TIGHT step (``vio_step``) returns ``(T_cw, health)`` so the divergence
-    # guard's verdict reaches the published pose; the LOOSE step (``ba_step``)
-    # returns the bare ``T_cw``. Merge the tight health fields (``vio_degraded``
-    # etc.) into the SAME info dict the FC already reads (alongside ``refined``
-    # and the ``pos_sigma_m`` position-noise field), so a downstream / FC consumer
-    # sees "estimator degraded this keyframe" next to the pose it acts on. On the
-    # loose path ``post`` is a bare array -> ``info`` stays ``{"refined": True}``
-    # exactly as before (the ``vio_degraded`` key is simply absent).
-    info = {"refined": True}
-    backend_state = None
-    if isinstance(post, tuple):
-        # TIGHT ``vio_step`` returns (T_cw, health, backend_bias); the LOOSE
-        # ``ba_step`` returns a bare array. Unpack defensively (a 2-tuple still
-        # works). ``backend_state`` = the latest keyframe's optimised (bg, ba)
-        # for the live feed-forward (PLAN P1) -- None on the loose path.
-        backend_state = post[2] if len(post) >= 3 else None
-        post, health = post[0], post[1]
-        info.update(health)
-    return PoseMsg(kf.seq, 0, np.linalg.inv(post), info), backend_state

@@ -1,10 +1,17 @@
-"""``vio.engine`` -- swappable runners for the heavy keyframe optimisers.
+"""``ba.engine`` -- swappable runners for the heavy keyframe optimisers.
+
+This is the SINGLE home of the engine runners: it was a verbatim COPY of the old
+``vio.engine`` while the windowed-BA backend was being extracted into the ``ba``
+process, and ``vio/engine`` has since been DELETED (the backend lives only here
+now). The ``ba`` process drives only the in-process engine (it IS its own process);
+:class:`SubprocessEngine` is retained for the ``--ba-window`` capture worker path
+(:func:`make_ba_engine` builds it under ``worker=True``), not used by ``ba.main``.
 
 A flow picks how its optimiser runs with one ``worker`` flag:
 
-* ``worker=False`` (default, OFFLINE) -> :class:`InProcessEngine` -- synchronous,
-  deterministic, byte-identical replay output.
-* ``worker=True`` (LIVE) -> :class:`~vio.engine.subprocess.SubprocessEngine`
+* ``worker=False`` (default, OFFLINE / ``ba.main``) -> :class:`InProcessEngine` --
+  synchronous, deterministic, byte-identical replay output.
+* ``worker=True`` (LIVE) -> :class:`~ba.engine.subprocess.SubprocessEngine`
   -- the solve runs in a separate process so it never holds the camera read loop's
   GIL (the fast-push undershoot fix).
 
@@ -32,8 +39,8 @@ def make_ba_engine(K: np.ndarray, cfg, *, worker: bool = False,
     """Build a windowed-BA engine (in-process unless ``worker``).
 
     ``capture_window`` (opt-in, ``--ba-window``) selects the RICHER capture step +
-    overlay (:func:`~vio.engine.ba_capture.ba_step_capture` /
-    :func:`~vio.engine.ba_capture.ba_window_overlay`): the SAME frozen
+    overlay (:func:`~ba.engine.ba_capture.ba_step_capture` /
+    :func:`~ba.engine.ba_capture.ba_window_overlay`): the SAME frozen
     ``run_ba`` solve plus a read-only PRE/POST snapshot for the UI's "BA Window"
     visualiser. Default OFF -> the historical ``ba_step`` / ``ba_overlay`` path,
     byte-identical to before (the oracle relies on this).

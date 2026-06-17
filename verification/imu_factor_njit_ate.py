@@ -37,7 +37,7 @@ from imu_camera.io.reader import SessionReader                        # noqa: E4
 from sky.vio.imu import GyroPreintegrator                            # noqa: E402
 from sky.front.odometry import OdometryConfig, RGBDVisualOdometry    # noqa: E402
 from sky.vio.window import WindowedVIOConfig                          # noqa: E402
-from vio.engine import make_vi_engine                                 # noqa: E402
+from ba.engine import make_vi_engine                                  # noqa: E402
 from sky.math import so3_log                                          # noqa: E402
 
 POS_GATE_MM = 1.0       # sub-mm per-keyframe position agreement

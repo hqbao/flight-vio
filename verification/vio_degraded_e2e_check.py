@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """END-TO-END proof: ``vio_degraded`` threads map -> step -> engine -> PoseMsg.
 
-Drives the REAL published-pose path (``vio.modules.backend.run_ba`` over a live
+Drives the REAL published-pose path (``ba.modules.backend.run_ba`` over a live
 ``InProcessEngine`` built exactly like ``make_vi_engine`` does) with a stub VIO
 map whose ``run_ba`` returns a chosen pose + ``last_info``. Asserts:
 
@@ -28,10 +28,10 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from vio.comms.messages import Keyframe                              # noqa: E402
-from vio.engine import InProcessEngine                               # noqa: E402
-from vio.engine.steps import ba_step, vio_step                      # noqa: E402
-from vio.modules.backend import run_ba                              # noqa: E402
+from ba.comms.messages import Keyframe                              # noqa: E402
+from ba.engine import InProcessEngine                               # noqa: E402
+from ba.engine.steps import ba_step, vio_step                      # noqa: E402
+from ba.modules.backend import run_ba                              # noqa: E402
 
 
 class _StubVioMap:

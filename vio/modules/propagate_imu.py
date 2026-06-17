@@ -193,6 +193,22 @@ _REANCHOR = os.environ.get("OAKD_REANCHOR", "1") != "0"            # re-anchor o
 # waved past a static camera) makes PnP report a spurious translation that the
 # vision pull would otherwise drag the position along with. Default ON; 0 disables.
 _ZUPT_FREEZE_TRANS = os.environ.get("OAKD_ZUPT_FREEZE_TRANS", "1") != "0"
+# --- sensor-dropout (frame-gap) safety guard -------------------------------
+# The IMU blocks are contiguous (prev_tail prepended so the integrated interval
+# is gap-free), which is correct WHEN frames are consecutive. But on a SENSOR
+# DROPOUT -- the OAK USB-crashes and re-enumerates (seconds of no camera AND no
+# IMU), a frame is starved, a worker stalls -- the next block's first sample is
+# SECONDS after prev_tail. Prepending across that boundary makes predict_state
+# dead-reckon ``v*dt + 0.5*a*dt^2`` over the WHOLE blackout -> a metres-large
+# pose JUMP the instant the stream returns (the "lúc đứng lúc chạy / nhảy quá
+# xa" the user saw; dangerous for the FC). When the boundary gap exceeds this
+# many seconds we treat it as a dropout: integrate only the FRESH block (drop
+# the stale tail), zero the now-meaningless velocity (vision re-anchors position
+# over the next frames -- a smooth recovery, NOT a snap), and flag the frame.
+# 0.25s = 5 frames @20fps -- far above normal frame jitter, far below any real
+# blackout. LIVE + --tight only -> oracle/loose byte-identical (never reached,
+# and the recorded replay sessions have no dropout so it never fires anyway).
+_SENSOR_GAP_S = float(os.environ.get("OAKD_SENSOR_GAP_S", "0.25"))
 # Backend->live BIAS feed-forward (PLAN P2, LIVE + --tight only). The tight BA's
 # optimised (bg, ba) arrive on backend.state; the dead-reckon adopts them via a
 # per-keyframe LOW-PASS (_K_BIAS ~0.4 -> tau ~0.5s at ~4Hz keyframes), HEALTH-
@@ -393,8 +409,24 @@ def propagate_imu(ctx: Any, step: Step) -> Step:
         # share NO boundary sample; prepending the previous block's last
         # sample makes the integrated interval exactly
         # (prev_block_last_ts, this_block_last_ts] with no dropped segment.
+        # EXCEPT across a SENSOR DROPOUT (boundary gap > _SENSOR_GAP_S): the
+        # prev_tail is seconds stale, so prepending would integrate the entire
+        # blackout into one giant step -> a dangerous pose jump on reconnect.
+        # Refuse it -- integrate only the fresh block (small internal dts) and
+        # zero the stale velocity so position holds and re-anchors smoothly
+        # instead of snapping; flag the frame as a gap-recovery for the UI/FC.
         tail = nav.get("prev_tail")
-        if tail is not None and int(tail[0]) < int(ts_raw[0]):
+        boundary_gap = (
+            (int(ts_raw[0]) - int(tail[0])) * 1e-9 if tail is not None else 0.0)
+        if boundary_gap > _SENSOR_GAP_S:
+            ts, gyro, accel = ts_raw, gyro_raw, accel_raw
+            nav["v"] = np.zeros(3)            # blind interval -> velocity unknown
+            nav["vis_offset"] = None          # re-seed the re-anchor on re-lock
+            nav["anchor_dt"] = 0.0            # stale dt the vel-feedback divides by
+            if isinstance(step.info, dict):
+                step.info["sensor_gap_s"] = float(boundary_gap)
+                step.info["inertial_dr"] = True
+        elif tail is not None and int(tail[0]) < int(ts_raw[0]):
             ts = np.concatenate(([np.int64(tail[0])], ts_raw))
             gyro = np.vstack((tail[1][None, :], gyro_raw))
             accel = np.vstack((tail[2][None, :], accel_raw))
@@ -577,18 +609,23 @@ def _record_kf_pose(state: dict, nav: dict, seq: int) -> None:
 
 
 def _adopt_backend_bias(state: dict, nav: dict) -> None:
-    """Fold the tight backend's optimised ``(bg, ba)`` into the live dead-reckon bias.
+    """Fold the BA backend's optimised ``(bg, ba)`` into the live dead-reckon bias.
 
-    The BackendWorker republishes its latest optimised bias on ``backend.state``;
-    the odometry thread takes the freshest one here (latest-wins inbox) and folds
-    it into ``nav["bg"]``/``nav["ba"]`` via a bounded per-keyframe LOW-PASS
-    (``_K_BIAS``), so a single noisy solve cannot step the dead-reckon. HEALTH-
-    GATED: adopt ONLY when the solve is NOT ``vio_degraded`` AND has held healthy
-    for ``_BACKEND_HEALTHY_HOLD`` keyframes (hysteresis -- fast to distrust, slow
-    to trust) AND the ``seq`` is fresh (newer than the last adopted; the backend
-    worker drains latest-wins, so a stale state can arrive). A diverging BA is
-    therefore NEVER fed and the live pose falls back to the decoupled behaviour.
+    The ``ba`` process publishes its latest optimised bias on the IPC ``ba.state``
+    topic (a :class:`~vio.comms.messages.BackendState` dataclass); vio.main's
+    ba-endpoint bridge re-hydrates it onto the local bus, where the odometry worker's
+    inbox holds the freshest one. We take it here (latest-wins inbox) and fold it into
+    ``nav["bg"]``/``nav["ba"]`` via a bounded per-keyframe LOW-PASS (``_K_BIAS``), so
+    a single noisy solve cannot step the dead-reckon. HEALTH-GATED: adopt ONLY when
+    the solve is NOT ``degraded`` AND has held healthy for ``_BACKEND_HEALTHY_HOLD``
+    keyframes (hysteresis -- fast to distrust, slow to trust) AND the ``seq`` is fresh
+    (newer than the last adopted). The seq staleness gate is what makes the async IPC
+    hop tolerable: a state that arrives late / out of order is dropped. A diverging BA
+    is therefore NEVER fed and the live pose falls back to the decoupled behaviour.
     LIVE + --tight only -- the loose / oracle path never wires the inbox.
+
+    ``msg`` is the :class:`~vio.comms.messages.BackendState` DATACLASS off IPC (seq /
+    bg / ba / degraded as attributes), not the old in-vio local-bus dict.
     """
     if not _BACKEND_FEEDBACK:
         return
@@ -598,11 +635,11 @@ def _adopt_backend_bias(state: dict, nav: dict) -> None:
     msg = inbox.take()
     if msg is None:
         return
-    seq = int(msg.get("seq", -1))
+    seq = int(msg.seq)
     if seq <= nav["backend_bias_seq"]:        # stale / already adopted -> drop
         return
     nav["backend_bias_seq"] = seq
-    if msg.get("degraded", False):
+    if bool(msg.degraded):
         nav["backend_healthy_run"] = 0        # distrust immediately on a bad solve
         nav["backend_degraded_run"] += 1
         # Sustained divergence: the held last-good bias may now be stale (thermal
@@ -617,7 +654,7 @@ def _adopt_backend_bias(state: dict, nav: dict) -> None:
     nav["backend_healthy_run"] += 1
     if nav["backend_healthy_run"] < _BACKEND_HEALTHY_HOLD:
         return                                # not yet trusted (hysteresis)
-    bg, ba = msg.get("bg"), msg.get("ba")
+    bg, ba = msg.bg, msg.ba
     if bg is None or ba is None:
         return
     nav["bg"] = nav["bg"] + _K_BIAS * (np.asarray(bg, dtype=np.float64) - nav["bg"])
