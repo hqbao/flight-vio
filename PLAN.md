@@ -1,88 +1,82 @@
-# PLAN — Tight-VIO solve optimisation chain (Schur + gauge reg + divergence guard + njit)
+# PLAN — FC link (VIO → custom FC ESKF) · Tier T3
+
+> Supersedes the prior PLAN.md (tight-solve optimisation chain, COMPLETE — that
+> record lives in `docs/TIGHT_COUPLED_PLAN.md` §4(g–j) + git history). This is the
+> "Known gap (PENDING)" that prior plan pointed to: the FC link itself.
 
 ## Task
-Optimise + harden the `--tight` LM window solve (`sky/vio/window.py`,
-`sky/vio/imu_factor_numba.py`, `vio/engine/steps.py`, `vio/modules/backend.py`),
-in order: (1) Schur complement on the dense solve, (2) absolute-velocity gauge
-regularisation (the real fix for the long-standing "tight explodes on shake"),
-(3) divergence guard, (4) njit IMU-Jacobian kernel coupled to the guard, and
-(5) thread a `vio_degraded` health signal end-to-end to the published pose.
+Stream the live VIO pose (`pose.odom`, `T_world_cam`) to the user's **custom**
+flight controller's ESKF as MAVLink `VISION_POSITION_ESTIMATE` (#102) over UART,
+with covariance from `pos_sigma_m` and a loop-jump `reset_counter`. Insertion
+point = the existing `# === FC OUTPUT HOOK` in
+`launcher/main.py::_start_pose_logger._on_pose` (a read-only `pose.odom` consumer).
 
-## Tier: T3 (touches the estimation core / flight-relevant tight VIO)
+## Decisions (delegated by the user: "Custom FC" + "you decide the lib")
+- **Self-owned, dependency-free MAVLink v2 packer** for the ONE message (#102) —
+  NO pymavlink in the flight runtime (keeps the lean Pi image + the self-owned
+  ethos; maps to the roadmap's future C `fc_link_mavlink.c`). pymavlink is used
+  ONLY as a dev-time GOLD cross-check in the selftest (never a flight dep).
+- **Opt-in** `--fc-out <port>` (+ `--fc-baud`, default 921600): OFF by default, so
+  the flight stack / oracle / `gap=0` are byte-unaffected when disabled.
+- Custom FC ⇒ no PX4/ArduPilot constraint; WE define the contract, the FC parses it.
 
-## Status: COMPLETE + VALIDATED (2026-06-16). Not committed.
+## Phases (each independently testable, opt-in, off-path when disabled)
+- **A — MVP (in progress).** Self-owned #102 packer (`sky/fc/mavlink_vpe.py`,
+  stdlib-only, leaf) + byte-correctness selftest [DONE]. Then: optical→NED
+  transform + wire into `_on_pose` behind `--fc-out` over pyserial.
+- **B.** Loop-closure → bump `reset_counter` + re-anchor (NEVER fuse the jump — a
+  fused discontinuity injects phantom velocity into the FC ESKF).
+- **C.** Velocity (`ODOMETRY` msg) where the FC supports it (VIO drifts → prefer
+  velocity); `vio_degraded` → inflate R / signal loiter-RTH; extend `pos_sigma_m`
+  to `--tight`/loose (today it is `--direct`-only).
 
-Opt-in/defaults: `--tight` is opt-in (loose is default; the oracle's loose
-entries stay `gap=0`). Within `--tight`, Schur + regularisation + guard + njit are
-all ON by default.
+## FRAME TRANSFORM — RESOLVED (math-reviewer; REQUEST_CHANGES → design locked)
+`pose.odom` world = **gravity-aligned OPTICAL** (proven from `gravity_aligned_R0`,
+`sky/imu/imu.py:257`, NOT the docstrings): +X = camera-start right, **+Y = DOWN
+along real gravity (the ONLY absolute axis)**, +Z = camera-start forward. Yaw is
+**vision-relative, NOT North-referenced** (zero magnetometer in the tree); roll/
+pitch ARE gravity-locked/absolute. `frames.py`'s `World=NED` / `R_BODY_CAM=I` is
+DEAD, misleading doc — never applied in the pipeline; do NOT wire from it.
+- **Position → NED:** `R_world→NED = [[0,0,1],[1,0,0],[0,1,0]]` (det +1; Down=+Y
+  gravity correct). BUT North/East are a FICTITIOUS gauge (vision-relative) → send
+  as a VISION / local-FRD frame (`MAV_FRAME_VISION_NED`), NOT true-North NED.
+- **Attitude → FRD:** FULL similarity `R_ned_frd = R_world→NED · R_cw · R_FRD_OPTᵀ`,
+  `R_FRD_OPT=[[0,0,1],[1,0,0],[0,1,0]]` (optical→FRD); then `quat_to_rpy` (ZYX) as-is.
+  Naive world-only rotation = WRONG (verified `(70,0,125)` vs correct `(0,−20,35)`).
+- **Covariance:** `Σ_ned = R Σ Rᵀ` is a provable NO-OP while σ is isotropic scalar
+  (`σ²I → σ²I`) — send σ² on the diagonal directly; the matmul becomes load-bearing
+  only at the anisotropic (inv-Hessian) upgrade. Mark that in code.
+- **SAFETY (the crash-risk finding):** VPE yaw is gauge-free → the FC must NOT fuse
+  it as absolute heading. ⇒ **MVP DECISION = POSITION-ONLY**: send position + the
+  Down-correct vision frame, attitude block marked UNKNOWN (NOT a small variance),
+  the FC keeps its own gyro/mag heading. Attitude (relative-yaw) is a later,
+  explicitly-flagged step.
 
-### Done (all five links)
-- [x] **Schur complement** — `_schur_solve`/`_schur_partition`/`_schur_reduce_dense`,
-      per-landmark scatter; marginalises the block-diagonal 3×3 landmark Hessian →
-      reduced nav-only solve (`ndim ~993 → ~114`). `use_schur` gated on IMU factors +
-      `M>0`. ALGEBRAICALLY EXACT. Closes the planned-Schur TODO in the window.py docstring.
-- [x] **Gauge regularisation** — `VioConfig.vel_abs_prior` (default ON, `sigma_vabs=1.0`,
-      toward the IMU forward-prediction not zero), `tau_nav=1e-3` (absolute nav-block
-      Tikhonov floor), `min_lambda` 1e-9→1e-6. ROOT CAUSE: IMU vel residual is a pure
-      DIFFERENCE operator → rank-3 abs-velocity null space → relative damping amplifies
-      round-off ~1.9e6×. math-reviewer APPROVED (legitimate gauge anchor, invents no
-      info; ~400× weaker than the IMU tie → drags a real manoeuvre only ~2 mm/s).
-- [x] **Divergence guard** — `WindowedVIOConfig.divergence_guard` (default ON) +
-      `max_reproj_px=20`, `max_window_jump_m=1.0`, `jump_reproj_floor_px=15`,
-      `max_deadreckon_speed_mps=5`. Detect (reproj primary, reproj-gated jump
-      secondary) → reject window mutation → bounded fallback (IMU dead-reckon if it
-      agrees with the frontend seed, else frontend seed) → gate `self.vo.pose`
-      writeback (no frontend poisoning) → raise `vio_degraded`. safety-reviewer APPROVE
-      (flagged: document as an always-on flight invariant; not FC-pose-trustworthy
-      until the FC consumes `vio_degraded`).
-- [x] **njit IMU-Jacobian kernel** — `imu_factor_numba.py` `@njit(cache=True,
-      fastmath=False)`, DEFAULT ON, COUPLED to the guard. `njit_guard_ok` gate
-      force-disables it if the guard is off (even with `SKY_VIO_IMU_NJIT=1`);
-      `SKY_VIO_IMU_NJIT=0` always forces off; `HAVE_NUMBA` fallback to pure-Python.
-- [x] **`vio_degraded` health signal** — `vio_step` returns `(T_cw, health)`;
-      `run_ba` merges `{vio_degraded, vio_reproj_px, vio_window_jump_m}` into
-      `pose.refined` `PoseMsg.info` (alongside `refined`/`pos_sigma_m`). InProcess +
-      Subprocess engines. Loose path info unchanged (key absent).
+## FC-side contract (what the user's custom FC must parse)
+Standard MAVLink v2 frame, `STX=0xFD`, msgid 102, `CRC_EXTRA=158`. Payload (MAVLink
+size-descending order, trailing zeros truncated per v2 → zero-pad to 117 on
+receive): `uint64 usec | float x,y,z,roll,pitch,yaw | float covariance[21] |
+uint8 reset_counter`. `covariance` = upper-triangular 6×6 pose cov; `cov[0]=NaN` ⇒
+"unknown". Position variance = σ² from `pos_sigma_m` at cov indices 0/6/11.
 
-### Validation (measured, verbatim)
-- Oracle `gap=0` (loose byte-frozen; the 2 tight `backend="vio"` baseline entries
-  RE-BASELINED against the new exact/intended tight solve).
-- `schur_equiv_selftest`: worst `max|δ_scatter − δ_dense| ≈ 1.7e-14` (observed up
-  to 2.4e-14 over 35 inner solves / 4 tight configs), far below the 1e-9 gate. PASS.
-- `imu_factor_njit_ate`: njit==pure full-session ATE **0.0 mm** incl. shake (the
-  guard makes shake deterministic). PASS.
-- `imu_factor_njit_equiv`: H/b relative ~7e-11.
-- Gauge rank: nav block lam_min **−6.45e-9 (rank-3 null) → +7.59e-3 (full rank)**.
-- Divergence guard: shake bounded **836 → 83 cm** (no runaway), ZERO false
-  positives on well-conditioned sessions. `divergence_guard_selftest` PASS
-  (rejects+flags a diverged KF without poisoning the frontend; bit-for-bit no-op on
-  a healthy solve).
-- `vio_ba_selftest` + `tight_smoke_selftest` + `tight_live_regression_selftest`
-  PASS; pyflakes 0.
-- Pi `--tight` fps: improved but noisy; does NOT reach 20 fps @ 320 (~6–9 fps was
-  the design estimate; the real Pi measurement is load-noisy). Loose stays the Pi
-  flight path.
+## Tier-T3 gate sequence
+1. math-reviewer — frame/covariance transform. ✅ DONE (REQUEST_CHANGES → resolved
+   into the position-only MVP above; frame proven from `gravity_aligned_R0`).
+2. developer — wire the position-only sender (transform + pyserial + `--fc-out`). ⏳ NEXT
+3. architecture-reviewer — `sky/fc` leaf placement + opt-in wiring + off-path proof.
+4. safety-reviewer + security-reviewer — FC-link behavior (relative-yaw / reset_counter /
+   degraded; the link's flight-safety + integrity posture).
+5. tester — loopback SIL (sender ↔ parser) + a documented HIL/UART protocol.
+6. docs-writer — `docs/` FC-link section + the FC-side contract; FIX the misleading
+   `frames.py` docstring (`World=NED`/`R_BODY_CAM=I` is dead/false).
 
-### Reviewer verdicts
-- math-reviewer: APPROVE (gauge anchor legitimate, invents no information).
-- safety-reviewer: APPROVE (divergence_guard = documented always-on flight
-  invariant; `--tight` bounded but NOT FC-pose-trustworthy until the FC consumes
-  `vio_degraded`).
-
-### Known gap (PENDING — separate, unbuilt item)
-- The FC consumer of `pose.refined.info['vio_degraded']` (hook
-  `launcher/main.py::_start_pose_logger._on_pose`) is NOT wired. The FC link itself
-  is a separate unbuilt item. Until then a sustained `vio_degraded` should drive FC
-  `pos_sigma_m` inflation / loiter-RTH once the FC link exists.
-
-### Docs (this change)
-- `docs/TIGHT_COUPLED_PLAN.md` §4(g–j) — Schur, gauge reg, divergence guard, njit
-  kernel + the run_ba Mermaid state diagram; Phase status updated.
-- `docs/ALGORITHMS.md` §3.3 — tight sibling note extended to the chain.
-- `docs/RPI5_DEPLOY.md` — `--tight` Pi profile (chain ON, guard invariant, njit
-  override, still slower than loose / not 20 fps@320).
-- `docs/PROC4_ARCHITECTURE.md` §9 invariant 18 — guard always-on + `vio_degraded`
-  flow + pending FC gap (SAFETY).
-- `README.md` — `--tight` recipe bullet.
-- DRIFT fixed: `sky/vio/imu_factor_numba.py` module docstring (was "SHIPPED
-  DISABLED / default-OFF", superseded by the divergence-guard default-ON gate).
+## Verdicts / blockers
+- **Packer** (`sky/fc/mavlink_vpe.py`) + selftest: BUILT, self-verified (CRC anchor
+  `MCRF4XX("123456789")==0x6F91` + independent self-parse round-trip + truncation).
+  pymavlink GOLD cross-check SKIPPED (pymavlink not installed — `pip install
+  pymavlink` as dev-only to run it). gap=0 unaffected (new leaf; nothing imports it yet).
+- **math-reviewer:** REQUEST_CHANGES — frame is gravity-aligned optical with a
+  GAUGE-FREE yaw, not NED. Resolved → MVP is POSITION-ONLY in a vision frame; FC
+  must not fuse VPE yaw as heading. Attitude needs the FULL similarity transform
+  when added. `frames.py` docstring is dead/misleading (developer to fix).
+- **NOT committed** (FC work is mid-Phase-A; user commits when ready).
