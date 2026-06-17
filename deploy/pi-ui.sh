@@ -98,6 +98,29 @@ SLAM_EP="oak.slam"
 # Resolve the IPC socket directory the SAME way comms.ipc does ($TMPDIR/ours_ipc).
 SOCK_DIR="$(.venv/bin/python -c 'import tempfile, os; print(os.path.join(tempfile.gettempdir(), "ours_ipc"))')"
 
+# Sweep ORPHAN receivers + STALE sockets from a previous watch session. This is the
+# Mac-side analog of the Pi forward-sweep in pi-run.sh/pi-stop.sh, and it is the real
+# safety net: closing the UI terminal sends SIGHUP, and a hard kill sends SIGKILL --
+# neither runs the cleanup trap below, so the background netbridge.receive LEAKS and
+# keeps owning oak.{capture,vio,slam}.sock. A new run then sees those leftover sockets,
+# its wait-loop below false-positives ("sockets up"), and ui.main attaches to the DEAD
+# receiver -> the UI shows no pose ("src fps 0.0 / samples 0"). Kill every stray
+# receiver and delete the re-served sockets so the fresh receiver below binds clean.
+# (pi-ui is the only thing that runs netbridge.receive on the Mac, so a blanket sweep
+# is safe; you watch one Pi at a time.)
+# Match on the module name only -- the Mac's Homebrew interpreter is
+# ".../Python.app/Contents/MacOS/Python" (no lowercase "python" substring), so a
+# "python -m netbridge.receive" pattern would NOT match here. "netbridge.receive" is
+# unambiguous (pi-ui is the only thing that runs it on the Mac) and matches any
+# interpreter path/case.
+if pgrep -f 'netbridge\.receive' >/dev/null 2>&1; then
+  echo "[pi-ui.sh] sweeping orphan netbridge.receive from a previous watch session ..." >&2
+  pkill -TERM -f 'netbridge\.receive' 2>/dev/null || true
+  sleep 1
+  pkill -KILL -f 'netbridge\.receive' 2>/dev/null || true
+fi
+rm -f "$SOCK_DIR/$CAP_EP.sock" "$SOCK_DIR/$VIO_EP.sock" "$SOCK_DIR/$SLAM_EP.sock"
+
 echo "[pi-ui.sh] starting netbridge.receive (connect $CONNECT) ..."
 .venv/bin/python -m netbridge.receive \
     --connect "$CONNECT" \
@@ -107,15 +130,20 @@ echo "[pi-ui.sh] starting netbridge.receive (connect $CONNECT) ..."
     "${RECV_MODE_ARGS[@]}" &
 RECV_PID=$!
 
-# Tear the receiver down whenever this script exits (clean quit OR error/Ctrl-C).
+# Tear the receiver down whenever this script exits (clean quit, error/Ctrl-C, OR the
+# terminal window being closed -- HUP). A leaked receiver keeps owning the re-served
+# sockets and breaks the NEXT run (see the sweep above), so we also unlink them here.
 cleanup() {
   if kill -0 "$RECV_PID" 2>/dev/null; then
     echo "[pi-ui.sh] stopping netbridge.receive (pid $RECV_PID) ..."
     kill "$RECV_PID" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do kill -0 "$RECV_PID" 2>/dev/null || break; sleep 0.3; done
+    kill -KILL "$RECV_PID" 2>/dev/null || true
     wait "$RECV_PID" 2>/dev/null || true
   fi
+  rm -f "$SOCK_DIR/$CAP_EP.sock" "$SOCK_DIR/$VIO_EP.sock" "$SOCK_DIR/$SLAM_EP.sock"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT INT TERM HUP
 
 # Wait for the three re-served sockets to appear (receive creates them only AFTER
 # it has learned the resolution from the forwarded calib.bundle -- so a socket
