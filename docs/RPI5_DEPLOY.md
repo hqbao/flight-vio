@@ -303,7 +303,11 @@ which diagnostic captures run.
   pass-through), but four heavy processes still oversubscribe four cores. For flight
   use **320×200** and drop what the mission does not need: `--no-ba` (no
   pose.refined / no bias feed-forward) and/or `--no-slam` (no loop closure) — both
-  are launcher spawn gates, so the dropped process is simply never started.
+  are launcher spawn gates, so the dropped process is simply never started. With
+  `--ui`, the netbridge forward **skips the slam bridge** under `--no-slam` (it used
+  to pass the real `oak.slam` endpoint anyway, block on the missing socket, and
+  crash the whole bridge after the 30 s connect timeout — taking the remote UI down;
+  fixed: `--no-slam` empties the forward's slam endpoint, like it does for vio).
 
 - **`--cap-numba-threads` is always passed.** The flight stack runs capture / vio /
   slam as separate OS processes; with nothing set, **each** spins a numba pool of
@@ -385,6 +389,31 @@ Per-stage wall-clock was measured on the real Pi 5 with
 > off the vio core) + `--cap-numba-threads` must be confirmed with a **live camera
 > run** at that resolution
 > (`./deploy/pi-run.sh --width 320 --height 200`), not a replay.
+
+### 3e. Reading `run.log` — heartbeat + freeze detection
+
+`run.log` (the headless stack's stdout; tail it with `./deploy/pi-run.sh --logs`)
+carries a continuous pulse so a freeze is never silent on the console:
+
+- **capture heartbeat** — every 5 s: `capture: 20.0 fps (frame N)`. A frozen OAK
+  does NOT kill the capture worker — it leaves it BLOCKED on its inbox (alive but
+  starved), which used to spin silently (runs a bit, then freezes, console says
+  nothing). Now the instant frames stop you get a LOUD, throttled warning:
+  ```
+  capture: STALLED -- no frame for 3.0s (last frame 432, read-thread alive=True). OAK crashed/hung? check `dmesg` + .cache/depthai/crashdumps
+  ```
+  and `capture: RECOVERED after Xs` when frames resume. So `grep STALLED run.log`
+  pins exactly WHEN it froze + the cause to chase (the OAK firmware crash under
+  streaming — see §1b; idle-stable but crashes under MIPI load).
+- **pose stream** — the `--no-ui` FC-output logger prints `pose: pos WORLD=... n=N`
+  at ~2 Hz; the `n=` counter is the live pose count, so it stalls when the pipeline
+  does. (Its IPC client now waits up to 30 s for VIO to come up, so `--no-ui` always
+  gets the pose log — it used to give up at 5 s, before VIO's server existed.)
+
+Keep a freeze log for later by copying `run.log` before the next run (it is
+truncated each start). Post-mortem of a freeze:
+`grep -E "STALLED|crashed|X_LINK" run.log`, then `dmesg | grep -iE "usb|movidius|luxonis"`
+and the newest `.cache/depthai/crashdumps/*.tar.gz`.
 
 ---
 

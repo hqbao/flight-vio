@@ -170,6 +170,52 @@ def _drain_wait(done_evt, ceiling_s: float, stop) -> None:
         waited += 0.1
 
 
+def _poll_with_watchdog(stop, cam_module, imu_module) -> None:
+    """Poll until the cam read thread exits, with a frame-flow WATCHDOG.
+
+    A frozen OAK does NOT kill the worker -- it BLOCKS on ``_inbox.get()``, alive
+    but starved, so a bare ``while is_alive(): sleep`` spins SILENTLY and a device
+    freeze leaves NO trace in run.log (the operator's "runs a bit then freezes,
+    console says nothing"). ``imu_module.frames_out`` is the count of
+    ``IMUCAM_SAMPLE`` frames published downstream -- the data VIO actually
+    consumes -- so a frozen count means "VIO is getting nothing", whatever
+    stalled (device read OR the pack stage). We emit a periodic fps heartbeat and
+    a LOUD, throttled WARNING the instant frames stall + when they RECOVER, so
+    the log always carries a timestamped trace + a cause hint to grep for.
+    """
+    _HB, _STALL = 5.0, 3.0                        # heartbeat / stall-warn (s)
+    last_n = imu_module.frames_out
+    t_frame = time.monotonic()                    # when frames last advanced
+    t_hb, hb_n = t_frame, last_n                  # heartbeat anchor
+    stalled = False
+    while not stop[0] and cam_module.is_alive():
+        time.sleep(0.2)
+        now = time.monotonic()
+        n = imu_module.frames_out
+        if n != last_n:                           # frames advancing
+            if stalled:
+                LOG.warning("capture: RECOVERED after %.1fs stall (frame %d)",
+                            now - t_frame, n)
+                stalled = False
+            last_n, t_frame = n, now
+        elif not stalled and now - t_frame >= _STALL:         # frames stopped
+            stalled = True
+            LOG.warning("capture: STALLED -- no frame for %.1fs (last frame %d, "
+                        "read-thread alive=%s). OAK crashed/hung? check `dmesg` + "
+                        ".cache/depthai/crashdumps", now - t_frame, last_n,
+                        cam_module.is_alive())
+        if now - t_hb >= _HB:                      # periodic heartbeat
+            fps = (n - hb_n) / (now - t_hb)
+            if stalled:
+                LOG.warning("capture: %.1f fps (frame %d) [STALLED %.1fs]",
+                            fps, n, now - t_frame)
+            else:
+                LOG.info("capture: %.1f fps (frame %d)", fps, n)
+            t_hb, hb_n = now, n
+    LOG.info("capture: loop exit (stop=%s, read-alive=%s, frames=%d)",
+             stop[0], cam_module.is_alive(), imu_module.frames_out)
+
+
 # --------------------------------------------------------------------------- #
 def run_capture_replay(session: Path, endpoint: str, *,
                        width: int, height: int,
@@ -260,14 +306,10 @@ def run_capture_replay(session: Path, endpoint: str, *,
     cam_module.start()
     LOG.info("capture: cam + imu modules started, waiting for join ...")
     try:
-        # Poll instead of pure join() so the signal handler is delivered
-        # promptly. The poll cadence (0.2 s) matches the live path;
-        # cam_module.is_alive() flips False after produce() returns or _stop is
-        # observed inside the loop.
-        while not stop[0] and cam_module.is_alive():
-            time.sleep(0.2)
-        LOG.info("capture: cam loop exit (stop=%s, alive=%s)",
-                 stop[0], cam_module.is_alive())
+        # Poll until the read thread exits, with the frame-flow watchdog
+        # (heartbeat + stall/recovery logging; a frozen source is otherwise a
+        # silent spin here). Signal handler stays prompt at the 0.2 s cadence.
+        _poll_with_watchdog(stop, cam_module, imu_module)
     finally:
         # ReadCamModule (producer thread) emits END on CAM_SYNC when its produce
         # loop returns; ImuCamWorker forwards END from CAM_SYNC to IMU_RAW +
@@ -382,8 +424,12 @@ def run_capture_live(endpoint: str, *,
     imu_module.start()
     cam_module.start()
     try:
-        while not stop[0] and cam_module.is_alive():
-            time.sleep(0.2)
+        # Poll until the read thread exits, with the frame-flow watchdog
+        # (heartbeat + stall/recovery logging). A frozen OAK leaves the worker
+        # alive-but-starved, so without this the loop spins silently and a device
+        # freeze leaves no trace -- the operator's "runs a bit then freezes,
+        # console says nothing". See _poll_with_watchdog.
+        _poll_with_watchdog(stop, cam_module, imu_module)
     finally:
         # Close the device FIRST: the OAK-D firmware watchdog is only ~1.5s and
         # tearing down the bridge / IPC before release() risks tripping it.

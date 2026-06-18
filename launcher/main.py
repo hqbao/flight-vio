@@ -470,7 +470,12 @@ def _start_pose_logger(vio_ep: str):
                  T[0, 3], T[1, 3], T[2, 3], qw, qx, qy, qz, sig_s, st["n"])
 
     try:
-        client = IPCPubSub(vio_ep, role="client", connect_timeout_s=5.0)
+        # 30 s, not 5 s: this logger is started right after spawning VIO, whose
+        # IPC server only comes up ~7 s later (calib wait + frontend build). At
+        # 5 s the connect timed out and the --no-ui run had NO pose log at all
+        # (blind). The client retries within the timeout, so 30 s simply waits
+        # for VIO to be ready.
+        client = IPCPubSub(vio_ep, role="client", connect_timeout_s=30.0)
         client.subscribe(topics.POSE_ODOM, _on_pose)
         client.start()
     except Exception as e:                                          # noqa: BLE001
@@ -502,10 +507,15 @@ def build_forward_args(host: str, port: int, args, cap_ep: str, vio_ep: str,
     ``--pose-only`` UNLESS ``args.bridge_frames`` is set; the Mac-side receive must
     be run with the MATCHING intent (``deploy/pi-ui.sh --frames`` to keep frames).
     """
+    # --no-slam: no SLAM process exists, so tell the forward NOT to bridge slam
+    # (empty endpoint -> skip). Passing the real slam_ep here made the forward
+    # block on `oak.slam` and crash after the 30 s connect timeout, taking the
+    # remote UI down with it. Mirrors build_vio_args' --slam-endpoint gating.
+    fwd_slam_ep = "" if getattr(args, "no_slam", False) else slam_ep
     forward_args = ["--listen", f"{host}:{port}",
                     "--capture-endpoint", cap_ep,
                     "--vio-endpoint", vio_ep,
-                    "--slam-endpoint", slam_ep,
+                    "--slam-endpoint", fwd_slam_ep,
                     "--width", str(args.width),
                     "--height", str(args.height)]
     if not args.bridge_frames:

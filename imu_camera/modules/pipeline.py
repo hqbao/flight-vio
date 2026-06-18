@@ -186,6 +186,11 @@ class ImuCamWorker(threading.Thread):
         self._stop = threading.Event()
         self.done = threading.Event()          #: set after END is handled
         self._emitted_end = False
+        #: monotone count of frames published downstream. Read by the capture
+        #: main-loop watchdog (imu_camera.main) to detect a stalled OAK: when the
+        #: device freezes this worker BLOCKS on `_inbox.get()` (still alive, just
+        #: starved), so a frozen count is the only signal a frame stopped arriving.
+        self.frames_out = 0
 
         # Subscribe the inbox feeder to cam.sync in __init__ (matches the old
         # Module.on timing) so a trigger published between construction and start()
@@ -248,6 +253,7 @@ class ImuCamWorker(threading.Thread):
                 self._handle_end()
                 continue
             process_cam_sync(self, msg)
+            self.frames_out += 1                 # watchdog heartbeat (imu_camera.main)
 
     def _handle_end(self) -> None:
         # Forward END to every downstream topic exactly once, then signal done.

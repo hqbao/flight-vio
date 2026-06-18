@@ -41,7 +41,7 @@ def _ns(**over) -> types.SimpleNamespace:
                 use_camera_calib=False, vl53l9cx=True,
                 tight=False, stabilize_velocity=False, depth_icp=False,
                 ba_window=False, frontend_viz=False, direct=False,
-                forward=None, model=None, bridge_frames=False)
+                forward=None, model=None, bridge_frames=False, no_slam=False)
     base.update(over)
     return types.SimpleNamespace(**base)
 
@@ -91,6 +91,28 @@ def test_pose_only_default() -> None:
     print("[e] default => --pose-only; --bridge-frames => legacy argv (compat)      OK")
 
 
+def test_no_slam_skips_bridge() -> None:
+    """`--no-slam` EMPTIES the forward's slam endpoint so it skips the slam bridge.
+
+    Regression: passing the real slam endpoint under --no-slam (no SLAM process
+    exists) made netbridge.forward block on `oak.slam` and CRASH after the 30 s
+    connect timeout -- taking the remote UI down with it (the user's `--ui
+    --no-slam` freeze). The forward treats an empty slam endpoint as "skip slam".
+    """
+    cap, vio, slam = "oak.capture", "oak.vio", "oak.slam"
+    host, port = parse_host_port(":8787")
+    # Default (slam on): the real slam endpoint is bridged.
+    on = build_forward_args(host, port, _ns(no_slam=False), cap, vio, slam)
+    assert on[on.index("--slam-endpoint") + 1] == slam, on
+    # --no-slam: the slam endpoint is EMPTY (forward skips the slam forwarder).
+    off = build_forward_args(host, port, _ns(no_slam=True), cap, vio, slam)
+    assert off[off.index("--slam-endpoint") + 1] == "", off
+    # capture + vio are still bridged regardless.
+    assert off[off.index("--capture-endpoint") + 1] == cap, off
+    assert off[off.index("--vio-endpoint") + 1] == vio, off
+    print("[f] --no-slam => forward slam endpoint EMPTY (skip), cap+vio kept         OK")
+
+
 def test_additive() -> None:
     """--forward must not leak into the capture / vio argv (additive)."""
     cap, vio, slam = "oak.capture", "oak.vio", "oak.slam"
@@ -120,6 +142,7 @@ if __name__ == "__main__":
     test_parse_host_port()
     test_build_forward_args()
     test_pose_only_default()
+    test_no_slam_skips_bridge()
     test_additive()
     test_help_registers_flag()
     print("\nnetbridge_forward_selftest: ALL PASS")

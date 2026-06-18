@@ -353,7 +353,13 @@ def run_forward(*, host: str, port: int,
     # server treats every forwarded topic as reliable POD/retained.
     image_union: set[str] = set()
     retained_union: set[str] = set()
-    for role in ("capture", "vio", "slam"):
+    # SLAM is OPTIONAL: under the lean flight config (`--no-slam`) the launcher
+    # passes an EMPTY slam endpoint, because no SLAM process exists -- attaching
+    # the slam forwarder anyway would block on `oak.slam` and crash the whole
+    # forward (and with it the remote UI) after the 30 s connect timeout.
+    bridge_slam = bool(slam_endpoint)
+    roles = ("capture", "vio", "slam") if bridge_slam else ("capture", "vio")
+    for role in roles:
         image_union |= allow.image_topics(role, include_images=include_images)
         retained_union |= allow.retained_topics(role)
     server = TcpServer(host, port,
@@ -367,10 +373,15 @@ def run_forward(*, host: str, port: int,
         EndpointForwarder("vio", vio_endpoint, server, vio_rings,
                           connect_timeout_s=connect_timeout_s,
                           include_images=include_images),
-        EndpointForwarder("slam", slam_endpoint, server, slam_rings,
-                          connect_timeout_s=connect_timeout_s,
-                          include_images=include_images),
     ]
+    if bridge_slam:
+        forwarders.append(
+            EndpointForwarder("slam", slam_endpoint, server, slam_rings,
+                              connect_timeout_s=connect_timeout_s,
+                              include_images=include_images))
+    else:
+        LOG.info("forward: SLAM bridge DISABLED (no slam endpoint -- --no-slam); "
+                 "bridging capture + vio only")
 
     stop = stop_event if stop_event is not None else threading.Event()
 
