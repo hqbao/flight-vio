@@ -437,7 +437,42 @@ def _terminate(procs: list[subprocess.Popen], *, deadline_s: float = 10.0,
                 pass
 
 
-def _start_pose_logger(vio_ep: str):
+# Overload watchdog tuning: warn when the end-to-end pose.odom rate stays below
+# _OVL_FRAC of the target across _OVL_HOLD windows of _OVL_WIN s (throttled).
+_OVL_FRAC, _OVL_WIN, _OVL_HOLD, _OVL_THROTTLE = 0.6, 3.0, 2, 8.0
+
+
+def _pose_overload_rate(st: dict, now: float, n: int, target_fps: int):
+    """Update the pose-rate overload state on a pose arrival.
+
+    ``st`` carries ``rate_t / rate_n / warn_t / low`` across calls. Returns the
+    measured rate (Hz) when a fresh OVERLOAD warning is DUE (the rate has held
+    below ``_OVL_FRAC * target_fps`` for ``_OVL_HOLD`` windows), else ``None``.
+    Pure + state-explicit so the launcher's overload watchdog is unit-testable
+    WITHOUT a live device (the live path can only be exercised on real hardware).
+    The clock anchors to the FIRST pose so VIO's startup wait never reads as slow.
+    """
+    if not target_fps:
+        return None
+    if n <= 1:                                  # first pose -> start the clock here
+        st["rate_t"], st["rate_n"], st["low"] = now, n, 0
+        return None
+    if now - st["rate_t"] < _OVL_WIN:           # window not elapsed yet
+        return None
+    rate = (n - st["rate_n"]) / (now - st["rate_t"])
+    st["rate_t"], st["rate_n"] = now, n
+    if rate >= _OVL_FRAC * target_fps:          # keeping up -> reset the run
+        st["low"] = 0
+        return None
+    st["low"] += 1                              # a slow window
+    if st["low"] >= _OVL_HOLD and now - st["warn_t"] >= _OVL_THROTTLE:
+        st["warn_t"] = now
+        return rate
+    return None
+
+
+def _start_pose_logger(vio_ep: str, target_fps: int = 0, width: int = 0,
+                       height: int = 0, live: bool = False):
     """``--no-ui`` FC-output preview: subscribe to the vio pose, print pos + quat.
 
     A READ-ONLY consumer on the vio endpoint -- the ours FC-output HOOK, the
@@ -448,16 +483,33 @@ def _start_pose_logger(vio_ep: str):
     attach (logging must never break the flight run). Pose is ``T_world_cam`` in
     the pipeline's gravity-aligned WORLD frame; the FC NED / body-extrinsic
     mapping is the (future) FC-link step, not done here.
+
+    Also an OVERLOAD watchdog (live only): when the chosen resolution is too heavy
+    for the box (e.g. 640x400 on a 4-core Pi), nothing ERRORS -- the pipeline just
+    can't keep real-time, the pose.odom rate collapses, and the (remote) UI looks
+    FROZEN with nothing in the log. So it compares the actual end-to-end pose rate
+    to ``target_fps`` (pose.odom is the LAST stage, so this catches a bottleneck in
+    EITHER capture or vio) and, when it stays well below, logs a LOUD WARNING
+    telling the operator to lower the resolution.
     """
     from launcher.comms import IPCPubSub, topics
     from launcher.comms.lib.misc.frames import rot_to_quat
 
-    st = {"last": 0.0, "n": 0}
+    st = {"last": 0.0, "n": 0, "rate_t": 0.0, "rate_n": 0, "warn_t": 0.0,
+          "low": 0}
 
     def _on_pose(wm) -> None:
         # === FC OUTPUT HOOK (ours) -- wire MAVLink VISION_POSITION_ESTIMATE here.
         st["n"] += 1
         now = time.monotonic()
+        # --- OVERLOAD watch: end-to-end pose rate vs the target fps (live only).
+        if live:
+            r = _pose_overload_rate(st, now, st["n"], target_fps)
+            if r is not None:
+                LOG.warning(
+                    "pipeline OVERLOADED: pose.odom only ~%.1f Hz vs %d target at "
+                    "%dx%d -- the box can't keep up at this resolution; lower it "
+                    "(e.g. --width 320 --height 200).", r, target_fps, width, height)
         if now - st["last"] < 0.5:
             return
         st["last"] = now
@@ -922,8 +974,12 @@ def main() -> int:
             vio_proc = named["vio"]
             ba_proc = named.get("ba")
             slam_proc = named.get("slam")
-            # FC-output preview: print the live pose (pos + quat) to the log.
-            pose_client = _start_pose_logger(vio_ep)
+            # FC-output preview: print the live pose (pos + quat) to the log, plus
+            # the OVERLOAD watchdog (live only: a session is replay-paced, not
+            # real-time, so its rate is not a "can't keep up" signal).
+            pose_client = _start_pose_logger(
+                vio_ep, target_fps=args.fps, width=args.width,
+                height=args.height, live=not bool(args.session))
             LOG.info("launcher: --no-ui set; waiting for capture to exit "
                      "(Ctrl-C to stop)")
             interrupted = False

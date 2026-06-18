@@ -390,10 +390,12 @@ Per-stage wall-clock was measured on the real Pi 5 with
 > run** at that resolution
 > (`./deploy/pi-run.sh --width 320 --height 200`), not a replay.
 
-### 3e. Reading `run.log` — heartbeat + freeze detection
+### 3e. Reading `run.log` — heartbeat, freeze + overload detection
 
 `run.log` (the headless stack's stdout; tail it with `./deploy/pi-run.sh --logs`)
-carries a continuous pulse so a freeze is never silent on the console:
+carries a continuous pulse so neither a **freeze** (frames stop) nor an
+**overload** (too slow to keep up) is ever silent on the console — both used to
+look identical: the UI froze and the log said nothing.
 
 - **capture heartbeat** — every 5 s: `capture: 20.0 fps (frame N)`. A frozen OAK
   does NOT kill the capture worker — it leaves it BLOCKED on its inbox (alive but
@@ -409,11 +411,24 @@ carries a continuous pulse so a freeze is never silent on the console:
   at ~2 Hz; the `n=` counter is the live pose count, so it stalls when the pipeline
   does. (Its IPC client now waits up to 30 s for VIO to come up, so `--no-ui` always
   gets the pose log — it used to give up at 5 s, before VIO's server existed.)
+- **overload watchdog** — a freeze is frames STOPPING; an overload is frames still
+  flowing but **too slow**. At too high a resolution for the box (e.g. 640×400 on
+  the 4-core Pi) nothing errors — the pipeline just can't keep real-time and the
+  (remote) UI looks frozen / "laggy". The launcher compares the live `pose.odom`
+  rate to `--fps`; when it stays below ~60 % of target for a few seconds (live
+  only — replay is paced, not a "can't keep up" signal) it logs:
+  ```
+  pipeline OVERLOADED: pose.odom only ~6.5 Hz vs 20 target at 640x400 -- the box can't keep up at this resolution; lower it (e.g. --width 320 --height 200).
+  ```
+  So `grep OVERLOADED run.log` says the box can't sustain the chosen resolution —
+  drop to **320×200** and/or shed `--no-ba` / `--no-slam` (§3c). pose.odom is the
+  LAST pipeline stage, so this one signal catches a bottleneck in EITHER capture or
+  vio.
 
-Keep a freeze log for later by copying `run.log` before the next run (it is
-truncated each start). Post-mortem of a freeze:
-`grep -E "STALLED|crashed|X_LINK" run.log`, then `dmesg | grep -iE "usb|movidius|luxonis"`
-and the newest `.cache/depthai/crashdumps/*.tar.gz`.
+Keep a freeze/overload log for later by copying `run.log` before the next run (it is
+truncated each start). Post-mortem:
+`grep -E "STALLED|OVERLOADED|crashed|X_LINK" run.log`, then for a freeze
+`dmesg | grep -iE "usb|movidius|luxonis"` + the newest `.cache/depthai/crashdumps/*.tar.gz`.
 
 ---
 
