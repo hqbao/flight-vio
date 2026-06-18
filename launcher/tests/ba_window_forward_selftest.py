@@ -45,7 +45,7 @@ def _ns(**over) -> types.SimpleNamespace:
 
 def _ba_ns(**over) -> types.SimpleNamespace:
     """A fuller namespace (the build_*_args builders read more fields)."""
-    base = dict(kf_every=5, no_gyro=False, worker=False, tight=False,
+    base = dict(kf_every=5, no_gyro=False, tight=False,
                 stabilize_velocity=False, depth_icp=False, ba_window=False,
                 backend_window=6, backend_iters=5, frontend_viz=False,
                 direct=False)
@@ -95,7 +95,7 @@ def test_forwards_to_ba_not_vio() -> None:
 
     # The backend left VIO -> --ba-window must NEVER reach the vio argv (VIO only
     # bridges ba.window back via --ba-endpoint, it does not produce it).
-    argv = build_vio_args(_ba_ns(ba_window=True), cap, vio, slam, use_worker=False)
+    argv = build_vio_args(_ba_ns(ba_window=True), cap, vio, slam)
     assert "--ba-window" not in argv, argv
     print("[i] resolved ON  -> '--ba-window' NOT in vio argv (left VIO)          OK")
 

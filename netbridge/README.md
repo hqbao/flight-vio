@@ -1,15 +1,18 @@
 # netbridge — cross-machine live-data bridge (Pi → Mac over TCP/WiFi)
 
-The 5-project split (`imu_camera` → `vio` → `slam` → `ui`) runs as a graph of
+The split (`imu_camera` → `vio` → `ba` → `slam` → `ui`) runs as a graph of
 processes on **one** host, wired by the in-host `comms.ipc.IPCPubSub` over AF_UNIX
 sockets + POSIX shared-memory rings. That works because every process shares the
 same kernel: a `SharedArrayRef` published by capture is `read_copy`-ed straight out
 of shared memory by the UI.
 
 `netbridge` lifts that boundary across the network so the **Pi** runs the whole
-flight stack (capture + vio + slam) and a **Mac** runs only the UI — live, over
-TCP/WiFi. The UI is **byte-for-byte unchanged**: the Mac re-serves the same
-abstract endpoints the UI already consumes.
+flight stack (capture + vio + ba + slam) and a **Mac** runs only the UI — live, over
+TCP/WiFi. The UI is **byte-for-byte unchanged**: the Mac re-serves the same abstract
+endpoints the UI already consumes. The bridge carries the **three** endpoints the UI
+reads — `oak.capture` / `oak.vio` / `oak.slam`; `ba` is **off-bridge** (its
+`pose.refined` / `ba.window` are already re-emitted on `oak.vio` by VIO, and
+`ba.state` is VIO-local), so the UI sees the BA line without a 4th bridged endpoint.
 
 ```
   PI (flight stack)                                  MAC (UI)

@@ -36,7 +36,7 @@ from launcher.main import build_vio_args                       # noqa: E402
 
 def _ns(**over) -> types.SimpleNamespace:
     """A launcher-args namespace with sane defaults, overridable per test."""
-    base = dict(kf_every=5, no_gyro=False, worker=False,
+    base = dict(kf_every=5, no_gyro=False,
                 tight=False, stabilize_velocity=False, depth_icp=False,
                 ba_window=False, frontend_viz=False, direct=False)
     base.update(over)
@@ -47,25 +47,25 @@ def test_forwarding() -> None:
     cap, vio, slam = "oak.capture", "oak.vio", "oak.slam"
 
     # (a) --direct SET -> forwarded.
-    argv = build_vio_args(_ns(direct=True), cap, vio, slam, use_worker=False)
+    argv = build_vio_args(_ns(direct=True), cap, vio, slam)
     assert "--direct" in argv, argv
     assert "--tight" not in argv, argv
     print("[a] --direct SET                 -> forwarded to vio argv               OK")
 
     # (b) --direct + --tight SET -> both forwarded (direct is tight-independent).
     argv = build_vio_args(_ns(direct=True, tight=True),
-                          cap, vio, slam, use_worker=False)
+                          cap, vio, slam)
     assert "--direct" in argv, argv
     assert "--tight" in argv, argv
     print("[b] --direct + --tight SET       -> BOTH forwarded (independent)        OK")
 
     # (c) no flag -> default OFF end-to-end (the oracle path).
-    argv = build_vio_args(_ns(), cap, vio, slam, use_worker=False)
+    argv = build_vio_args(_ns(), cap, vio, slam)
     assert "--direct" not in argv, argv
     print("[c] no flag (default)            -> NOT in vio argv (default OFF)       OK")
 
     # (d) --tight only -> --direct NOT forwarded (only --direct turns it on).
-    argv = build_vio_args(_ns(tight=True), cap, vio, slam, use_worker=False)
+    argv = build_vio_args(_ns(tight=True), cap, vio, slam)
     assert "--direct" not in argv, argv
     assert "--tight" in argv, argv
     print("[d] --tight only (no --direct)   -> --direct NOT in vio argv            OK")

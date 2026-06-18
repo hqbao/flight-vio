@@ -6,9 +6,9 @@ to close the gap (or to deliberately keep a difference) has a concrete basis and
 does not have to re-derive it.
 
 **Last updated**: 2026-06-08
-**Our code**: the 5-project split — `vio/` (odometry + windowed BA) + `slam/`
-(loop closure + pose graph) + `imu_camera/` (capture + inline depth) over the
-vendored `comms/` bus; `ui/` (viewer)
+**Our code**: the split — `vio/` (RGB-D odometry + live IMU dead-reckon) + `ba/`
+(windowed BA, its own process — ADR 0001) + `slam/` (loop closure + pose graph) +
+`imu_camera/` (capture + inline depth) over the vendored `comms/` bus; `ui/` (viewer)
 **Basalt (reference)**: `dai.node.BasaltVIO` consumed in `baseline/sources/basalt_vio.py`
 **Scoring**: `verification/vio_oracle_runner.py` (offline byte-parity oracle, vs
 recorded Basalt poses + the frozen `baseline_metrics.json`)
@@ -167,9 +167,11 @@ The tight-coupled window solver lives in `sky/vio/window.py`
 `verification/vio_oracle_runner.py --backend vio` and validated by
 `vio/tests/vio_ba_selftest.py`.
 
-> A live tight-coupled viewer would be rebuilt on the `vio` process exactly like the
-> `ba` / `slam` backends (the swappable engine in `vio/engine/`), reusing the
-> out-of-process engine so the solve never holds the camera read-loop GIL.
+> A live tight-coupled viewer is the `--tight` backend of the `ba` process: the
+> tight VIO-window solve (`WindowedVIOMap`) runs behind the in-process engine in
+> [`ba/engine/`](../ba/README.md), in its OWN process — so the solve never contends
+> with the camera read loop's GIL (it is no longer in `vio` at all; `vio/engine/`
+> was deleted when the windowed BA was extracted into `ba`, ADR 0001).
 
 Two properties measured offline are **already inherited by the `vio` process**, so a
 rebuild starts from them:
@@ -188,9 +190,12 @@ rebuild starts from them:
 2. **The window solve does not starve the camera loop.** `optimize_vio` was
    vectorised (batched numpy: einsum + `np.add.at` scatter) so it releases the GIL,
    **numerically identical** to the old scalar version (`vio_ba_selftest` A/B/C
-   PASS). On the rebuilt path the heavy solve runs **out-of-process**
-   (`vio/engine/subprocess.py`), which removes GIL contention entirely — the
-   same mechanism that keeps the BA/SLAM fast-push from undershooting.
+   PASS). On the live path the heavy solve runs in the **separate `ba` process**
+   ([ADR 0001](adr/0001-extract-windowed-ba-into-ba-process.md)), so it cannot
+   contend with the camera read loop's GIL at all — the same mechanism that keeps
+   the BA / SLAM fast-push from undershooting. (The old in-`vio`
+   `vio/engine/subprocess.py` worker-child engine, which freed the GIL within one
+   process, was removed when BA moved to its own process.)
 
 ---
 
@@ -235,8 +240,8 @@ Do these on the `vio` path (`vio_window.py`) so production `ours` stays safe.
 ## 6. Run / score commands (for the next session)
 
 ```bash
-# Live (device) or replay: the full 5-project pipeline (VO / VIO / VIO-BA / SLAM lines)
-./run.sh                                       # live: imu_camera + vio + slam + ui
+# Live (device) or replay: the full pipeline (VO / VIO / VIO-BA / SLAM lines)
+./run.sh                                       # live: imu_camera + vio + ba + slam + ui
 ./run.sh --session sessions/gold/<name>        # replay a recorded session through the pipeline
 
 # Offline byte-parity scoring vs Basalt (the in-process oracle)

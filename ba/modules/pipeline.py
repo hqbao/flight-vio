@@ -106,11 +106,11 @@ class BackendWorker(threading.Thread):
       (keyframe ts + raw inter-keyframe IMU block).
 
     The heavy solve runs behind an :class:`~ba.engine.base.Engine`. ``ba`` is its
-    OWN process, so it always uses the in-process engine (``worker=False``) -- the
-    solve runs synchronously in this thread, byte-identical to the old in-VIO
-    in-process path. (The ``vio`` process used ``worker=True`` to push the solve off
-    the camera read loop's GIL; that motivation is gone once BA has its own process,
-    so the engine here is in-process only.)
+    OWN process, so it runs the in-process engine -- the solve runs synchronously in
+    this thread, byte-identical to the old in-VIO in-process path. (The pre-split
+    in-VIO backend had an opt-in worker-child engine to push the solve off the camera
+    read loop's GIL; that motivation is gone once BA has its own process, so the
+    engine here is in-process only.)
 
     Single ``keyframe`` input, so the first END is terminal (no join). END is
     forwarded to ``pose.refined`` (+ ``ba.window`` when the capture engine built).
@@ -157,10 +157,10 @@ class BackendWorker(threading.Thread):
                 vio_cfg.depth_icp = True
                 LOG.info("ba: tight dense-ICP relative-pose factor ON "
                          "(translation anchor for feature-starved frames)")
-            self.engine = make_vi_engine(K, vio_cfg, worker=False)
+            self.engine = make_vi_engine(K, vio_cfg)
         else:
             cfg = WindowedConfig(window=window, ba=BAConfig(max_iters=iters))
-            self.engine = make_ba_engine(K, cfg, worker=False,
+            self.engine = make_ba_engine(K, cfg,
                                          capture_window=self.capture_window)
             if self.capture_window:
                 LOG.info("ba: BA-window capture ON (--ba-window) -- publishing "

@@ -103,15 +103,19 @@ class SlamWorker(threading.Thread):
 
     def __init__(self, bus: LocalPubSub, K: np.ndarray,
                  cfg: SlamConfig | None = None, *,
-                 latest_only: bool = False, worker: bool = False,
+                 latest_only: bool = False,
                  publish_map: bool = False) -> None:
         super().__init__(name="slam", daemon=True)
         self.bus = bus
         self.publish_map = bool(publish_map)
-        # capture_loops rides the SAME LIVE-only flag as publish_map: the
-        # loop-closure funnel (slam.loop) is a live overlay, so the offline engine
-        # never captures and the deterministic correction path stays byte-identical.
-        self.engine = make_slam_engine(K, cfg or SlamConfig(), worker=worker,
+        # The solve always runs IN-PROCESS on this worker's thread (no worker child
+        # -- every project is one process that runs its solve in-process). The live
+        # latest-only inbox drops stale keyframes if a heavy PGO briefly blocks, so
+        # the map stays current without a child process. capture_loops rides the SAME
+        # LIVE-only flag as publish_map: the loop-closure funnel (slam.loop) is a live
+        # overlay, so the offline engine never captures and the deterministic
+        # correction path stays byte-identical.
+        self.engine = make_slam_engine(K, cfg or SlamConfig(),
                                        capture_loops=publish_map)
 
         self._latest_only = bool(latest_only)
@@ -163,7 +167,8 @@ class SlamWorker(threading.Thread):
 
     def run(self) -> None:
         # Close the engine on THIS thread when the loop exits (stop sentinel or
-        # _stop), so a subprocess worker is reaped without a cross-thread race.
+        # _stop). The in-process engine's close is a no-op, but keep the same
+        # lifecycle shape for clarity.
         try:
             self._loop()
         finally:

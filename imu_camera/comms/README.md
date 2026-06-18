@@ -1,10 +1,11 @@
 # `comms/` — the canonical, vendored comms contract
 
 This package is the **single source of truth** for the cross-project comms layer
-of the split. It is **copied bit-identically** into all 5 projects
-(`imu_camera`, `depth`, `vio`, `slam`, `ui`); CI diffs the copies (`diff -r
-<proj>/comms imu_camera/comms` must be empty) and compares the codec digest
-oracle byte-for-byte. Because of that:
+of the split. The anchor is `imu_camera/comms`; it is **copied bit-identically**
+into every other project (`depth`, `vio`, `ba`, `slam`, `ui`, `launcher`, and
+`netbridge` — a 7th copy). CI diffs the copies (`diff -r <proj>/comms
+imu_camera/comms` must be empty) and compares the codec digest oracle
+byte-for-byte. Because of that:
 
 - **All internal imports are RELATIVE** (`from .codec import …`), so the package
   drops into any project unchanged.
@@ -20,7 +21,7 @@ the split.
 | Transport | Class | Serialization | Use |
 |-----------|-------|---------------|-----|
 | In-process | `LocalPubSub` (`pubsub.py`) | **none** — passes Python objects directly | offline deterministic replay / oracle; byte-for-byte unchanged from pre-split |
-| Cross-process | `IPCPubSub(endpoint, role="server"\|"client")` (`ipc.py`) | the class-path-independent `codec` (NOT pickle) | the 4-process live topology |
+| Cross-process | `IPCPubSub(endpoint, role="server"\|"client")` (`ipc.py`) | the class-path-independent `codec` (NOT pickle) | the live multi-process topology (`capture → vio → ba → slam → ui`) |
 
 `IPCPubSub` merges the old `IpcServerBus` (`role="server"` → publish) and
 `IpcClientBus` (`role="client"` → subscribe + recv thread). All the old logic is

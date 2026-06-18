@@ -1,22 +1,13 @@
-"""Engine contract: a swappable runner for the heavy keyframe optimisers.
+"""Engine contract: the runner for the heavy keyframe optimisers.
 
 An *engine* owns one heavy map optimiser (windowed BA or tight-coupled VIO) and
 exposes a tiny, uniform interface so the flow tasks (``RunBA`` / ``RunVIO``)
-never care *where* the solve runs:
+never care *how* the solve runs:
 
 * :class:`InProcessEngine` -- runs the solve synchronously on the calling thread.
-  Used by the OFFLINE replay/scoring path, where determinism matters and there is
-  no real-time constraint: ``submit`` does the whole solve, ``poll`` returns its
-  one result. This keeps the offline numbers byte-identical to the old in-thread
-  flow.
-* :class:`~ba.engine.subprocess.SubprocessEngine` -- ships each keyframe to
-  a separate process and reads the result back asynchronously. Used by the LIVE
-  path so the mostly-pure-Python solve never holds the GIL of the camera read
-  loop (the cause of the fast-push stall / undershoot -- see
-  ``ba/engine/subprocess.py``).
-
-Both implement the same four methods, so a flow picks one with a single ``worker``
-flag and nothing else changes.
+  This is the SINGLE engine: ``ba`` is one process that runs its solve in-process.
+  ``submit`` does the whole solve, ``poll`` returns its one result. This keeps the
+  offline numbers byte-identical to the old in-thread flow.
 
 CONTRACT (critical for offline byte-parity)
 -------------------------------------------
@@ -25,8 +16,7 @@ result stashed by the matching ``submit`` and then clears it. It is NOT
 latest-wins. A warmup keyframe whose solve returns ``None`` must make ``poll``
 return ``None`` -- never re-surface a previous keyframe's result -- otherwise the
 back-end would emit an extra ``pose.refined`` and break the replay self-test count
-(``len(refined) <= ceil(frames/kf_every)``). The subprocess engine, used only
-live, is free to be latest-wins (it drops backlog on purpose).
+(``len(refined) <= ceil(frames/kf_every)``).
 """
 from __future__ import annotations
 

@@ -150,7 +150,6 @@ def run_vio(*,
             ba_endpoint: str | None = None,
             kf_every: int = 5,
             use_gyro: bool = True,
-            worker: bool = False,
             calib_timeout_s: float = 30.0,
             tight: bool = False,
             no_live_loop_correct: bool = False,
@@ -183,14 +182,10 @@ def run_vio(*,
     loose path never sets it, so those paths are byte-identical. Drift bounding is
     SMOOTH (the correction is bled over a few frames, never a hard snap).
 
-    ``worker`` is INERT in VIO (the windowed-BA backend moved to the ``ba`` process,
-    which always solves in-process; the in-VIO ``--worker`` existed only to free the
-    camera read loop's GIL). It is accepted only so the launcher's existing VIO
-    forward keeps working (the launcher's ``--worker`` is still live for ``slam``).
-    The windowed-BA backend knobs themselves (window / iters / stabilize_velocity /
-    depth_icp / the ``--ba-window`` viz) NO LONGER live on VIO: they were removed and
-    route directly to ``ba.main`` (``launcher.build_ba_args``). None of them ever
-    affected ``pose.odom`` (the live VIO), so the byte-parity oracle is unchanged.
+    The windowed-BA backend knobs (window / iters / stabilize_velocity / depth_icp /
+    the ``--ba-window`` viz) NO LONGER live on VIO: they were removed and route
+    directly to ``ba.main`` (``launcher.build_ba_args``). None of them ever affected
+    ``pose.odom`` (the live VIO), so the byte-parity oracle is unchanged.
 
     ``direct`` selects the opt-in DENSE DIRECT RGB-D VO odometry mode
     (``--direct``): the front-end's sparse corner/KLT track -> PnP path is replaced
@@ -280,14 +275,8 @@ def run_vio(*,
                  "on the VIO endpoint%s)", ba_endpoint,
                  "; ba.state -> live bias feed-forward" if tight else "")
     # The windowed-BA backend now lives in the ``ba`` process -- VIO produces the
-    # keyframe (still) but no longer runs a backend. ``--worker`` is therefore INERT
-    # in VIO (it is still live for slam, hence accepted, not removed); warn once so a
-    # forwarded flag is not silently lost. The other backend knobs were removed from
-    # VIO outright and route straight to ba.main (launcher.build_ba_args).
-    if worker:
-        LOG.warning("vio: --worker is INERT in VIO (the windowed-BA backend now "
-                    "runs in the ba process, always in-process); it is still live "
-                    "for slam, so it is accepted but has no effect here")
+    # keyframe (still) but no longer runs a backend. The backend knobs were removed
+    # from VIO outright and route straight to ba.main (launcher.build_ba_args).
     # Frontend-internals capture is NOT tight-only: the KLT frontend is identical
     # on the loose and tight paths, so --frontend-viz works on both. The
     # CaptureKLTFrontend returns byte-identical tracks, so the oracle is
@@ -499,11 +488,6 @@ def main() -> int:
                          "Off when unset (no refined pose; inert bias feed).")
     ap.add_argument("--kf-every", type=int, default=5)
     ap.add_argument("--no-gyro", action="store_true")
-    ap.add_argument("--worker", action="store_true",
-                    help="INERT in VIO (the windowed-BA backend moved to the ba "
-                         "process, which always solves in-process); accepted only "
-                         "for the launcher's forward (--worker is still live for "
-                         "slam). Has no effect on VIO.")
     ap.add_argument("--calib-timeout", type=float, default=30.0,
                     help="seconds to wait for the calib.bundle on boot")
     ap.add_argument("--tight", action="store_true",
@@ -539,7 +523,6 @@ def main() -> int:
         ba_endpoint=args.ba_endpoint,
         kf_every=args.kf_every,
         use_gyro=not args.no_gyro,
-        worker=args.worker,
         calib_timeout_s=args.calib_timeout,
         tight=args.tight,
         no_live_loop_correct=args.no_live_loop_correct,

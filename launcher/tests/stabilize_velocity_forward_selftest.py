@@ -41,7 +41,7 @@ from launcher.main import build_ba_args, build_vio_args            # noqa: E402
 
 def _ns(**over) -> types.SimpleNamespace:
     """A launcher-args namespace with sane defaults, overridable per test."""
-    base = dict(kf_every=5, no_gyro=False, worker=False,
+    base = dict(kf_every=5, no_gyro=False,
                 tight=False, stabilize_velocity=False, depth_icp=False,
                 ba_window=False, backend_window=6, backend_iters=5,
                 frontend_viz=False, direct=False)
@@ -80,7 +80,7 @@ def test_not_in_vio_argv() -> None:
     """The backend left VIO -> --stabilize-velocity must NEVER reach the vio argv."""
     cap, vio, slam = "oak.capture", "oak.vio", "oak.slam"
     argv = build_vio_args(_ns(tight=True, stabilize_velocity=True),
-                          cap, vio, slam, use_worker=False)
+                          cap, vio, slam)
     assert "--tight" in argv, argv
     assert "--stabilize-velocity" not in argv, argv
     print("[e] --tight + --stabilize-velocity     -> NOT in vio argv (left VIO)    OK")

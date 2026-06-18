@@ -115,7 +115,6 @@ def _drain_wait(done_evt, ceiling_s: float, stop) -> None:
 def run_slam(*,
              vio_endpoint: str = DEFAULT_VIO_ENDPOINT,
              endpoint: str = DEFAULT_SLAM_ENDPOINT,
-             worker: bool = False,
              calib_timeout_s: float = 30.0,
              loop_search_radius_m: float = 0.0) -> int:
     """Run the SLAM process until END / SIGTERM / Ctrl-C."""
@@ -160,11 +159,18 @@ def run_slam(*,
     if loop_search_radius_m > 0.0:
         LOG.info("slam: loop-search SPATIAL GATE on, radius=%.1f m "
                  "(O(N) brute-force loop search capped)", loop_search_radius_m)
+    # The loop-closure + pose-graph solve runs IN-PROCESS on this worker's own
+    # thread (no internal worker child -- every project is one process that runs
+    # its solve in-process). slam's IPC recv is a SEPARATE thread feeding the
+    # latest-only inbox, so a brief block during a heavy PGO just drops the stale
+    # keyframes the coalescing inbox is already built to drop -- the live `slam.map`
+    # overlay stays current. This is the same deterministic InProcessEngine the
+    # offline / oracle path uses, so SLAM's offline replay output is byte-identical.
     slam = SlamWorker(local, bundle.K,
                       SlamConfig(loop_max_odom_rot_deg=30.0,
                                  kf_min_trans_m=0.1, kf_min_rot_deg=5.0,
                                  loop_search_radius_m=loop_search_radius_m),
-                      latest_only=True, worker=worker, publish_map=True)
+                      latest_only=True, publish_map=True)
 
     # 4. Open output IPCPubSub server + publisher for the loop corrections.
     #    Retain `calib.bundle` and re-broadcast VIO's bundle so consumers that
@@ -244,8 +250,6 @@ def main() -> int:
                     help=f"VIO IPC endpoint (default: {DEFAULT_VIO_ENDPOINT!r})")
     ap.add_argument("--endpoint", default=DEFAULT_SLAM_ENDPOINT,
                     help=f"this process's IPC endpoint (default: {DEFAULT_SLAM_ENDPOINT!r})")
-    ap.add_argument("--worker", action="store_true",
-                    help="run pose-graph solve in a child process (release GIL)")
     ap.add_argument("--calib-timeout", type=float, default=30.0,
                     help="seconds to wait for the calib.bundle on boot")
     ap.add_argument("--loop-search-radius", type=float, nargs="?", const=5.0,
@@ -262,7 +266,6 @@ def main() -> int:
     return run_slam(
         vio_endpoint=args.vio_endpoint,
         endpoint=args.endpoint,
-        worker=args.worker,
         calib_timeout_s=args.calib_timeout,
         loop_search_radius_m=args.loop_search_radius,
     )
@@ -270,8 +273,8 @@ def main() -> int:
 
 if __name__ == "__main__":
     # Use os._exit (not SystemExit / return-from-main) so a lingering non-daemon
-    # thread -- IPCSubscriber's recv loop, the InProcessEngine worker, etc --
-    # cannot keep the process alive past `slam: shutdown complete`. Without this
+    # thread -- IPCSubscriber's recv loop, the SlamWorker thread, etc -- cannot
+    # keep the process alive past `slam: shutdown complete`. Without this
     # the launcher waits its full 10 s deadline and SIGKILLs us. Mirrors the same
     # pattern in `imu_camera.main` / `vio.main`.
     import os as _os

@@ -1,7 +1,7 @@
 # `slam/` — the loop-closure SLAM project (Phase 4 of the split)
 
-The **fourth** of the five split projects (`imu_camera`, `depth`, `vio`, `slam`,
-`ui`), built by replicating the **proven `imu_camera` / `vio` template**. `slam`
+One of the split projects (`imu_camera`, `depth`, `vio`, `ba`, `slam`, `ui`), built
+by replicating the **proven `imu_camera` / `vio` template**. `slam`
 subscribes to the VIO process over IPC, runs ORB loop closure + SE(3) pose-graph
 optimisation over the keyframe stream, and republishes its results on its own IPC
 endpoint for the UI / tools.
@@ -11,11 +11,11 @@ imu_camera.main ──(oak.capture)──▶ vio.main ──(oak.vio)──▶ s
    capture proc        IPC          VIO proc      IPC         SLAM proc      IPC
 ```
 
-It owns the **SLAM map** (ORB feature index + pose graph). The VIO map (windowed
-BA) lives in the VIO process; the two maps are **independent by design**. The
-correction stream is **one-way**: SLAM publishes `loop.correction` for the UI but
-**never closes the loop back into VIO** — behaviour unchanged from the pre-split
-`ours.proc.slam`.
+It owns the **SLAM map** (ORB feature index + pose graph). The windowed-BA map lives
+in the separate [`ba`](../ba/README.md) process; the two maps are **independent by
+design**. The correction stream is **one-way**: SLAM publishes `loop.correction` for
+the UI but **never closes the loop back into VIO** — behaviour unchanged from the
+pre-split `ours.proc.slam`.
 
 It was ported **VERBATIM** from the reference oracle (`ours/`): only import roots
 were re-rooted and Flow/Task/Bus classes were renamed (Flow → Module, Task → Step,
@@ -30,7 +30,7 @@ matching the oracle loop count.
 | Package | Role | Source it was ported from |
 |---------|------|---------------------------|
 | `slam/comms/` | the **FROZEN** vendored comms contract | copied **bit-identically** from `imu_camera/comms` |
-| `slam/engine/` | the swappable in-process / subprocess runner SLAM owns; the loop-closure math now comes from `sky.slam` | `ours/lib/engine` (loop algorithms consolidated into `sky.slam`) |
+| `slam/engine/` | the in-process runner SLAM owns (no worker child); the loop-closure math now comes from `sky.slam` | `ours/lib/engine` (loop algorithms consolidated into `sky.slam`) |
 | `slam/resolution_build.py` | the math-coupled config builder SLAM owns at the project root | `ResolutionProfile.loop` |
 | `slam/modules/` | the loop-closure pipeline (**procedural** functions + a plain worker thread) | `ours/flows/slam` |
 | `slam/main.py` | the SLAM process | `ours/proc/slam.py` |
@@ -84,17 +84,20 @@ library (no process / `comms` / `io` imports), so importing it keeps SLAM portab
 
 What SLAM still owns (now at the project root, not under a `mathlib`):
 
-- `slam/engine/` — SLAM's **own** copy of the swappable in-process / subprocess
-  runners (`worker=False` is byte-identical offline, `worker=True` runs the solve
-  in a child process so it never holds the read loop's GIL). The worker
-  lazy-imports the heavy map from `sky.slam.slam`.
+- `slam/engine/` — SLAM's **own** copy of the in-process runner. SLAM is one
+  process that runs its loop-closure + pose-graph solve IN-PROCESS — there is no
+  worker-child engine. The live path runs the `InProcessEngine` on SLAM's own worker
+  thread (fed by a latest-only inbox that drops stale keyframes if a heavy PGO briefly
+  blocks); the offline / oracle path runs the same engine on a deterministic FIFO
+  inbox, so its replay output stays byte-identical. The engine lazy-imports the heavy
+  map from `sky.slam.slam`.
 
 The **windowed BA** is *not* part of SLAM: SLAM only ever calls
 `make_slam_engine` (loop closure), so the engine carries **only** the
-loop-closure path (`make_slam_engine` / `slam_step` / `_slam_worker_main`). The
-never-fired `make_ba_engine` / `_ba_worker_main` path the byte-copied engine used
-to carry (a lazy import of the windowed-BA backend that SLAM never resolved) has
-been removed — there is no BA backend under `slam/engine/`.
+loop-closure path (`make_slam_engine` / `slam_step`). The never-fired
+`make_ba_engine` path the byte-copied engine used to carry (a lazy import of the
+windowed-BA backend that SLAM never resolved) has been removed — there is no BA
+backend under `slam/engine/`.
 
 **ARCHITECTURE RULE.** The math-coupled config builder lives at the **project
 root**, **not** in the generic, bit-identical `slam/comms/`:
@@ -158,7 +161,7 @@ Two key behaviours are preserved byte-for-byte from the oracle:
 
 > **`SlamWorker` has two in-process consumers besides `slam.main`:**
 > `vio/tests/closed_loop_drift_selftest.py` and `verification/loop_teleport_diag.py`
-> both construct it directly (as `SlamModule`, `latest_only=False`, `worker=False`,
+> both construct it directly (as `SlamModule`, `latest_only=False`,
 > `publish_map=False`) over a `LocalPubSub` bus to collect real `loop.correction`s.
 > The legacy `SlamModule` name is kept as an alias of `SlamWorker` so they are
 > unchanged.
@@ -173,10 +176,11 @@ graph with the **live** config:
 `SlamConfig(loop_max_odom_rot_deg=30.0, kf_min_trans_m=0.1, kf_min_rot_deg=5.0)`,
 `latest_only=True`, `publish_map=True`. It mirrors `loop.correction` + `slam.map`
 onto its own `IPCPubSub` server with an `IPCPublisher`, re-broadcasting the
-retained `calib.bundle` as a readiness barrier. The worker-engine subprocess
-boundary (`--worker`) stays on stdlib pickle (`multiprocessing.Queue`,
-same-project classes) — it is **not** routed through the cross-process codec. Same
-SIGTERM / drain / `os._exit` lifecycle as the template.
+retained `calib.bundle` as a readiness barrier. The loop-closure + pose-graph solve
+runs **in-process** on the `SlamWorker` thread (no worker child) — its IPC recv is a
+separate thread feeding the latest-only inbox, so a brief block during a heavy PGO
+just drops stale keyframes. Same SIGTERM / drain / `os._exit` lifecycle as the
+template.
 
 ## Run
 

@@ -206,23 +206,23 @@ capture process's `imu_cam` thread, so the launcher never spawns a depth process
 
 ## Resolution presets (suggested run params)
 
-You only ever pass `--width/--height`, `--fps`, `--kf-every`, and (for heavy
-resolutions) `--worker`. Everything else — the SGM disparity range, the corner
-budget, the KLT window, the ORB budget — is **auto-scaled from the width** by
+You only ever pass `--width/--height`, `--fps`, and `--kf-every`. Everything else —
+the SGM disparity range, the corner budget, the KLT window, the ORB budget — is
+**auto-scaled from the width** by
 `ResolutionProfile` ([comms/lib/config/resolution.py](imu_camera/comms/lib/config/resolution.py)),
 so there is nothing else to hand-tune. Append `--session sessions/gold/<name>`
 to replay instead of going live, or `--no-ui` for headless.
 
-| Resolution | fps | kf-every | `--worker` | Use case |
-|---|---|---|---|---|
-| 1280×800 | 10 | 8 | on  | Max accuracy. **Not CPU-realtime** (192-disparity SGM) |
-| 640×400  | 20 | 5 | on  | Best quality + realtime on a good CPU — the tuning baseline |
-| 320×200  | 20 | 5 | off | Balanced; light CPU — good default for a modest machine |
-| 160×100  | 20 | 4 | off | **Practical VIO floor** (SBC / low-power); pose noisier but tracks |
+| Resolution | fps | kf-every | Use case |
+|---|---|---|---|
+| 1280×800 | 10 | 8 | Max accuracy. **Not CPU-realtime** (192-disparity SGM) |
+| 640×400  | 20 | 5 | Best quality + realtime on a good CPU — the tuning baseline |
+| 320×200  | 20 | 5 | Balanced; light CPU — good default for a modest machine |
+| 160×100  | 20 | 4 | **Practical VIO floor** (SBC / low-power); pose noisier but tracks |
 
 ```bash
-./run.sh --width 1280 --height 800 --fps 10 --kf-every 8 --worker
-./run.sh --width 640  --height 400 --fps 20 --kf-every 5 --worker
+./run.sh --width 1280 --height 800 --fps 10 --kf-every 8
+./run.sh --width 640  --height 400 --fps 20 --kf-every 5
 ./run.sh --width 320  --height 200 --fps 20 --kf-every 5
 ./run.sh --width 160  --height 100 --fps 20 --kf-every 4
 ```
@@ -237,11 +237,11 @@ What auto-scales with width (for reference — **not** CLI knobs):
 | 160×100  | 32  | 100 | 7px / 1lvl  | 200  | ~0.30 m |
 
 Tips:
-- **`--worker`** now applies to the **SLAM** solve only (GIL-free, latest-wins) —
-  worth it at 640+; below that the in-process latest-only SLAM is already responsive.
-  The windowed BA already runs in its own `ba` process (its own GIL escape), so
-  `--worker` is a logged no-op there. It prints one benign
-  `resource_tracker: leaked semaphore` line at shutdown (stdlib self-cleans).
+- **Every project is its own process and runs its solve in-process** — capture, vio,
+  `ba` (windowed BA), and `slam` (loop closure + pose graph) are four separate OS
+  processes, so the heavy BA/SLAM solves are already off the vio/frontend GIL with no
+  flag to toggle. SLAM keeps its live map current via a latest-only inbox (it drops a
+  backlog instead of lagging).
 - **Watch `src fps`** in the UI telemetry panel — if it sits well below `--fps`,
   the CPU is not keeping up; drop the resolution or the fps.
 - **`--kf-every`** ↑ at high resolution to lighten BA/SLAM; ↓ at low resolution
@@ -567,8 +567,9 @@ Everything is fed over IPC — the UI imports no depthai and never opens the dev
 (capture owns it). SLAM stays responsive because its live module uses a
 **latest-only (coalescing) inbox**: it drops a keyframe backlog and always solves
 the freshest keyframe, so `slam.map` stays current instead of lagging as the pose
-graph grows. The heavy BA/SLAM solves run **in-process by default**; `--worker`
-(forwarded by the launcher) moves them to GIL-free child subprocesses.
+graph grows. The heavy BA and SLAM solves each run **in their own process**
+(`ba` / `slam`), in-process on that process's own thread — they are already off the
+vio/frontend GIL by construction (there is no internal worker child to toggle).
 
 The **Controls toolbar** carries the five per-line toggle buttons (all checkable,
 default visible), then **Clear Trail** (clears the live trajectory trail) and

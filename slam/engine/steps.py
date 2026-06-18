@@ -1,12 +1,12 @@
-"""The per-keyframe solve, factored out so in-process and subprocess engines run
-*exactly the same code* (the whole offline byte-parity argument depends on this).
+"""The per-keyframe solve, factored out as a pure function the engine runs
+*exactly the same way* on the live and offline paths (the whole offline
+byte-parity argument depends on this).
 
 ``slam_step`` takes a live map object + one keyframe snapshot and returns the
 solve result (or ``None`` when there is nothing to publish for that keyframe).
 It is a pure function of (map, snapshot): no threads, no queues, no flow/bus
-knowledge -- it receives the map instance so the same function drives both the
-synchronous :class:`~slam.engine.inprocess.InProcessEngine` and the child of
-:class:`~slam.engine.subprocess.SubprocessEngine`.
+knowledge -- it receives the map instance so the same function drives the
+synchronous :class:`~slam.engine.inprocess.InProcessEngine` on either path.
 
 The logic is lifted verbatim from the old in-thread ``SlamStep`` task so the
 offline path stays identical.

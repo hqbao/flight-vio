@@ -11,8 +11,9 @@ map whose ``run_ba`` returns a chosen pose + ``last_info``. Asserts:
   2. a HEALTHY keyframe -> published ``info['vio_degraded'] is False``;
   3. the LOOSE path (``ba_step``) publishes ``{'refined': True}`` with NO
      ``vio_degraded`` key (info byte-unchanged);
-  4. the SubprocessEngine pickle boundary round-trips the ``(T_cw, health)``
-     tuple cleanly (plain float/bool scalars cross).
+  4. the ``(T_cw, health)`` tuple is plain-data serialisable (float/bool scalars,
+     no numpy types/objects), so it crosses the IPC ``pose.refined`` / ``ba.state``
+     wire cleanly -- the discipline ``_vio_health`` / ``_backend_bias`` enforce.
 
 Run::
 
@@ -128,8 +129,8 @@ def test_loose_info_unchanged() -> None:
     print("   OK -- loose published info byte-unchanged.\n")
 
 
-def test_subprocess_pickle_boundary() -> None:
-    print("4) SubprocessEngine pickle boundary round-trips (T_cw, health):")
+def test_plaindata_wire_roundtrip() -> None:
+    print("4) (T_cw, health) is plain-data -> crosses the IPC wire cleanly:")
     T_cw = np.linalg.inv(np.eye(4))
     health = {"vio_degraded": True, "vio_reproj_px": 71.0,
               "vio_window_jump_m": 4.5}
@@ -148,9 +149,9 @@ def main() -> int:
     test_divergence_flag_published()
     test_healthy_flag_published()
     test_loose_info_unchanged()
-    test_subprocess_pickle_boundary()
+    test_plaindata_wire_roundtrip()
     print("PASS -- vio_degraded threads end-to-end to the published pose info; "
-          "healthy=False; loose info unchanged; subprocess pickle clean.")
+          "healthy=False; loose info unchanged; (T_cw, health) wire-clean.")
     return 0
 
 

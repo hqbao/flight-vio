@@ -52,7 +52,7 @@ ANCHOR = "imu_camera"
 # transitional vio-only ``BACKEND_STATE`` exception was retired when the in-vio
 # local-bus feed-forward moved to the IPC ``ba.state`` topic, present byte-identically
 # in every copy).
-COPIES = ("imu_camera", "vio", "slam", "ui", "launcher", "ba", "netbridge")
+COPIES = ("imu_camera", "depth", "vio", "slam", "ui", "launcher", "ba", "netbridge")
 
 
 def _check(cond: bool, msg: str) -> bool:

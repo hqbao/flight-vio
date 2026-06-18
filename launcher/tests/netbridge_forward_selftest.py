@@ -38,7 +38,7 @@ def _ns(**over) -> types.SimpleNamespace:
     """A launcher-args namespace with sane defaults, overridable per test."""
     base = dict(width=54, height=42, fps=20, kf_every=5, session=None,
                 max_frames=0, no_gyro=False, recalibrate_bias=False,
-                use_camera_calib=False, vl53l9cx=True, worker=False,
+                use_camera_calib=False, vl53l9cx=True,
                 tight=False, stabilize_velocity=False, depth_icp=False,
                 ba_window=False, frontend_viz=False, direct=False,
                 forward=None, model=None, bridge_frames=False)
@@ -98,9 +98,8 @@ def test_additive() -> None:
     base_cap = build_capture_args(_ns(forward=None), cap)
     fwd_cap = build_capture_args(_ns(forward=":8787"), cap)
     assert base_cap == fwd_cap, (base_cap, fwd_cap)
-    base_vio = build_vio_args(_ns(forward=None), cap, vio, slam, use_worker=False)
-    fwd_vio = build_vio_args(_ns(forward=":8787"), cap, vio, slam,
-                             use_worker=False)
+    base_vio = build_vio_args(_ns(forward=None), cap, vio, slam)
+    fwd_vio = build_vio_args(_ns(forward=":8787"), cap, vio, slam)
     assert base_vio == fwd_vio, (base_vio, fwd_vio)
     assert "--forward" not in base_cap and "--forward" not in base_vio
     print("[d] --forward is additive: capture/vio argv UNCHANGED                    OK")

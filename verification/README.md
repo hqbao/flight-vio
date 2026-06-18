@@ -1,8 +1,8 @@
-# `verification/` — byte-parity harness for the 5-project split
+# `verification/` — byte-parity harness for the split
 
 This directory PROVES that splitting the monolithic pre-split `ours/` codebase into
-five projects (`imu_camera` + `vio` + `slam` + `ui` + `launcher`) preserved the
-numerical behaviour **byte-for-byte**.
+the independent projects (`imu_camera` + `vio` + `ba` + `slam` + `ui` + `launcher`,
+plus `depth`) preserved the numerical behaviour **byte-for-byte**.
 
 It only **imports** the projects. It never modifies `ours/` (the reference oracle)
 or any project directory — `ours/` is kept INTACT as the gold oracle.
@@ -23,9 +23,10 @@ Two independent things are proven:
    (only import roots + docstrings re-rooted), so the end-to-end score is
    bit-identical.
 2. **IPC contract parity** — the vendored `comms/` package is byte-identical
-   across all 5 project copies, every copy's codec produces identical bytes for a
-   fixed test-vector set, and the bridge + shared-memory rings round-trip a
-   message intact.
+   across every project copy (`ipc_comms_selftest.py` dir-diffs `imu_camera`, `vio`,
+   `ba`, `slam`, `ui`, `launcher`, `netbridge` against the anchor), every copy's
+   codec produces identical bytes for a fixed test-vector set, and the bridge +
+   shared-memory rings round-trip a message intact.
 
 ## Files
 

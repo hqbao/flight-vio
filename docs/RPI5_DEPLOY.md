@@ -282,16 +282,19 @@ which diagnostic captures run.
 
 | `pi-run.sh` injects | default on the Pi | opt out | why |
 |---|---|---|---|
-| `--worker` | **on** | `--no-worker` | run SLAM's loop-closure solve GIL-free in a child process (the windowed BA is already its own `ba` process, so `--worker` is a no-op for it now) |
 | `--cap-numba-threads` | **on** (always passed) | — | per-process numba thread caps so capture+vio don't oversubscribe 4 cores |
 | `--no-frontend-viz --no-ba-window` | on (with `--ui`) | `--viz` | the UI diagnostic captures run in the vio process and drag it below real-time |
 | pose-only bridge | **on** (with `--ui`) | `--frames` | only the small pose/map/overlay topics cross the WiFi — the heavy uncompressed camera/depth/keyframe frames the main UI never displays would saturate the 2.4 GHz link |
 
-- **The windowed BA runs in its own `ba` process (always).** The bursty
-  ~48 ms/keyframe BA solve used to share the vio/frontend core (a 1-in-5 ~80 ms
-  stutter); it is now the standalone `ba` project, GIL-isolated from the frontend
-  by construction, so `--worker` no longer applies to it — `--worker` now only
-  offloads SLAM's loop-closure solve. Pass **`--no-worker`** to keep SLAM in-thread.
+- **The windowed BA and SLAM each run in their own process (always, in-process).**
+  Every project is one process that runs its solve in-process — there is no internal
+  worker child and **no `--worker` flag**. The bursty ~48 ms/keyframe BA solve used
+  to share the vio/frontend core (a 1-in-5 ~80 ms stutter); it is now the standalone
+  `ba` project, GIL-isolated from the frontend by construction. SLAM likewise runs
+  its loop-closure + pose-graph solve on its own thread in the `slam` process; its
+  IPC recv is a separate thread feeding a latest-only inbox, so a brief block during
+  a heavy PGO just drops stale keyframes (the inbox is built to) and the live map
+  stays current.
 
 - **Lean flight config on the 4-core Pi.** HIL (2026-06-18): the FULL stack
   `capture + vio + ba + slam` at **640×400 `--tight`** saturates the Pi (load ~4.2,
@@ -349,9 +352,10 @@ Per-stage wall-clock was measured on the real Pi 5 with
   loose serial budget at every resolution, and the single bottleneck of the vio
   process. At loose 320×200 it is ~29 ms (after the KLT pyramid-reuse change in
   `sky/front/klt.py`/`frontend.py`: one pyramid build/frame instead of four).
-- **The live frame rate is the busiest PROCESS, not the serial sum.** With
-  `--worker`, loose 320×200 is set by the vio process (~33 ms/frame → ~30 fps);
-  capture (SGM ~9 ms) and the BA worker run concurrently.
+- **The live frame rate is the busiest PROCESS, not the serial sum.** Because `ba`
+  and `slam` are their own processes (each runs its solve in-process), loose 320×200
+  is set by the vio process (~33 ms/frame → ~30 fps); capture (SGM ~9 ms) and the
+  `ba` solve run concurrently.
 - **Tight `--tight` on the Pi (optimisation chain, 2026-06-16).** The tight
   `optimize_vio` solve now ships the four-link chain — **landmark Schur complement**
   (exact, ~1.4–1.8×), an **absolute-velocity gauge regulariser**, an always-on
@@ -377,8 +381,9 @@ Per-stage wall-clock was measured on the real Pi 5 with
 > (`imu_camera/main.py` overrides `--width`/`--height`), so you **cannot** get a
 > deterministic 320×200 replay of a 640×400 gold session. The 320×200 figures above
 > come from the `stage_profile.py` harness (which models capture-at-resolution by
-> area-downsampling). The live 320×200 win from `--worker` + `--cap-numba-threads`
-> must be confirmed with a **live camera run** at that resolution
+> area-downsampling). The live 320×200 win from the per-process split (`ba`/`slam`
+> off the vio core) + `--cap-numba-threads` must be confirmed with a **live camera
+> run** at that resolution
 > (`./deploy/pi-run.sh --width 320 --height 200`), not a replay.
 
 ---

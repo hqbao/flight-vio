@@ -878,22 +878,25 @@ a short replay segment can be inspected solve-by-solve.
 
 *Data path (all REAL, no parallel pipeline).* The capture-aware engine
 (`make_ba_engine(capture_window=True)`, opt-in) runs the **SAME frozen `run_ba`**
-and, on the existing overlay channel (`ov_q`), stashes a `BaWindowSnap` built from
-the live map's public state (`keyframes` / `landmarks` / `last_info.ba_reproj_px`)
+and, on the engine's overlay channel (`poll_overlay`), stashes a `BaWindowSnap` built
+from the live map's public state (`keyframes` / `landmarks` / `last_info.ba_reproj_px`)
 plus a pre-solve shallow copy for the toggle — the frozen solve is never edited, so
 the byte-parity oracle is gap=0 and `pose.refined` is byte-identical to the
-no-capture path. `vio.modules.publish_ba_window` republishes it as a `BaWindow` on
-the pure-POD `ba.window` topic (no images, mirrors `slam.loop`), bounded to `N ≤ 8`
+no-capture path. `ba.modules.publishers.publish_ba_window` republishes it as a
+`BaWindow` on the pure-POD `ba.window` topic (no images, mirrors `slam.loop`),
+bounded to `N ≤ 8`
 keyframes (the window) and `M ≤ 100` landmarks (the most-observed; the cap lives
 only in the capture function, never in the solve). The UI's `IpcBaWindowSource`
 buffers the last `K` (≈240) snapshots in a lock-guarded deque for the slider;
 `ui/viz/ba_render.py` renders the top-down image (cv2, PNG-verifiable offscreen).
 
-**Code.** `vio/engine/ba_capture.py` (`ba_step_capture`, `_build_ba_window`,
-`ba_window_overlay`, `BaWindowSnap`), `vio/modules/publish_ba_window.py`,
-`comms/{messages,wire,converters,topics}.py` (`BaWindow` / `WireBaWindow` /
-`ba.window`), `ui/modules/ipc_sources.py` (`IpcBaWindowSource`),
-`ui/qt/ba_window.py`, `ui/viz/ba_render.py`.
+**Code.** `ba/engine/ba_capture.py` (`ba_step_capture`, `_build_ba_window`,
+`ba_window_overlay`, `BaWindowSnap`), `ba/modules/publishers.py`
+(`publish_ba_window`), `comms/{messages,wire,converters,topics}.py` (`BaWindow` /
+`WireBaWindow` / `ba.window`), `ui/modules/ipc_sources.py` (`IpcBaWindowSource`),
+`ui/qt/ba_window.py`, `ui/viz/ba_render.py`. The BA-window solve + capture now run
+in the [`ba`](../ba/README.md) process; VIO re-emits `ba.window` on its own endpoint
+so the UI reads it unchanged.
 
 ---
 

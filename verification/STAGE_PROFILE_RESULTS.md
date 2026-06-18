@@ -53,17 +53,23 @@ frame rate is set by the **busiest PROCESS**, not the serial sum (see "Per-proce
 The live launcher runs capture / vio / slam as separate `Popen` processes. Group the stages
 by the process they run in and the achievable fps = 1000 / (busiest process ms/frame):
 
-### LOOSE 320x200, `--worker` ON (current Pi default — BA in its own process)
+> **Note (post-BA-split + worker removal):** the `--worker` ON/OFF A/B below was taken
+> when the windowed BA ran *inside* the vio process and an opt-in `--worker` could push
+> it to a child. The BA has since moved to its OWN `ba` process (and `slam` likewise runs
+> its solve in its own process), so today's stack is ALWAYS the "BA off the vio core" case
+> — the in-VIO `--worker` flag is gone. The "ON" row is the current behaviour; the "OFF"
+> row (in-thread BA) can no longer occur.
+
+### LOOSE 320x200, BA in its own process (current behaviour — was `--worker` ON)
 - capture proc = SGM 9.0 ms → **111 fps**
 - vio proc = frontend 32.4 + IMU 1.2 = **33.5 ms → 30 fps**  ← bottleneck
-- BA worker = 48.4 ms/call, fires every 5 vio frames (≈167 ms) → keeps up ✓
+- BA proc = 48.4 ms/call, fires every 5 vio frames (≈167 ms) → keeps up ✓
 → **pipeline ≈ 30 fps achievable** (vs 19.3 fps serial). The frontend KLT+PnP is the wall.
-- This is why `deploy/pi-run.sh` now defaults `--worker` ON (opt out with `--no-worker`).
 
-### LOOSE 320x200, `--worker` OFF (`pi-run.sh --no-worker`)
+### LOOSE 320x200, in-thread BA (was `--worker` OFF — no longer possible)
 - vio proc = frontend 32.4 ms every frame **+ 48.4 ms BA burst every 5th frame** (same core,
   GIL-contended) → 80 ms hitch 1-in-5 frames = visible stutter, ≈19 fps effective.
-→ This is the stall the default `--worker` avoids — keep it on for loose 320x200.
+→ This is the stall the per-process split avoids — it is now structural, not a flag.
 
 ### TIGHT 320x200
 - tight optimize_vio = **404 ms/call** every 5th frame. Even in its own worker process the
@@ -76,8 +82,9 @@ by the process they run in and the achievable fps = 1000 / (busiest process ms/f
    (58–62% loose). It is the vio-process wall. The KLT pyramid-reuse change
    (`sky/front/klt.py`/`frontend.py`: 1 pyramid build/frame instead of 4) trims the loose
    320×200 frontend ~32.4 → ~28.7 ms (−11%); the table above pre-dates that change.
-2. **Loose windowed BA** is a bursty 48 ms/call (1-in-5 frames) → stalls the vio core when
-   in-thread; `--worker` fixes it (now the `deploy/pi-run.sh` default; opt out `--no-worker`).
+2. **Loose windowed BA** is a bursty 48 ms/call (1-in-5 frames) → would stall the vio core
+   if in-thread; the per-process split fixes it structurally (BA runs in its own `ba`
+   process — there is no in-VIO worker flag any more).
 3. **Tight optimize_vio** is catastrophic (284–404 ms/call) — the FD IMU-Jacobian build.
 4. **SGM depth** is cheap and not the bottleneck (9–13 ms, its own capture core).
 5. With no `NUMBA_NUM_THREADS` set, overlapping SGM+KLT bursts oversubscribe (8 numba

@@ -13,10 +13,10 @@
 #                                            #   (watch pi-ui.sh --frames on the Mac)
 #   ./deploy/pi-run.sh --logs                # just tail the live run.log, no start
 #
-# Pi defaults (no flag needed): --worker ON (the bursty windowed-BA solve runs in
-# its own process so it can't stall the vio/frontend core) and --cap-numba-threads
-# (per-process numba thread caps so capture+vio don't oversubscribe the 4 cores).
-#   --no-worker  keep the BA/SLAM solve in-thread (reproduce the stall / spare-core host)
+# Pi defaults (no flag needed): --cap-numba-threads (per-process numba thread caps
+# so capture+vio don't oversubscribe the 4 cores). Every project is its own process
+# and runs its solve IN-PROCESS (ba + slam each have their own process), so there is
+# no internal worker child to toggle.
 #   --viz        with --ui, keep the Frontend-Internals + BA-Window UI captures ON
 #                (OFF by default on the Pi: they drag the vio process below real-time)
 #   --frames     with --ui, ALSO bridge the heavy camera/depth/keyframe IMAGE topics
@@ -41,10 +41,6 @@ WANT_VIZ=0
 WANT_FRAMES=0          # default OFF: the bridge is POSE-ONLY (low-bandwidth). Pass
                        # --frames to also bridge the heavy camera/depth/keyframe
                        # image topics (only worth it on a fast link).
-WANT_WORKER=1          # default ON: the Pi is 4-core, so move the bursty BA/SLAM
-                       # solve off the frontend core (measured: loose 320x200 vio
-                       # process drops from a 80ms 1-in-5 hitch to ~33ms/frame).
-                       # Pass --no-worker to keep it in-thread.
 PORT="8787"
 EXTRA=()
 while [ $# -gt 0 ]; do
@@ -54,8 +50,6 @@ while [ $# -gt 0 ]; do
     --logs)      LOGS_ONLY=1; shift ;;
     --viz)       WANT_VIZ=1; shift ;;
     --frames)    WANT_FRAMES=1; shift ;;   # bridge camera frames too (default pose-only)
-    --worker)    WANT_WORKER=1; shift ;;   # explicit (already the default)
-    --no-worker) WANT_WORKER=0; shift ;;   # keep BA/SLAM in-thread
     --port) PORT="$2"; shift 2 ;;
     *) EXTRA+=("$1"); shift ;;
   esac
@@ -76,7 +70,7 @@ Stop it first:  ./deploy/pi-stop.sh"
 fi
 
 # Sweep ORPHANS from a crashed/interrupted previous run. We're past the live-PID
-# guard above, so any lingering capture/vio/slam/launcher procs are orphans -- and
+# guard above, so any lingering capture/vio/ba/slam/launcher procs are orphans -- and
 # a stray capture still HOLDS the OAK USB device, so the new run opens "no OAK
 # device found" (the classic "it worked, then after a crash it stopped working").
 # pi-stop does this on teardown; do it here too so a forgotten stop never blocks.
@@ -92,11 +86,11 @@ fi
 
 # Build the remote run.sh args. --ui adds the cross-machine bridge.
 RUN_ARGS=(--no-ui)
-# On the 4-core Pi: run the heavy solves in worker processes (--worker) and cap
-# each child's numba pool so overlapping SGM (capture) + KLT (vio) bursts don't
-# oversubscribe the 4 cores (--cap-numba-threads -> capture=2, vio=2, slam=1).
-# Both are no-ops on a big dev host and gap-safe (no math changes).
-[ "$WANT_WORKER" -eq 1 ] && RUN_ARGS+=(--worker)
+# On the 4-core Pi: cap each child's numba pool so overlapping SGM (capture) + KLT
+# (vio) bursts don't oversubscribe the 4 cores (--cap-numba-threads -> capture=2,
+# vio=2, slam=1). The heavy BA + SLAM solves already run in their OWN processes
+# (each project is one process that runs its solve in-process), so they can't stall
+# the vio/frontend core. --cap-numba-threads is a no-op on a big dev host + gap-safe.
 RUN_ARGS+=(--cap-numba-threads)
 [ "${#EXTRA[@]}" -gt 0 ] && RUN_ARGS+=("${EXTRA[@]}")
 ENV_PREFIX=""

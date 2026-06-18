@@ -13,9 +13,9 @@ keyframe arrives over IPC on the :class:`~ba.comms.IPCSubscriber` recv thread,
 which drops it onto the local bus; the :class:`~ba.modules.pipeline.BackendWorker`
 runs :func:`~ba.modules.pipeline.process_kf` per keyframe (strict FIFO -- the
 offline byte-parity argument needs every keyframe solved in order). ``ba`` is its
-OWN process, so the heavy solve runs in-process in the worker thread (the in-VIO
-``--worker`` subprocess engine was there to free the camera read loop's GIL, a
-motivation that is gone once BA has its own process).
+OWN process, so the heavy solve runs in-process in the worker thread (the pre-split
+in-VIO backend's opt-in worker-child engine was there to free the camera read loop's
+GIL, a motivation that is gone once BA has its own process).
 
 This process owns the windowed-BA map (sliding window of keyframe poses +
 landmarks). The SLAM map (ORB index, pose-graph) lives in the ``slam`` process;
@@ -130,7 +130,6 @@ def run_ba_proc(*,
                 vio_endpoint: str = DEFAULT_VIO_ENDPOINT,
                 endpoint: str = DEFAULT_BA_ENDPOINT,
                 tight: bool = False,
-                worker: bool = False,
                 backend_window: int = 6,
                 backend_iters: int = 5,
                 stabilize_velocity: bool = False,
@@ -161,16 +160,7 @@ def run_ba_proc(*,
     ``ba_window and not tight``; a consumer never waits on a topic that will never emit.
     Oracle-safe: the capture engine runs the SAME frozen ``run_ba`` solve, and the
     default-OFF path never captures it.
-
-    ``worker`` is ACCEPTED for argparse symmetry with the other process shells but
-    is a NO-OP for ``ba``: the backend already runs the solve in-process in its own
-    process (the in-VIO subprocess engine existed only to free the camera read
-    loop's GIL, which ``ba`` does not share). It is logged when set so the operator
-    knows it had no effect.
     """
-    if worker:
-        LOG.info("ba: --worker is a NO-OP for the ba process (the solve already "
-                 "runs in-process in its own process); ignoring it")
     # BA-window capture is LOOSE-only; --tight overrides it (the tight map has no
     # capture overlay). Publish ba.window only when the capture engine is actually
     # built, so a consumer never waits on a topic that will never emit. (Mirrors the
@@ -309,10 +299,6 @@ def main() -> int:
                          "default LOOSE windowed-BA backend, and publish the "
                          "ba.state feed-forward bias for VIO. Opt-in; the default "
                          "(loose) path is byte-identical to the in-VIO backend.")
-    ap.add_argument("--worker", action="store_true",
-                    help="ACCEPTED for symmetry with the other shells but a NO-OP "
-                         "for ba (the solve already runs in-process in its own "
-                         "process); logged + ignored when set.")
     ap.add_argument("--backend-window", type=int, default=6,
                     help="LOOSE windowed-BA sliding-window size (keyframes); inert "
                          "on the tight path (which uses WindowedVIOConfig defaults).")
@@ -340,7 +326,6 @@ def main() -> int:
         vio_endpoint=args.vio_endpoint,
         endpoint=args.endpoint,
         tight=args.tight,
-        worker=args.worker,
         backend_window=args.backend_window,
         backend_iters=args.backend_iters,
         stabilize_velocity=args.stabilize_velocity,

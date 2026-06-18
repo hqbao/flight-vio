@@ -247,7 +247,7 @@ def resolve_frontend_viz(args) -> bool:
 
 
 def build_vio_args(args, cap_ep: str, vio_ep: str, slam_ep: str,
-                   use_worker: bool, ba_ep: str | None = None,
+                   ba_ep: str | None = None,
                    ba_spawned: bool = False) -> list[str]:
     """Build the ``vio.main`` argv from the parsed launcher ``args``.
 
@@ -274,8 +274,6 @@ def build_vio_args(args, cap_ep: str, vio_ep: str, slam_ep: str,
                            "--kf-every", str(args.kf_every)]
     if args.no_gyro:
         vio_args += ["--no-gyro"]
-    if use_worker:
-        vio_args += ["--worker"]
     # BACKEND PASS-THROUGH: VIO subscribes the ba endpoint's pose.refined + ba.window
     # (both re-emitted on the VIO endpoint) + ba.state (the --tight bias feed). Only
     # when the launcher actually spawned ba (not --no-ba); else omit it (no refined
@@ -335,10 +333,6 @@ def build_ba_args(args, vio_ep: str, ba_ep: str) -> list[str]:
       ``--no-ba-window``), so we forward it verbatim.
     * ``--backend-window`` / ``--backend-iters`` -- the loose solve size; forwarded
       only when non-default so the common argv stays minimal.
-
-    ``--worker`` is deliberately NOT forwarded: it is a NO-OP for ``ba`` (the solve
-    already runs in-process in ``ba``'s own process; the in-VIO ``--worker`` existed
-    only to free the camera read loop's GIL, which ``ba`` does not share).
     """
     ba_args: list[str] = ["--vio-endpoint", vio_ep, "--endpoint", ba_ep]
     if args.tight:
@@ -367,7 +361,7 @@ def build_ba_args(args, vio_ep: str, ba_ep: str) -> list[str]:
 def _numba_thread_caps(cap: bool) -> dict[str, int]:
     """Per-role numba thread budget when ``--cap-numba-threads`` is set.
 
-    The flight stack runs capture / vio / slam as SEPARATE OS processes, and
+    The flight stack runs capture / vio / ba / slam as SEPARATE OS processes, and
     nothing sets ``NUMBA_NUM_THREADS`` -- so by default EVERY process spins a
     numba pool of all cores. When capture's SGM burst and vio's KLT burst
     overlap (they pipeline), that is 2x ncores runnable threads fighting over
@@ -565,10 +559,6 @@ def main() -> int:
                          "connected, by product-name substring (e.g. 'lite') or "
                          "deviceId. Forwarded to the capture subprocess. Device "
                          "capabilities (IMU, mono resolution) are auto-detected.")
-    ap.add_argument("--worker", action="store_true",
-                    help="run the heavy BA/SLAM solves in worker subprocesses "
-                         "(GIL-free). Off by default -- SLAM already stays "
-                         "responsive via its latest-only in-process inbox.")
     ap.add_argument("--cap-numba-threads", action="store_true",
                     help="cap each child's numba thread pool so the per-stage "
                          "parallel bursts don't oversubscribe a small core count "
@@ -697,13 +687,6 @@ def main() -> int:
     args.ba_window = resolve_ba_window(args)
     args.frontend_viz = resolve_frontend_viz(args)
 
-    # SLAM keeps its live map current via a LATEST-ONLY in-process inbox (set in
-    # slam.main) -- it drops a backlog instead of lagging, with NO worker
-    # subprocess (so no resource_tracker semaphore noise on every shutdown /
-    # Restart). `--worker` is an opt-in for running the heavy solves GIL-free in
-    # child processes; off by default.
-    use_worker = bool(args.worker)
-
     # ---- Endpoint names (computed ONCE, identical across restarts) --------
     # The auto-suffix is derived from THIS launcher's PID, so re-spawning the
     # pipeline (Restart button) re-creates the same-named endpoints + rings.
@@ -778,12 +761,11 @@ def main() -> int:
     spawn_ba = not getattr(args, "no_ba", False)
     # VIO gets --ba-endpoint only when ba is actually spawned (else no refined pose,
     # inert bias feed -- exactly the old --no-ba behaviour, now launcher-gated).
-    vio_args = build_vio_args(args, cap_ep, vio_ep, slam_ep, use_worker,
+    vio_args = build_vio_args(args, cap_ep, vio_ep, slam_ep,
                               ba_ep=ba_ep, ba_spawned=spawn_ba)
 
     # BA argv (a pure consumer of VIO's keyframe output) lives in build_ba_args so
-    # the contract is unit-testable without spawning. --worker is NOT forwarded (it
-    # is a no-op for ba -- the solve already runs in-process in ba's own process).
+    # the contract is unit-testable without spawning.
     ba_args = build_ba_args(args, vio_ep, ba_ep)
 
     # NB: the new `slam.main` is a PURE consumer of VIO's output and -- unlike the
@@ -793,8 +775,6 @@ def main() -> int:
     # `--capture-endpoint` would make slam's argparse abort on startup.
     slam_args = ["--vio-endpoint", vio_ep,
                  "--endpoint", slam_ep]
-    if use_worker:
-        slam_args += ["--worker"]
     # Spatial-gate the loop search (caps the O(N) per-keyframe SLAM cost -- the live
     # CPU hog on the Pi). 0 = exact (default); forwarded to slam.main.
     if getattr(args, "loop_search_radius", 0.0) and args.loop_search_radius > 0.0:

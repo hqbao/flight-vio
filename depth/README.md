@@ -1,7 +1,7 @@
 # `depth/` — the stereo-depth project (SOURCE-OF-TRUTH for the SGM math)
 
-The **second** of the five split projects (`imu_camera`, `depth`, `vio`, `slam`,
-`ui`), built by replicating the **proven `imu_camera` template**. `depth` owns the
+One of the split projects (`imu_camera`, `depth`, `vio`, `ba`, `slam`, `ui`), built
+by replicating the **proven `imu_camera` template**. `depth` owns the
 from-scratch SGM dense-stereo matcher + the two depth steps
 (`compute_depth` → `publish_depth`).
 

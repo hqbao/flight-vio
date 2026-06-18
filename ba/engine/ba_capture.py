@@ -77,9 +77,9 @@ class BaWindowSnap:
     positions are camera-optical world frame; quaternions are ``(qw,qx,qy,qz)`` of
     the camera-in-world rotation. ``*_pre`` are the PRE-solve poses/landmarks.
 
-    Picklable (plain numpy fields, module-level class) so it crosses the
-    subprocess-engine ``ov_q`` under the ``spawn`` start method, exactly like the
-    ``{kf_id: pos}`` dict ``ba_overlay`` returns.
+    Plain numpy fields on a module-level class, exactly like the ``{kf_id: pos}``
+    dict ``ba_overlay`` returns, so the publisher can serialise it onto the IPC
+    ``ba.window`` topic with no special handling.
     """
 
     seq: int

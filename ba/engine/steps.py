@@ -1,12 +1,12 @@
-"""The per-keyframe solve, factored out so in-process and subprocess engines run
-*exactly the same code* (the whole offline byte-parity argument depends on this).
+"""The per-keyframe solve, factored out as pure functions the engine runs
+*exactly the same way* on the live and offline paths (the whole offline
+byte-parity argument depends on this).
 
 Each ``*_step`` takes a live map object + one keyframe snapshot and returns the
 solve result (or ``None`` when there is nothing to publish for that keyframe).
 These are pure functions of (map, snapshot): no threads, no queues, no flow/bus
-knowledge -- they receive the map instance so the same function drives both the
-synchronous :class:`~ba.engine.inprocess.InProcessEngine` and the child of
-:class:`~ba.engine.subprocess.SubprocessEngine`.
+knowledge -- they receive the map instance so the same function drives the
+synchronous :class:`~ba.engine.inprocess.InProcessEngine`.
 
 The logic is lifted verbatim from the old in-thread ``RunBA`` task so the offline
 path stays identical.
@@ -38,17 +38,17 @@ def ba_step(ba_map, snap: Any):
 #: ``vio_degraded`` is the load-bearing one (the divergence guard fired this
 #: keyframe -> a detected fault the FC must see); the reprojection error + window
 #: jump are the two diagnostics behind that decision. All are plain scalars so the
-#: tuple crosses the subprocess pickle boundary cleanly (see ``run_ba``).
+#: tuple serialises cleanly onto the published pose info (see ``run_ba``).
 _VIO_HEALTH_KEYS = ("vio_degraded", "vio_reproj_px", "vio_window_jump_m")
 
 
 def _vio_health(vio_map) -> dict:
-    """Extract the picklable tight-VIO health fields from ``last_info``.
+    """Extract the tight-VIO health fields from ``last_info`` as plain scalars.
 
     Casts ``vio_degraded`` to ``bool`` and the diagnostics to ``float`` so the
     returned dict holds ONLY plain Python scalars (no numpy types / objects) --
-    the subprocess engine pickles this across the process boundary, and the FC
-    info consumer wants stable scalar types. A key absent from ``last_info`` is
+    these ride the published pose info onto the IPC ``pose.refined`` topic, and the
+    FC info consumer wants stable scalar types. A key absent from ``last_info`` is
     simply omitted (e.g. the guard was off / no jump computed).
     """
     src = getattr(vio_map, "last_info", None) or {}
@@ -63,11 +63,11 @@ def _vio_health(vio_map) -> dict:
 def _backend_bias(vio_map):
     """Latest keyframe's optimised ``(bg, ba)`` as plain ndarrays, or ``None``.
 
-    Crosses the subprocess ``out_q`` with the step result (mirror ``_vio_health``'s
-    plain-data discipline -- numpy arrays pickle cleanly). The live
+    Rides the step result onto the IPC ``ba.state`` topic (mirror ``_vio_health``'s
+    plain-data discipline -- plain numpy arrays serialise cleanly). The live
     ``propagate_imu`` adopts these into its dead-reckoning bias: the tight
     backend->live feed-forward (PLAN P1/P2). TIGHT path only; a copy so the
-    worker map's state is never aliased across the boundary.
+    map's state is never aliased into the published message.
     """
     # The optimised per-keyframe bias lives in the WindowedVIOMap's keyframe dicts
     # (``keyframes[-1]["bg"]/["ba"]``, written back after a HEALTHY solve --

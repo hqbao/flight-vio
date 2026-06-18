@@ -40,7 +40,7 @@ def _ns(**over) -> types.SimpleNamespace:
 
 def _vio_ns(**over) -> types.SimpleNamespace:
     """A launcher-args namespace for build_vio_args (the VIO forwarding test)."""
-    base = dict(kf_every=5, no_gyro=False, worker=False,
+    base = dict(kf_every=5, no_gyro=False,
                 tight=False, stabilize_velocity=False, depth_icp=False,
                 ba_window=False, frontend_viz=False, direct=False)
     base.update(over)
@@ -77,16 +77,14 @@ def test_resolution() -> None:
 def test_vio_forwarding() -> None:
     cap, vio, slam = "oak.capture", "oak.vio", "oak.slam"
     # ON -> --frontend-viz forwarded to vio.main (loose AND tight).
-    argv = build_vio_args(_vio_ns(frontend_viz=True), cap, vio, slam,
-                          use_worker=False)
+    argv = build_vio_args(_vio_ns(frontend_viz=True), cap, vio, slam)
     assert "--frontend-viz" in argv, argv
     argv_t = build_vio_args(_vio_ns(frontend_viz=True, tight=True), cap, vio,
-                            slam, use_worker=False)
+                            slam)
     assert "--frontend-viz" in argv_t, argv_t
     print("[g] build_vio_args forwards --frontend-viz (loose AND tight)           OK")
     # OFF -> NOT forwarded.
-    argv_off = build_vio_args(_vio_ns(frontend_viz=False), cap, vio, slam,
-                              use_worker=False)
+    argv_off = build_vio_args(_vio_ns(frontend_viz=False), cap, vio, slam)
     assert "--frontend-viz" not in argv_off, argv_off
     print("[h] build_vio_args omits --frontend-viz when off                       OK")
 

@@ -269,8 +269,7 @@ live IMU dead-reckon (`PropagateImu`). Two-client startup: a **calib client** bl
 on the retained `calib.bundle`, then a **data client** for `imucam.sample` +
 `frame.depth`. VIO re-broadcasts the retained `calib.bundle` on its own endpoint
 AFTER allocating its `kf_*` rings (readiness barrier, §9 invariant 10) — this is also
-the barrier `ba` and `slam` block on. `--worker` is no longer a `vio` backend lever
-(the backend left); it is forwarded to `slam` only.
+the barrier `ba` and `slam` block on.
 
 `pose.vo` (`topics.POSE_VO`) is the PURE-VISION frame-to-frame trajectory — raw PnP
 R/t only, **no gyro fusion, no tilt leveling, no BA**. It is accumulated by
@@ -324,9 +323,9 @@ IPCPubSub(endpoint="oak.vio", role="client")
   deliberately does NOT subscribe to capture — it is a pure consumer of VIO's output.
 - **Strict-FIFO solve (`latest_only=False`):** every keyframe is solved in order so
   the refined-pose output matches the pre-split in-VIO path. `ba` runs the solve
-  **in-process** (it IS its own process → the GIL is already escaped); `--worker` is
-  accepted but is a **logged no-op** (the in-VIO `--worker` existed only to free the
-  camera read loop's GIL, which `ba` does not share).
+  **in-process** (it IS its own process → the GIL is already escaped). There is no
+  worker-child engine (the pre-split in-VIO backend's opt-in worker child existed
+  only to free the camera read loop's GIL, which `ba` does not share).
 - **Backend knobs route here.** `--tight` selects the tight `WindowedVIOMap`;
   `--backend-window` / `--backend-iters` size the loose solve; `--stabilize-velocity`
   / `--depth-icp` are the tight-only Phase-4 knobs; `--ba-window` is the loose-only
@@ -359,7 +358,7 @@ is unaffected because it never consumed the backend.
 ```
 IPCPubSub(endpoint="oak.vio", role="client")
   └── IPCSubscriber → LocalPubSub
-        ├── SlamModule(latest_only=True, publish_map=True, worker=False,
+        ├── SlamModule(latest_only=True, publish_map=True,
         │              SlamConfig(loop_max_odom_rot_deg=30.0, kf_min_trans_m=0.1, kf_min_rot_deg=5.0))
         └── IPCPublisher → IPCPubSub(endpoint="oak.slam", role="server")
               └── publishes: loop.correction, slam.map
@@ -389,10 +388,12 @@ current; `END` is never coalesced so clean shutdown still propagates. The offlin
 replay oracle keeps the `SlamModule` default `latest_only=False` (strict FIFO) for
 determinism (§9 invariant 14).
 
-**`worker=False` is the default:** the heavy BA/SLAM solves run **in-process** (this
-process is already off the main interpreter), so there is no worker subprocess and
-no `resource_tracker` semaphore noise at shutdown / Restart. `--worker` is an opt-in
-that runs those solves GIL-free in child subprocesses.
+**The solve always runs in-process.** SLAM runs its loop-closure + pose-graph solve
+on this process's own worker thread (this process is already off the main interpreter,
+and the IPC recv is a separate thread feeding the latest-only inbox). There is no
+worker-child engine and no `--worker` flag — so no `resource_tracker` semaphore noise
+at shutdown / Restart. A brief block during a heavy PGO just drops stale keyframes
+(the coalescing inbox is built to), keeping the live map current.
 
 `publish_map=True` (the LIVE-only flag) adds the `publish_slam_map` step so SLAM
 emits **two** topics, distinct in cadence:
@@ -531,7 +532,7 @@ carries the **five per-line toggle buttons**, then **Clear Trail** and **Restart
   (server→client) the UI **cannot** reset vio/slam in place, so it sets a flag and
   calls `app.quit()`; `run_ui` then returns **`RESTART_EXIT_CODE = 42`**. The
   launcher's restart loop sees code 42, `_cleanup_orphans()`es the prior generation,
-  and respawns capture + vio + slam + ui from scratch (§7, §9 invariant 13).
+  and respawns capture + vio + ba + slam + ui from scratch (§7, §9 invariant 13).
 
 The menu is plain Qt (`QMenuBar` / `QAction`); `ui.main` calls
 `mbar.setNativeMenuBar(False)` so the bar renders **in-window on every platform**.
@@ -838,12 +839,11 @@ call `_terminate()` — `_terminate` polls `os.waitpid(pid, WNOHANG)` on the sam
 the main thread is blocked in `ui_proc.wait()` on, and the two waitpid callers would
 race for the single reap event.
 
-**`--worker` is an opt-in (default off).** It is now forwarded to **`slam` only** —
-the windowed BA left `vio` for its own `ba` process, which always solves in-process
-(it IS its own process → the GIL is already escaped; `ba` accepts `--worker` but logs
-it as a no-op). With `--worker` off, SLAM runs its solve in-process and stays
-responsive via its latest-only inbox (§5.3) — no worker subprocess, no
-`resource_tracker` noise.
+**Every project runs its solve in-process — there is no `--worker` flag.** The
+windowed BA left `vio` for its own `ba` process, and `slam` runs its loop-closure +
+pose-graph solve on its own thread in the `slam` process; both are their own OS
+process, so the GIL is already escaped without a worker child. SLAM stays responsive
+via its latest-only inbox (§5.3) — no worker subprocess, no `resource_tracker` noise.
 
 **Process-parallelism → the bottleneck is the busiest PROCESS, not the serial sum.**
 Because capture / vio / ba / slam are separate `Popen` processes, the achievable
@@ -851,10 +851,9 @@ frame rate is `1000 / (busiest process ms/frame)`, not the sum of all stages. On
 Pi5 (loose 320×200) the vio process is the wall — frontend KLT+PnP (~29 ms after the
 KLT pyramid-reuse change) + IMU (~1 ms) — while capture's SGM (~9 ms) runs
 concurrently. The windowed BA now runs in its OWN `ba` process (its own core), so the
-bursty ~48 ms/keyframe solve no longer shares the vio core at all — the in-VIO
-`--worker` subprocess that used to escape that hitch is therefore retired for BA (the
-`ba` process IS the GIL escape). `ba` runs on the keyframe cadence, off the per-frame
-path. Full per-stage numbers: `verification/STAGE_PROFILE_RESULTS.md` (harness
+bursty ~48 ms/keyframe solve no longer shares the vio core at all — the `ba` process
+IS the GIL escape (no worker child needed). `ba` runs on the keyframe cadence, off the
+per-frame path. Full per-stage numbers: `verification/STAGE_PROFILE_RESULTS.md` (harness
 `verification/stage_profile.py`).
 
 **`--cap-numba-threads` (opt-in, default off; on under `pi-run.sh`).** Each process
@@ -1105,8 +1104,8 @@ proven (see [`verification/README.md`](../verification/README.md)):
     (`slam/main.py`) so the LIVE viewer drops a keyframe backlog and always solves the
     freshest keyframe. `END` is never coalesced, so shutdown still propagates. The
     deterministic offline / replay path keeps the default `latest_only=False` (strict
-    FIFO), so its scoring stays byte-identical. In-process solve is the default
-    (`worker=False`); `--worker` moves the heavy solves to GIL-free child subprocesses.
+    FIFO), so its scoring stays byte-identical. The solve always runs in-process (on
+    the `slam` process's own thread); there is no worker-child engine / `--worker` flag.
 15. **`pose.vo` is LIVE-only; `pose.odom` byte-parity is preserved.** The pure-vision
     frame-to-frame trajectory (`topics.POSE_VO`, the UI's VO line) is emitted by the
     `publish_vo` step (`vio/modules/publish_vo.py`), wired into the frame chain **only**
@@ -1158,7 +1157,7 @@ proven (see [`verification/README.md`](../verification/README.md)):
     flight build** (the njit IMU-Jacobian kernel is validated only with it on; see
     `docs/TIGHT_COUPLED_PLAN.md` §4i–4j). The guard raises `vio_degraded=True` (+
     `vio_reproj_px` / `vio_window_jump_m` diagnostics), which `vio_step` returns as
-    `(T_cw, health)` and `vio/modules/backend.py::run_ba` merges into the published
+    `(T_cw, health)` and `ba/modules/backend.py::run_ba` merges into the published
     `pose.refined` `PoseMsg.info`, next to `refined` and the `pos_sigma_m`
     position-noise field. **PENDING (known gap):** the FC consumer of
     `pose.refined.info['vio_degraded']` (hook `launcher/main.py::_start_pose_logger
@@ -1174,12 +1173,15 @@ The split was shipped in phases, each independently verifiable. The end state:
 1. `imu_camera` — capture process + inline SGM depth (the template the others
    replicate).
 2. `depth` — SGM source-of-truth + standalone depth-as-a-process harness.
-3. `vio` — odometry + windowed BA process.
-4. `slam` — loop closure + pose graph process (pure VIO consumer).
-5. `ui` — single 5-trajectory `Viewer3D` + Visualize/Calibration menus over IPC.
-6. `launcher` — process lifecycle (spawn / restart loop / orphan cleanup);
+3. `vio` — RGB-D odometry + live IMU dead-reckon process (emits `keyframe`; the
+   windowed BA later left for its own `ba` process — ADR 0001).
+4. `ba` — the windowed-BA process (loose `WindowedBAMap` / tight `WindowedVIOMap`);
+   pure `keyframe` consumer, publishes `pose.refined` (+ `ba.state` / `ba.window`).
+5. `slam` — loop closure + pose graph process (pure VIO consumer).
+6. `ui` — single 5-trajectory `Viewer3D` + Visualize/Calibration menus over IPC.
+7. `launcher` — process lifecycle (spawn / restart loop / orphan cleanup);
    `./run.sh --proc` → `launcher.main`.
-7. `verification` — in-process byte-parity oracle (gap = 0) + cross-copy comms gate.
+8. `verification` — in-process byte-parity oracle (gap = 0) + cross-copy comms gate.
 
 Each project vendors a byte-identical `comms/` (the codec replaces pickle), all
 internal imports are RELATIVE, and the package pulls no depthai / PyQt6 / cv2 — so

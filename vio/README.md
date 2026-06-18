@@ -1,14 +1,23 @@
 # `vio/` — the visual-inertial odometry project (Phase 3 of the split)
 
-The **third** of the five split projects (`imu_camera`, `depth`, `vio`, `slam`,
+The **third** of the split projects (`imu_camera`, `depth`, `vio`, `ba`, `slam`,
 `ui`), built by replicating the **proven `imu_camera` template**. `vio` subscribes
-to the capture process over IPC, runs the RGB-D visual odometry (+ gyro prior)
-and the sliding-window bundle adjustment, and republishes its results on its own
-IPC endpoint for SLAM / UI / tools.
+to the capture process over IPC, runs the RGB-D visual odometry (+ gyro prior) and
+the live IMU dead-reckon, emits a `keyframe` stream, and republishes its results on
+its own IPC endpoint for `ba` / `slam` / UI / tools.
+
+The **windowed bundle adjustment is NO LONGER in `vio`** — it was extracted into the
+[`ba/`](../ba/README.md) process (ADR
+[0001](../docs/adr/0001-extract-windowed-ba-into-ba-process.md), commit `611dc45`):
+`vio` now PRODUCES `keyframe` (both `ba` and `slam` consume it) and is a pure
+*consumer* of `ba`'s `pose.refined` over a read-only `--ba-endpoint` client, which
+it re-emits on its own endpoint so the UI keeps a single endpoint (see
+[`vio/main.py`](#viomainpy--the-vio-process) below).
 
 ```
-imu_camera.main  ──(oak.capture)──▶  vio.main  ──(oak.vio)──▶  slam / ui / tools
-   capture proc        IPC            VIO proc       IPC
+imu_camera.main ─(oak.capture)─▶ vio.main ─(oak.vio)─┬─▶ ba.main   ─(oak.ba)─┐
+   capture proc       IPC         VIO proc     IPC    └─▶ slam.main ─(oak.slam)┴─▶ ui / tools
+                                              ba.pose.refined re-emitted on oak.vio ┘
 ```
 
 It was ported **VERBATIM** from the reference oracle (`ours/`): only import roots
@@ -22,11 +31,15 @@ line-for-line).
 | Package | Role | Source it was ported from |
 |---------|------|---------------------------|
 | `vio/comms/` | the **FROZEN** vendored comms contract | copied **bit-identically** from `imu_camera/comms` |
-| `vio/engine/` | the swappable in-process / subprocess runners for the heavy keyframe solve (the algorithm lives in shared `sky`) | `ours/lib/engine` |
 | `vio/resolution_build.py`, `vio/warmup.py` | the math-coupled config builders + JIT warmup VIO owns at the project root | `ResolutionProfile.{frontend,odometry,ba_huber_px}` + `ours/lib` warmup |
-| `vio/modules/` | the odometry + backend pipeline (**procedural** step functions + two plain worker threads) | `ours/flows/{odometry,backend}` |
-| `vio/main.py` | the VIO process | `ours/proc/vio.py` |
+| `vio/modules/` | the odometry pipeline + keyframe emission + live IMU dead-reckon (**procedural** step functions + one plain worker thread) | `ours/flows/odometry` |
+| `vio/main.py` | the VIO process (incl. the `--ba-endpoint` pass-through) | `ours/proc/vio.py` |
 | `vio/tests/` | regression self-tests | `ours/tools/{klt,vio_ba}_selftest.py` |
+
+> **No `vio/engine/`.** The in-process engine that drove the heavy keyframe solve
+> moved to [`ba/engine/`](../ba/README.md) when the windowed BA was extracted into
+> the `ba` process; `vio/engine/` was **deleted**. `vio` no longer runs any
+> keyframe solve — it only emits the `keyframe` that `ba` (and `slam`) consume.
 
 ### `vio/comms/` — byte-identical, do not hand-edit
 
@@ -44,19 +57,23 @@ no longer imports them: its pipeline is plain procedural Python, see below.
 `ModuleContext` is the one comms type still used, as a plain `(bus, name, state)`
 state holder for the odometry worker.)
 
-### `vio/engine/` — the swappable solve runners
+### What VIO owns now — execution glue, no solve engine
 
 After the `sky.*` consolidation the VIO algorithm itself (frontend KLT, RGB-D
-odometry, windowed BA, the tight VIO window, IMU/SO(3) helpers) lives in the shared
-`sky` leaf library; the misnamed grab-bag `vio/mathlib/` has been **dissolved by
-concern**. What VIO still owns is the *execution* glue:
+odometry, the IMU/SO(3) helpers) lives in the shared `sky` leaf library; the
+misnamed grab-bag `vio/mathlib/` has been **dissolved by concern**. The heavy
+keyframe solvers (windowed BA `WindowedBAMap`, tight VIO window `WindowedVIOMap`)
+and the in-process engine that drove them now live in [`ba/`](../ba/README.md) —
+`vio/engine/` was **deleted**. What VIO still owns is the *execution* glue around
+the front-end:
 
-- `vio/engine/` — the swappable in-process / subprocess engines that drive the
-  heavy keyframe solve. `make_ba_engine` wraps `sky.backend.windowed.WindowedBAMap`
-  and `make_vi_engine` wraps `sky.vio.window.WindowedVIOMap`; `worker=True` ships
-  each keyframe to a child process so the solve never holds the camera read loop's
-  GIL. The engines know nothing about the bus — pure machinery called by the
-  module steps.
+- the **odometry worker** (`vio/modules/pipeline.py`) — KLT track → RGB-D PnP +
+  gyro fusion + the live IMU dead-reckon, emitting `pose.odom` / `pose.vo` and the
+  `keyframe` stream that `ba` and `slam` consume. There is **no keyframe solve in
+  VIO** any more.
+- the **`--ba-endpoint` pass-through** (`vio/main.py`) — a read-only client on the
+  `ba` endpoint that re-emits `ba`'s `pose.refined` / `ba.window` on the VIO endpoint
+  and feeds `ba.state` (the `--tight` optimised bias) into `propagate_imu`.
 
 **ARCHITECTURE RULE.** The math-coupled config builders and the JIT warmup live at
 the **project root**, **not** in the generic, bit-identical `vio/comms/`:
@@ -78,13 +95,15 @@ each reactive module became a plain `threading.Thread` worker that owns its inbo
 coalescing, END handling, and downstream-END forward explicitly.
 
 The files are grouped by **role in the data flow** (the package `__init__.py` carries
-the full module-map): `pipeline.py` (read first — the workers that orchestrate),
-`carriers.py` (the per-frame dataclass records), `frontend.py` (sparse visual VO),
-`imu_prior.py` (IMU prior + gravity + tilt), `backend.py` (keyframe + windowed BA),
-`publishers.py` (emit results on topics), plus `propagate_imu.py` (the `--tight` live
-nav), `direct_odometry.py` (the `--direct` alternative front-end), and `loop_inbox.py`
-(SLAM loop-correction feedback). Flow: `frame → frontend → imu_prior → backend →
-publishers`.
+the full module-map): `pipeline.py` (read first — the odometry worker that
+orchestrates), `carriers.py` (the per-frame dataclass records), `frontend.py`
+(sparse visual VO), `imu_prior.py` (IMU prior + gravity + tilt), `backend.py`
+(keyframe **emission** — `emit_keyframe`, on the odometry thread; the windowed BA it
+used to feed moved to the `ba` process), `publishers.py` (emit results on topics),
+plus `propagate_imu.py` (the `--tight` live nav), `direct_odometry.py` (the
+`--direct` alternative front-end), and `loop_inbox.py` (the SLAM `loop.correction`
+**and** `ba.state` bias feedback inboxes). Flow: `frame → frontend → imu_prior →
+backend → publishers`.
 
 `OdometryWorker` joins `imucam.sample` (IMU prior, `process_imucam`) +
 `frame.depth` (KLT track → RGB-D PnP → gyro fusion → pose, `process_frame`) and
@@ -93,12 +112,14 @@ when the live builder enables it). It owns the **2-input multi-END join**
 explicitly: one inbox carries `(topic, msg)` tuples, the loop routes each by topic
 to the right step chain, and END is forwarded downstream + `done` set only once
 **both** inputs have ENDed (`expected_ends == 2`) — the load-bearing concurrency
-the old `Module` gave for free. `BackendWorker` consumes `keyframe`
-(`process_kf`), runs windowed BA behind a swappable engine (`worker=True` runs it
-in a subprocess; `tight=True` switches to the VIO map), and publishes
-`pose.refined`. `OdometryModule` / `BackendModule` are kept as aliases (vio.main +
-the selftests import them). The internal carriers (`Step` / `Primed` / `Tracked`, in
-`carriers.py`) thread one frame's state through the chain; they never go on the bus.
+the old `Module` gave for free. `OdometryModule` is kept as a public alias for the
+worker (vio.main + the vio/verification selftests import it). The internal carriers
+(`Step` / `Primed` / `Tracked`, in `carriers.py`) thread one frame's state through
+the chain; they never go on the bus.
+
+> **The backend worker is gone from VIO.** `BackendWorker` / `BackendModule` /
+> `process_kf` / `run_ba` now live in [`ba.modules.pipeline`](../ba/README.md); `vio`
+> no longer constructs a backend worker — it is a pure producer of `keyframe`.
 
 The odometry worker holds a `ModuleContext` (a plain `(bus, name, state)` holder,
 NOT the reactive substrate) so the per-run state the step functions thread through
@@ -189,21 +210,43 @@ the live recipe is `./run.sh --vl53l9cx --direct`. Gate: `vio.tests.direct_smoke
 
 Two-client startup against the capture endpoint (a **calib client** that blocks on
 the retained `calib.bundle`, then a **data client** for `imucam.sample` +
-`frame.depth`), builds the local odometry/backend graph with the **live** config
+`frame.depth`), builds the local **odometry** graph with the **live** config
 (`level_tilt=True`, `OdometryConfig(gyro_fuse=use_gyro)`, `publish_vo=True`), and
 mirrors its outputs onto its own `IPCPubSub` server with an `IPCPublisher`,
-re-broadcasting the retained `calib.bundle` as a readiness barrier. The
-worker-engine subprocess boundary (`--worker`) stays on stdlib pickle
-(`multiprocessing.Queue`, same-project classes) — it is **not** routed through the
-cross-process codec. Same SIGTERM / drain / `os._exit` lifecycle as the template.
+re-broadcasting the retained `calib.bundle` as a readiness barrier. There is **no
+keyframe solve in the VIO process** — VIO emits `keyframe`; the windowed BA runs in
+the `ba` process. Same SIGTERM / drain / `os._exit` lifecycle as the template.
+
+**Backend pass-through (`--ba-endpoint`).** The `ba` process publishes `pose.refined`
+(the windowed-BA line) on ITS OWN endpoint. To keep the UI + netbridge UNCHANGED (no
+4th UI endpoint), VIO — when given `--ba-endpoint` — opens a **read-only** client on
+the `ba` endpoint and bridges two topics back onto its local bus (the mirror of the
+slam `loop.correction` re-hydrate):
+
+- `pose.refined` (and, under `--ba-window`, `ba.window`) is re-published so VIO's
+  existing `IPCPublisher` re-emits it on the **VIO** endpoint — the UI's trajectory +
+  "BA Window" sources read it off the single VIO endpoint, unchanged across the split.
+- `ba.state` (the `--tight` optimised-bias feed-forward) is handed to `propagate_imu`
+  via `vio.modules.loop_inbox.BackendStateInbox`. It is consumed VIO-local only and
+  is **never** re-emitted on the VIO endpoint (off-bridge).
+
+When `--ba-endpoint` is unset (the launcher omits it under `--no-ba`, which spawns no
+`ba` process), VIO simply never opens the client — no `pose.refined`, inert bias feed.
 
 ## Run
 
 ```bash
-# capture (replay) serves oak.capture; vio subscribes + serves oak.vio
+# capture (replay) serves oak.capture; vio subscribes + serves oak.vio; ba
+# consumes vio's keyframe + publishes pose.refined; vio re-emits it via --ba-endpoint.
 python -m imu_camera.main --session sessions/gold/lab_loop_30s &
-python -m vio.main --capture-endpoint oak.capture --endpoint oak.vio
+python -m vio.main --capture-endpoint oak.capture --endpoint oak.vio \
+                   --ba-endpoint oak.ba &
+python -m ba.main  --vio-endpoint oak.vio --endpoint oak.ba
 ```
+
+> `vio` alone (no `ba`, no `--ba-endpoint`) still runs fully — it just emits no
+> `pose.refined` (that line now comes from `ba`). The whole stack is normally
+> launched by `launcher.main` / `run.sh`, which spawns `ba` between `vio` and `slam`.
 
 ## Verify
 
@@ -222,5 +265,6 @@ diff -r -x '__pycache__' -x '*.pyc' -x '*.nbc' -x '*.nbi' \
 .venv/bin/python -m vio.tests.odometry_selftest    # PASS
 
 # 4. PAIR smoke: capture (replay) + vio over IPC on a gold session
-#    expect ~60 pose.odom (dense), ~12 keyframe, ~12 pose.refined, clean exit.
+#    expect ~60 pose.odom (dense), ~12 keyframe, clean exit. (pose.refined now
+#    comes from the ba process — add `ba.main` + `--ba-endpoint` to see it.)
 ```
