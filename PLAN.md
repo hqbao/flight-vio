@@ -339,3 +339,83 @@ backend-less). Pass-through design keeps the UI + netbridge UNCHANGED.
   velocity-stabilize ON (CV prior + gated ZUPT)` (the shipped shake fix is LIVE end-to-end again);
   (9) pyflakes vio/ ba/ launcher/ = 0. ba_refined_functional loose+tight PASS.
 - NOT committed. REMAINING in Chunk 3: step 3 docs (ADR + Mermaid + CLAUDE.md roster) — docs-writer.
+
+---
+
+## TASK: `fc/` project — UART output to the FC (2026-06-18) — PROTOCOL = dblink (user-locked)
+
+**Goal:** consumer-only sibling `fc/` that streams the VIO earth-frame pose to the in-house
+drone FC over UART. Tier **T3** (flight-safety). Staged: BENCH/UI-verify first, then flight-harden.
+architecture-reviewer: **APPROVE_WITH_NITS** (structure). `fc/` already exists with the approved
+structure (latest-wins, UART-off-callback, safety floors, reset_counter) — only the PROTOCOL swaps.
+
+**PROTOCOL DECISION (user, 2026-06-18): dblink, NOT MAVLink.** The FC speaks its own `dblink`
+(sibling repo `../flight-controller`). MAVLink VPE (`sky/fc/mavlink_vpe.py`) is SUPERSEDED — remove it.
+- **Wire frame** (host→FC, verbatim `build_db_frame`, [tools/dblink_test.py]): `'d''b'` + CMD(1B) +
+  CLASS(1B,=0x00) + LEN(2B LE) + payload + checksum(2B LE). Checksum = `(cmd+class+len_lo+len_hi+
+  sum(payload)) & 0xFFFF`, LE. FC routes by the CMD byte (`data[0]`); FC does NOT verify the DB
+  checksum (only UBX) but the frame must be well-formed. FC has **no vision receiver yet** → a
+  matching FC-side module + EKF wiring is SEPARATE work in `../flight-controller` (user owns).
+- **CMD = `DB_CMD_VISION_POSE` = 0x0C** (proposed; FC header owns the final value).
+- **Payload (38B, little-endian, `struct '<8f I 2B'`):** `pos_n,pos_e,pos_d` (f32 NED m);
+  `q_w,q_x,q_y,q_z` (f32 quaternion body→NED, Hamilton, unit — **FC extracts heading itself**, no
+  Euler imposed, gimbal-lock-free); `pos_sigma_m` (f32 1-σ → √R; inflated when degraded);
+  `age_us` (u32); `reset_counter` (u8); `flags` (u8: bit0 pos_valid, bit1 att_valid, bit2 degraded).
+- **TIME SYNC = "Mức 1 / age" (user-locked, simplest, TX-only, NO clock sync).** Send `age`;
+  FC computes `validity_fc = fc_rx_time − age − C`. age is a *duration* → FC anchors it to its OWN
+  clock; the module's absolute clock is never needed.
+  **HONEST age property (do NOT call it "conservative/errs old" — it is biased YOUNGER):** because
+  `O_est = running-min(recv − ts_device) = O + min(capture→fc pipeline latency)`, the reported
+  `age = send − ts − O_est` UNDER-reports the true capture→send age by ≈ that minimum pipeline-latency
+  floor. That floor is NOT sub-ms — it includes the VIO compute floor (tens of ms) + IPC hop + sender
+  queue wait. So `age` carries only the VARIABLE latency ABOVE the floor (fc queue wait + pipeline
+  jitter); the only hard guarantees are age ≥ 0 (floored, never negative) and this constant under-report.
+  Therefore **C must absorb the floor: `C = UART_transport + pipeline_latency_floor`** (NOT just the
+  ~4ms UART) — FC-calibrated once via `DB_CMD_ECHO` + the observed pipeline floor. With C set that way,
+  `fc_rx_time − age − C` lands on the true capture instant.
+  **age clock detail:** `pose.ts_ns` is DEVICE clock (`imu_camera/io/synced.py`), populated live
+  (`publishers.py:192` `PoseMsg(seq, frame.ts_ns, …)`). fc/ estimates `O` by a running-min of
+  `(recv_host_s − ts_ns·1e-9)` (relax-up ~1e-4/s for drift; a candidate >0.5s below the min is rejected
+  as a corrupt/future ts so one bad sample can't latch `O_est` low forever), then
+  `age_us = clamp((send_host_s − ts_ns·1e-9 − O)·1e6, 0, …)`. A hard `age > 1s` ceiling drops the frame.
+  Fallback ts_ns==0 → age from recv time only. Future **"Mức 2"** = `imu_camera` host-capture-stamp (or
+  passive regression on FC's `t_ms` heartbeat) → age becomes the FULL absolute capture→send age and
+  C reduces to UART transport only (swap `age_us`→`t_fc_ms`, u32, same size, wire unchanged).
+
+**Key corrections (baked into the plan):**
+- **reset_counter trigger** (MAJOR): NOT `loop.correction` (tight-only + blended, invisible on
+  the loose/`--direct` default). Key it off `info["sensor_gap_s"]` (re-lock after dropout) +
+  a fc-local position-JUMP detector (delta vs `pos_sigma_m`+dt). Rising-edge debounce (bump once).
+- **reset_counter owned in `fc/`** (sender state), NOT `sky/`. `sky/fc/fc_earth_pose.py` stays
+  PURE (pose→earth-pose, no time/IO/counters) → testable + the SSOT shared by ui/ + fc/.
+- **UART off the IPC callback** (REQUIRED): callback only stores latest (1-slot); a daemon UART
+  thread loops fixed cadence (default 30Hz, clamp [10,50]), drops stale (>250ms), `write_timeout`,
+  non-fatal on error (never back-pressure flight / never crash the run).
+- **Bench FLOOR (non-negotiable from send #1):** the latest-wins thread + **never send an
+  over-confident cov** (cov from `pos_sigma_m` when present; NaN-cov "unknown" when absent OR
+  `vio_degraded`/`sensor_gap_s` set). Full reset/jump-detector edge logic = hardening pass.
+- `fc/` = FULL vendored `comms/` (9th copy, add `"fc"` to ipc_comms_selftest COPIES); it just
+  doesn't instantiate the server/publisher. Shared conversion in `sky/fc/fc_earth_pose.py`
+  (NOT the frozen `comms/lib/misc/frames.py`). Heading RELATIVE (no mag); `R_body_cam` mount
+  extrinsic = operator config, default I; rpy derived from the quaternion (singularity-safe).
+
+**Build plan (dblink swap — structure already in place, DONE items marked):**
+- ✅ `sky/fc/fc_earth_pose.py` SSOT extracted; ui's call sites refactored (UI byte-unchanged).
+- ✅ `fc/` package (vendored comms 9th copy; `"fc"` in ipc_comms COPIES); latest-wins UART thread,
+  staleness floor, reset_counter edge logic, calib barrier — all present (MAVLink-flavored).
+- ✅ launcher `--fc PORT[:BAUD]` + `--fc-rate` + `--fc-mount`, `parse_fc_port`, `build_fc_args`,
+  gated spawn after slam — wired (docstrings still say MAVLink → update).
+- **(1) NEW `sky/fc/dblink.py`:** `DB_CMD_VISION_POSE=0x0C`, `build_db_frame` (verbatim checksum),
+  `pack_vision_pose(pos_ned, q_wxyz, pos_sigma_m, age_us, reset_counter, flags) -> frame bytes`.
+- **(2) `fc/main.py` swap:** import dblink (not mavlink_vpe); `send_once` packs the dblink frame
+  (now carries the FULL quaternion + age_us + flags); add the age/offset computation above; degraded
+  → inflate `pos_sigma_m` + set flag bit2 (NOT a NaN on the wire). Keep latest-wins/staleness/
+  reset_counter UNTOUCHED. Update docstrings MAVLink→dblink.
+- **(3) Remove `sky/fc/mavlink_vpe.py`** + drop the MAVLink dep refs (confirm nothing else imports it).
+- **(4) Launcher cosmetics:** `build_fc_args`/`--fc-rate` help text MAVLink VPE → dblink.
+- **(5) UI:** fix the misleading `heading == yaw` comment in `ui/qt/panels.py` (value already = heading).
+- **(6) tester:** ipc_comms 9-copy, NEW `sky/fc/dblink` selftest (golden frame + `parse_db_stream`
+  roundtrip + checksum parity), rewrite `fc/tests/fc_sil_selftest.py` for dblink (frame bytes + age
+  + reset edge + latest-wins-under-load + degraded floor), `./run.sh` replay `--fc <pty>` + offscreen UI.
+- **(7) T3 fan-out before in-flight send:** safety + security + math reviewers on the diff. (8) docs.
+- **OPEN (user):** final `DB_CMD_VISION_POSE` value (FC header); who writes the FC-side receiver+EKF fusion.

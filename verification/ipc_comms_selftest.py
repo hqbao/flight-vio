@@ -46,13 +46,15 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
 ANCHOR = "imu_camera"
-# The 6 split projects (imu_camera / vio / slam / ui / launcher / ba) + ``netbridge``
-# (the cross-machine TCP bridge, which vendors comms as a further copy). Every copy
-# must be byte-identical to the anchor -- source parity is now FULLY CLEAN (the
+# The split projects (imu_camera / depth / vio / slam / ui / launcher / ba / fc) +
+# ``netbridge`` (the cross-machine TCP bridge, which vendors comms as a further copy).
+# Every copy must be byte-identical to the anchor -- source parity is FULLY CLEAN (the
 # transitional vio-only ``BACKEND_STATE`` exception was retired when the in-vio
 # local-bus feed-forward moved to the IPC ``ba.state`` topic, present byte-identically
-# in every copy).
-COPIES = ("imu_camera", "depth", "vio", "slam", "ui", "launcher", "ba", "netbridge")
+# in every copy). ``fc`` is the FC UART-output project -- a pure CONSUMER that vendors
+# the full comms contract but only instantiates the client/subscriber half.
+COPIES = ("imu_camera", "depth", "vio", "slam", "ui", "launcher", "ba", "fc",
+          "netbridge")
 
 
 def _check(cond: bool, msg: str) -> bool:

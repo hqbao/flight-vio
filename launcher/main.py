@@ -377,7 +377,9 @@ def _numba_thread_caps(cap: bool) -> dict[str, int]:
     n = os.cpu_count() or 4
     half = max(1, n // 2)
     rest = max(1, n // 4)
-    return {"imu_camera": half, "vio": half, "slam": rest, "ba": rest}
+    # fc is a tiny pose->UART sink (no numba kernels), so it gets the remainder
+    # budget alongside slam/ba; it never contends on the per-frame hot path.
+    return {"imu_camera": half, "vio": half, "slam": rest, "ba": rest, "fc": rest}
 
 
 def _role_env(base_env: dict[str, str], threads: int | None) -> dict[str, str]:
@@ -476,7 +478,7 @@ def _start_pose_logger(vio_ep: str, target_fps: int = 0, width: int = 0,
     """``--no-ui`` FC-output preview: subscribe to the vio pose, print pos + quat.
 
     A READ-ONLY consumer on the vio endpoint -- the ours FC-output HOOK, the
-    single place a real MAVLink ``VISION_POSITION_ESTIMATE`` send will go (mirrors
+    single place a real ``dblink`` ``DB_CMD_VISION_POSE`` send will go (mirrors
     baseline's ``_on_pose``). Prints the RAW pose (position + quaternion; the FC
     derives heading itself), throttled to ~2 Hz. Best-effort: returns the
     ``IPCPubSub`` client to ``stop()`` on teardown, or ``None`` if it cannot
@@ -499,7 +501,7 @@ def _start_pose_logger(vio_ep: str, target_fps: int = 0, width: int = 0,
           "low": 0}
 
     def _on_pose(wm) -> None:
-        # === FC OUTPUT HOOK (ours) -- wire MAVLink VISION_POSITION_ESTIMATE here.
+        # === FC OUTPUT HOOK (ours) -- wire the dblink DB_CMD_VISION_POSE send here.
         st["n"] += 1
         now = time.monotonic()
         # --- OVERLOAD watch: end-to-end pose rate vs the target fps (live only).
@@ -573,6 +575,41 @@ def build_forward_args(host: str, port: int, args, cap_ep: str, vio_ep: str,
     if not args.bridge_frames:
         forward_args += ["--pose-only"]
     return forward_args
+
+
+def parse_fc_port(s: str, *, default_baud: int = 115200) -> tuple[str, int]:
+    """Parse a ``--fc PORT[:BAUD]`` value -> ``(port, baud)`` (pure -> testable).
+
+    The optional ``:BAUD`` suffix is recognised ONLY when the text after the LAST
+    colon is all digits, so a bare serial path that itself has no baud
+    (``/dev/ttyAMA0``) keeps its default baud, and an explicit
+    ``/dev/ttyUSB0:921600`` overrides it. (A serial device path never ends in a
+    plain integer, so this split is unambiguous.)
+    """
+    s = str(s).strip()
+    port, sep, tail = s.rpartition(":")
+    if sep and tail.isdigit():
+        return port, int(tail)
+    return s, int(default_baud)
+
+
+def build_fc_args(args, vio_ep: str) -> list[str]:
+    """Build the ``fc.main`` argv from the parsed launcher ``args`` (pure).
+
+    Mirrors :func:`build_forward_args`: ``fc`` is a pure CONSUMER of VIO's
+    ``pose.odom`` -- it subscribes the VIO endpoint (``--vio-endpoint``), converts
+    each pose to NED, and streams ``dblink`` ``DB_CMD_VISION_POSE`` frames to the FC
+    over the serial ``--port`` at ``--baud``. ``args.fc`` is ``PORT[:BAUD]`` (parsed
+    by :func:`parse_fc_port`); the optional ``args.fc_mount`` forwards the
+    ``R_body_cam`` mount extrinsic. No rings, no server -- ``fc`` opens neither.
+    """
+    port, baud = parse_fc_port(args.fc)
+    fc_args = ["--vio-endpoint", vio_ep, "--port", port, "--baud", str(baud)]
+    if getattr(args, "fc_rate", 0.0):
+        fc_args += ["--rate", str(args.fc_rate)]
+    if getattr(args, "fc_mount", None):
+        fc_args += ["--mount", args.fc_mount]
+    return fc_args
 
 
 def parse_host_port(s: str, *, default_host: str = "0.0.0.0") -> tuple[str, int]:
@@ -655,6 +692,22 @@ def main() -> int:
                          "frames. Use this only to feed the opt-in camera Visualize "
                          "windows over a FAST link -- and run the Mac side with the "
                          "matching `deploy/pi-ui.sh --frames`.")
+    ap.add_argument("--fc", default=None, metavar="PORT[:BAUD]",
+                    help="ALSO stream the VIO pose to a drone FC over UART: spawn "
+                         "fc.main on the serial PORT (e.g. /dev/ttyAMA0 or "
+                         "/dev/ttyUSB0:921600; default baud 115200) writing dblink "
+                         "DB_CMD_VISION_POSE frames. Additive + NON-FATAL: a bad / "
+                         "missing port makes fc log + exit WITHOUT taking the stack "
+                         "down (like a failed --forward). Spawned after slam; "
+                         "consumer-only (no IPC server). Heading is RELATIVE (no mag).")
+    ap.add_argument("--fc-rate", type=float, default=0.0,
+                    help="with --fc: dblink vision-pose send cadence in Hz (clamped "
+                         "[10,50] by fc.main). 0 = fc.main's default (30 Hz).")
+    ap.add_argument("--fc-mount", default=None, metavar="R11,..,R33",
+                    help="with --fc: the R_body_cam mount extrinsic as 9 "
+                         "comma-separated row-major values (OpenCV-camera body -> "
+                         "FRD airframe body, relative to the nominal forward mount). "
+                         "Default = identity (camera faces forward).")
     ap.add_argument("--vl53l9cx", action="store_true",
                     help="simulate a VL53L9CX-class ToF camera in the capture "
                          "process: compute depth at the source resolution then "
@@ -842,6 +895,11 @@ def main() -> int:
     if getattr(args, "loop_search_radius", 0.0) and args.loop_search_radius > 0.0:
         slam_args += ["--loop-search-radius", str(args.loop_search_radius)]
 
+    # FC UART-output argv (a pure consumer of VIO's pose.odom) lives in build_fc_args
+    # so the contract is unit-testable without spawning. Built only when --fc is set
+    # (parse_fc_port would choke on None otherwise).
+    fc_args = build_fc_args(args, vio_ep) if getattr(args, "fc", None) else []
+
     # The UI's calib + visualise windows subscribe capture directly (IMU /
     # imucam.sample / frame.depth), so it must know the suffixed live endpoint
     # under an --auto-suffix run.
@@ -950,6 +1008,17 @@ def main() -> int:
                                env=_role_env(env, caps.get("slam")), name="slam")
             procs.append(slam_proc)
             named["slam"] = slam_proc
+        # FC UART output (--fc): spawn fc.main AFTER slam (it subscribes vio's
+        # pose.odom, which is up by now). It joins `procs` + `named` so _terminate
+        # tears it down with the rest. NON-FATAL: fc opens the serial port itself
+        # and, on a bad / missing port, logs + exits WITHOUT signalling anyone --
+        # the rest of the stack runs on (mirror of how a failed --forward connect
+        # never takes the pipeline down). Consumer-only: no IPC server, no rings.
+        if getattr(args, "fc", None):
+            fc_proc = _spawn(py, "fc.main", fc_args,
+                             env=_role_env(env, caps.get("fc")), name="fc")
+            procs.append(fc_proc)
+            named["fc"] = fc_proc
         # Cross-machine bridge: spawn netbridge.forward LAST (it connects to the
         # capture/vio/slam IPC servers, which retry, so order is cosmetic) when
         # --forward is set. It joins `procs`, so _terminate tears it down with the
@@ -974,6 +1043,7 @@ def main() -> int:
             vio_proc = named["vio"]
             ba_proc = named.get("ba")
             slam_proc = named.get("slam")
+            fc_proc = named.get("fc")
             # FC-output preview: print the live pose (pos + quat) to the log, plus
             # the OVERLOAD watchdog (live only: a session is replay-paced, not
             # real-time, so its rate is not a "can't keep up" signal).
@@ -997,9 +1067,9 @@ def main() -> int:
             # busy back-end won't lose data. On Ctrl-C, skip this wait -- END never
             # arrives, so `_terminate`'s SIGTERM (fast teardown) is the clean path.
             if not interrupted:
-                LOG.info("launcher: waiting for vio + ba + slam to drain "
+                LOG.info("launcher: waiting for vio + ba + slam + fc to drain "
                          "naturally ...")
-                for child in (p for p in (vio_proc, ba_proc, slam_proc)
+                for child in (p for p in (vio_proc, ba_proc, slam_proc, fc_proc)
                               if p is not None):
                     try:
                         child.wait(timeout=30.0)

@@ -172,6 +172,9 @@ remotely on a dev box (it consumes the same abstract IPC topics).
 # Live flight, once the OAK-D / VL53 ToF is attached (the 54×42 ToF recipe):
 ./run.sh --no-ui --vl53l9cx --direct
 
+# Live flight + stream the pose to the drone FC over UART (dblink); see §3a:
+./run.sh --no-ui --vl53l9cx --direct --fc /dev/ttyAMA0
+
 # Live capture only, to confirm the device opens:
 ./run.sh --no-ui --vl53l9cx
 ```
@@ -184,7 +187,8 @@ pass-through, so the UI is unchanged). `--no-ba` drops the `ba` process and
 `--no-slam` drops `slam` — the **lean flight config** for the 4-core Pi (see the
 saturation note below). `--vl53l9cx` selects the VL53-class ToF source (downsample to
 54×42); `--direct` selects the dense direct photometric VO front-end tuned for
-that low-res ToF recipe.
+that low-res ToF recipe. `--fc PORT[:BAUD]` (e.g. `/dev/ttyAMA0`) additionally streams
+the VIO pose to the drone FC over UART — see §3a.
 
 **Clean stop.** A single `Ctrl-C` (or `SIGTERM`) shuts the whole stack down
 cleanly — each process handles `SIGINT`/`SIGTERM` identically (set a stop flag,
@@ -192,11 +196,39 @@ short-circuit the drain, release SHM rings + close the OAK-D in an order the
 firmware watchdog tolerates), and the launcher ignores further `Ctrl-C` while
 tearing down so a second press can never abort cleanup or print a traceback.
 
-### 3a. FC output — the pose stream
+### 3a. FC output — `--fc` (dblink UART)
 
-`--no-ui` **is** the FC-output path. The launcher attaches a pose logger
-(`_start_pose_logger` → `_on_pose` in `launcher/main.py`) that subscribes to the
-VIO's `pose.odom` topic and prints each pose, throttled to ~2 Hz:
+The real FC output is the **`--fc PORT[:BAUD]`** flag: it spawns the consumer-only
+`fc` process (after `slam`), which subscribes the VIO's `pose.odom`, converts each
+pose to the FC's **NED** earth frame via the shared SSOT, and writes it to the serial
+port as a **dblink `DB_CMD_VISION_POSE`** frame — the in-house FC protocol
+(`../flight-controller`), **not** MAVLink. It is additive + **non-fatal** (a bad /
+missing port logs + exits without taking the stack down) and independent of `--no-ui`.
+
+```bash
+# Pi flight + FC UART output. --direct makes pos_sigma_m usable (see below);
+# --fc-rate clamps to [10,50] Hz; --fc-mount is the R_body_cam extrinsic.
+./run.sh --no-ui --vl53l9cx --direct --fc /dev/ttyAMA0
+./run.sh --no-ui --vl53l9cx --direct --fc /dev/ttyUSB0:921600 --fc-rate 50
+```
+
+**The full wire contract — dblink frame, the 38-byte payload (fields/units/ranges),
+the `reset_counter` edges, the safety floors, and the `age` time model (and why the
+FC's constant `C` must absorb the pipeline-latency floor) — lives in
+[fc/README.md](../fc/README.md).** Two flight-critical points:
+
+- **`pos_sigma_m` is `--direct`-only.** On the loose default path it is absent, so
+  `fc` inflates the sigma to 100 m and the **FC ignores VIO position**. A usable FC
+  *position* fix needs `--vl53l9cx --direct --fc ...` (attitude is sent regardless).
+- **Loop closure / re-lock is a JUMP, not a measurement.** `fc` bumps the dblink
+  `reset_counter` on a sensor-gap re-lock and an fc-local position jump so the FC ESKF
+  **resets its origin** instead of fusing the discontinuity; a degraded / non-finite
+  pose goes out advertised INVALID with the sigma inflated (never NaN on the wire).
+
+A separate read-only pose *logger* (`_start_pose_logger` → `_on_pose` in
+`launcher/main.py`) prints a **preview** of `pose.odom`, throttled to ~2 Hz — useful
+on `--no-ui` to confirm the pose is flowing, but it is **not** the FC link (`--fc`
+is):
 
 ```
 pose: pos WORLD=(+0.005 -0.027 -0.003) m  quat wxyz=(+0.003 +0.017 -0.025 +0.999)  sig_pos=0.076m  n=14
@@ -209,21 +241,18 @@ pose: pos WORLD=(+0.005 -0.027 -0.003) m  quat wxyz=(+0.003 +0.017 -0.025 +0.999
 | `sig_pos`   | **position noise σ (m)** for the FC ESKF: `R ≈ sig_pos²`. Only on `--direct` (`wm.info["pos_sigma_m"]`); σ ∝ Z/√N, clamped [0.05, 3.0] m. High at startup / few features / far scene; ~0.07 m when tracking well |
 | `n`         | cumulative pose-message counter (the print is throttled, not every msg) |
 
-**Wiring the real FC link (TODO — not done yet).** The log line is a *preview*.
-To feed the FC, send a MAVLink `VISION_POSITION_ESTIMATE` from inside `_on_pose`
-(marked `# === FC OUTPUT HOOK`): pose from `wm.T_world_cam`, covariance from
-`wm.info["pos_sigma_m"]`. Two caveats before flight:
+> The logger prints the raw **WORLD** pose (gravity-aligned *optical*, +Y down). The
+> `--fc` path does **not** ship those raw axes: the SSOT rotates the position **and**
+> the attitude into the FC's NED / FRD frame before packing (see fc/README.md). The
+> `sig_pos` column here is the same `pos_sigma_m` the `--fc` frame carries — the
+> deliberately-simple first model (commit `7f9769a`, σ ∝ Z/√N); the principled
+> upgrade is the inverse-Hessian marginal covariance with NEES calibration, left as
+> future work since the FC floors the value.
 
-- **Frame.** `WORLD` is gravity-aligned *optical* (+Y down), **not** NED. Rotate
-  the position *and* the 3×3 covariance into the FC frame before sending — don't
-  ship raw axes.
-- **Loop closure is a JUMP, not a measurement.** When SLAM closes a loop the pose
-  steps discontinuously; signal it with the MAVLink `reset_counter` (+ re-anchor
-  the ESKF), never as a fused position update — a fused jump injects phantom
-  velocity. VIO is odometry and drifts, so prefer fusing velocity where the FC
-  supports it. (`sig_pos` is the deliberately-simple first model — commit
-  `7f9769a`; the principled upgrade is the inverse-Hessian marginal covariance
-  with NEES calibration, left as future work since the FC floors the value.)
+**Still open (FC side):** the FC-side dblink vision *receiver* + EKF fusion does not
+exist yet — that is separate work in `../flight-controller`. The `DB_CMD_VISION_POSE`
+value (`0x0C`) is proposed; the FC header owns the final value. HIL on the Pi is
+pending.
 
 ### 3b. Remote UI over WiFi (`netbridge`)
 

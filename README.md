@@ -155,6 +155,9 @@ capture process's `imu_cam` thread, so the launcher never spawns a depth process
 # headless flight path (Pi / FC): no GUI, logs raw pose for the flight controller
 ./run.sh --no-ui
 
+# stream the VIO pose to the drone FC over UART (dblink); --direct gives usable pos_sigma_m
+./run.sh --vl53l9cx --direct --fc /dev/ttyAMA0
+
 # remote UI over WiFi: Pi runs the flight stack, Mac runs the UI
 ./run.sh --no-ui --forward HOST:PORT          # on the Pi
 ./deploy/pi-ui.sh --connect <pi-host>:PORT   # on the Mac (same OAKD_NETBRIDGE_KEY)
@@ -179,15 +182,22 @@ capture process's `imu_cam` thread, so the launcher never spawns a depth process
   guard; `SKY_VIO_IMU_NJIT=0` to force pure-Python). Loose is the default and the
   recommended Pi flight path; `--tight` is still slower than loose. Details in
   [docs/TIGHT_COUPLED_PLAN.md](docs/TIGHT_COUPLED_PLAN.md) §4(g–j).
-- **`--no-ui` — the Pi / FC path.** Runs capture + vio + ba + slam headless (once, no
+- **`--no-ui` — headless flight.** Runs capture + vio + ba + slam headless (once, no
   Restart loop; pair with `--no-ba` / `--no-slam` for the leanest stack) and starts a
-  read-only pose logger on the VIO endpoint that prints
-  the **raw pose** (position + quaternion in the gravity-aligned WORLD frame; the FC
-  derives heading itself), throttled to ~2 Hz. This is the **FC-output hook** — the
-  single place a real MAVLink `VISION_POSITION_ESTIMATE` send will go
-  (`launcher/main.py:_start_pose_logger`). **The FC link itself is not done yet**
-  (the NED / body-extrinsic mapping + the MAVLink send are the future FC-link step);
-  the hook is wired and the pose is flowing.
+  read-only pose logger on the VIO endpoint that prints the **raw pose** (position +
+  quaternion in the gravity-aligned WORLD frame; the FC derives heading itself),
+  throttled to ~2 Hz — a *preview*, not the FC link itself (the actual FC output is
+  `--fc`, below). Independent of `--fc`.
+- **`--fc PORT[:BAUD]` — stream the pose to the drone FC over UART (dblink).** Spawns
+  the consumer-only `fc` process (after `slam`), which converts each VIO pose to the
+  FC's NED earth frame and writes it as a **dblink `DB_CMD_VISION_POSE`** frame over
+  the serial port — the in-house FC protocol, **not** MAVLink. Additive + **non-fatal**
+  (a bad / missing port logs + exits without taking the stack down). The position
+  noise `pos_sigma_m` is only populated on `--direct`, so the recipe for a *usable* FC
+  position fix is `--vl53l9cx --direct --fc /dev/ttyAMA0`; on the loose path the sigma
+  is inflated and the FC ignores VIO position. `--fc-rate` (Hz, clamped `[10,50]`) and
+  `--fc-mount` (`R_body_cam` extrinsic) tune it. Full contract, payload, and the `age`
+  time model: [fc/README.md](fc/README.md).
 - **Remote UI over WiFi (`netbridge`).** With `--forward HOST:PORT` the launcher
   ALSO spawns `netbridge.forward` on the Pi (one more managed flight subprocess) to
   bridge the local IPC graph to TCP; on the Mac `./deploy/pi-ui.sh --connect
@@ -416,6 +426,7 @@ flowchart LR
 | `ba` | windowed BA — loose `WindowedBAMap` / tight `WindowedVIOMap` (`--tight`) | `keyframe`, `calib.bundle` (from VIO) | `pose.refined`, `ba.window` (`--ba-window`, loose-only), `ba.state` (`--tight` bias) |
 | `slam` | ORB loop closure + SE(3) pose-graph (the SLAM map) | `keyframe`, `calib.bundle` (from VIO) | `loop.correction`, `slam.map` (live-only) |
 | `ui` | Qt `MainWindow`, one 5-line `Viewer3D`, Visualize/Calibration windows | `pose.odom`/`pose.vo`/`pose.refined`/`ba.window`/`calib.bundle` (vio); `slam.map`/`calib.bundle` (slam); on-demand `imu.raw`/`imucam.sample`/`frame.depth` (capture) + `frame.tracks`/`frame.inliers`/`keyframe` (vio) | — (sink) |
+| `fc` | drone-FC UART output (`--fc`): pose → NED → **dblink** `DB_CMD_VISION_POSE` over serial; consumer-only sink (no server). See [fc/README.md](fc/README.md) | `pose.odom`, `calib.bundle` (from VIO) | — (writes UART, not IPC) |
 | `launcher` | process lifecycle (spawn / restart loop / orphan cleanup; `--no-ba`/`--no-slam` spawn gates) | — | — |
 | `depth` | standalone SGM depth-as-a-process harness | `cam.sync`, `calib.bundle` (capture) | `frame.depth` |
 
@@ -918,11 +929,13 @@ clobber each other, and `imu_camera/device/camera_calib_store.py`
       [docs/PROC4_ARCHITECTURE.md](docs/PROC4_ARCHITECTURE.md)
 - [x] End-to-end byte-parity vs the pre-split baseline (gap = 0), verified live on
       a real OAK-D; harness in `verification/`
-- [~] Link to flight-controller — the `--no-ui` headless path logs the raw pose
-      (position + quaternion, WORLD frame) and exposes the **FC-output hook**
-      (`launcher/main.py:_start_pose_logger`), the single place a MAVLink
-      `VISION_POSITION_ESTIMATE` send will go. The MAVLink/UART link + the NED /
-      body-extrinsic mapping themselves are **not done yet**
+- [~] Link to flight-controller — the **`--fc PORT[:BAUD]`** flag spawns the
+      consumer-only `fc` process, which converts the VIO pose to the FC's NED earth
+      frame and streams it over UART as a **dblink `DB_CMD_VISION_POSE`** frame (the
+      in-house FC protocol, not MAVLink), with the staleness / non-finite / sigma /
+      `reset_counter` safety floors — see [fc/README.md](fc/README.md). The TX side is
+      built + bench-verified; the **FC-side dblink receiver + EKF fusion** (in
+      `../flight-controller`) and **HIL on the Pi** are **not done yet**
 - [x] Tracking-lost UI badge: two-tier debounced master-warning badge on the 3D
       viewer + drone-marker recolour, driven by `pose.tracking_ok` /
       `pose.inertial_dr` — RED `⚠ TRACKING LOST` (no inertial fallback) vs AMBER

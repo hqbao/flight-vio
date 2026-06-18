@@ -72,9 +72,11 @@ from ui.comms.messages import END                                   # noqa: E402
 from ui.comms.wire import (                                         # noqa: E402
     WireCalibBundle, WireEnd, WirePoseMsg, WireSlamMap,
 )
-from ui.comms.lib.misc.frames import rot_to_quat                     # noqa: E402
 from ui.comms.lib.misc.pose import Pose, PoseHistory                 # noqa: E402
 from ui.qt.source import PoseSource                                  # noqa: E402
+from sky.fc.fc_earth_pose import (                                   # noqa: E402
+    _M_OPT_TO_NED, earth_pose_from_T_world_cam,
+)
 
 LOG = logging.getLogger("ui.main")
 
@@ -89,15 +91,11 @@ DEFAULT_CAPTURE_ENDPOINT = "oak.capture"
 RESTART_EXIT_CODE = 42
 
 
-# Camera optical (x right, y down, z forward) -> NED, matching the
-# single-process FlowPoseSource so both code paths display in the same
-# convention. _P_OPT_TO_FRD reorders attitude columns from optical to FRD body.
-_M_OPT_TO_NED = np.array([[0.0, 0.0, 1.0],
-                          [1.0, 0.0, 0.0],
-                          [0.0, 1.0, 0.0]])
-_P_OPT_TO_FRD = np.array([[0.0, 1.0, 0.0],
-                          [0.0, 0.0, 1.0],
-                          [1.0, 0.0, 0.0]])
+# The optical-world -> NED + attitude conversion is the SHARED SSOT in
+# ``sky.fc.fc_earth_pose`` (the SAME conversion the ``fc`` UART sender uses, so the
+# viewer and the FC can never drift apart). ``_M_OPT_TO_NED`` is imported from there
+# for the position-only overlay sites below; the full pose+attitude path goes
+# through ``earth_pose_from_T_world_cam``.
 
 
 def _wire_pose_to_ned(wm: WirePoseMsg, prev_pos: np.ndarray | None,
@@ -107,12 +105,7 @@ def _wire_pose_to_ned(wm: WirePoseMsg, prev_pos: np.ndarray | None,
     Returns ``(pose, new_prev_pos, new_prev_t)`` so the caller can carry the
     velocity finite-difference state forward.
     """
-    T = wm.T_world_cam
-    pos_opt = T[:3, 3]
-    R_opt = T[:3, :3]
-    pos_ned = _M_OPT_TO_NED @ pos_opt
-    R_ned = _M_OPT_TO_NED @ R_opt @ _P_OPT_TO_FRD
-    q_ned = rot_to_quat(R_ned)
+    pos_ned, q_ned, _ = earth_pose_from_T_world_cam(wm.T_world_cam)
     now = time.monotonic()
     if prev_t is None:
         vel_ned = np.zeros(3)

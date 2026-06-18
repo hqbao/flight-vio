@@ -9,6 +9,12 @@ from PyQt6.QtWidgets import (
 
 from ui.comms.lib.misc.pose import PoseHistory
 
+# Heading (ZYX yaw) is SINGULAR at pitch ~ +/-90 deg (camera pointing straight
+# down/up -> gimbal lock): yaw and roll couple and the scalar heading is
+# meaningless. Flag the FC-output heading there so the operator knows to keep the
+# camera off-vertical (or, for the FC link, fall back to the full quaternion).
+_GIMBAL_DEG = 85.0
+
 
 def _panel(title: str) -> tuple[QFrame, QVBoxLayout]:
     f = QFrame()
@@ -73,6 +79,26 @@ class TelemetryPanel(QWidget):
         self.att_ap = _row(ag, 4, "accel pitch")
         al.addLayout(ag)
 
+        # ---- FC OUTPUT (exactly what the flight controller receives) -----
+        # heading (deg) + earth-frame NED position -- the values the UART/FC link
+        # will send. Grouped + labelled so it is unambiguous which numbers are the
+        # FC contract (vs the general telemetry above). "heading" here is the
+        # ZYX-yaw extracted from R_ned (the body forward axis's azimuth in the NED
+        # horizontal plane) -- the same scalar as Attitude yaw, NOT the body-Z
+        # intrinsic yaw. The fc wire now carries the FULL body->NED quaternion; the
+        # FC extracts heading from it itself (this readout is for the operator).
+        cf, cl = _panel("FC output (-> FC)")
+        cg = QGridLayout(); cg.setHorizontalSpacing(12); cg.setVerticalSpacing(2)
+        self.fc_hdg = _row(cg, 0, "heading")
+        self.fc_n = _row(cg, 1, "north")
+        self.fc_e = _row(cg, 2, "east")
+        self.fc_d = _row(cg, 3, "down")
+        cl.addLayout(cg)
+        self.fc_note = QLabel("")
+        self.fc_note.setObjectName("FieldWarn")
+        self.fc_note.setWordWrap(True)
+        cl.addWidget(self.fc_note)
+
         # ---- status ------------------------------------------------------
         sf, sl = _panel("Tracking")
         sg = QGridLayout(); sg.setHorizontalSpacing(12); sg.setVerticalSpacing(2)
@@ -82,7 +108,7 @@ class TelemetryPanel(QWidget):
         self.st_uptime = _row(sg, 3, "uptime")
         sl.addLayout(sg)
 
-        for w in (pf, vf, af, sf):
+        for w in (pf, vf, af, cf, sf):
             root.addWidget(w)
         root.addStretch(1)
 
@@ -124,6 +150,24 @@ class TelemetryPanel(QWidget):
             else:
                 self.att_ar.setText("--")
                 self.att_ap.setText("--")
+
+            # ---- FC output: heading + NED position ------------------------
+            # heading = the ZYX-yaw extracted from R_ned (nose azimuth in the NED
+            # horizontal plane), == Attitude yaw above -- NOT the body-Z intrinsic
+            # yaw. Flag the gimbal-lock zone (pitch ~ +/-90), where this scalar
+            # heading is unreliable; the wire carries the full quaternion so the FC
+            # recovers heading itself there.
+            gimbal = abs(pi) >= _GIMBAL_DEG
+            self.fc_hdg.setText(f"{y:+7.2f}")
+            self.fc_hdg.setObjectName("FieldWarn" if gimbal else "FieldValue")
+            self.fc_hdg.style().unpolish(self.fc_hdg)
+            self.fc_hdg.style().polish(self.fc_hdg)
+            self.fc_n.setText(f"{p[0]:+8.3f}")
+            self.fc_e.setText(f"{p[1]:+8.3f}")
+            self.fc_d.setText(f"{p[2]:+8.3f}")
+            self.fc_note.setText(
+                "GIMBAL LOCK (pitch~90 deg) -- heading unreliable; use quaternion"
+                if gimbal else "")
 
             # 3-state to match the big-view badge: OK (green) / DR (amber,
             # vision lost but the --tight IMU is still dead-reckoning) / LOST

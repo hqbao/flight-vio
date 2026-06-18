@@ -28,6 +28,11 @@ stay vendored per project.
 """
 from __future__ import annotations
 
+from .quat import (
+    quat_to_rot,
+    quat_to_rpy,
+    rot_to_quat,
+)
 from .se3 import (
     se3_adjoint,
     se3_exp,
@@ -47,6 +52,10 @@ from .so3 import (
 )
 
 __all__ = [
+    # quaternion <-> rotation / Euler
+    "quat_to_rot",
+    "quat_to_rpy",
+    "rot_to_quat",
     # SO(3)
     "skew",
     "so3_exp",
