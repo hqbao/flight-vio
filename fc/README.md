@@ -235,13 +235,34 @@ recognised only when the text after the last colon is all digits; default baud
 **115200**):
 
 ```bash
-# Full FC recipe on the Pi: ToF + direct VO (for usable pos_sigma_m) + FC UART out.
-./run.sh --vl53l9cx --direct --fc /dev/ttyAMA0
+# Raspberry Pi 5 LEAN flight config — THIS is the command that actually flies:
+# OAK-D stereo at 320x200, no windowed-BA, no SLAM. The RP5 saturates on BA /
+# SLAM / higher resolution, so keep it lean — anything heavier and it can't keep up.
+# (--width/--height = CAPTURE resolution; this mode uses the OAK-D stereo depth
+#  directly, NOT the VL53 ToF downsample — see the variant below.)
+./run.sh --no-ui --fc /dev/ttyAMA0 --width 320 --height 200 --no-ba --no-slam
+# ...or launch it detached from the Mac (auto-tails run.log):
+./deploy/pi-run.sh --fc /dev/ttyAMA0 --width 320 --height 200 --no-ba --no-slam
+
+# VL53 ToF-sim variant — a SEPARATE stage from --width/--height: it computes depth
+# at the capture res then downsamples gray+depth to 54x42 to match the real VL53
+# target (needs --direct, the dense VO that works at 54x42 where sparse fails):
+./run.sh --no-ui --vl53l9cx --direct --fc /dev/ttyAMA0 --width 320 --height 200 --no-ba --no-slam
 
 # explicit baud + non-default cadence + a pitched-down mount extrinsic:
 ./run.sh --vl53l9cx --direct --fc /dev/ttyUSB0:921600 --fc-rate 50 \
          --fc-mount 1,0,0,0,0.94,-0.34,0,0.34,0.94
 ```
+
+**Finding the Pi→FC UART port.** On the Raspberry Pi 5 the FC link is the GPIO-header
+UART **`/dev/ttyAMA0`** (symlinked as `/dev/serial0`), baud **115200**. Confirm with:
+
+```bash
+ls -l /dev/serial0      # -> /dev/serial0 -> ttyAMA0
+ls -l /dev/serial* /dev/ttyAMA*   # list all candidates
+```
+
+Wiring: Pi **pin 8 (TXD0)** → FC **RX**, Pi **pin 10 (RXD0)** ← FC **TX**, Pi **pin 6/9 (GND)** → FC **GND**.
 
 | Launcher flag | Effect |
 |---|---|

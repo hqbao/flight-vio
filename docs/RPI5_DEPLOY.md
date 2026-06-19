@@ -172,8 +172,12 @@ remotely on a dev box (it consumes the same abstract IPC topics).
 # Live flight, once the OAK-D / VL53 ToF is attached (the 54×42 ToF recipe):
 ./run.sh --no-ui --vl53l9cx --direct
 
-# Live flight + stream the pose to the drone FC over UART (dblink); see §3a:
-./run.sh --no-ui --vl53l9cx --direct --fc /dev/ttyAMA0
+# Live flight + stream the pose to the drone FC over UART (dblink); see §3a.
+# RP5 LEAN flight — OAK-D stereo at 320x200, the config that actually flies (the
+# Pi saturates on BA/SLAM/higher res, so keep --no-ba --no-slam). UART port =
+# /dev/ttyAMA0 (= /dev/serial0); confirm with: ls -l /dev/serial0
+./run.sh --no-ui --fc /dev/ttyAMA0 --width 320 --height 200 --no-ba --no-slam
+# (VL53 ToF-sim variant for the 54x42 target: add --vl53l9cx --direct.)
 
 # Live capture only, to confirm the device opens:
 ./run.sh --no-ui --vl53l9cx
