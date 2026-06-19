@@ -1,7 +1,7 @@
 # Fast-motion `--tight` VIO — issue tracker
 
 Behaviour of the live `pose.odom` ("VIO") line under fast arc / push sweeps.
-**Issue #1 (the "giật về" snap-back) is FIXED**; #2–#4 remain open. Fix one at a
+**Issue #1 (the snap-back) is FIXED**; #2–#4 remain open. Fix one at a
 time; escalate a tier the moment a change touches the flight-critical path.
 
 Repro session: `sessions/arc_fast_15s` (OAK-D W, 640x400, 399 frames, fast arc).
@@ -30,15 +30,15 @@ The ONLY external feedback into `pose.odom` is `loop.correction` (gated on
 
 ## Issues
 
-### #1 — "giật về" snap-back on fast `--tight` · ✅ FIXED (2026-06-17, confirmed live)
+### #1 — snap-back on fast `--tight` · ✅ FIXED (2026-06-17, confirmed live)
 Root cause = the per-frame complementary VISION correction yanking the IMU-tracked
 arc back to the frame-to-frame PnP, which under-estimates arc translation under
 fast rotation. Fix = overlap gate + re-anchor offset in `propagate_imu` (inlier
 gate removed). **Full write-up: `docs/TIGHT_COUPLED_PLAN.md` Phase 4(k); commit
-`ba53f15`.** Driver: jitter 14.5 → 5.8, arc preserved 3.94 m. User: "phản ứng
-giệt hệt BasaltVIO".
+`ba53f15`.** Driver: jitter 14.5 → 5.8, arc preserved 3.94 m. User: "reacts
+exactly like BasaltVIO".
 
-### #2 — Frontend VO "ghì lại" (translation under-estimate) · OPEN (compensated)
+### #2 — Frontend VO holds back (translation under-estimate) · OPEN (compensated)
 Under fast rotation the frame-to-frame PnP under-estimates TRANSLATION (optical
 flow is rotation-dominated): `pose.vo` reached only 0.83 m on the arc while the
 real motion was larger. Smooth but too small. The #1 re-anchor now COMPENSATES for
@@ -57,7 +57,7 @@ true translation ≈ 0, so freeze the accel double-integral through the burst). 
 on `_arc_live_driver.py`; gap stays 0 (`propagate_imu` is `--tight` live only).
 
 ### #4 — Window BA ("VIO-BA" / `pose.refined`) diverges under fast motion · OPEN
-The windowed-BA line goes "loạn" under fast sweeps. Independent of `pose.odom`
+The windowed-BA line goes haywire under fast sweeps. Independent of `pose.odom`
 (output-only) but it is the line that will feed the FC's refined pose, so it must
 be trustworthy before the FC link consumes it. Two known causes:
 - (a) **KLT track SLIP** — wrong correspondences (not loss) survive `huber_px=2.0`
@@ -76,7 +76,7 @@ Fix (`propagate_imu`, LIVE + `--tight`, gap=0): when `zupt` holds, zero the visi
 TRANSLATION pull (`k_pos`/`k_vel` → 0) and freeze the re-anchor offset; ROTATION is
 still corrected (gyro-anchored yaw, robust to the dynamic object). Env
 `OAKD_ZUPT_FREEZE_TRANS=0` disables. Selftest contrast: 0 cm (gate ON) vs 22.45 cm
-(OFF); confirmed live ("quơ tay nó ko chạy theo nữa"). SCOPE: only fires at genuine
+(OFF); confirmed live ("waving a hand no longer drags it along"). SCOPE: only fires at genuine
 rest (ZUPT hysteresis) — the camera-MOVING + dynamic-object case still needs a
 general IMU↔vision disagreement gate (the coast-gate that was reverted for fast
 motion; see below), kept out of the fast path on purpose.

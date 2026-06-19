@@ -9,7 +9,7 @@
 > The golden rule here: **one task = one new idea + one plot/overlay + one
 > number gate.** If a task can't be visualised, it's too big — split it.
 >
-> Vietnamese gloss ("Ý nghĩa") is added per task so the *why* is clear.
+> A "Why it matters" gloss is added per task so the *why* is clear.
 
 > **Status (2026-06-10):** The phase-level rollup lives in
 > `docs/TIGHT_COUPLED_PLAN.md`. Phases 0–2 are **DONE**: the tight IMU
@@ -35,7 +35,7 @@ Input          : the file/stream it consumes (something you can already inspect)
 Visual output  : the exact artifact you LOOK AT (a plot, an image overlay, a 3D
                  trajectory) + the command/tool that produces it.
 Pass gate      : the number / shape that means "this step is correct".
-Ý nghĩa        : một câu tiếng Việt — tại sao bước này quan trọng.
+Why it matters : one sentence — why this step is important.
 Builds         : new files this task adds (kept tiny + self-tested).
 ```
 
@@ -54,8 +54,8 @@ Visual output  : `baseline/tools/viz_session.py sessions/fast_push_15s` — scru
                  frames; the Basalt pose path is drawn so you see the true motion.
 Pass gate      : the session has the fast push that fails live (net ≥ ~1.0 m,
                  peak speed ≥ ~1.0 m/s — read from the Basalt pose).
-Ý nghĩa        : gold hiện tại quá hiền (net ~0.56 m) nên KHÔNG tái hiện được
-                 "ì lại". Cần đúng cú đẩy siêu nhanh anh làm trên bàn.
+Why it matters : the current gold is too gentle (net ~0.56 m) so it does NOT reproduce
+                 the "stall". We need the exact super-fast push done on the bench.
 Builds         : nothing (uses `baseline/tools/record_session.py`).
 
 ### T0.2 — Reproduce the stall offline (prove the mechanism BEFORE coding)
@@ -68,8 +68,8 @@ Visual output  : `verification/vio_oracle_runner.py … --plot` → one figure, 
 Pass gate      : the VIO-BA curve visibly **stalls then crawls at ~0.3 m/s**
                  while the raw-tip curve tracks Basalt. (Confirms the rate cap is
                  the culprit, not KLT.)
-Ý nghĩa        : nhìn tận mắt cái "ì lại" sinh ra từ EMA + giới hạn 0.3 m/s, chứ
-                 không phải KLT. Đây là bằng chứng để chốt, trước khi sửa gì.
+Why it matters : see with your own eyes that the "stall" comes from the EMA + 0.3 m/s cap,
+                 not from KLT. This is the evidence to lock down before fixing anything.
 Builds         : `--plot` flag on the oracle runner (distance-vs-time curves).
 
 > Tracks A–F below are the actual rebuild. They are ordered so each track is
@@ -90,7 +90,7 @@ Input          : `sessions/<s>/input/imu.jsonl`, `frames.jsonl`.
 Visual output  : `imu_preint_viz.py --stage timeline` → plot accel.xyz & gyro.xyz
                  vs time with vertical lines at each camera frame.
 Pass gate      : timestamps strictly increasing; IMU ≈ 200 Hz; 0 gaps > 2× median.
-Ý nghĩa        : nền móng — sai đồng hồ/dt thì mọi tích phân sau đều sai.
+Why it matters : the foundation — if the clock/dt is wrong, every integration after it is wrong.
 Builds         : `vio/tools/imu_preint_viz.py` (grows each task), `vio/mathlib/imu/preintegration.py` (skeleton).
 
 ### A2 — Gyro-only ΔR per segment
@@ -100,7 +100,7 @@ Input          : two consecutive frames' IMU segment.
 Visual output  : `--stage dR` → plot the preintegrated `ΔR` angle vs the VO
                  rotation angle between the same two frames, over the session.
 Pass gate      : median |ΔR_preint − ΔR_vo| < 1.0° on a gold session.
-Ý nghĩa        : xác nhận khâu xoay đúng (ta đã có gyro prior, đây là bản tích phân).
+Why it matters : confirms the rotation part is correct (we already have a gyro prior, this is the integrated version).
 Builds         : `propagate ΔR` in `preintegration.py` + `imu_preint_selftest.py`.
 
 ### A3 — Full midpoint propagate (ΔR, Δv, Δp)
@@ -113,8 +113,8 @@ Visual output  : `--stage dp` → two panels: (1) a STILL session's |Δp| vs tim
                  displacement (should be the right order of magnitude).
 Pass gate      : still-session drift < 5 cm/s; push |Δp| within 2× of Basalt over
                  0.5 s windows.
-Ý nghĩa        : đây là khâu mà gia tốc kế **dự đoán tịnh tiến** — chính cái
-                 `ours-ba` đang thiếu khi đẩy nhanh.
+Why it matters : this is where the accelerometer **predicts translation** — exactly what
+                 `ours-ba` is missing during a fast push.
 Builds         : `propagateState` + extends selftest.
 
 ### A4 — Jacobians F / A / G (finite-difference check)
@@ -124,7 +124,7 @@ Input          : a random valid segment (synthetic).
 Visual output  : `--stage jac` → bar chart of max |analytic − numeric| per block
                  (F, A, G).
 Pass gate      : every bar < 1e-5.
-Ý nghĩa        : Jacobian sai thì bộ tối ưu (Track C) hội tụ bậy. Phải khoá bằng số.
+Why it matters : a wrong Jacobian makes the optimizer (Track C) converge wrongly. Must be locked down numerically.
 Builds         : `F/A/G` in `preintegration.py` + jacobian selftest (mirrors
                  the existing `_vt_jac_check` pattern in `bundle.py`).
 
@@ -142,7 +142,7 @@ Visual output  : Monte-Carlo gate (analytic Σ vs empirical covariance of 4000
                  a stronger correctness check than the 1σ-vs-time curve.
 Pass gate      : MET — full-matrix relative Frobenius 2.6 %; Σ-trace
                  monotonically increasing; position 1σ 0.25 cm over 0.25 s (sane).
-Ý nghĩa        : cho bộ tối ưu biết "tin IMU tới mức nào" — trọng số của factor IMU.
+Why it matters : tells the optimizer "how much to trust the IMU" — the weight of the IMU factor.
 Builds         : covariance accumulation in `sky/imu/imu.py` (additive,
                  deltas bit-unchanged) + `vio/tests/imu_preint_cov_selftest.py`.
 
@@ -167,9 +167,9 @@ Pass gate      : MET — residual → ~0 at the optimum; recovery pos ≤ 0.19 m
                  correctness is exercised end-to-end by the recovery, not a
                  standalone FD-bar check; that lands with analytic Jacobians in
                  Phase 4.)
-Ý nghĩa        : đây chính là "sợi dây" IMU nối 2 trạng thái trong cửa sổ tối ưu —
-                 nay được cân đúng bằng hiệp phương sai thật Σ_ij⁻¹, không phải
-                 sigma cố định.
+Why it matters : this IS the IMU "tie" linking two states in the optimization window —
+                 now weighted correctly by the true covariance Σ_ij⁻¹, not a
+                 fixed sigma.
 Builds         : `Ω_I` whitening + `_ImuEdge` per-edge cache in
                  `sky/vio/window.py` + scenarios D/E/F in
                  `vio/tests/vio_ba_selftest.py`.
@@ -203,8 +203,8 @@ Pass gate      : MET — oracle `gap=0` flags OFF (incl. `backend="vio"`); FD/an
                  regression). ZUPT anchors rest (still maxstep ↓, scale →1) without
                  crushing dynamic forward speed. HONEST LIMIT: shake runaway HALVED
                  not flattened (the IMU seed itself ramps); scale stays <1 at 54×42.
-Ý nghĩa        : tiêm "thông tin vận tốc tuyệt đối" mà factor IMU đơn lẻ thiếu —
-                 hãm đà phân kỳ vận tốc ở 54×42 mà KHÔNG đụng đường loose/oracle.
+Why it matters : injects the "absolute velocity information" that the lone IMU factor lacks —
+                 damps the velocity divergence at 54×42 WITHOUT touching the loose/oracle path.
 Builds         : `vel_cv_prior`/`vel_zupt` + gravity-aware gate in
                  `sky/vio/window.py`; `stabilize_velocity` knob;
                  `vio/tests/phase4_velprior_selftest.py`;
@@ -228,9 +228,9 @@ Visual output  : the `ui` Viewer3D overlay — IMU-only trajectory vs Basalt vs 
 Pass gate      : qualitative — during the **first ~1 s of the fast push** the
                  IMU-only path follows the push shape (it WILL drift after; that's
                  expected and is exactly what vision will correct).
-Ý nghĩa        : đây là khoảnh khắc "thấy tận mắt" tại sao tight-coupling chữa
-                 được đẩy nhanh — IMU một mình đã bắt được cú đẩy mà loose path
-                 phải bò theo. Không viết optimiser vẫn thấy được giá trị.
+Why it matters : this is the "see it with your own eyes" moment for why tight-coupling fixes
+                 fast pushes — the IMU alone already catches the push that the loose path
+                 has to crawl after. You see the value without writing the optimiser.
 Builds         : `vio/tools/imu_only_odom.py` (thin driver over Track A).
 
 ---
@@ -247,7 +247,7 @@ Input          : synthetic: known relative pose + landmarks + a matching IMU seg
 Visual output  : `vi_bundle_viz.py --case two_frame` → before/after reprojection
                  overlay on both frames + a printed recovered-vs-true transform.
 Pass gate      : recovers the known transform to < 1 mm / 0.1°.
-Ý nghĩa        : đơn vị nhỏ nhất của bộ tối ưu tight — vision + IMU cùng 1 hệ.
+Why it matters : the smallest unit of the tight optimizer — vision + IMU in one system.
 Builds         : `vio/mathlib/backend/vio_solve.py` (2-state core) + selftest.
 
 ### C2 — N-state sliding window (vision + IMU, no marginalisation yet)
@@ -259,7 +259,7 @@ Visual output  : two artifacts — (a) per-iteration cost curve (vision / IMU /
                  total) per frame; (b) `view_pose3d` window trajectory vs Basalt.
 Pass gate      : `vio_run.py --backend vio2` ATE ≤ `--backend ba` on every gold
                  motion session (today's `vio` regresses — this must beat it).
-Ý nghĩa        : cửa sổ tight thực sự. Cổng so trực tiếp với BA hiện tại.
+Why it matters : the real tight window. The gate that compares directly against the current BA.
 Builds         : window assembly in `vio_solve.py`; `--backend vio2` in `vio_run.py`.
 
 ### C3 — Estimate IMU biases in the window
@@ -270,8 +270,8 @@ Visual output  : `vi_bundle_viz.py --stage bias` → estimated `ba`,`bg` vs time
                  should converge to a small steady value (not wander).
 Pass gate      : bias bounded (|ba| < 0.5 m/s², |bg| < 2°/s) and steady on a still
                  segment.
-Ý nghĩa        : bias là lý do loose filter không dám dùng gia tốc kế. Ước lượng
-                 được bias = dùng được IMU để dự đoán tịnh tiến một cách trung thực.
+Why it matters : bias is why the loose filter doesn't dare use the accelerometer. Estimating
+                 the bias = being able to use the IMU to honestly predict translation.
 Builds         : bias states + priors + selftest.
 
 ### C4 — Fast-push gate (the target)
@@ -281,8 +281,8 @@ Visual output  : `view_pose3d` overlay: `ours-vio` (tight) vs `ours` vs Basalt +
                  the distance-vs-time curve from T0.2.
 Pass gate      : tight path Sim3 scale ≥ 0.95 **and** distance-vs-time has **no
                  stall/crawl** (it should match `ours`, not the old `ours-ba`).
-Ý nghĩa        : đây là mục tiêu cuối của anh — đẩy siêu nhanh mà vẫn full đoạn,
-                 không ì. Chứng minh bằng đúng session đã làm `ours-ba` fail.
+Why it matters : this is the final goal — a super-fast push that still covers the full distance,
+                 no stall. Proven on the exact session that made `ours-ba` fail.
 Builds         : nothing new (it's the gate that retires the bug).
 
 ---
@@ -298,7 +298,7 @@ Visual output  : `kf_viz.py` → timeline: camera speed curve with a marker at e
                  KF + the connection ratio that triggered it.
 Pass gate      : KFs cluster at low-overlap (fast-motion / turn) moments, not at
                  fixed intervals; same/better ATE with **fewer** KFs.
-Ý nghĩa        : đặt keyframe đúng lúc cảnh đổi nhiều — vừa nhẹ vừa vững hơn.
+Why it matters : place keyframes exactly when the scene changes a lot — both lighter and more robust.
 Builds         : KF trigger in `vio_solve.py` + viz.
 
 ### D2 — Anchored inverse-depth landmarks
@@ -309,9 +309,9 @@ Visual output  : `lm_viz.py` → (a) landmarks reprojected on the image coloured
                  inverse depth; (b) scatter of SGM depth vs triangulated depth.
 Pass gate      : scatter sits on the diagonal (no systematic scale offset);
                  reprojection RMSE ≤ the XYZ version.
-Ý nghĩa        : inverse-depth ổn định hướng "đẩy thẳng" (ít parallax) — đúng trục
-                 mà BA hay sập scale. Đây là bản nguyên lý của thí nghiệm
-                 depth-host từng thất bại khi làm thô.
+Why it matters : inverse-depth stabilizes the "straight push" direction (low parallax) — exactly the axis
+                 where BA tends to collapse scale. This is the principled version of the
+                 depth-host experiment that failed when done crudely.
 Builds         : inverse-depth landmark type + triangulation + selftest.
 
 ### D3 — Triangulation baseline gate
@@ -321,7 +321,7 @@ Input          : a gold session.
 Visual output  : `lm_viz.py --stage gate` → histogram of accepted vs rejected
                  baselines; rejected (tiny-baseline, ill-conditioned) ones drop out.
 Pass gate      : no landmark with inv_dist outside (0,3); fewer wild depths.
-Ý nghĩa        : chặn điểm 3D "ảo" do baseline quá nhỏ — nguồn nhiễu scale.
+Why it matters : reject "phantom" 3D points caused by too-small baselines — a source of scale noise.
 Builds         : the gate + selftest.
 
 ---
@@ -338,8 +338,8 @@ Visual output  : `marg_viz.py` → (a) heatmap of the sqrt prior `H` before/afte
                  marginalised, there must be **no jump**.
 Pass gate      : trajectory continuous across marginalisation; ATE improves vs
                  Track C (C had no memory of dropped states).
-Ý nghĩa        : giữ thông tin quá khứ → quỹ đạo mượt, không giật khi keyframe rời
-                 cửa sổ. Đây là thứ làm Basalt drift cực thấp.
+Why it matters : keep past information → smooth trajectory, no jump when a keyframe leaves
+                 the window. This is what gives Basalt its extremely low drift.
 Builds         : `MargHelper` sqrt marginalisation in `sky/backend/marginalize.py` (extend) + selftest.
 
 ### E2 — FEJ (first-estimates Jacobian) null-space check
@@ -350,8 +350,8 @@ Visual output  : `marg_viz.py --stage nullspace` → the 4-DoF gauge null-space
                  energy vs time (Basalt's `checkMargNullspace`); must stay ≈ 0.
 Pass gate      : null-space energy < threshold for the whole run (no spurious
                  information injected into the unobservable gauge).
-Ý nghĩa        : tránh "bơm" thông tin giả vào hướng tự do (yaw/translation gauge)
-                 — lỗi kinh điển làm VIO tự tin sai rồi drift.
+Why it matters : avoid "pumping" false information into the free directions (yaw/translation gauge)
+                 — the classic bug that makes VIO over-confident and then drift.
 Builds         : FEJ handling + null-space selftest.
 
 ---
@@ -367,8 +367,8 @@ Visual output  : one figure — 3 distance-vs-time curves over Basalt + a 3D ove
 Pass gate      : `ours-vio` ≥ 0.95 scale, ATE ≤ `ours-ba`, **no stall**, and it
                  matches `ours` on the push while ALSO being drift-corrected on the
                  loop sessions (where `ours` drifts).
-Ý nghĩa        : một hình duy nhất chứng minh tight-coupled vừa đẩy-nhanh-full
-                 (như ours) vừa hết drift (như Basalt). Kết thúc bài toán.
+Why it matters : a single figure proving tight-coupled does both fast-push-full
+                 (like ours) and drift-free (like Basalt). Closes the problem.
 Builds         : nothing new (composes T0.2 `--plot` + `view_pose3d`).
 
 ---

@@ -370,7 +370,7 @@ portable). Numba compiles our own explicit loops; a pure-NumPy fallback runs ide
    - **Left↔right consistency** (lines 686, 732): compute the right-image disparity from the
      same aggregated volume and reject if `|d − dispR[round(u−d)]| > lr_max_diff (1.5)`.
      False matches don't round-trip.
-5. **Speckle filter** (`_speckle_filter`, line 794, optional): 4-connected flood fill (à la
+5. **Speckle filter** (`_speckle_filter`, line 794, optional): 4-connected flood fill (like
    `cv2.filterSpeckles`); invalidate connected disparity blobs ≤ `speckle_window` px.
 6. **Disparity → metric depth** (`dense_depth`, line 939): `Z = fx·B/d`, clamped to
    `[min_depth, max_depth]`, 0 = invalid. `fx = K_left[0,0]`, `B = baseline_m`.

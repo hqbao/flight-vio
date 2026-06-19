@@ -3,7 +3,7 @@
 
 THE QUESTION THIS ANSWERS
 -------------------------
-"so sánh cái nào ngon hơn" -- is the tightly-coupled RGB-D VIO backend
+"compare which one is better" -- is the tightly-coupled RGB-D VIO backend
 (`WindowedVIORGBDOdometry`, IMU preintegration factors, covariance-weighted via
 `imu_info_weight=True`) actually better than the existing LOOSE backend
 (`WindowedRGBDOdometry`, vision-only windowed BA + a VO translation prior)?
@@ -14,7 +14,7 @@ It runs BOTH backends over the gold session suite at TWO resolutions
   * ATE RMSE after rigid-SE(3) Umeyama alignment (cm)            -- the field standard
   * Sim3 scale  (our path scale vs the Basalt reference)          -- scale collapse
   * end-vs-start drift (cm)                                       -- accumulated drift
-  * max single-frame step (cm)                                    -- the fast-push "ì lại" symptom
+  * max single-frame step (cm)                                    -- the fast-push "stall" symptom
   * phantom translation on in-place-yaw / shake sessions          -- the loose path's documented failure
 
 then a per-session verdict (who wins + by how much) with the fast-push and
@@ -99,8 +99,8 @@ _MAX_VALID_STEP_M = 1.0
 # failure (slipped visual tracks read as motion). Highlighted in the verdict.
 _INPLACE_YAW = {"yaw_inplace_15s", "push_shake_20s", "quick_motion_15s"}
 
-# Sessions with a fast forward/back push -- the "ì lại" (stall / scale-collapse)
-# regime where the loose VO-trans-prior is documented weak.
+# Sessions with a fast forward/back push -- the stall / scale-collapse regime
+# where the loose VO-trans-prior is documented weak.
 _FAST_PUSH = {"push_straight_fast_15s", "push_fwdback_20s"}
 
 
@@ -295,7 +295,7 @@ def run_session(session_dir: Path, *, backend: str, resolution: str,
     traj_len = float(np.linalg.norm(np.diff(dst, axis=0), axis=1).sum())
 
     # --- failure-case metrics --------------------------------------------- #
-    # max single-frame step of OUR trajectory (the fast-push "ì lại" stalls show
+    # max single-frame step of OUR trajectory (the fast-push stalls show
     # up as a giant single step or, conversely, a near-zero crawl; we report the
     # peak step so the table shows whether the estimator jumped or held).
     est_ordered = np.array([est[s] for s in seqs_in_order])

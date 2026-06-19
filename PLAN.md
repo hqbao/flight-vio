@@ -96,7 +96,7 @@ pose/velocity re-base.** Key corrections folded in:
 
 ## Sensor-dropout safety guard (2026-06-17) — DONE (bench), FC plumbing DEFERRED
 
-**Root cause of the Pi "lúc đứng lúc chạy / nhảy quá xa nguy hiểm":** the OAK
+**Root cause of the Pi "sometimes freezes, sometimes runs / jumps dangerously far":** the OAK
 USB-crashes + re-enumerates mid-run (95 crashdumps; `get_throttled=0x0` → NOT power;
 depthai 3.6.1 still crashes under full flight load — recovers vs 3.7.x loop). Each crash
 = seconds of NO camera AND NO IMU. The live `--tight` propagator (`propagate_imu`) prepends
@@ -361,7 +361,7 @@ structure (latest-wins, UART-off-callback, safety floors, reset_counter) — onl
   `q_w,q_x,q_y,q_z` (f32 quaternion body→NED, Hamilton, unit — **FC extracts heading itself**, no
   Euler imposed, gimbal-lock-free); `pos_sigma_m` (f32 1-σ → √R; inflated when degraded);
   `age_us` (u32); `reset_counter` (u8); `flags` (u8: bit0 pos_valid, bit1 att_valid, bit2 degraded).
-- **TIME SYNC = "Mức 1 / age" (user-locked, simplest, TX-only, NO clock sync).** Send `age`;
+- **TIME SYNC = "Level 1 / age" (user-locked, simplest, TX-only, NO clock sync).** Send `age`;
   FC computes `validity_fc = fc_rx_time − age − C`. age is a *duration* → FC anchors it to its OWN
   clock; the module's absolute clock is never needed.
   **HONEST age property (do NOT call it "conservative/errs old" — it is biased YOUNGER):** because
@@ -378,7 +378,7 @@ structure (latest-wins, UART-off-callback, safety floors, reset_counter) — onl
   `(recv_host_s − ts_ns·1e-9)` (relax-up ~1e-4/s for drift; a candidate >0.5s below the min is rejected
   as a corrupt/future ts so one bad sample can't latch `O_est` low forever), then
   `age_us = clamp((send_host_s − ts_ns·1e-9 − O)·1e6, 0, …)`. A hard `age > 1s` ceiling drops the frame.
-  Fallback ts_ns==0 → age from recv time only. Future **"Mức 2"** = `imu_camera` host-capture-stamp (or
+  Fallback ts_ns==0 → age from recv time only. Future **"Level 2"** = `imu_camera` host-capture-stamp (or
   passive regression on FC's `t_ms` heartbeat) → age becomes the FULL absolute capture→send age and
   C reduces to UART transport only (swap `age_us`→`t_fc_ms`, u32, same size, wire unchanged).
 

@@ -7,7 +7,7 @@ On reconnect the next IMU block's first sample is SECONDS after the last one the
 live propagator integrated. The gap-free prepend (``prev_tail``) would then make
 :func:`~sky.vio.imu.predict_state` dead-reckon ``v*dt + 0.5*a*dt^2`` over the
 WHOLE blackout in one step -> a metres-large pose JUMP the instant the stream
-returns (the user's "lúc đứng lúc chạy / nhảy quá xa" -- dangerous for the FC).
+returns (the user's "sometimes still, sometimes moving / jumps too far" -- dangerous for the FC).
 
 This drives the REAL :class:`~vio.modules.pipeline.OdometryModule`
 (``retain_imu=True``, the live ``--tight`` front-end) over a gold session but

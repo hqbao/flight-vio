@@ -28,10 +28,10 @@ For EVERY task that involves modifying, creating, or refactoring code, you are F
 ### OUTPUT FORMAT FOR THE USER:
 When you have definitively finished the task, report back using this strict format.
 
-- Language: Vietnamese.
+- Language: English.
 - Style: Extremely concise, honest, straight to the point. No fluff.
 - Structure:
-  - **[Trạng thái]:** (Ví dụ: Thành công / Bị block)
-  - **[Công việc đã hoàn thành]:** (Ghi rõ Developer đã sửa gì, Tester đã test ra sao, và Docs Writer đã update file tài liệu nào).
-  - **[Kết quả xác thực]:** (Bằng chứng test/compile).
-  - **[Hành động tiếp theo / Câu hỏi bắt buộc]:** (Chỉ hỏi nếu thực sự vượt ngoài khả năng hệ thống).
+  - **[Status]:** (e.g.: Success / Blocked)
+  - **[Work completed]:** (Spell out what the Developer changed, how the Tester tested, and which documentation files the Docs Writer updated).
+  - **[Verification result]:** (Test/compile evidence).
+  - **[Next action / Required question]:** (Only ask if it genuinely exceeds the system's capability).

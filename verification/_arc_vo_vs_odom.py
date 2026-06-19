@@ -5,7 +5,7 @@ Settles whether the arc-fast jitter/spikes are in the VISION signal (pure
 frame-to-frame PnP) or introduced by the IMU dead-reckon + complementary
 correction. Drives the real OdometryModule with publish_vo=True, retain_imu=True
 (--tight), captures BOTH lines, plots X vs frame, prints jitter for each. This is
-the decomposition that pinned Phase 4(k) (the "giật về" snap-back root cause).
+the decomposition that pinned Phase 4(k) (the "snap-back" root cause).
 """
 from __future__ import annotations
 from pathlib import Path

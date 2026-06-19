@@ -97,7 +97,7 @@ regardless of the caller:
 - **`reset_counter` / `flags`** are masked to `[0, 255]` (`& 0xFF`) — by design a
   **wrap**, not a clamp (a free-running counter and a bitfield).
 
-## The "Mức 1 / age" time model
+## The "Level 1 / age" time model
 
 The wire carries `age_us` (a **duration** — capture→send elapsed), **not** an
 absolute timestamp. Because it is a duration, the FC anchors it to its **own** clock
@@ -129,7 +129,7 @@ C = UART_transport + pipeline_latency_floor      (NOT just the ~4 ms UART transp
 
 With `C` calibrated that way, `fc_rx_time − age − C` lands on the true capture
 instant. (Fallback: if `ts_ns` is unset (0; the loose path shouldn't hit this live)
-the age falls back to the queue age `send − recv` only. A future "Mức 2" — once
+the age falls back to the queue age `send − recv` only. A future "Level 2" — once
 `imu_camera` stamps a host capture time — makes `age` the full absolute capture→send
 age and reduces `C` to UART transport only.)
 

@@ -174,14 +174,14 @@ _K_ROT = 0.25
 # pose pure-dead-reckons from the IMU (the covered-camera-keeps-moving win).
 _MIN_VIS_INLIERS = 8
 
-# --- track-continuity gate + re-anchor (fast-motion "giật về" fix) ----------
+# --- track-continuity gate + re-anchor (fast-motion "snap-back" fix) --------
 # The per-frame track-overlap RATIO (survivors/prev, from odometry.estimate)
 # scales the TRANSLATION correction gain: full when tracks persist, -> 0 when a
 # fast frame loses most tracks (survivors are KLT-slip-suspect). Rotation
 # correction is untouched (vision yaw is reliable). MORE IMPORTANT: a re-anchor
 # OFFSET forgives the IMU-vs-vision position gap that accumulates while vision is
 # unreliable -- so when vision re-engages it does NOT yank the (correctly
-# IMU-tracked) arc back to the under-estimated ("ghì lại") vision absolute (THE
+# IMU-tracked) arc back to the under-estimated ("held back") vision absolute (THE
 # snap). The offset tracks (nav - p_vis) when unreliable and FREEZES when
 # reliable, so the live pose keeps the IMU's real translation and vision only
 # corrects NEW drift relative to the re-anchor. LIVE + --tight only -> gap=0
@@ -200,8 +200,8 @@ _ZUPT_FREEZE_TRANS = os.environ.get("OAKD_ZUPT_FREEZE_TRANS", "1") != "0"
 # IMU), a frame is starved, a worker stalls -- the next block's first sample is
 # SECONDS after prev_tail. Prepending across that boundary makes predict_state
 # dead-reckon ``v*dt + 0.5*a*dt^2`` over the WHOLE blackout -> a metres-large
-# pose JUMP the instant the stream returns (the "lúc đứng lúc chạy / nhảy quá
-# xa" the user saw; dangerous for the FC). When the boundary gap exceeds this
+# pose JUMP the instant the stream returns (the "stop-and-go / jumps too far"
+# the user saw; dangerous for the FC). When the boundary gap exceeds this
 # many seconds we treat it as a dropout: integrate only the FRESH block (drop
 # the stale tail), zero the now-meaningless velocity (vision re-anchors position
 # over the next frames -- a smooth recovery, NOT a snap), and flag the frame.
@@ -506,7 +506,7 @@ def propagate_imu(ctx: Any, step: Step) -> Step:
     # good few-inlier frames the overlap gate already trusts. On the degenerate
     # vision paths (too_few_points / pnp_failed / low_inliers_frozen) p_vis is the
     # gyro-propagated / frozen pose, NOT a position fix, so pulling DR toward it
-    # would yank the IMU-tracked arc back -- exactly the "giật về" snap we removed.
+    # would yank the IMU-tracked arc back -- exactly the "snap-back" we removed.
     vis_scale = overlap_scale if bool(info.get("ok", True)) else 0.0
     # ZUPT owns translation at genuine rest: zero the vision TRANSLATION pull (and
     # freeze the re-anchor offset) so a moving object in view -- e.g. a hand waved
@@ -520,7 +520,7 @@ def propagate_imu(ctx: Any, step: Step) -> Step:
     # tracks (nav - p_vis) when vision is unreliable (low scale -> the accumulated
     # IMU-vs-vision gap is forgiven), FREEZES while reliable (or at rest). So when
     # vision re-engages after a fast sweep the target is p_vis + frozen_offset ~ nav
-    # -- NO yank back to the under-estimated vision absolute (the "giật về" snap).
+    # -- NO yank back to the under-estimated vision absolute (the "snap-back").
     p_target = p_vis
     if _REANCHOR:
         off = nav.get("vis_offset")

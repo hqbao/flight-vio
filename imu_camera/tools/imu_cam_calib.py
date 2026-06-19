@@ -112,14 +112,14 @@ def run_wizard(model: str | None) -> int:
         for i, pose in enumerate(POSES, 1):
             print(f"\n--- Pose {i}/{len(POSES)}: {pose.instruction}")
             while True:
-                input("    Giữ yên đúng tư thế rồi nhấn ENTER để chụp... ")
-                print("    đang đo, giữ yên ...", flush=True)
+                input("    Hold still in the correct pose then press ENTER to capture... ")
+                print("    measuring, hold still ...", flush=True)
                 m = _collect_still(q)
                 if m is None:
-                    print("    !! không đứng yên / sai độ lớn trọng lực -- "
-                          "giữ chắc hơn rồi thử lại.")
+                    print("    !! not at rest / wrong gravity magnitude -- "
+                          "hold steadier and try again.")
                     continue
-                print(f"    ✔ chụp xong  accel={np.array2string(m, precision=2)}")
+                print(f"    ✔ captured  accel={np.array2string(m, precision=2)}")
                 meas.append(m)
                 ups.append(pose.up_cam)
                 break
@@ -129,21 +129,21 @@ def run_wizard(model: str | None) -> int:
 
     R = solve_imu_cam_rotation(np.array(meas), np.array(ups))
     res = residual_deg(R, np.array(meas), np.array(ups))
-    print("\n=== KẾT QUẢ ===")
-    print("R_imu_cam (đo được):")
+    print("\n=== RESULT ===")
+    print("R_imu_cam (measured):")
     print(np.array2string(R, precision=4, suppress_small=True))
-    print(f"residual mỗi tư thế (deg): "
+    print(f"residual per pose (deg): "
           f"{np.array2string(res, precision=2)}  max={res.max():.2f}")
     if res.max() > 5.0:
-        print(f"[wizard] ⚠️ residual lớn ({res.max():.1f} deg) -- nhiều khả năng "
-              f"giữ tư thế lệch. KHÔNG lưu; chạy lại và giữ đúng hướng.",
+        print(f"[wizard] ⚠️ large residual ({res.max():.1f} deg) -- most likely "
+              f"the poses were held off-axis. NOT saving; rerun and hold the correct orientation.",
               file=sys.stderr)
         return 2
     path = save_imu_cam_rotation(caps.device_id, R, n_poses=len(POSES),
                                  residual_deg=float(res.max()))
-    print(f"\n✅ Đã lưu cho device {caps.device_id} -> {path}")
-    print("   Lần chạy live tới sẽ tự dùng giá trị này thay cho EEPROM "
-          "(roll/pitch khởi tạo sẽ đúng).")
+    print(f"\n✅ Saved for device {caps.device_id} -> {path}")
+    print("   The next live run will use this value instead of the EEPROM "
+          "(initial roll/pitch will be correct).")
     return 0
 
 
@@ -156,7 +156,7 @@ def main() -> int:
     try:
         return run_wizard(args.model)
     except KeyboardInterrupt:
-        print("\n[wizard] huỷ.", file=sys.stderr)
+        print("\n[wizard] cancelled.", file=sys.stderr)
         return 130
 
 

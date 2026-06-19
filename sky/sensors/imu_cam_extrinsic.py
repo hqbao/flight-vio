@@ -51,12 +51,12 @@ class CalibPose:
 #: direction is easy to instruct unambiguously, which is what makes the capture
 #: repeatable in the field.
 POSES: tuple[CalibPose, ...] = (
-    CalibPose("lens-up", "Đặt camera nằm phẳng, ỐNG KÍNH HƯỚNG LÊN TRẦN",
+    CalibPose("lens-up", "Lay the camera flat, LENS POINTING UP AT THE CEILING",
               np.array([0.0, 0.0, 1.0])),
     CalibPose("upright-forward",
-              "Dựng camera ĐỨNG, ống kính NHÌN NGANG ra trước, ĐỈNH HƯỚNG LÊN",
+              "Stand the camera UPRIGHT, lens LOOKING LEVEL FORWARD, TOP POINTING UP",
               np.array([0.0, -1.0, 0.0])),
-    CalibPose("lens-down", "Đặt camera nằm phẳng, ỐNG KÍNH ÚP XUỐNG bàn",
+    CalibPose("lens-down", "Lay the camera flat, LENS FACING DOWN onto the table",
               np.array([0.0, 0.0, -1.0])),
 )
 

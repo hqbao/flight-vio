@@ -411,7 +411,7 @@ different axes — they never compete**, because each owns only what it can obse
   "tilt from accel, yaw from SLAM" automatically — no hand-coded "who wins" rule.
 - **IMPLEMENTED in the from-scratch VIO prototype (2026-06-03, "Phase 4")**: the
   gravity term now lives *inside* the sliding-window BA. Each at-rest keyframe
-  adds the residual `r_g = R_cw · g_world − (−â_meas)`, whitened by a small
+  adds the residual `r_g = R_cw · g_world − (−a_meas)`, whitened by a small
   `σ ≈ 0.05 rad` with a Huber kernel and an `|accel|` band gate. Its Jacobian
   `∂r_g/∂φ = −[R_cw · g_world]_×` has no landmark coupling and no translation
   term, so it only feeds the rotation block of that free camera's Hessian and

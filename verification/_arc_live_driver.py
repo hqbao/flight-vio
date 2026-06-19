@@ -7,8 +7,8 @@ the UI shows) over a session via a LocalPubSub in FIFO (latest_only=False) order
 -- so EVERY frame is processed, NO real-time frame drops, and the result is
 seq-keyed {seq: position} that aligns 1:1 to the Basalt reference by seq.
 
-A clean, deterministic metric (vs the confounded multiprocess capture) — the arc
-regression behind Phase 4(k) ("giật về" snap-back fix).
+A clean, deterministic metric (vs the confounded multiprocess capture) -- the arc
+regression behind Phase 4(k) (the "snap-back" fix).
   .venv/bin/python -m verification._arc_live_driver [--session DIR]
 """
 from __future__ import annotations

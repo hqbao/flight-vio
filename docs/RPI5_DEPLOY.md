@@ -111,9 +111,9 @@ Lite crash — that was the depthai pin above.)
 **OAK-D Lite vs OAK-D W — fast-motion VIO.** The mono FOVs differ a lot:
 **W ≈ 97° HFOV** (the "W" = Wide, designed for VIO/SLAM) vs **Lite ≈ 70°**. On a
 **fast push** the Lite's narrower FOV whips features out of frame → the KLT/PnP
-frontend loses tracks → **loose pose stalls** ("ì lại một chỗ") and the **tight
-backend's window is under-constrained → it lurches then snaps back** ("đi một
-đoạn rồi giật ngược"). This is largely a **hardware-FOV limit**, not a regression:
+frontend loses tracks → **loose pose stalls** (sticks in one place) and the **tight
+backend's window is under-constrained → it lurches then snaps back** (moves a stretch
+then jerks backward). This is largely a **hardware-FOV limit**, not a regression:
 prefer the **OAK-D W for fast-motion** work; the Lite is fine for slower motion.
 
 **OAK-D Lite IMU→cam extrinsic.** The Lite's BMI270 EEPROM ships a **wrong nominal
