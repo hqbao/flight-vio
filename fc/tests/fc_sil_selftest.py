@@ -34,6 +34,7 @@ import struct
 import sys
 import threading
 import time
+import tty
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -79,6 +80,18 @@ class _FdSerial:
 
     def write(self, data: bytes) -> int:
         return os.write(self._fd, data)
+
+
+def _open_raw_pty():
+    """openpty() with BOTH ends in RAW mode. A default pty is in COOKED mode, so
+    its output line discipline (OPOST/ONLCR) translates a 0x0A byte to CR-LF --
+    inserting a 0x0D into the BINARY dblink frame and desyncing the stream (the
+    age/checksum fields routinely contain 0x0A). A real UART (pyserial) is raw and
+    never does this, so the corruption is a pty-stand-in artifact only."""
+    master, slave = os.openpty()
+    tty.setraw(master)
+    tty.setraw(slave)
+    return master, slave
 
 
 def _T(p=(0.0, 0.0, 0.0), R=None) -> np.ndarray:
@@ -143,7 +156,7 @@ def _drain(fd: int, sink: list, stop: threading.Event,
 # --------------------------------------------------------------------------- #
 def test_wire_and_degraded() -> bool:
     print("[a/e] well-formed dblink frames + inflated sigma/flag when degraded")
-    master, slave = os.openpty()
+    master, slave = _open_raw_pty()
     sink: list = []
     stop = threading.Event()
     rdr = threading.Thread(target=_drain, args=(master, sink, stop), daemon=True)
@@ -211,7 +224,7 @@ def test_wire_and_degraded() -> bool:
 
 def test_age() -> bool:
     print("[b] age_us is small for a fresh pose + larger for an old capture ts")
-    master, slave = os.openpty()
+    master, slave = _open_raw_pty()
     sink: list = []
     stop = threading.Event()
     rdr = threading.Thread(target=_drain, args=(master, sink, stop), daemon=True)
@@ -257,7 +270,7 @@ def test_age() -> bool:
 
 def test_age_fallback_no_ts() -> bool:
     print("[b'] age fallback: ts_ns==0 -> age from queue time only (never crashes)")
-    master, slave = os.openpty()
+    master, slave = _open_raw_pty()
     os.set_blocking(master, False)
     latest = LatestPose()
     sender = UartSender(latest, _FdSerial(slave), rate_hz=50.0)
@@ -272,7 +285,7 @@ def test_age_fallback_no_ts() -> bool:
 
 def test_reset_edge() -> bool:
     print("[c] reset_counter bumps ONCE per gap re-lock + once on an fc-local jump")
-    master, slave = os.openpty()
+    master, slave = _open_raw_pty()
     os.set_blocking(master, False)
     latest = LatestPose()
     sender = UartSender(latest, _FdSerial(slave), rate_hz=50.0)
@@ -328,7 +341,7 @@ def test_reset_edge() -> bool:
 
 def test_stale_not_sent() -> bool:
     print("[d] a pose older than the staleness window is NOT sent")
-    master, slave = os.openpty()
+    master, slave = _open_raw_pty()
     os.set_blocking(master, False)
     latest = LatestPose()
     sender = UartSender(latest, _FdSerial(slave), rate_hz=50.0)
@@ -348,7 +361,7 @@ def test_latest_wins_under_load() -> bool:
     # A tiny pty buffer that a slow reader lets fill: the sender thread will block
     # in write(), but the callback (LatestPose.set, the real IPC path) must stay
     # instant. We measure the worst-case callback latency while the sender runs.
-    master, slave = os.openpty()
+    master, slave = _open_raw_pty()
     sink: list = []
     stop = threading.Event()
     # DELIBERATELY slow reader (50 ms between reads) so the pty write buffer backs
@@ -397,7 +410,7 @@ def test_nonfinite_pose_survives() -> bool:
     # silently starve the FC of pose) and must go out advertised INVALID, never as
     # a real fix.
     _FLAG_POS_VALID = 1 << 0
-    master, slave = os.openpty()
+    master, slave = _open_raw_pty()
     sink: list = []
     stop = threading.Event()
     rdr = threading.Thread(target=_drain, args=(master, sink, stop), daemon=True)
