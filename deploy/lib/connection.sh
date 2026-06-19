@@ -61,38 +61,50 @@ pi_reset_cache() {
 _pi_q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 
 # --------------------------------------------------------------------------- #
-# IP discovery (mac-side): mDNS hostname -> ARP Pi-vendor -> port-22 scan       #
+# IP discovery (mac-side): SCAN for SSH hosts, operator PICKS (no MAC guessing)  #
 # --------------------------------------------------------------------------- #
 pi_resolve_ip() {
-  # Echoes the discovered IP (empty on failure). Honours an already-set PI_IP if
-  # it still answers on SSH. PI_HOST is the mDNS label (e.g. "bao" -> bao.local).
+  # Non-interactive fast path ONLY: honour an already-set PI_IP that still answers
+  # SSH. Real discovery is scan + operator-pick (pi_scan_hosts -> pi-discover.sh):
+  # no MAC/vendor guessing, so ANY Pi model works and you choose the right box when
+  # several devices answer (multiple Pis, a NAS, ...).
   if [ -n "${PI_IP:-}" ] && nc -z -G 3 "$PI_IP" 22 >/dev/null 2>&1; then
     printf '%s' "$PI_IP"; return 0
   fi
-  local ip host
-  for host in "${PI_HOST:-raspberrypi}.local" raspberrypi.local pi.local; do
-    ip=$(ping -c1 -t2 "$host" 2>/dev/null | sed -n 's/.*(\([0-9.]*\)).*/\1/p' | head -1)
-    [ -n "$ip" ] && { printf '%s' "$ip"; return 0; }
-  done
-  # Subnet ping-sweep to populate ARP, then match a Raspberry Pi MAC vendor (OUI).
-  local iface myip subnet
+  return 0
+}
+
+# Best-effort, NO-auth label for a host so the operator can tell what it is:
+# reverse-DNS name + the SSH banner's OS hint (e.g. "OpenSSH_9.2p1 Debian-...").
+# Echoes the label, or "?" when nothing resolves.
+pi_host_label() {
+  local ip="$1" name banner
+  name=$(dscacheutil -q host -a ip_address "$ip" 2>/dev/null | sed -n 's/^name: *//p' | head -1)
+  banner=$(nc -w 2 "$ip" 22 2>/dev/null | head -1 | tr -d '\r' | sed -n 's/^SSH-[0-9.]*-//p')
+  local label="$name"
+  [ -n "$banner" ] && label="${label:+$label  }[$banner]"
+  printf '%s' "${label:-?}"
+}
+
+# Scan the LAN for hosts with SSH (port 22) open. Echoes one "IP<TAB>LABEL" line per
+# host, sorted by last octet. The port-22 filter keeps the list short (Pis/servers,
+# not every phone) -- it drives the interactive picker in pi-discover.sh.
+pi_scan_hosts() {
+  local iface myip subnet tmp ip
   iface=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')
   myip=$(ipconfig getifaddr "$iface" 2>/dev/null || true)
   [ -z "$myip" ] && return 0
   subnet=$(printf '%s' "$myip" | cut -d. -f1-3)
-  local i; for i in $(seq 1 254); do ping -c1 -t1 "$subnet.$i" >/dev/null 2>&1 & done; wait
-  ip=$(arp -an | grep -iE '2c:cf:67|d8:3a:dd|dc:a6:32|e4:5f:01|b8:27:eb|28:cd:c1' \
-       | sed -n 's/.*(\([0-9.]*\)).*/\1/p' | head -1)
-  [ -n "$ip" ] && { printf '%s' "$ip"; return 0; }
-  # Fallback: single host (other than us) with SSH open.
-  local tmp cand; tmp=$(mktemp -d "${TMPDIR:-/tmp}/fvio-scan.XXXXXX")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fvio-scan.XXXXXX")
+  local i
   for i in $(seq 1 254); do
     [ "$subnet.$i" = "$myip" ] && continue
     ( nc -z -G1 -w1 "$subnet.$i" 22 >/dev/null 2>&1 && printf '%s\n' "$subnet.$i" >"$tmp/$i" ) &
   done; wait
-  cand=$(cat "$tmp"/* 2>/dev/null); rm -rf "$tmp"
-  set -- $cand; [ "$#" -eq 1 ] && printf '%s' "$1"
-  return 0
+  for ip in $(cat "$tmp"/* 2>/dev/null | sort -t. -k4 -n); do
+    printf '%s\t%s\n' "$ip" "$(pi_host_label "$ip")"
+  done
+  rm -rf "$tmp"
 }
 
 # --------------------------------------------------------------------------- #

@@ -41,33 +41,51 @@ pi_rule
 pi_say "flight-vio Raspberry Pi discovery + one-time authentication"
 pi_rule
 
-# 1. Credentials (env override -> prompt -> prior cache default).
-def_user="${PI_USER:-bao}"; def_host="${PI_HOST:-$def_user}"
+# 1. Credentials -- username + password ONLY (no hostname; discovery is scan+pick).
+def_user="${PI_USER:-bao}"
 if [ -z "${PI_USER:-}" ] || [ -t 0 ]; then
   read -rp "Pi SSH username [$def_user]: " in_user || true; PI_USER="${in_user:-$def_user}"
-  read -rp "Pi mDNS hostname (for <name>.local) [$def_host]: " in_host || true; PI_HOST="${in_host:-$def_host}"
 fi
-PI_USER="${PI_USER:-$def_user}"; PI_HOST="${PI_HOST:-$def_host}"
+PI_USER="${PI_USER:-$def_user}"; PI_HOST="${PI_HOST:-$PI_USER}"
 if [ -z "${PI_PASS:-}" ]; then
   read -rsp "Pi SSH password (stored 0600 for sudo; entered once): " PI_PASS; echo
 fi
 [ -n "$PI_PASS" ] || pi_die "a password is required to install the SSH key the first time."
 
-# 2. Discover the IP.
-pi_say "locating $PI_USER@$PI_HOST on the LAN ..."
-PI_IP="$(pi_resolve_ip)"
-[ -n "$PI_IP" ] || pi_die "could not find the Pi. Check it is powered + on this WiFi/LAN, \
-or set its IP:  PI_IP=<ip> ./deploy/pi-discover.sh"
-pi_say "found Pi at $PI_IP"
-
-# 3. Install the SSH key (passwordless from now on) + verify.
-if pi_key_works; then
-  pi_say "key auth already works -- no key install needed."
+# 2+3. Reuse a cached IP that still answers with the key; otherwise SCAN the LAN and
+# let the OPERATOR PICK the Pi from the list (no MAC/vendor guessing -- works for any
+# model, and you pick the right box when several devices answer). The chosen host
+# gets the key installed + verified; on failure you pick another.
+if [ -n "${PI_IP:-}" ] && pi_key_works; then
+  pi_say "reusing cached $PI_USER@$PI_IP (key auth OK)."
+elif [ ! -t 0 ]; then
+  pi_die "no working cached Pi and not a terminal -- run interactively to pick, or: PI_IP=<ip> $0"
 else
-  pi_say "installing SSH key (one-time, uses the password) ..."
-  pi_install_key || pi_die "SSH key install failed -- wrong password, or SSH refused."
-  pi_key_works || pi_die "key installed but key-auth still fails -- check the Pi's sshd config."
-  pi_say "key auth verified."
+  while :; do
+    pi_say "scanning the LAN for SSH (port 22) hosts ..."
+    hosts="$(pi_scan_hosts)"
+    if [ -z "$hosts" ]; then
+      pi_warn "no SSH host found -- is the Pi powered + on this WiFi?"
+      read -rp "  Enter = rescan, Ctrl-C = quit ... " _ || pi_die "aborted."; continue
+    fi
+    pi_rule; pi_say "devices answering SSH (pick yours):"
+    ips=(); n=0
+    while IFS="$(printf '\t')" read -r ip label; do
+      [ -n "$ip" ] || continue
+      n=$((n + 1)); ips+=("$ip")
+      printf '   [%d] %-15s %s\n' "$n" "$ip" "$label"
+    done <<<"$hosts"
+    pi_rule
+    read -rp "Pick the Pi [1-$n] (r = rescan): " sel || true
+    [ "$sel" = r ] && continue
+    case "$sel" in '' | *[!0-9]*) pi_warn "enter a number."; continue ;; esac
+    { [ "$sel" -ge 1 ] && [ "$sel" -le "$n" ]; } || { pi_warn "out of range."; continue; }
+    PI_IP="${ips[$((sel - 1))]}"
+    pi_say "connecting to $PI_USER@$PI_IP ..."
+    pi_key_works && { pi_say "key auth already works."; break; }
+    pi_install_key && pi_key_works && { pi_say "key installed + verified."; break; }
+    pi_warn "could not log in to $PI_IP (wrong device or password?) -- pick another."
+  done
 fi
 
 # 4. Cache + confirm.

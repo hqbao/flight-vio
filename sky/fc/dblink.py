@@ -18,12 +18,12 @@ Every dblink frame is::
 * ``CLASS`` is the log/message class, fixed ``0x00`` for the host->FC commands.
 * ``LEN`` is the payload byte count, little-endian.
 * ``checksum`` = ``(cmd + class + len_lo + len_hi + sum(payload)) & 0xFFFF``,
-  little-endian. The FC does NOT verify this dblink checksum for vision frames
-  (it only CRC-checks UBX) -- it routes on the CMD byte and parses the payload --
-  so only well-formedness matters on the wire. We still emit the correct checksum
-  so the link is byte-clean and a future FC-side validator (or the
-  ``parse_db_stream`` test) accepts it. The framing + checksum here are VERBATIM
-  the FC's own ``build_db_frame`` (``flight-controller/tools/dblink_test.py``).
+  little-endian. The FC's ``db_reader.c`` now VERIFIES this dblink checksum and
+  DROPS any frame that fails it (the same gate it already applied to UBX), so a
+  correct checksum is REQUIRED for the FC to route the frame on the CMD byte and
+  decode the payload. This packer emits the correct checksum, so the VIO pose
+  always passes the gate; the framing + checksum here are VERBATIM the FC's own
+  ``build_db_frame`` (``flight-controller/tools/_dblink.py``).
 
 Vision-pose payload (38 bytes, little-endian ``struct '<8fIBB'``)
 -----------------------------------------------------------------

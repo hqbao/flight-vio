@@ -135,17 +135,17 @@ else
   warn "could not mask $SERIAL_GETTY"
 fi
 
-# cloud-init: disable cleanly via the documented sentinel file.
-if [ ! -d /etc/cloud ]; then
-  say "skip  cloud-init (not installed)"
-elif [ -e "$CLOUD_DISABLED" ]; then
-  say "skip  cloud-init (already disabled)"
-elif [ "$DRY" -eq 1 ]; then
-  say "WOULD disable cloud-init (touch $CLOUD_DISABLED)"
-else
-  touch "$CLOUD_DISABLED"; say "disabled cloud-init ($CLOUD_DISABLED)"
-  printf '%s\n' "cloud-init:disabled-file" >> "${STATE}.tmp"
-fi
+# cloud-init: DO NOT disable. The Imager-provisioned headless WiFi/SSH is a
+# cloud-init nocloud datasource (boot-partition network-config + user-data) that
+# renders the network at boot. Disabling it (this script's old behaviour) dropped
+# that per-boot WiFi rendering, so the FIRST reboot afterwards came up with NO
+# network and was unreachable -- recoverable only via HDMI + keyboard (a brownout
+# reboot hit exactly this). The few seconds saved at boot are not worth bricking
+# remote access. (--rollback above still re-enables cloud-init on any Pi a previous
+# version of this script disabled.) If you ever DO want it off, first persist the
+# WiFi as a standalone NetworkManager profile so boot connectivity no longer
+# depends on cloud-init.
+say "keep  cloud-init (owns headless WiFi/SSH; disabling it breaks boot networking)"
 
 # OAK camera USB power: the Pi5 default-caps total USB current at 600mA, which
 # browns out an OAK-D under load -- ESPECIALLY the OAK-D Lite (narrower-FOV,
