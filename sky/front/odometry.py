@@ -586,6 +586,26 @@ class RGBDVisualOdometry:
                             T_pc = np.eye(4)
                             T_pc[:3, :3] = np.asarray(R_prior, dtype=np.float64).T
                             self.pose = self.pose @ np.linalg.inv(T_pc)
+                        else:
+                            # No gyro prior (no IMU->camera extrinsic, or gyro
+                            # fusion off): advance the rotation by the VISION
+                            # rotation while still freezing translation. PnP
+                            # SUCCEEDED here (ninl >= min_pnp_points), so ``R``
+                            # (cur<-prev point-rotation) is a usable attitude
+                            # delta -- only the translation is untrustworthy on a
+                            # blank wall. Without this the attitude froze at the
+                            # identity init forever in the no-gyro regime (the
+                            # rotation never left the seed), so the VIO reported a
+                            # constant orientation. ``R`` is ALREADY cur<-prev (no
+                            # transpose, unlike the gyro prior above which is
+                            # prev<-cur), so this is the main-path composition
+                            # (see ``T_pc`` at the success branch below) with the
+                            # translation zeroed: T_pc[:3,:3]=R, T_pc[:3,3]=0,
+                            # self.pose @= inv(T_pc).
+                            T_pc = np.eye(4)
+                            T_pc[:3, :3] = R
+                            self.pose = self.pose @ np.linalg.inv(T_pc)
+                            info["reason"] = "low_inliers_rot_vision"
                         self._prev_obs = cur_obs
                         self._prev_depth = depth_m
                         self.last_info = info

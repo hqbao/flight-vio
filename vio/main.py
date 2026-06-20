@@ -213,9 +213,24 @@ def run_vio(*,
     LOG.info("vio: waiting for calib.bundle on %s ...", capture_endpoint)
     bundle = _await_calib_bundle(capture_endpoint, calib_timeout_s)
     width, height = int(bundle.width), int(bundle.height)
-    LOG.info("vio: got calib %dx%d, T_imu=%s, gyro_bias=%s",
+    LOG.info("vio: got calib %dx%d, T_imu=%s, R_imu_cam=%s, accel_align=%s, gyro_bias=%s",
              width, height, bundle.T_imu_left is not None,
+             bundle.R_imu_cam is not None, bundle.accel_align is not None,
              bundle.gyro_bias is not None)
+    # Loud, one-shot attitude-degradation warning. A missing IMU->camera
+    # extrinsic (OAK-D Lite EEPROM read failed AND no imu_cam wizard calib)
+    # leaves R_imu_cam=None downstream, which disables the gyro rotation prior
+    # AND the one-shot gravity-align. The attitude then comes from vision alone
+    # (frame-to-frame PnP) and is NOT gravity-leveled -- it tracks rotation but
+    # has no absolute roll/pitch reference and no gyro to bridge feature-starved
+    # frames. Surface this explicitly rather than burying it in the T_imu=False
+    # field above, because the failure mode (vision-only attitude) is silent.
+    if bundle.R_imu_cam is None:
+        LOG.warning(
+            "vio: IMU->camera extrinsic MISSING (R_imu_cam=None) -> gyro prior "
+            "+ gravity-align DISABLED; attitude is vision-only and NOT "
+            "gravity-leveled. Run the imu_cam_calib wizard for gyro-stabilized, "
+            "gravity-referenced attitude.")
 
     # 2. Allocate the capture-side ring registry (consumer-attach) for the
     #    subscriber bridge to read frame data from shared memory.
