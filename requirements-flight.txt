@@ -24,9 +24,16 @@ numba>=0.61
 pyserial>=3.5
 
 # Downward rangefinder (VL53L1X over I2C) for the `lidar` process -- the AGL range
-# the fc sender bundles into the dblink VIO-pose frame. Both pure-Python (aarch64
-# wheel / no build on the Pi5), cv2-free. Omit if the Pi has no rangefinder.
-pimoroni-vl53l1x>=1.1.2
+# the fc sender bundles into the dblink VIO-pose frame. NO sensor driver is pinned
+# in the lean flight image: the `lidar` process runs DEVICELESS with `--lidar-mock`
+# (needs nothing). The REAL VL53L1X read is a BENCH BRING-UP item -- there is no
+# drop-in pip driver for the Pi5 (aarch64 + py3.13): `pimoroni-vl53l1x` does NOT
+# exist on PyPI (the package is `vl53l1x`), and `vl53l1x` (the Pimoroni C-extension)
+# has NO aarch64/py3.13 wheel on piwheels (only 32-bit armv6l/v7l up to cp311), so
+# it will not install on the Pi5 without a from-source C build the old code can't do
+# on py3.13. Pick a pure-Python driver (smbus2 register access) or Adafruit Blinka
+# at bring-up -- see lidar/requirements.txt. smbus2 (the I2C transport) is the only
+# bit that installs cleanly, kept here for whichever real driver is chosen:
 smbus2>=0.4.1
 
 # OAK-D / camera device driver -- needed for `--live` on the actual board (the

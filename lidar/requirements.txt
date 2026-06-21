@@ -1,11 +1,21 @@
 # lidar project: downward VL53L1X rangefinder over I2C (Pi flight, cv2-free).
 #
-# Both deps are pure-Python and aarch64-wheel / no-build on the Pi5. They are also
-# folded into the top-level requirements-flight.txt (the lean flight install).
+# IMPORTANT (bench bring-up): there is NO drop-in pip driver for the real sensor on
+# the Pi5 (aarch64, Python 3.13). Verified 2026-06-21:
+#   - `pimoroni-vl53l1x` does NOT exist on PyPI (404). The Pimoroni package is named
+#     `vl53l1x` (== `VL53L1X`), latest 0.0.5 -- NOT "1.1.2".
+#   - `vl53l1x` is a C-extension with NO aarch64 / py3.13 wheel on piwheels (only
+#     32-bit armv6l/armv7l up to cp311), so `pip install vl53l1x` on the Pi5 has to
+#     build from source -- which the 2021-era code does not do on py3.13.
+# So the REAL read path (lidar/io/vl53l1x_reader.py :: VL53L1XReader, lazy
+# `import VL53L1X`) is a BRING-UP TODO -- pick ONE at the bench:
+#   (a) pure-Python: drive the VL53L1X registers directly over `smbus2` (below) and
+#       point VL53L1XReader at it;
+#   (b) Adafruit: `adafruit-circuitpython-vl53l1x` + `adafruit-blinka` (both
+#       pure-Python, install on py3.13/aarch64) and adapt VL53L1XReader to that API.
+# Until then the `lidar` process runs with `--lidar-mock` (MockRangeReader, no
+# sensor dep at all) -- enough to validate the 42B VIO wire + the FC UI.
 
-# Pimoroni's VL53L1X driver (distance + range_status over I2C). Generic VL53L1X
-# register map, so it drives the TOF400F breakout too.
-pimoroni-vl53l1x>=1.1.2
-
-# Linux SMBus / I2C transport the driver talks over (/dev/i2c-1 on the Pi header).
+# Linux SMBus / I2C transport (pure-Python, installs cleanly on the Pi5). Needed by
+# whichever real driver is chosen above; harmless when only --lidar-mock is used.
 smbus2>=0.4.1
