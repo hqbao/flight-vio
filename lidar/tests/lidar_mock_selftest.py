@@ -97,14 +97,18 @@ def test_publish_roundtrip() -> bool:
             if len(received) >= 5:
                 got_enough.set()
 
-    # Run the lidar producer in a thread (mock reader). A MODERATE rate + a generous
-    # max_reads keeps the server up for ~3 s so the client has time to connect (the
-    # producer binds the server, then the client retries the connect until it is up).
-    # This drives the REAL run_lidar publish path, not a hand-rolled server.
+    # Run the lidar producer in a thread, INJECTING a reader with a KNOWN valid+invalid
+    # mix (the live --lidar-mock default is now an all-valid smooth sweep, so we inject
+    # a reject-bearing script here to exercise the publish path for BOTH). A MODERATE
+    # rate + a generous max_reads keeps the server up for ~3 s so the client has time to
+    # connect. This drives the REAL run_lidar publish path, not a hand-rolled server.
     rc_box: list[int] = []
+    mix = [(300, RANGE_STATUS_OK), (600, RANGE_STATUS_OK), (5000, RANGE_STATUS_OK),
+           (900, RANGE_STATUS_OK), (840, 4), (450, RANGE_STATUS_OK)]  # 4 valid, 2 reject
 
     def _run() -> None:
-        rc_box.append(run_lidar(endpoint=endpoint, rate_hz=30.0, mock=True,
+        rc_box.append(run_lidar(endpoint=endpoint, rate_hz=30.0,
+                                reader=MockRangeReader(script=mix),
                                 max_reads=90))     # ~3 s at 30 Hz
 
     producer = threading.Thread(target=_run, name="lidar.producer", daemon=True)
@@ -122,7 +126,7 @@ def test_publish_roundtrip() -> bool:
     _check(rc_box and rc_box[0] == 0, "run_lidar(mock) returned 0")
     _check(len(received) >= 3,
            f"client received WireRange messages (got {len(received)})")
-    # The default mock script yields a mix of valid + invalid; both must arrive and
+    # The injected reader yields a mix of valid + invalid; both must arrive and
     # round-trip the contract the fc sender reads (range_m metres, valid 0/1).
     valids = [m for m in received if m.valid == 1]
     invalids = [m for m in received if m.valid == 0]

@@ -197,27 +197,35 @@ class VL53L1XReader:
 # Host MOCK (no hardware) -- for selftests + a deviceless dry-run.
 # --------------------------------------------------------------------------- #
 class MockRangeReader:
-    """Deterministic, hardware-free :class:`RangeReader` for host tests.
+    """Deterministic, hardware-free :class:`RangeReader` for host tests + the
+    ``--lidar-mock`` live dry-run.
 
-    Returns a scripted sequence of ``(dist_mm, range_status)`` pairs (cycling
-    once exhausted), passing each through the SAME :func:`gate_reading` as the real
-    reader -- so a host test exercises the read -> gate -> publish path including
-    the ``range_status != 0`` reject WITHOUT an I2C bus.
+    Returns a scripted sequence of ``(dist_mm, range_status)`` pairs (cycling once
+    exhausted), each passed through the SAME :func:`gate_reading` as the real reader
+    -- so the read -> gate -> publish path runs WITHOUT an I2C bus.
 
-    Default script: a steady ~0.84 m valid reading, a ``range_status`` fail (-> the
-    reject path), and an out-of-band distance (-> the distance-gate reject).
+    DEFAULT (live ``--lidar-mock``): a smooth ~0.20 m <-> 1.20 m sine sweep, ALL
+    valid + in-band, so the FC UI shows a clean MOVING range (obviously "working")
+    rather than a confusing static value. The validity-gate reject path is covered by
+    the unit selftest, which passes its OWN reject-heavy script via ``script=``.
     """
 
-    _DEFAULT_SCRIPT = (
-        (842, RANGE_STATUS_OK),    # valid -> ~0.842 m
-        (843, RANGE_STATUS_OK),    # valid
-        (5000, RANGE_STATUS_OK),   # out of band (> LIDAR_MAX_MM) -> reject
-        (840, 4),                  # range_status != 0 (e.g. signal fail) -> reject
-        (841, RANGE_STATUS_OK),    # valid again
-    )
+    @staticmethod
+    def _default_sweep():
+        """Smooth LIVE-demo sweep: distance glides ~0.20 m <-> 1.20 m and back (an
+        object waved under the sensor / a drone bobbing), ALL valid + in-band -- a
+        clean moving range on the FC UI. ~160 steps -> a few-second period at the
+        read rate."""
+        import math
+        n = 160
+        return tuple(
+            (int(200 + 500.0 * (1.0 - math.cos(2.0 * math.pi * i / n))),
+             RANGE_STATUS_OK)
+            for i in range(n)
+        )
 
     def __init__(self, script=None) -> None:
-        self._script = tuple(script) if script else self._DEFAULT_SCRIPT
+        self._script = tuple(script) if script else self._default_sweep()
         if not self._script:
             raise ValueError("MockRangeReader needs a non-empty script")
         self._i = 0

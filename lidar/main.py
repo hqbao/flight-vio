@@ -90,7 +90,8 @@ def run_lidar(*,
               mock: bool = False,
               i2c_bus: int = DEFAULT_I2C_BUS,
               i2c_address: int = DEFAULT_I2C_ADDRESS,
-              max_reads: int = 0) -> int:
+              max_reads: int = 0,
+              reader: RangeReader | None = None) -> int:
     """Run the standalone lidar process until SIGTERM / Ctrl-C (or ``max_reads``).
 
     Opens the rangefinder (real I2C or the mock), serves ``lidar.range`` on a
@@ -103,8 +104,11 @@ def run_lidar(*,
     LOG.info("lidar: opening rangefinder (mock=%s) -> serving %s on %s @ %.1f Hz",
              mock, _OUTPUT_TOPIC, endpoint, rate_hz)
     try:
-        reader = _build_reader(mock=mock, i2c_bus=i2c_bus,
-                               i2c_address=i2c_address)
+        # ``reader`` lets a test inject a pre-built reader (e.g. a scripted mock with
+        # a known valid+invalid mix); production passes None -> build from mock/I2C.
+        if reader is None:
+            reader = _build_reader(mock=mock, i2c_bus=i2c_bus,
+                                   i2c_address=i2c_address)
     except Exception as e:                                          # noqa: BLE001
         # NON-FATAL to the stack (mirror fc's failed-serial-open): log + exit
         # non-zero. The launcher does not take the pipeline down on a lidar fault.
