@@ -1,0 +1,11 @@
+# lidar project: downward VL53L1X rangefinder over I2C (Pi flight, cv2-free).
+#
+# Both deps are pure-Python and aarch64-wheel / no-build on the Pi5. They are also
+# folded into the top-level requirements-flight.txt (the lean flight install).
+
+# Pimoroni's VL53L1X driver (distance + range_status over I2C). Generic VL53L1X
+# register map, so it drives the TOF400F breakout too.
+pimoroni-vl53l1x>=1.1.2
+
+# Linux SMBus / I2C transport the driver talks over (/dev/i2c-1 on the Pi header).
+smbus2>=0.4.1

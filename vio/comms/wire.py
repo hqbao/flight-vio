@@ -91,6 +91,35 @@ class WireImuRaw:
 
 
 @dataclass(frozen=True)
+class WireRange:
+    """Downward-rangefinder (VL53L1X) reading for the ``lidar.range`` topic.
+
+    Pure POD -- four scalars per reading, so it rides the message itself (no
+    shared-memory ring), like :class:`WireBackendState`. The ``lidar`` process
+    publishes one per I2C read; the ``fc`` UART sender keeps the freshest and
+    BUNDLES ``range_m`` (+ its validity) into the dblink VIO-pose frame.
+
+    Fields:
+        seq: monotone reading counter (debug / drop detection).
+        ts_ns: host ``time.monotonic_ns`` capture instant of this reading (the fc
+            sender uses it for a freshness gate, not absolute time).
+        range_m: measured downward range in METRES. Meaningful ONLY when
+            ``valid == 1``; on a rejected reading it is 0.0.
+        valid: 1 iff the sensor-side gate passed (``range_status == 0`` and the
+            distance is within the configured min/max), 0 otherwise. Kept as an int
+            (not bool) so the wire stays a fixed POD and the FC's range_valid flag
+            maps 1:1.
+
+    Field ORDER is the FROZEN codec contract (see module docstring).
+    """
+
+    seq: int
+    ts_ns: int
+    range_m: float
+    valid: int
+
+
+@dataclass(frozen=True)
 class WireDepthFrame:
     """Wire form of :class:`comms.messages.DepthFrame`."""
 
@@ -456,6 +485,7 @@ TOPIC_WIRE: dict[str, type] = {
     topics.CAM_SYNC:        WireCamSync,
     topics.IMUCAM_SAMPLE:   WireImuCamPacket,
     topics.IMU_RAW:         WireImuRaw,
+    topics.LIDAR_RANGE:     WireRange,
     topics.FRAME_DEPTH:     WireDepthFrame,
     topics.FRAME_TRACKS:    WireFrameTracks,
     topics.FRAME_INLIERS:   WireFrameInliers,

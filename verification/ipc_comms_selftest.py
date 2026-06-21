@@ -46,15 +46,17 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
 ANCHOR = "imu_camera"
-# The split projects (imu_camera / depth / vio / slam / ui / launcher / ba / fc) +
-# ``netbridge`` (the cross-machine TCP bridge, which vendors comms as a further copy).
-# Every copy must be byte-identical to the anchor -- source parity is FULLY CLEAN (the
-# transitional vio-only ``BACKEND_STATE`` exception was retired when the in-vio
-# local-bus feed-forward moved to the IPC ``ba.state`` topic, present byte-identically
-# in every copy). ``fc`` is the FC UART-output project -- a pure CONSUMER that vendors
-# the full comms contract but only instantiates the client/subscriber half.
+# The split projects (imu_camera / depth / vio / slam / ui / launcher / ba / fc /
+# lidar) + ``netbridge`` (the cross-machine TCP bridge, which vendors comms as a
+# further copy). Every copy must be byte-identical to the anchor -- source parity is
+# FULLY CLEAN (the transitional vio-only ``BACKEND_STATE`` exception was retired when
+# the in-vio local-bus feed-forward moved to the IPC ``ba.state`` topic, present
+# byte-identically in every copy). ``fc`` is the FC UART-output project -- a pure
+# CONSUMER that vendors the full comms contract but only instantiates the
+# client/subscriber half. ``lidar`` is the downward-rangefinder project -- a pure
+# PRODUCER of ``lidar.range`` that likewise vendors the full contract.
 COPIES = ("imu_camera", "depth", "vio", "slam", "ui", "launcher", "ba", "fc",
-          "netbridge")
+          "lidar", "netbridge")
 
 
 def _check(cond: bool, msg: str) -> bool:
@@ -129,6 +131,8 @@ def _build_vectors(mod):
         (w.topics.FRAME_DEPTH,
          w.WireDepthFrame(seq=14, ts_ns=43, gray_left_ref=ref_l,
                           depth_ref=ref_d)),
+        (w.topics.LIDAR_RANGE,
+         w.WireRange(seq=14, ts_ns=43, range_m=0.842, valid=1)),
         (w.topics.FRAME_TRACKS,
          w.WireFrameTracks(seq=15, ts_ns=44, ids=ids, points=pts)),
         (w.topics.FRAME_INLIERS,

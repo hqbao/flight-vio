@@ -24,6 +24,10 @@ device:
       daemon thread (it must never silently starve the FC of pose) and goes out as
       an explicitly INVALID, degraded frame (pos_valid=0, degraded=1, position
       zeroed, no NaN/inf on the wire) -- never as a real fix.
+  (h) BUNDLED RANGE -- a fresh, valid downward range sets the range_valid flag bit
+      (0x08) and writes range_m into the 42-byte frame; a STALE / sensor-rejected /
+      ABSENT (no --lidar-endpoint) reading clears the bit + zeroes range_m, and the
+      pose send is unaffected either way (no second frame).
 
   .venv/bin/python -m fc.tests.fc_sil_selftest
 """
@@ -44,15 +48,15 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from fc.main import (                                            # noqa: E402
-    LatestPose, UartSender, _SIGMA_DEGRADED, _STALE_S,
+    LatestPose, LatestRange, UartSender, _RANGE_STALE_S, _SIGMA_DEGRADED, _STALE_S,
 )
 from sky.fc.dblink import (                                      # noqa: E402
-    DB_CMD_VIO_POSE, VIO_LEN,
+    DB_CMD_VIO_POSE, VIO_FLAG_RANGE_VALID, VIO_LEN,
 )
 from sky.fc.fc_earth_pose import earth_pose_from_T_world_cam    # noqa: E402
 
 #: The dblink VIO-pose payload layout (mirrors sky.fc.dblink._PAYLOAD_STRUCT).
-_POSE_STRUCT = struct.Struct("<8fIBB")
+_POSE_STRUCT = struct.Struct("<8fIBBf")
 _FLAG_DEGRADED = 1 << 2
 
 
@@ -190,9 +194,9 @@ def test_wire_and_degraded() -> bool:
     ok = True
     for msg_id, payload, cksum in frames[:2]:
         ok &= (msg_id == DB_CMD_VIO_POSE == 0x0C)
-        ok &= (len(payload) == VIO_LEN == 38)
+        ok &= (len(payload) == VIO_LEN == 42)
         ok &= (cksum == _checksum(msg_id, payload))
-    _check(ok, "CMD==0x0C, LEN==38, checksum correct on both frames")
+    _check(ok, "CMD==0x0C, LEN==42, checksum correct on both frames")
 
     pos_ned_expected, _, _ = earth_pose_from_T_world_cam(_T(p=pos_opt))
     g0 = _POSE_STRUCT.unpack(frames[0][1])
@@ -472,6 +476,88 @@ def test_nonfinite_pose_survives() -> bool:
     return True
 
 
+def test_range_bundle() -> bool:
+    print("[h] BUNDLED downward range: fresh/valid -> 0x08 + range_m; stale/absent -> clear")
+    master, slave = _open_raw_pty()
+    os.set_blocking(master, False)
+
+    latest = LatestPose()
+    latest_range = LatestRange()
+    sender = UartSender(latest, _FdSerial(slave), rate_hz=50.0,
+                        latest_range=latest_range)
+
+    base = _T(p=(0.0, 0.0, 1.0))
+
+    def _send_and_unpack() -> tuple:
+        """One send_once -> unpack the freshest frame off the pty."""
+        sent = sender.send_once()
+        _check(sent is True, "frame sent")
+        time.sleep(0.01)
+        buf = b""
+        try:
+            buf = os.read(master, 65536)
+        except BlockingIOError:
+            pass
+        frames, _ = _parse_db_stream(buf)
+        _check(len(frames) >= 1, "at least one frame on the wire")
+        return _POSE_STRUCT.unpack(frames[-1][1])
+
+    # (1) A FRESH, VALID range -> bit3 set + range_m carried.
+    latest.set(_FakePose(base, info={"ok": True, "pos_sigma_m": 0.1}),
+               time.monotonic())
+    latest_range.set(0.842, 1, time.monotonic())
+    g = _send_and_unpack()
+    _check(bool(g[10] & VIO_FLAG_RANGE_VALID),
+           "fresh valid range -> flags bit3 (0x08) SET")
+    rng = struct.unpack("<f", struct.pack("<f", 0.842))[0]
+    _check(abs(g[11] - rng) < 1e-6, f"range_m carried on the wire ({g[11]:.3f} m)")
+
+    # (2) A STALE range (older than the range-stale window) -> bit3 clear + 0.0.
+    latest.set(_FakePose(base, info={"ok": True, "pos_sigma_m": 0.1}),
+               time.monotonic())
+    latest_range.set(0.842, 1, time.monotonic() - (_RANGE_STALE_S + 0.1))
+    g = _send_and_unpack()
+    _check(not (g[10] & VIO_FLAG_RANGE_VALID),
+           "stale range -> flags bit3 CLEAR (FC sees range_valid=0)")
+    _check(g[11] == 0.0, "stale range -> range_m forced 0.0")
+
+    # (3) A sensor-REJECTED range (valid=0 from the lidar gate) -> bit3 clear.
+    latest.set(_FakePose(base, info={"ok": True, "pos_sigma_m": 0.1}),
+               time.monotonic())
+    latest_range.set(5.0, 0, time.monotonic())     # fresh but valid=0
+    g = _send_and_unpack()
+    _check(not (g[10] & VIO_FLAG_RANGE_VALID),
+           "sensor-rejected range (valid=0) -> flags bit3 CLEAR")
+    _check(g[11] == 0.0, "rejected range -> range_m 0.0")
+
+    os.close(master)
+    os.close(slave)
+
+    # (4) NO range holder wired at all (the --no-lidar / lidar-absent case) -> the
+    # sender must still send, with bit3 clear + range 0.0 (the pose send unaffected).
+    master2, slave2 = _open_raw_pty()
+    os.set_blocking(master2, False)
+    latest2 = LatestPose()
+    sender2 = UartSender(latest2, _FdSerial(slave2), rate_hz=50.0)  # no latest_range
+    latest2.set(_FakePose(base, info={"ok": True, "pos_sigma_m": 0.1}),
+                time.monotonic())
+    _check(sender2.send_once() is True, "no-lidar: frame still sent (pose unaffected)")
+    time.sleep(0.01)
+    try:
+        buf2 = os.read(master2, 65536)
+    except BlockingIOError:
+        buf2 = b""
+    frames2, _ = _parse_db_stream(buf2)
+    g2 = _POSE_STRUCT.unpack(frames2[-1][1])
+    _check(not (g2[10] & VIO_FLAG_RANGE_VALID) and g2[11] == 0.0,
+           "no-lidar: bit3 clear + range_m 0.0 (range_valid=0)")
+    _check(sender2.n_range_valid == 0,
+           "no-lidar: sender counted zero valid ranges")
+    os.close(master2)
+    os.close(slave2)
+    return True
+
+
 def main() -> int:
     print("fc_sil_selftest -- pty-loopback SIL for the dblink UART sender")
     results = {
@@ -482,14 +568,16 @@ def main() -> int:
         "stale not sent":        test_stale_not_sent(),
         "latest-wins/load":      test_latest_wins_under_load(),
         "non-finite survives":   test_nonfinite_pose_survives(),
+        "range bundle":          test_range_bundle(),
     }
     print("\n" + "=" * 64)
     all_ok = all(results.values())
     for name, ok in results.items():
         print(f"  [{'ok' if ok else 'FAIL'}] {name}")
     if all_ok:
-        print("\nPASS -- fc UART sender: well-formed dblink frames, age tracking, "
-              "reset-counter edges, inflated-sigma floor, non-blocking latest-wins.")
+        print("\nPASS -- fc UART sender: well-formed 42-byte dblink frames, age "
+              "tracking, reset-counter edges, inflated-sigma floor, non-blocking "
+              "latest-wins, BUNDLED range (0x08 set/clear; stale/absent -> 0).")
         return 0
     print("\nFAIL -- see the [FAIL] lines above.")
     return 1

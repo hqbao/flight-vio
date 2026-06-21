@@ -62,9 +62,15 @@ flight-vio/
                 (VO / VIO / VIO-BA / SLAM-corrected VIO / SLAM) + per-line toggles
                 + Restart, plus Visualize / Calibration windows fed over IPC.
                 main.py = the UI process.
-  launcher/     process lifecycle only: spawns imu_camera + vio + ba + slam
-                (background) and ui (foreground); restart loop + orphan SHM/socket
-                cleanup. --no-ba / --no-slam are spawn gates.
+  lidar/        OPTIONAL downward rangefinder process: reads a VL53L1X (TOF400F)
+                over I2C and publishes lidar.range on its own oak.lidar endpoint.
+                A PURE producer (no capture/vio dependency, no rings). The fc sender
+                BUNDLES the range into the dblink VIO-pose frame (NOT a separate
+                channel). cv2-free (pimoroni-vl53l1x + smbus2). See lidar/README.md.
+                publishes: lidar.range (WireRange: seq, ts_ns, range_m, valid)
+  launcher/     process lifecycle only: spawns imu_camera + vio + ba + slam (+ lidar
+                + fc when wired) (background) and ui (foreground); restart loop +
+                orphan SHM/socket cleanup. --no-ba / --no-slam / --no-lidar are spawn gates.
                 ./run.sh (--proc) -> python -m launcher.main
   verification/ in-process byte-parity oracle (vs the frozen baseline_metrics.json)
                 + cross-copy comms parity gate + selftests.
@@ -198,6 +204,19 @@ capture process's `imu_cam` thread, so the launcher never spawns a depth process
   is inflated and the FC ignores VIO position. `--fc-rate` (Hz, clamped `[10,50]`) and
   `--fc-mount` (`R_body_cam` extrinsic) tune it. Full contract, payload, and the `age`
   time model: [fc/README.md](fc/README.md).
+- **Downward rangefinder (`lidar`) — bundled into the FC link.** When `--fc` is set the
+  launcher ALSO spawns the consumer-free **`lidar`** process (after `slam`, before `fc`):
+  it reads a downward **VL53L1X** (a TOF400F breakout) over **I2C** (default
+  `/dev/i2c-1`, address `0x29`) and publishes the gated AGL range on `lidar.range`. `fc`
+  subscribes it and **bundles** `range_m` (+ a `range_valid` flag) **into the dblink
+  VIO-pose frame** — it is NOT a separate dblink channel; the payload grew from 38→**42 B**
+  (`'<8fIBBf'`, `range_m` @ offset 38, `VIO_FLAG_RANGE_VALID=0x08`). Two gates: the sensor
+  side (`range_status==0` AND 30–4000 mm) and an fc-side 200 ms freshness gate; a stale /
+  rejected / absent reading sends `range_valid=0`. **`--no-lidar`** skips the process (mirror
+  `--no-slam`) for a rig with no rangefinder; **`--lidar-mock`** runs the hardware-free
+  reader for a deviceless dry-run. Before flight run **`python -m lidar.tools.characterize`**
+  on the ground to set the FC `disarm_range`. Full I2C wiring + bring-up:
+  [lidar/README.md](lidar/README.md).
 - **Remote UI over WiFi (`netbridge`).** With `--forward HOST:PORT` the launcher
   ALSO spawns `netbridge.forward` on the Pi (one more managed flight subprocess) to
   bridge the local IPC graph to TCP; on the Mac `./deploy/pi-ui.sh --connect
@@ -361,8 +380,10 @@ That fixes BasaltVIO AND the from-scratch stack, since both read the device EEPR
 python3.13 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 # Lean FLIGHT install for the Pi -- NO OpenCV (numpy + numba + pyserial +
-# depthai). The whole imu_camera -> vio -> ba -> slam runtime runs with cv2
-# uninstalled; proven by `python -m verification.cv2_absent_flight_litmus`:
+# depthai + pimoroni-vl53l1x + smbus2 for the downward rangefinder, both
+# pure-Python/cv2-free). The whole imu_camera -> vio -> ba -> slam (+ lidar)
+# runtime runs with cv2 uninstalled; proven by
+# `python -m verification.cv2_absent_flight_litmus`:
 .venv/bin/pip install -r requirements-flight.txt
 ```
 
@@ -426,8 +447,9 @@ flowchart LR
 | `ba` | windowed BA — loose `WindowedBAMap` / tight `WindowedVIOMap` (`--tight`) | `keyframe`, `calib.bundle` (from VIO) | `pose.refined`, `ba.window` (`--ba-window`, loose-only), `ba.state` (`--tight` bias) |
 | `slam` | ORB loop closure + SE(3) pose-graph (the SLAM map) | `keyframe`, `calib.bundle` (from VIO) | `loop.correction`, `slam.map` (live-only) |
 | `ui` | Qt `MainWindow`, one 5-line `Viewer3D`, Visualize/Calibration windows | `pose.odom`/`pose.vo`/`pose.refined`/`ba.window`/`calib.bundle` (vio); `slam.map`/`calib.bundle` (slam); on-demand `imu.raw`/`imucam.sample`/`frame.depth` (capture) + `frame.tracks`/`frame.inliers`/`keyframe` (vio) | — (sink) |
-| `fc` | drone-FC UART output (`--fc`): pose → NED → **dblink** `DB_CMD_VIO_POSE` over serial; consumer-only sink (no server). See [fc/README.md](fc/README.md) | `pose.odom`, `calib.bundle` (from VIO) | — (writes UART, not IPC) |
-| `launcher` | process lifecycle (spawn / restart loop / orphan cleanup; `--no-ba`/`--no-slam` spawn gates) | — | — |
+| `fc` | drone-FC UART output (`--fc`): pose → NED → **dblink** `DB_CMD_VIO_POSE` over serial (with the bundled downward `range_m`); consumer-only sink (no server). See [fc/README.md](fc/README.md) | `pose.odom`, `calib.bundle` (from VIO); `lidar.range` (from lidar, when wired) | — (writes UART, not IPC) |
+| `lidar` | OPTIONAL downward rangefinder (`--fc`, unless `--no-lidar`): VL53L1X/TOF400F over **I2C** → `lidar.range`; pure producer (no rings). The `fc` sender bundles it into the VIO-pose frame. See [lidar/README.md](lidar/README.md) | — | `lidar.range` |
+| `launcher` | process lifecycle (spawn / restart loop / orphan cleanup; `--no-ba`/`--no-slam`/`--no-lidar` spawn gates) | — | — |
 | `depth` | standalone SGM depth-as-a-process harness | `cam.sync`, `calib.bundle` (capture) | `frame.depth` |
 
 The architecture, endpoints, invariants, and byte-parity story are in
@@ -811,6 +833,10 @@ README lists its own; the headline gates:
 .venv/bin/python -m slam.tests.loop_closure_selftest            # SE(3) pose graph + loop closure
 .venv/bin/python -m depth.tests.stereo_sgm_selftest             # SGM dense depth vs chip depth
 
+# downward rangefinder (no I2C device): gate (incl. range_status!=0 reject) +
+# mm->m + run_lidar publishes WireRange round-tripping the lidar.range contract
+.venv/bin/python -m lidar.tests.lidar_mock_selftest
+
 # multi-process smokes over a gold session (replay; no device)
 .venv/bin/python -m slam.tests.proc3_smoke_selftest \
     --session sessions/gold/lab_loop_30s --expect-loops 4       # imu_camera + vio + slam
@@ -936,6 +962,12 @@ clobber each other, and `imu_camera/device/camera_calib_store.py`
       `reset_counter` safety floors — see [fc/README.md](fc/README.md). The TX side is
       built + bench-verified; the **FC-side dblink receiver + EKF fusion** (in
       `../flight-controller`) and **HIL on the Pi** are **not done yet**
+- [~] Downward rangefinder — the **`lidar`** process reads a VL53L1X (TOF400F) over
+      **I2C** and publishes `lidar.range`; the `fc` sender **bundles** the gated AGL
+      range into the dblink VIO-pose frame (payload 38→**42 B** `'<8fIBBf'`, `range_m`
+      @ offset 38 + the `range_valid` flag) — NOT a separate channel. `--no-lidar`
+      skips it; `lidar.tools.characterize` sets the FC `disarm_range`. Mock-selftest
+      verified; **HIL on a real TOF400F is pending** — see [lidar/README.md](lidar/README.md)
 - [x] Tracking-lost UI badge: two-tier debounced master-warning badge on the 3D
       viewer + drone-marker recolour, driven by `pose.tracking_ok` /
       `pose.inertial_dr` — RED `⚠ TRACKING LOST` (no inertial fallback) vs AMBER

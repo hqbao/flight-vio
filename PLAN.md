@@ -419,3 +419,56 @@ structure (latest-wins, UART-off-callback, safety floors, reset_counter) — onl
   + reset edge + latest-wins-under-load + degraded floor), `./run.sh` replay `--fc <pty>` + offscreen UI.
 - **(7) T3 fan-out before in-flight send:** safety + security + math reviewers on the diff. (8) docs.
 - **OPEN (user):** final `DB_CMD_VIO_POSE` value (FC header); who writes the FC-side receiver+EKF fusion.
+
+---
+
+# PLAN — Stage 4b (Pi side): downward-lidar read + BUNDLE into VIO pose · Tier T3
+
+Task: VL53L1X downward rangefinder over I2C on the Pi, published as `lidar.range`,
+BUNDLED into the EXISTING `db_vio_pose_t` (38B -> 42B) on the fc/ UART sender — NOT a
+separate dblink message. The FC side (flight-controller repo) is DONE and expects the
+range INSIDE the VIO message. Supersedes the leftover SEPARATE-channel lidar attempt
+(`DB_CMD_LIDAR_RANGE=0x0E`, `pack_lidar_range`) — DELETED here.
+
+LOCKED WIRE (from the FC, matched byte-for-byte): `db_vio_pose_t` = `'<8fIBBf'` = 42 B.
+8×f32 [pos_n,pos_e,pos_d,q_w,q_x,q_y,q_z,pos_sigma_m], u32 age_us, u8 reset_counter,
+u8 flags, f32 range_m @ offset 38. CMD = 0x0C. VIO_FLAG_RANGE_VALID = 0x08.
+
+## Steps / status
+1. `sky/fc/dblink.py`: 38->42B `pack_vio_pose` (+`range_m`,+`range_valid` -> 0x08 fold);
+   DELETE `DB_CMD_LIDAR_RANGE`/`pack_lidar_range`/`_LIDAR_STRUCT`/`LIDAR_LEN`. [DONE]
+2. comms contract: add `LIDAR_RANGE` topic + `WireRange` POD + registry entry to ALL
+   copies (anchor `imu_camera` + depth/vio/slam/ui/launcher/netbridge/ba/fc) and the
+   NEW `lidar/comms` (`cp -r imu_camera/comms`). diff -r stays EMPTY. [DONE]
+3. `lidar/` project: `io/vl53l1x_reader.py` (real I2C via pimoroni-vl53l1x+smbus2 +
+   MOCK), `main.py` (read->publish `lidar.range`, bridge to `oak.lidar`),
+   `requirements.txt`, `tools/characterize.py` (I2C, prints FC `disarm_range`). [DONE]
+4. `fc/main.py`: `LatestRange` 1-slot holder + `lidar.range` client + bundle range into
+   `UartSender.send_once()`; freshness-gated. NO second frame. [DONE]
+5. `launcher/main.py`: `build_lidar_args` + `--no-lidar` spawn gate + `oak.lidar`
+   endpoint + spawn lidar (after slam, before fc). [DONE]
+6. `requirements-flight.txt`: + `pimoroni-vl53l1x` + `smbus2` (after pyserial). [DONE]
+7. selftests: `fc_dblink_selftest` + `fc_sil_selftest` -> 42B + 0x08; lidar mock
+   selftest; add `"lidar"` to `ipc_comms_selftest` COPIES + a `WireRange` vector. [DONE]
+
+## Gates (all run GREEN 2026-06-21)
+- fc_dblink_selftest PASS @42B + 0x08 set/clear ........... [GREEN]
+- fc_sil_selftest PASS @42B (range fold; stale/absent->0) . [GREEN]
+- ipc_comms_selftest (10 copies byte-identical + WireRange) [GREEN]
+- lidar mock selftest (gate status!=0->0; publish RT) ..... [GREEN]
+- grep DB_CMD_LIDAR_RANGE/pack_lidar_range/_LIDAR_STRUCT=0 . [GREEN]
+- grep cv2/opencv in lidar/ = 0 (+cv2-blocked import OK) .. [GREEN]
+- oracle_replay_selftest (gap=0, unaffected) ............. [GREEN]
+- launcher build_lidar_args / --no-lidar gate ............ [GREEN]
+- FC wire byte-match: Pi pack <-> FC '<8fIBBf' (CMD 0x0C,
+  42B, range@38, flag 0x08) ............................. [GREEN]
+- real lidar.main subprocess -> fc-style client reads
+  lidar.range (valid+invalid gated) ..................... [GREEN]
+- depth proc smoke (comms copies still functional) ....... [GREEN]
+
+## HIL-unknown (flag to user)
+- TOF400F exact I2C address (default 0x29) + I2C mode is HIL-unknown (user's Pi +
+  sensor). Reader is SWAPPABLE + has a MOCK for host tests; I2C errors -> valid=0,
+  never crash. `--characterize` prints the recommended FC `disarm_range`.
+
+## Blockers: none.

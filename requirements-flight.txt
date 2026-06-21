@@ -23,6 +23,12 @@ numba>=0.61
 # IMU serial transport.
 pyserial>=3.5
 
+# Downward rangefinder (VL53L1X over I2C) for the `lidar` process -- the AGL range
+# the fc sender bundles into the dblink VIO-pose frame. Both pure-Python (aarch64
+# wheel / no build on the Pi5), cv2-free. Omit if the Pi has no rangefinder.
+pimoroni-vl53l1x>=1.1.2
+smbus2>=0.4.1
+
 # OAK-D / camera device driver -- needed for `--live` on the actual board (the
 # real ToF/stereo source). Omit it if the Pi only ever replays recorded sessions.
 # PIN <3.7: depthai 3.7.x ships a device-firmware regression in the MIPI camera

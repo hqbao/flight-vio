@@ -92,12 +92,24 @@ Same as SLAM -- a dedicated calib client blocks until the retained
 ``calib.bundle`` arrives on the VIO endpoint. Receiving it proves VIO is up and
 publishing; ``fc`` does not need the intrinsics themselves (it only sends pose).
 
+Bundled downward range (optional)
+---------------------------------
+When ``--lidar-endpoint`` is given, ``fc`` ALSO opens a read-only client on the
+``lidar`` process's endpoint, subscribes ``lidar.range``, and BUNDLES the freshest
+gated reading into each VIO-pose frame (the trailing ``range_m`` + the
+``range_valid`` flag bit in :mod:`sky.fc.dblink` -- it is NOT a separate dblink
+message). This is best-effort + freshness-gated: a stale (> ``_RANGE_STALE_S``),
+sensor-rejected, or absent reading sends ``range_valid=0``, and a missing / down
+lidar process never blocks or delays the pose link (no calib barrier on the lidar
+endpoint). So the VIO send is unaffected whether or not the rangefinder is present.
+
 CONSUMER-ONLY: ``fc`` opens NO IPC server and publishes nothing. It is a pure sink.
 
 Run::
 
     python -m fc.main --port /dev/ttyAMA0
     python -m fc.main --vio-endpoint oak.vio.test --port /dev/ttyUSB0 --baud 921600
+    python -m fc.main --port /dev/ttyAMA0 --lidar-endpoint oak.lidar   # +range
 """
 from __future__ import annotations
 
@@ -122,12 +134,23 @@ from sky.fc.fc_earth_pose import earth_pose_from_T_world_cam       # noqa: E402
 LOG = logging.getLogger("fc.main")
 
 DEFAULT_VIO_ENDPOINT = "oak.vio"
+#: Default IPC endpoint the ``lidar`` process serves ``lidar.range`` on. The fc
+#: sender opens a read-only client here (when --lidar-endpoint is given) to bundle
+#: the downward range into the VIO-pose frame.
+DEFAULT_LIDAR_ENDPOINT = "oak.lidar"
 DEFAULT_BAUD = 115200
 DEFAULT_RATE_HZ = 30.0
 
 #: A stored pose older than this (seconds) is STALE -> not sent (never fuse a
 #: stale fix as fresh). Matches the propagate_imu sensor-gap guard's 250 ms.
 _STALE_S = 0.25
+#: A stored downward-range reading older than this (seconds) is treated as STALE ->
+#: the VIO-pose frame goes out with range_valid=0 (the FC must not act on a stale
+#: AGL range). The lidar process reads at ~50 Hz, so 200 ms is several missed reads
+#: -- generous enough to ride a scheduling hiccup, tight enough to drop a dead
+#: sensor. The range rides the pose frame; this only gates the range field, never
+#: the pose itself (a stale / absent range never blocks the pose send).
+_RANGE_STALE_S = 0.20
 #: UART send cadence clamp (Hz). Below 10 the FC fusion starves; above 50 a slow
 #: link (115200 baud ~= one 46-byte dblink frame per ~4 ms) can't keep up.
 _RATE_MIN_HZ, _RATE_MAX_HZ = 10.0, 50.0
@@ -203,6 +226,34 @@ class LatestPose:
             return self._wm, self._recv_t
 
 
+class LatestRange:
+    """A 1-slot, lock-guarded holder for the freshest downward-range reading.
+
+    Mirrors :class:`LatestPose`: the lidar IPC recv callback ``set()``s
+    ``(range_m, valid, recv_monotonic)``; the UART thread ``get()``s the snapshot
+    and applies its own freshness gate (against the local ``recv_t``, NOT the
+    reading's device ts -- no cross-process clock assumption). Absent / never-set ->
+    ``get()`` returns ``valid=0`` so a missing lidar process simply yields no range.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._range_m = 0.0
+        self._valid = 0
+        self._recv_t = 0.0
+
+    def set(self, range_m: float, valid: int, recv_t: float) -> None:
+        with self._lock:
+            self._range_m = float(range_m)
+            self._valid = int(valid)
+            self._recv_t = recv_t
+
+    def get(self):
+        """Return ``(range_m, valid, recv_monotonic)`` -- a cheap snapshot."""
+        with self._lock:
+            return self._range_m, self._valid, self._recv_t
+
+
 def _is_degraded(info: dict | None) -> bool:
     """True iff the fix must NOT be trusted at face value.
 
@@ -266,9 +317,11 @@ class UartSender(threading.Thread):
     """
 
     def __init__(self, latest: LatestPose, ser, *, rate_hz: float = DEFAULT_RATE_HZ,
-                 mount_extrinsic: np.ndarray | None = None) -> None:
+                 mount_extrinsic: np.ndarray | None = None,
+                 latest_range: "LatestRange | None" = None) -> None:
         super().__init__(name="fc.uart_sender", daemon=True)
         self._latest = latest
+        self._latest_range = latest_range
         self._ser = ser
         self._period = 1.0 / _clamp_rate(rate_hz)
         self._R_body_cam = mount_extrinsic
@@ -286,6 +339,7 @@ class UartSender(threading.Thread):
         self.n_stale = 0
         self.n_write_err = 0
         self.n_nonfinite = 0   # frames with a non-finite pose -> sent INVALID
+        self.n_range_valid = 0  # frames that carried a fresh, valid downward range
 
     def stop(self) -> None:
         self._stop.set()
@@ -366,6 +420,24 @@ class UartSender(threading.Thread):
         age_s = send_t - (ts_s + self._o_est)
         return int(max(0.0, age_s) * 1e6)
 
+    # ---- downward range (bundled into the VIO frame) ----------------------- #
+    def _range_for(self, now: float) -> tuple[float, bool]:
+        """The (range_m, range_valid) to BUNDLE into this frame's VIO-pose payload.
+
+        Reads the latest downward-range reading and gates it on BOTH the sensor's
+        own validity flag AND local freshness (``now - recv_t <= _RANGE_STALE_S``):
+        a stale or sensor-rejected reading -> ``(0.0, False)`` so the FC sees
+        range_valid=0. When no lidar holder is wired (no ``--lidar-endpoint`` / the
+        lidar process is absent) this is always ``(0.0, False)`` -- the range field
+        is simply never advertised valid, and the pose send is unaffected.
+        """
+        if self._latest_range is None:
+            return 0.0, False
+        range_m, valid, recv_t = self._latest_range.get()
+        if not valid or (now - recv_t) > _RANGE_STALE_S:
+            return 0.0, False
+        return float(range_m), True
+
     # ---- the one-frame send (isolated so the SIL test can call it) --------- #
     def send_once(self) -> bool:
         """Read the latest pose; if fresh, convert + pack + write ONE dblink frame.
@@ -424,11 +496,16 @@ class UartSender(threading.Thread):
             if self.n_nonfinite <= 3 or self.n_nonfinite % 100 == 0:
                 LOG.warning("fc: NON-FINITE quaternion -> identity + att_valid "
                             "cleared (count=%d)", self.n_nonfinite)
+        # BUNDLE the downward range into THIS frame (NOT a second frame): grab the
+        # freshest gated reading; a stale / rejected / absent one -> range_valid=0.
+        # The packer owns the range_valid flag bit + zeroes the field when invalid.
+        range_m, range_valid = self._range_for(now)
         try:
             # pack is INSIDE the try: the leaf is engineered not to raise, but an
             # unforeseen error here must never escape run() and kill the thread.
             frame = pack_vio_pose(pos_ned, q_ned, sigma, age_us,
-                                  self.reset_counter, flags)
+                                  self.reset_counter, flags,
+                                  range_m=range_m, range_valid=range_valid)
             self._ser.write(frame)
         except Exception as e:                                      # noqa: BLE001
             self.n_write_err += 1
@@ -437,6 +514,8 @@ class UartSender(threading.Thread):
                 LOG.warning("fc: pack/serial write failed (%s); continuing", e)
             return False
         self.n_sent += 1
+        if range_valid:
+            self.n_range_valid += 1
         return True
 
     def run(self) -> None:
@@ -487,6 +566,7 @@ def run_fc(*,
            baud: int = DEFAULT_BAUD,
            rate_hz: float = DEFAULT_RATE_HZ,
            mount_extrinsic: np.ndarray | None = None,
+           lidar_endpoint: str | None = None,
            calib_timeout_s: float = 30.0) -> int:
     """Run the FC UART-output process until END / SIGTERM / Ctrl-C.
 
@@ -495,6 +575,14 @@ def run_fc(*,
     ONLY: no IPC server, no publish), and runs the latest-wins :class:`UartSender`.
     A failed serial open returns non-zero (the launcher treats that as non-fatal
     -- the rest of the stack keeps running).
+
+    ``lidar_endpoint`` (optional): when given, also open a read-only client on the
+    ``lidar`` process's endpoint, subscribe ``lidar.range``, and feed the freshest
+    reading into the sender so the downward range is BUNDLED into each VIO-pose
+    frame. The lidar client is BEST-EFFORT + non-blocking: if the lidar process is
+    absent / never comes up, the sender simply emits range_valid=0 and the pose
+    send is completely unaffected (no calib barrier on the lidar endpoint -- we do
+    NOT block the FC link on the rangefinder).
     """
     import serial  # lazy: only the fc process needs pyserial
 
@@ -536,8 +624,35 @@ def run_fc(*,
     in_client = IPCPubSub(vio_endpoint, role="client")
     in_client.subscribe(topics.POSE_ODOM, _on_pose)
 
+    # Optional downward-range client (best-effort): subscribe lidar.range on the
+    # lidar endpoint and store the freshest reading, latest-wins, store-and-return.
+    # NOT a calib-barriered dependency -- a missing lidar process must never block
+    # or delay the FC link; the sender just sends range_valid=0.
+    latest_range: LatestRange | None = None
+    lidar_client = None
+    if lidar_endpoint:
+        latest_range = LatestRange()
+
+        def _on_range(wm) -> None:
+            # CONSUMER callback: store-and-return ONLY. A WireRange carries
+            # (range_m, valid); END just stops feeding (the pose path owns the run
+            # lifetime). NEVER write serial here.
+            if wm is END or isinstance(wm, WireEnd):
+                return
+            latest_range.set(getattr(wm, "range_m", 0.0),
+                             getattr(wm, "valid", 0), time.monotonic())
+
+        # connect_timeout_s is short + non-fatal: if the lidar endpoint never comes
+        # up the client keeps retrying in the background; the sender meanwhile sends
+        # range_valid=0. We do NOT block run_fc on it.
+        lidar_client = IPCPubSub(lidar_endpoint, role="client")
+        lidar_client.subscribe(topics.LIDAR_RANGE, _on_range)
+        LOG.info("fc: bundling downward range from %s (lidar.range)",
+                 lidar_endpoint)
+
     sender = UartSender(latest, ser, rate_hz=rate_hz,
-                        mount_extrinsic=mount_extrinsic)
+                        mount_extrinsic=mount_extrinsic,
+                        latest_range=latest_range)
 
     stop = [False]
 
@@ -550,6 +665,16 @@ def run_fc(*,
 
     sender.start()
     in_client.start()
+    if lidar_client is not None:
+        # Best-effort: start the range client AFTER the pose client so a slow lidar
+        # connect can never delay the pose link coming up. Its own recv thread
+        # retries the connect; a failure here is swallowed (range stays invalid).
+        try:
+            lidar_client.start()
+        except Exception as e:                                      # noqa: BLE001
+            LOG.warning("fc: lidar.range client could not start (%s); sending "
+                        "range_valid=0", e)
+            lidar_client = None
     LOG.info("fc[%s] streaming dblink DB_CMD_VIO_POSE -> %s (quaternion attitude; "
              "RELATIVE heading, no mag)", vio_endpoint, port)
 
@@ -572,13 +697,19 @@ def run_fc(*,
             in_client.stop()
         except Exception:                                          # noqa: BLE001
             pass
+        if lidar_client is not None:
+            try:
+                lidar_client.stop()
+            except Exception:                                      # noqa: BLE001
+                pass
         try:
             ser.close()
         except Exception:                                          # noqa: BLE001
             pass
         LOG.info("fc: shutdown complete (sent=%d stale=%d write_err=%d "
-                 "nonfinite=%d reset_counter=%d)", sender.n_sent, sender.n_stale,
-                 sender.n_write_err, sender.n_nonfinite, sender.reset_counter)
+                 "nonfinite=%d range_valid=%d reset_counter=%d)", sender.n_sent,
+                 sender.n_stale, sender.n_write_err, sender.n_nonfinite,
+                 sender.n_range_valid, sender.reset_counter)
     return 0
 
 
@@ -616,6 +747,13 @@ def main() -> int:
                          "row-major values (OpenCV-camera body -> FRD airframe body, "
                          "relative to the nominal forward mount). Default = identity "
                          "(camera faces forward). Heading is RELATIVE (no mag).")
+    ap.add_argument("--lidar-endpoint", default=None,
+                    help="optional: the lidar process's IPC endpoint (e.g. "
+                         f"{DEFAULT_LIDAR_ENDPOINT!r}). When given, subscribe "
+                         "lidar.range and BUNDLE the downward range into each "
+                         "dblink VIO-pose frame. Best-effort: a missing lidar "
+                         "process simply yields range_valid=0 (the pose send is "
+                         "unaffected). Omit to never bundle a range.")
     ap.add_argument("--calib-timeout", type=float, default=30.0,
                     help="seconds to wait for the calib.bundle on boot")
     args = ap.parse_args()
@@ -626,6 +764,7 @@ def main() -> int:
         baud=args.baud,
         rate_hz=args.rate,
         mount_extrinsic=_parse_mount(args.mount),
+        lidar_endpoint=args.lidar_endpoint,
         calib_timeout_s=args.calib_timeout,
     )
 

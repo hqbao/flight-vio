@@ -216,9 +216,10 @@ missing port logs + exits without taking the stack down) and independent of `--n
 ./run.sh --no-ui --vl53l9cx --direct --fc /dev/ttyUSB0:921600 --fc-rate 50
 ```
 
-**The full wire contract — dblink frame, the 38-byte payload (fields/units/ranges),
-the `reset_counter` edges, the safety floors, and the `age` time model (and why the
-FC's constant `C` must absorb the pipeline-latency floor) — lives in
+**The full wire contract — dblink frame, the 42-byte payload (fields/units/ranges,
+incl. the bundled downward `range_m` + the `range_valid` flag), the `reset_counter`
+edges, the safety floors, and the `age` time model (and why the FC's constant `C` must
+absorb the pipeline-latency floor) — lives in
 [fc/README.md](../fc/README.md).** Two flight-critical points:
 
 - **`pos_sigma_m` is `--direct`-only.** On the loose default path it is absent, so

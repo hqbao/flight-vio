@@ -357,6 +357,28 @@ def build_ba_args(args, vio_ep: str, ba_ep: str) -> list[str]:
     return ba_args
 
 
+def build_lidar_args(args, lidar_ep: str) -> list[str]:
+    """Build the ``lidar.main`` argv from the parsed launcher ``args`` (pure).
+
+    The ``lidar`` process is a PURE PRODUCER (no capture / vio dependency): it just
+    reads the downward VL53L1X over I2C and serves ``lidar.range`` on its own
+    endpoint (``--endpoint``). ``--lidar-rate`` sets the I2C read cadence;
+    ``--lidar-i2c-bus`` / ``--lidar-i2c-address`` override the (HIL-unknown) wiring;
+    ``--lidar-mock`` runs the hardware-free reader (host dry-run). Forwarded ONLY
+    when the operator overrode the default so the common argv stays minimal.
+    """
+    lidar_args: list[str] = ["--endpoint", lidar_ep]
+    if getattr(args, "lidar_rate", 0.0):
+        lidar_args += ["--rate", str(args.lidar_rate)]
+    if getattr(args, "lidar_i2c_bus", None) is not None:
+        lidar_args += ["--i2c-bus", str(args.lidar_i2c_bus)]
+    if getattr(args, "lidar_i2c_address", None):
+        lidar_args += ["--i2c-address", str(args.lidar_i2c_address)]
+    if getattr(args, "lidar_mock", False):
+        lidar_args += ["--mock"]
+    return lidar_args
+
+
 # --------------------------------------------------------------------------- #
 def _numba_thread_caps(cap: bool) -> dict[str, int]:
     """Per-role numba thread budget when ``--cap-numba-threads`` is set.
@@ -593,7 +615,8 @@ def parse_fc_port(s: str, *, default_baud: int = 115200) -> tuple[str, int]:
     return s, int(default_baud)
 
 
-def build_fc_args(args, vio_ep: str) -> list[str]:
+def build_fc_args(args, vio_ep: str, lidar_ep: str | None = None,
+                  lidar_spawned: bool = False) -> list[str]:
     """Build the ``fc.main`` argv from the parsed launcher ``args`` (pure).
 
     Mirrors :func:`build_forward_args`: ``fc`` is a pure CONSUMER of VIO's
@@ -602,9 +625,17 @@ def build_fc_args(args, vio_ep: str) -> list[str]:
     over the serial ``--port`` at ``--baud``. ``args.fc`` is ``PORT[:BAUD]`` (parsed
     by :func:`parse_fc_port`); the optional ``args.fc_mount`` forwards the
     ``R_body_cam`` mount extrinsic. No rings, no server -- ``fc`` opens neither.
+
+    ``lidar_ep`` / ``lidar_spawned``: when the launcher spawns the ``lidar`` process
+    (NOT ``--no-lidar``), pass ``--lidar-endpoint lidar_ep`` so ``fc`` subscribes
+    ``lidar.range`` and BUNDLES the downward range into each VIO-pose frame. Under
+    ``--no-lidar`` no lidar is spawned, so ``--lidar-endpoint`` is omitted and ``fc``
+    sends range_valid=0 -- the pose send is unaffected either way.
     """
     port, baud = parse_fc_port(args.fc)
     fc_args = ["--vio-endpoint", vio_ep, "--port", port, "--baud", str(baud)]
+    if lidar_spawned and lidar_ep:
+        fc_args += ["--lidar-endpoint", lidar_ep]
     if getattr(args, "fc_rate", 0.0):
         fc_args += ["--rate", str(args.fc_rate)]
     if getattr(args, "fc_mount", None):
@@ -729,6 +760,25 @@ def main() -> int:
                          "pose.odom; bounded-on-revisit drift is forgone). For a "
                          "one-way flight that never revisits. Pairs with --no-ba "
                          "for the lightest stack.")
+    ap.add_argument("--no-lidar", action="store_true",
+                    help="don't spawn the lidar process (the downward VL53L1X "
+                         "rangefinder). A launcher SPAWN gate (mirror --no-slam): "
+                         "with it, fc is NOT given --lidar-endpoint, so the dblink "
+                         "VIO-pose frame carries range_valid=0 -- the VIO send is "
+                         "unaffected. Use on a rig with no rangefinder.")
+    ap.add_argument("--lidar-rate", type=float, default=0.0,
+                    help="lidar I2C read + publish cadence in Hz (clamped [1,100] by "
+                         "lidar.main). 0 = lidar.main's default (50 Hz).")
+    ap.add_argument("--lidar-i2c-bus", type=int, default=None,
+                    help="lidar Linux I2C bus number (default: lidar.main's, =1 / "
+                         "/dev/i2c-1). The TOF400F wiring is HIL-unknown.")
+    ap.add_argument("--lidar-i2c-address", default=None,
+                    help="lidar VL53L1X 7-bit I2C address (e.g. 0x29). Default = "
+                         "lidar.main's 0x29; the TOF400F may strap a different one "
+                         "(HIL-unknown until bench).")
+    ap.add_argument("--lidar-mock", action="store_true",
+                    help="run the lidar process with its hardware-free MOCK reader "
+                         "(no I2C bus) -- for a deviceless integration dry-run.")
     ap.add_argument("--loop-search-radius", type=float, nargs="?", const=5.0,
                     default=0.0,
                     help="metres: make SLAM LIGHTER while KEEPING loop-closure -- "
@@ -822,11 +872,15 @@ def main() -> int:
     # ``ba`` owns no rings (it ATTACHES to vio's kf_* rings), so its endpoint name
     # has no shm-name length constraint -- one form for both suffixed + default.
     ba_ep = f"oak.ba{suffix}"
-    LOG.info("launcher: endpoints cap=%r vio=%r ba=%r slam=%r",
-             cap_ep, vio_ep, ba_ep, slam_ep)
+    # ``lidar`` also owns no rings (a pure POD producer, no shared memory), so its
+    # endpoint name is unconstrained too. It is INDEPENDENT of the capture/vio
+    # endpoints -- only the ``fc`` sender consumes it.
+    lidar_ep = f"oak.lidar{suffix}" if suffix else "oak.lidar"
+    LOG.info("launcher: endpoints cap=%r vio=%r ba=%r slam=%r lidar=%r",
+             cap_ep, vio_ep, ba_ep, slam_ep, lidar_ep)
     # Persist our endpoints so the NEXT launcher's `_cleanup_orphans` can
     # recover them even if our sock files are deleted between runs.
-    _record_endpoints([cap_ep, vio_ep, ba_ep, slam_ep])
+    _record_endpoints([cap_ep, vio_ep, ba_ep, slam_ep, lidar_ep])
 
     py = sys.executable
     env = dict(os.environ)
@@ -895,10 +949,20 @@ def main() -> int:
     if getattr(args, "loop_search_radius", 0.0) and args.loop_search_radius > 0.0:
         slam_args += ["--loop-search-radius", str(args.loop_search_radius)]
 
+    # --no-lidar is a launcher SPAWN gate (mirror --no-slam / --no-ba): skip the
+    # lidar process (the downward rangefinder). When skipped, fc is NOT given
+    # --lidar-endpoint, so the dblink VIO-pose frame carries range_valid=0 -- the
+    # VIO send is unaffected. lidar.main is the pure POD producer of lidar.range.
+    spawn_lidar = not getattr(args, "no_lidar", False)
+    lidar_args = build_lidar_args(args, lidar_ep)
+
     # FC UART-output argv (a pure consumer of VIO's pose.odom) lives in build_fc_args
     # so the contract is unit-testable without spawning. Built only when --fc is set
-    # (parse_fc_port would choke on None otherwise).
-    fc_args = build_fc_args(args, vio_ep) if getattr(args, "fc", None) else []
+    # (parse_fc_port would choke on None otherwise). fc gets --lidar-endpoint only
+    # when the lidar process is actually spawned (else range_valid=0).
+    fc_args = (build_fc_args(args, vio_ep, lidar_ep=lidar_ep,
+                             lidar_spawned=spawn_lidar)
+               if getattr(args, "fc", None) else [])
 
     # The UI's calib + visualise windows subscribe capture directly (IMU /
     # imucam.sample / frame.depth), so it must know the suffixed live endpoint
@@ -1008,11 +1072,22 @@ def main() -> int:
                                env=_role_env(env, caps.get("slam")), name="slam")
             procs.append(slam_proc)
             named["slam"] = slam_proc
-        # FC UART output (--fc): spawn fc.main AFTER slam (it subscribes vio's
-        # pose.odom, which is up by now). It joins `procs` + `named` so _terminate
-        # tears it down with the rest. NON-FATAL: fc opens the serial port itself
-        # and, on a bad / missing port, logs + exits WITHOUT signalling anyone --
-        # the rest of the stack runs on (mirror of how a failed --forward connect
+        # Downward rangefinder (--no-lidar gate): spawn lidar.main AFTER slam +
+        # BEFORE fc (so its lidar.range endpoint is up when fc opens its read-only
+        # client). PURE PRODUCER: no capture/vio dependency, no rings. NON-FATAL:
+        # lidar opens the I2C device itself and, on a fault, logs + exits WITHOUT
+        # signalling anyone -- fc then just sends range_valid=0 (mirror of fc's own
+        # non-fatal serial open). Joins `procs` + `named` so _terminate tears it down.
+        if spawn_lidar:
+            lidar_proc = _spawn(py, "lidar.main", lidar_args,
+                                env=_role_env(env, caps.get("lidar")), name="lidar")
+            procs.append(lidar_proc)
+            named["lidar"] = lidar_proc
+        # FC UART output (--fc): spawn fc.main AFTER slam + lidar (it subscribes vio's
+        # pose.odom + the lidar.range, both up by now). It joins `procs` + `named` so
+        # _terminate tears it down with the rest. NON-FATAL: fc opens the serial port
+        # itself and, on a bad / missing port, logs + exits WITHOUT signalling anyone
+        # -- the rest of the stack runs on (mirror of how a failed --forward connect
         # never takes the pipeline down). Consumer-only: no IPC server, no rings.
         if getattr(args, "fc", None):
             fc_proc = _spawn(py, "fc.main", fc_args,

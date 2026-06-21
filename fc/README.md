@@ -47,11 +47,11 @@ Carried **verbatim** from the FC's own `build_db_frame`
 | magic | 2 | `'d' 'b'` (`DB_MAGIC`) |
 | CMD | 1 | `DB_CMD_VIO_POSE = 0x0C` — the FC routes purely on this byte (`data[0]`) |
 | CLASS | 1 | `0x00` (`DB_CLASS`, fixed for host→FC commands) |
-| LEN | 2 (LE) | payload byte count = **38** |
-| payload | 38 | the VIO pose (below) |
+| LEN | 2 (LE) | payload byte count = **42** (`VIO_LEN`) |
+| payload | 42 | the VIO pose + bundled downward range (below) |
 | checksum | 2 (LE) | `(cmd + class + len_lo + len_hi + sum(payload)) & 0xFFFF` |
 
-Full VIO-pose frame on the wire = **46 bytes** (6 header + 38 payload + 2
+Full VIO-pose frame on the wire = **50 bytes** (6 header + 42 payload + 2
 checksum).
 
 > **The FC does NOT verify the dblink checksum for VIO frames** — it routes on
@@ -59,7 +59,7 @@ checksum).
 > correct checksum so the link is byte-clean and a future FC-side validator (or the
 > `parse_db_stream` test) accepts it. **Only well-formedness matters on the wire.**
 
-### VIO-pose payload (38 bytes, little-endian `struct '<8fIBB'`)
+### VIO-pose payload (42 bytes, little-endian `struct '<8fIBBf'`)
 
 | off | field | type | meaning / units |
 |-----|-------|------|-----------------|
@@ -73,7 +73,20 @@ checksum).
 | 28 | `pos_sigma_m` | f32 | 1-σ position noise, metres — the FC uses it as **√R** |
 | 32 | `age_us` | u32 | measurement age, microseconds (capture → send elapsed) |
 | 36 | `reset_counter` | u8 | bumped on a pose discontinuity (re-lock / jump) — wraps mod-256 |
-| 37 | `flags` | u8 | bit0 `pos_valid`, bit1 `att_valid`, bit2 `degraded` |
+| 37 | `flags` | u8 | bit0 `pos_valid`, bit1 `att_valid`, bit2 `degraded`, bit3 `range_valid` (`VIO_FLAG_RANGE_VALID = 0x08` — the trailing `range_m` is meaningful) |
+| 38 | `range_m` | f32 | downward rangefinder (VL53L1X / TOF400F) AGL range, **metres**. **BUNDLED into this VIO-pose message — NOT a separate dblink frame.** Meaningful **only** when `flags` bit3 (`range_valid`) is set; `0.0` otherwise |
+
+The trailing `range_m` (offset 38) carries the downward rangefinder reading
+**inside** the VIO-pose frame; the FC reads it from the same 42-byte payload, gated
+on `range_valid`. There is **no separate range channel on the wire** — the old
+`DB_CMD_LIDAR_RANGE` / `pack_lidar_range` separate-frame design was removed. The Pi's
+standalone [`lidar`](../lidar/) process publishes the gated range on the `lidar.range`
+IPC topic; `fc.main` grabs the freshest one each cadence tick and folds it (+ its
+validity) into the payload. `sky/fc/dblink.py` **owns** the `range_valid` bit (bit3):
+it clears whatever the caller passed there and OR-s it back **only** from the
+sender's `range_valid`, and zeroes `range_m` whenever invalid — so a dropped flag or
+a stale/rejected reading can never expose a live range to the FC. See
+[Bundled downward range](#bundled-downward-range-vl53l1x--tof400f) below.
 
 The pose carries the **full attitude quaternion**, not a heading scalar: the FC
 extracts heading (and roll/pitch) from it itself, which is **gimbal-lock-free** (a
@@ -195,6 +208,42 @@ over-confident sigma.
 > re-trusts a large sigma** — a bigger sigma must monotonically *reduce* the Kalman
 > gain toward zero. If the FC ever floored R, this defence is void.
 
+## Bundled downward range (VL53L1X / TOF400F)
+
+The drone's downward-facing rangefinder rides **inside** the VIO-pose frame, not on a
+separate channel. The Pi's standalone [`lidar`](../lidar/) process reads a VL53L1X (a
+TOF400F breakout) over **I2C** and publishes each gated reading on the `lidar.range`
+IPC topic; with `--lidar-endpoint` (auto-wired by the launcher unless `--no-lidar`)
+`fc` opens a **read-only** client there, keeps the freshest reading latest-wins, and
+folds `range_m` (+ its validity) into the payload (`range_m` @ offset 38, `flags`
+bit3 `range_valid`).
+
+Two independent gates must both pass for the FC to see a live range:
+
+1. **Sensor-side** (in `lidar`): `valid = (range_status == 0) AND (30 mm ≤ dist ≤
+   4000 mm)`. A non-zero VL53L1X status (sigma/signal fail, wrap-around,
+   out-of-bounds) or an out-of-band distance → `valid=0`, `range_m=0.0`.
+2. **fc-side freshness** (`UartSender._range_for`): the reading must be no older than
+   `_RANGE_STALE_S` (**200 ms**) by the local receive clock. A stale / rejected /
+   absent reading → the frame goes out with `range_valid=0` and `range_m=0.0`.
+
+This freshness gate is **independent of the pose staleness gate** — a dead or stalled
+rangefinder clears `range_valid` on its own without affecting the pose send, and a
+fresh pose with no range still ships (just with `range_valid=0`). A missing / down /
+`--no-lidar` lidar process means `fc` simply never advertises a valid range; the VIO
+pose link is **completely unaffected** (no calib barrier on the lidar endpoint, no
+blocking, no delay). The `range_valid` bit is **packer-owned** in `sky/fc/dblink.py`
+(it overwrites any caller bit3 and zeroes `range_m` when invalid), so the FC can trust
+bit3 to mean "the range field is meaningful" regardless of caller hygiene.
+
+**Bring-up / disarm threshold.** The FC arms/disarms partly on this AGL range (it must
+recognise "this is the ground"). The ground floor is a property of the rig (sensor
+height above the skids, the sensor's near bias), so it is **measured, not guessed**:
+run `python -m lidar.tools.characterize` on the Pi with the rig sat on the ground — it
+streams the readings and prints the recommended FC `disarm_range` = measured ground
+floor + margin (default 0.10 m). Set that on the FC (`PARAM_ID_DISARM_RANGE`). See the
+[`lidar` README](../lidar/) for the I2C wiring and the standalone process.
+
 ## Data flow
 
 ```mermaid
@@ -216,7 +265,7 @@ flowchart LR
     CB --> HOLD
     HOLD -->|latest-wins| UART
     UART --> SSOT --> FLOORS --> PACK
-    PACK -->|46-byte dblink frame| TX["serial.write"]
+    PACK -->|50-byte dblink frame| TX["serial.write"]
     TX -->|UART| DEV
 ```
 
@@ -267,7 +316,8 @@ Wiring: Pi **pin 8 (TXD0)** → FC **RX**, Pi **pin 10 (RXD0)** ← FC **TX**, P
 | Launcher flag | Effect |
 |---|---|
 | `--fc PORT[:BAUD]` | spawn `fc.main` on the serial PORT writing dblink `DB_CMD_VIO_POSE` frames. Additive + **non-fatal**: a bad / missing port makes `fc` log + exit without taking the stack down. Spawned **after** `slam`. |
-| `--fc-rate HZ` | UART send cadence, Hz — **clamped `[10, 50]`** by `fc.main` (`0` = the default 30 Hz). Below 10 the FC fusion starves; above 50 a 115200-baud link (~one 46-byte frame per ~4 ms) can't keep up. |
+| `--fc-rate HZ` | UART send cadence, Hz — **clamped `[10, 50]`** by `fc.main` (`0` = the default 30 Hz). Below 10 the FC fusion starves; above 50 a 115200-baud link (~one 50-byte frame per ~4.3 ms) can't keep up. |
+| `--lidar-endpoint EP` | the [`lidar`](../lidar/) process's IPC endpoint (default `oak.lidar`). When given, `fc` subscribes `lidar.range` and **bundles** the freshest gated downward range into each VIO-pose frame (`range_m` @ offset 38 + the `range_valid` flag). Best-effort + freshness-gated: a stale / rejected / absent reading sends `range_valid=0`; a missing lidar process never blocks the pose link. Omit to never bundle a range. The launcher wires this automatically unless `--no-lidar`. |
 | `--fc-mount R11,..,R33` | the `R_body_cam` mount extrinsic: 9 comma-separated row-major values (OpenCV-camera body → FRD airframe body, relative to the nominal forward mount). Default = identity. |
 
 `fc.main` can also run standalone for SIL / bench:

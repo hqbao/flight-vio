@@ -98,6 +98,16 @@ IMUCAM_SAMPLE = "imucam.sample"
 # the sensor reported). ``imucam.sample`` carries the CALIBRATED IMU.
 IMU_RAW = "imu.raw"
 
+# Downward rangefinder (VL53L1X) range, published by the standalone ``lidar``
+# process on its own ``oak.lidar`` IPC endpoint. Carries a WireRange POD (seq,
+# ts_ns, range_m metres, valid 0/1 = the sensor-side gate passed). It is INDEPENDENT
+# of the visual pipeline (no shared-memory ring, off the capture endpoint): the
+# ``fc`` UART sender opens a read-only client on the lidar endpoint, keeps the
+# freshest range, and BUNDLES it into the dblink VIO-pose frame (it is NOT a separate
+# dblink message). LIVE-only; the offline / oracle path never publishes it, so pose
+# math + the byte-parity oracle are UNAFFECTED.
+LIDAR_RANGE = "lidar.range"
+
 # One-shot retained calibration broadcast (intrinsics + extrinsics) the capture
 # process publishes on boot; read DIRECTLY by VIO / SLAM / UI (no flow message).
 CALIB_BUNDLE = "calib.bundle"

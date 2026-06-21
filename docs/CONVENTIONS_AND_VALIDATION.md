@@ -31,7 +31,26 @@ they cannot drift apart. Heading is RELATIVE (no compass) → the FC handles it 
 |---|---|
 | FC: stores (w,x,y,z), body→earth, Hamilton, right-mult error `q←q⊗Exp(δθ)` | `quat.h:7-10`, `fusion6.h:27`, `fusion6.c:567-570` |
 | VIO: (w,x,y,z), body→world, Hamilton (same quat→rot formula) | `sky/math/quat.py:10-28` |
-| Wire: `q_w,q_x,q_y,q_z` = **body→NED**, w-first | `messages.h:597`, `sky/fc/dblink.py:35-39` |
+| Wire: `q_w,q_x,q_y,q_z` = **body→NED**, w-first (payload offsets 12..24) | `messages.h:597`, `sky/fc/dblink.py:36-39` |
+
+**Wire layout (VIO-pose payload = 42 B, `struct '<8fIBBf'`, `DB_CMD_VIO_POSE=0x0C`).**
+The wire grew from 38 B (`'<8fIBB'`) to **42 B** (`'<8fIBBf'`) when the downward
+rangefinder range was **bundled** into the VIO-pose message (no separate dblink
+channel). Layout — `sky/fc/dblink.py:30-48,85-87` (`_PAYLOAD_STRUCT`, `VIO_LEN`):
+
+| off | field | type | note |
+|---|---|---|---|
+| 0/4/8 | `pos_n / pos_e / pos_d` | f32 | NED metres |
+| 12/16/20/24 | `q_w / q_x / q_y / q_z` | f32 | body→NED, Hamilton, w-first, unit |
+| 28 | `pos_sigma_m` | f32 | 1-σ position noise (m) — FC uses as √R |
+| 32 | `age_us` | u32 | capture→send age, µs |
+| 36 | `reset_counter` | u8 | wraps mod-256 on a re-lock / jump |
+| 37 | `flags` | u8 | bit0 pos_valid, bit1 att_valid, bit2 degraded, **bit3 `range_valid`** (`VIO_FLAG_RANGE_VALID=0x08`) |
+| 38 | `range_m` | f32 | downward range (m), **meaningful only when bit3 set**; 0.0 otherwise — see A.8 |
+
+Full frame on the wire = **50 B** (6-byte header `'<2sBBH'` + 42 payload + 2-byte
+checksum). The old separate `DB_CMD_LIDAR_RANGE` / `pack_lidar_range` / `_LIDAR_STRUCT`
+frame was **removed**.
 
 ### A.4 VIO native frame and the conversion to NED (the EASIEST place to get WRONG — verified)
 - VIO native = **gravity-aligned OPTICAL world** (cam optical: X=right, Y=down, Z=forward),
@@ -65,6 +84,30 @@ The EEPROM returns a wrong `Rx(90°)` → flips roll ~180°. Fixed by a per-devi
 ### A.7 Z-sign at the SE2 publish boundary (already annotated, CRITICAL)
 fusion5_z runs POSITIVE-UP internally → **negate** at the publish boundary to emit NED-down:
 `state_estimation2.c:335,338` `pos_body.z=-g_pos_z.pos_final`. Forget this = positive-feedback altitude-hold.
+
+### A.8 Downward range (VL53L1X / TOF400F over I2C) — bundled into the VIO-pose frame
+The downward AGL rangefinder rides **inside** the VIO-pose message (A.3 `range_m` @ offset 38), **not** a
+separate dblink channel. Standalone `lidar` process (`lidar/main.py`) reads a VL53L1X (TOF400F breakout) over
+**I2C** and publishes `lidar.range`; `fc` bundles the freshest gated reading into each frame.
+
+| | Convention | Evidence |
+|---|---|---|
+| Wiring | I2C, Pi `/dev/i2c-1` (bus 1), default 7-bit addr **`0x29`**, short mode | `lidar/io/vl53l1x_reader.py:48-50,55` (`DEFAULT_I2C_*`, `DIST_MODE_SHORT`) |
+| Units | chip reports **mm** → published / wire value is **metres** | `vl53l1x_reader.py:32,180` (`dist_mm * 1e-3`) |
+| Sensor gate | `valid = (range_status==0) AND (30 mm ≤ dist ≤ 4000 mm)` | `vl53l1x_reader.py:93-103` (`gate_reading`, `RANGE_STATUS_OK=0`) |
+| fc freshness gate | reading older than **200 ms** (local clock) → `range_valid=0` | `fc/main.py:153,424-439` (`_RANGE_STALE_S`, `_range_for`) |
+| Flag ownership | `range_valid` (bit3) is **packer-owned** — OR-ed in only from the sender's `range_valid`; `range_m` zeroed when invalid | `sky/fc/dblink.py:94,229-239` (`VIO_FLAG_RANGE_VALID`) |
+| Independence | a missing / down / `--no-lidar` lidar process → `range_valid=0`; the pose send is **unaffected** (no calib barrier on the lidar endpoint) | `fc/main.py:96-104,631-651`; `launcher/main.py:763-768,1081-1085` |
+
+- **range_status MUST be checked (HIL must-fix).** `range_status==0` is the VL53L1X "range valid" code; any other
+  status (sigma/signal fail, wrap-around, OOB) rejects the reading. The real reader reads `range_status` via the
+  driver's `get_range_status` accessor **only if present**, else falls back to "valid status" → the gate degrades to
+  **distance-band-only**. Confirm `get_range_status` exists on the bench `pimoroni-vl53l1x` build, else a
+  sigma/signal-failed in-band reading is wrongly accepted. `fc/main.py:170-171`, `vl53l1x_reader.py:170-171`.
+- **disarm_range is MEASURED, not guessed.** The FC arms/disarms on this AGL range; the ground floor is a rig
+  property (sensor height above skids + near bias). Run `python -m lidar.tools.characterize` on the ground →
+  prints `disarm_range = ground-floor median + margin (0.10 m)` → set the FC `PARAM_ID_DISARM_RANGE`.
+  `lidar/tools/characterize.py:59-80,131-139`.
 
 ---
 
