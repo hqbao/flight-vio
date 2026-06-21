@@ -2,15 +2,15 @@
 
 A standalone, independently-runnable sibling project (`imu_camera`, `depth`, `vio`,
 `ba`, `slam`, `ui`, `netbridge`, `fc`, `lidar`). It reads a **downward-facing
-VL53L1X** time-of-flight rangefinder (a **TOF400F** breakout, a generic VL53L1X
-exposing the chip's I2C register map) over **I2C** and publishes each gated reading on
-the `lidar.range` IPC topic, served on its own `oak.lidar` endpoint.
+VL53L1X** time-of-flight rangefinder (a **bare VL53L1X breakout**) over **I2C** via a
+**pure-`smbus2` register-level driver** and publishes each gated reading on the
+`lidar.range` IPC topic, served on its own `oak.lidar` endpoint.
 
 The range is **not** a separate flight-controller channel: the [`fc`](../fc/) UART
 sender opens a read-only client on `oak.lidar`, keeps the freshest reading, and
 **bundles** `range_m` (+ its validity) into the dblink VIO-pose frame (`sky.fc.dblink
 pack_vio_pose`: the trailing `range_m` @ offset 38 + the `VIO_FLAG_RANGE_VALID` =
-`0x08` flag bit). See [`fc/README.md` → Bundled downward range](../fc/README.md#bundled-downward-range-vl53l1x--tof400f).
+`0x08` flag bit). See [`fc/README.md` → Bundled downward range](../fc/README.md#bundled-downward-range-vl53l1x).
 
 ```
                         lidar.main (oak.lidar)
@@ -30,57 +30,57 @@ means `fc` never sees a range (it sends `range_valid=0`); the VIO send is unaffe
 | File | Role |
 |------|------|
 | `lidar/comms/` | the **FROZEN** vendored comms contract (byte-identical to the other copies); `lidar` consumes only its server API |
-| `lidar/io/vl53l1x_reader.py` | the swappable I2C reader: `VL53L1XReader` (real `pimoroni-vl53l1x` + `smbus2`) + `MockRangeReader` (hardware-free, for host tests); the pure `gate_reading` validity rule |
+| `lidar/io/vl53l1x_reader.py` | the swappable I2C reader: `VL53L1XReader` (a bare VL53L1X driven register-level with `smbus2` only) + `MockRangeReader` (hardware-free, for host tests); the pure `gate_reading` validity rule |
 | `lidar/main.py` | the standalone process: read loop → publish `WireRange` on `lidar.range` (a non-blocking `IPCPubSub` server) |
 | `lidar/tools/characterize.py` | I2C bench tool: stream dist + `range_status` + signal and, on the ground, print the recommended FC `disarm_range` |
 | `lidar/tests/lidar_mock_selftest.py` | mock-sensor read → gate → publish selftest (no I2C) |
 
-`cv2-free`: the only third-party deps are `smbus2` + `pimoroni-vl53l1x`, both
-pure-Python (aarch64 wheel, no build on the Pi5) — nothing here imports OpenCV, so the
-lean Pi flight image (`requirements-flight.txt`) stays clean.
+`cv2-free`: the only third-party dep is `smbus2` (pure-Python, installs cleanly on the
+Pi5 aarch64/py3.13 with no build) — it **is** the whole VL53L1X driver, talking the
+chip's register map directly. Nothing here imports OpenCV, so the lean Pi flight image
+(`requirements-flight.txt`) stays clean.
 
 ## Hardware / wiring
 
 | Item | Value |
 |------|-------|
-| Sensor | VL53L1X (TOF400F breakout), downward-facing, AGL rangefinder |
+| Sensor | bare VL53L1X breakout, downward-facing, AGL rangefinder |
+| Driver | pure-`smbus2` register-level (`VL53L1XReader`): writes the 91-byte ST/Adafruit default config block at init, then reads `RESULT__RANGE_STATUS` + distance directly. Verified on-device (model id `EA CC 10`, status `0x09`, live distance) |
 | Bus | **I2C** — Pi `/dev/i2c-1` (the 40-pin header bus; `DEFAULT_I2C_BUS = 1`) |
 | Address | **`0x29`** (the VL53L1X default 7-bit address; `DEFAULT_I2C_ADDRESS = 0x29`) |
 | Pi pins | **pin 3 (SDA1 / GPIO2)** → sensor SDA, **pin 5 (SCL1 / GPIO3)** → sensor SCL, **3V3** (pin 1) → VIN, **GND** (pin 6/9) → GND |
-| Distance mode | **short** (`DIST_MODE_SHORT = 1`, ~1.3 m range, best ambient-light immunity — correct for a low-altitude AGL sensor) |
-| Timing budget | **20 ms** (`DEFAULT_TIMING_BUDGET_US = 20_000`) → ~50 Hz read cadence |
+| Distance mode | **long @ 50 ms** (the bench-proven config the register init writes, ~4 m range; `DIST_MODE_SHORT` ~1.3 m is a future tuning) |
+| Timing budget | 50 ms inter-measurement (set by the macro-period registers in `_init_sensor`) → continuous ranging at ~20 Hz |
 
-> ⚠️ **HIL-unknown until the bench.** The TOF400F may strap a non-default I2C address,
-> and which distance/timing mode the optics want is a bring-up call. The reader is
-> behind a tiny `RangeReader` interface for exactly this reason; override the wiring
-> with `--i2c-address` / `--i2c-bus` (or the launcher's `--lidar-i2c-address` /
-> `--lidar-i2c-bus`) once the bench values are known. Enable the Pi's I2C bus first
-> (`raspi-config` → Interface → I2C) and confirm the device responds:
-> `i2cdetect -y 1` should show the strapped address.
+> ℹ️ **Wiring is overridable.** The bare VL53L1X answers at its factory address `0x29`
+> (verified on-device); the reader is behind a tiny `RangeReader` interface, so override
+> the bus/address with `--i2c-address` / `--i2c-bus` (or the launcher's
+> `--lidar-i2c-address` / `--lidar-i2c-bus`) if you re-strap it. Enable the Pi's I2C bus
+> first (`raspi-config` → Interface → I2C) and confirm the device responds:
+> `i2cdetect -y 1` should show `0x29`.
 
 ## The validity gate (`range_status` + distance band)
 
 `gate_reading(dist_mm, range_status)` is a pure function (unit-testable in isolation):
 
 ```
-valid = (range_status == 0) AND (LIDAR_MIN_MM <= dist_mm <= LIDAR_MAX_MM)
-        # RANGE_STATUS_OK = 0,  LIDAR_MIN_MM = 30,  LIDAR_MAX_MM = 4000  (millimetres)
+valid = (range_status == 0x09) AND (LIDAR_MIN_MM <= dist_mm <= LIDAR_MAX_MM)
+        # RANGE_STATUS_OK = 0x09,  LIDAR_MIN_MM = 30,  LIDAR_MAX_MM = 4000  (millimetres)
 ```
 
-`range_status == 0` is the VL53L1X "range valid" code; **any** other status (sigma
-fail, signal fail, wrap-around, out-of-bounds, …) rejects the reading. The distance
-band additionally rejects a reading below the sensor's near dead-zone / a spurious zero
-and above short-mode trust **even when** `range_status == 0`. The chip reports
-**millimetres**; the published / wire value is **metres** (`range_m`). On a reject,
-`range_m` is forced to `0.0`.
+`range_status == 0x09` is the VL53L1X `RESULT__RANGE_STATUS` (reg `0x0089`) code for a
+completed range (verified on-device); **any** other status (sigma fail, signal fail,
+wrap-around, out-of-bounds, …) rejects the reading. The distance band additionally
+rejects a reading below the sensor's near dead-zone / a spurious zero and above trusted
+range **even when** `range_status == 0x09`. The chip reports **millimetres**; the
+published / wire value is **metres** (`range_m`). On a reject, `range_m` is forced to
+`0.0`.
 
-> ⚠️ **HIL must-fix.** The real `VL53L1XReader.read()` reads `range_status` via the
-> driver's `get_range_status` accessor **only if it exists**, else it falls back to
-> "valid status" (`RANGE_STATUS_OK`) so the distance gate still applies. **Confirm
-> `get_range_status` is present on the bench `pimoroni-vl53l1x` build** — if it is
-> absent the status gate silently degrades to **distance-band-only**, which accepts a
-> sigma/signal-failed reading inside the band. Verify the module's I2C mode exposes the
-> VL53L1X register map (some breakouts boot in a UART/other mode).
+> ℹ️ **The status gate reads the raw register.** `VL53L1XReader.read()` reads
+> `RESULT__RANGE_STATUS` (reg `0x0089`) directly over `smbus2` and compares it to
+> `RANGE_STATUS_OK = 0x09` — there is no driver-accessor dependency to verify, and the
+> status gate always applies (it never degrades to distance-band-only). The register
+> map is confirmed present on-device (model id `EA CC 10`).
 
 `WireRange` (the `lidar.range` POD) carries `{ seq, ts_ns, range_m, valid }` — `seq`
 is a monotone reading counter (drop detection), `ts_ns` is the host `monotonic_ns`
@@ -136,7 +136,7 @@ a spawn gate (mirror of `--no-slam` / `--no-ba`):
 | `--no-lidar` | don't spawn `lidar`; `fc` is not given `--lidar-endpoint` → the dblink VIO-pose frame carries `range_valid=0`. Use on a rig with no rangefinder. |
 | `--lidar-rate HZ` | lidar I2C read + publish cadence (clamped `[1,100]` by `lidar.main`; `0` = the default 50 Hz). |
 | `--lidar-i2c-bus N` | lidar Linux I2C bus number (default `lidar.main`'s `1`). |
-| `--lidar-i2c-address A` | lidar VL53L1X 7-bit I2C address (default `0x29`; the TOF400F may strap another — HIL-unknown). |
+| `--lidar-i2c-address A` | lidar VL53L1X 7-bit I2C address (default `0x29`, the bare breakout's factory address; override only if re-strapped). |
 | `--lidar-mock` | run `lidar` with the hardware-free MOCK reader (no I2C) — for a deviceless integration dry-run. |
 
 ## Characterize → FC `disarm_range`
@@ -177,12 +177,10 @@ distance — yield `valid=0`); (b) `MockRangeReader` producing `RangeSample`s wi
 both valid + invalid readings round-tripping the exact contract the `fc` sender
 consumes.
 
-## Open items (bring-up)
+The bare VL53L1X + `smbus2` register driver is **final and verified on-device** (model
+id `EA CC 10`, `RESULT__RANGE_STATUS = 0x09`, live distance). Remaining bring-up items
+are rig integration, not the driver:
 
-- **Confirm `get_range_status` on the bench driver** (else the status gate degrades to
-  distance-band-only — a must-fix; see the gate section above).
-- **Confirm the I2C address + bus** (`i2cdetect -y 1`) and that the module exposes the
-  VL53L1X register map; override with `--i2c-address` / `--i2c-bus` if non-default.
 - **Run `lidar.tools.characterize` on the ground** → set the FC `PARAM_ID_DISARM_RANGE`.
-- **HIL on the Pi is pending** — mock-selftest verified; not yet read off a real
-  TOF400F on the assembled rig.
+- **Full-rig HIL** — the driver reads on-device; running the whole launcher pipeline
+  (lidar → fc → dblink) on the assembled drone is the remaining integration check.

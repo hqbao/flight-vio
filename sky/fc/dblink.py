@@ -216,7 +216,7 @@ def pack_vio_pose(
             is true; when invalid the field is forced to 0.0 (and bit3 cleared) so a
             stale / rejected reading never reaches the FC as a live range. Non-finite
             -> 0.0 via :func:`_safe_f32`.
-        range_valid: True iff the sensor-side gate passed (range_status == 0 and the
+        range_valid: True iff the sensor-side gate passed (range_status == 0x09 and the
             distance is within the configured min/max). Sets/clears bit3 and gates
             whether ``range_m`` is written. Default False (no range source attached
             -- e.g. the lidar process is absent / ``--no-lidar``).

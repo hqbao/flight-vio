@@ -1,21 +1,17 @@
 # lidar project: downward VL53L1X rangefinder over I2C (Pi flight, cv2-free).
 #
-# IMPORTANT (bench bring-up): there is NO drop-in pip driver for the real sensor on
-# the Pi5 (aarch64, Python 3.13). Verified 2026-06-21:
-#   - `pimoroni-vl53l1x` does NOT exist on PyPI (404). The Pimoroni package is named
-#     `vl53l1x` (== `VL53L1X`), latest 0.0.5 -- NOT "1.1.2".
-#   - `vl53l1x` is a C-extension with NO aarch64 / py3.13 wheel on piwheels (only
-#     32-bit armv6l/armv7l up to cp311), so `pip install vl53l1x` on the Pi5 has to
-#     build from source -- which the 2021-era code does not do on py3.13.
-# So the REAL read path (lidar/io/vl53l1x_reader.py :: VL53L1XReader, lazy
-# `import VL53L1X`) is a BRING-UP TODO -- pick ONE at the bench:
-#   (a) pure-Python: drive the VL53L1X registers directly over `smbus2` (below) and
-#       point VL53L1XReader at it;
-#   (b) Adafruit: `adafruit-circuitpython-vl53l1x` + `adafruit-blinka` (both
-#       pure-Python, install on py3.13/aarch64) and adapt VL53L1XReader to that API.
-# Until then the `lidar` process runs with `--lidar-mock` (MockRangeReader, no
-# sensor dep at all) -- enough to validate the 42B VIO wire + the FC UI.
+# The real read path (lidar/io/vl53l1x_reader.py :: VL53L1XReader) is a PURE
+# register-level driver: it drives a bare VL53L1X over `smbus2` directly -- writes
+# the 91-byte ST/Adafruit default config block, selects long distance mode @ 50 ms,
+# and reads RESULT__RANGE_STATUS (0x0089) + the distance register itself. Verified
+# on-device (model id EA CC 10, status 0x09, live distance). So `smbus2` is the ONLY
+# sensor dependency -- no extra package, no C-extension, nothing to build. (There is
+# no `pimoroni-vl53l1x` on PyPI, and the `vl53l1x` C-extension has no aarch64/py3.13
+# wheel -- both irrelevant now that the register driver is the implementation.)
+#
+# Deviceless: the `lidar` process can still run with `--lidar-mock` (MockRangeReader,
+# no sensor dep at all) -- enough to validate the 42B VIO wire + the FC UI.
 
-# Linux SMBus / I2C transport (pure-Python, installs cleanly on the Pi5). Needed by
-# whichever real driver is chosen above; harmless when only --lidar-mock is used.
+# Linux SMBus / I2C transport (pure-Python, installs cleanly on the Pi5). This is
+# the entire driver stack -- VL53L1XReader talks the chip's register map over it.
 smbus2>=0.4.1

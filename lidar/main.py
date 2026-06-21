@@ -205,8 +205,8 @@ def main() -> int:
     ap.add_argument("--i2c-address", type=lambda s: int(s, 0),
                     default=DEFAULT_I2C_ADDRESS,
                     help=f"VL53L1X 7-bit I2C address (default: "
-                         f"0x{DEFAULT_I2C_ADDRESS:02X}; the TOF400F may strap a "
-                         f"different one -- HIL-unknown until bench)")
+                         f"0x{DEFAULT_I2C_ADDRESS:02X}, the bare breakout's factory "
+                         f"address; override only if re-strapped)")
     ap.add_argument("--max-reads", type=int, default=0,
                     help="stop after publishing this many readings (0 = run forever)")
     args = ap.parse_args()

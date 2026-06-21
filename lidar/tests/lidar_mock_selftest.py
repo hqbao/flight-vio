@@ -4,12 +4,13 @@
 Exercises the read -> gate -> publish path WITHOUT a device, three ways:
 
   (a) GATE -- :func:`lidar.io.vl53l1x_reader.gate_reading` is the pure validity
-      rule: ``valid iff range_status == 0 AND LIDAR_MIN_MM <= dist_mm <=
-      LIDAR_MAX_MM``. Both reject paths (a non-zero range_status; an out-of-band
-      distance) MUST yield valid=0.
+      rule: ``valid iff range_status == 0x09 AND LIDAR_MIN_MM <= dist_mm <=
+      LIDAR_MAX_MM`` (0x09 = VL53L1X RESULT__RANGE_STATUS "range valid"). Both
+      reject paths (a non-OK range_status; an out-of-band distance) MUST yield
+      valid=0.
   (b) MOCK READER -- :class:`MockRangeReader` returns a scripted sequence and
       produces :class:`RangeSample`s with range_m in METRES, 0.0 on a reject, and
-      the range_status carried through. A ``range_status != 0`` sample is invalid.
+      the range_status carried through. A ``range_status != 0x09`` sample is invalid.
   (c) PUBLISH -- ``lidar.main.run_lidar(mock=True)`` reads + publishes WireRange on
       a real IPC server; a client on the endpoint receives them and the
       valid/invalid readings round-trip (range_m metres, valid 0/1) exactly as the
@@ -43,11 +44,11 @@ def _check(cond: bool, msg: str) -> None:
 
 
 def test_gate() -> bool:
-    print("[a] gate_reading: status==0 + in-band -> valid; else reject")
-    _check(gate_reading(842, RANGE_STATUS_OK), "0.842 m, status 0 -> VALID")
+    print("[a] gate_reading: status==0x09 + in-band -> valid; else reject")
+    _check(gate_reading(842, RANGE_STATUS_OK), "0.842 m, status 0x09 -> VALID")
     _check(gate_reading(LIDAR_MIN_MM, RANGE_STATUS_OK), "exactly the min -> VALID")
     _check(gate_reading(LIDAR_MAX_MM, RANGE_STATUS_OK), "exactly the max -> VALID")
-    # range_status != 0 rejects even a sane distance.
+    # range_status != 0x09 rejects even a sane distance.
     _check(not gate_reading(842, 4), "status 4 (signal fail) -> REJECT")
     _check(not gate_reading(842, 1), "status 1 (sigma fail) -> REJECT")
     # out-of-band distance rejects even with a valid status.
@@ -69,10 +70,10 @@ def test_mock_reader() -> bool:
     s0 = reader.read()
     _check(s0.valid and abs(s0.range_m - 0.842) < 1e-9,
            f"reading 0: VALID, range_m={s0.range_m:.3f} m (mm/1000)")
-    _check(s0.range_status == RANGE_STATUS_OK, "reading 0: status carried (0)")
+    _check(s0.range_status == RANGE_STATUS_OK, "reading 0: status carried (0x09)")
     s1 = reader.read()
     _check(not s1.valid and s1.range_m == 0.0,
-           "reading 1: range_status != 0 -> INVALID, range_m forced 0.0")
+           "reading 1: range_status != 0x09 -> INVALID, range_m forced 0.0")
     _check(s1.range_status == 4, "reading 1: the failing status is carried (4)")
     s2 = reader.read()
     _check(not s2.valid and s2.range_m == 0.0,
@@ -156,7 +157,7 @@ def main() -> int:
     for name, ok in results.items():
         print(f"  [{'ok' if ok else 'FAIL'}] {name}")
     if all_ok:
-        print("\nPASS -- lidar mock: gate (incl. range_status != 0 -> valid=0), "
+        print("\nPASS -- lidar mock: gate (incl. range_status != 0x09 -> valid=0), "
               "mm->m conversion, and run_lidar publishes WireRange round-tripping "
               "the lidar.range contract.")
         return 0

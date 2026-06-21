@@ -105,7 +105,7 @@ class WireRange:
             sender uses it for a freshness gate, not absolute time).
         range_m: measured downward range in METRES. Meaningful ONLY when
             ``valid == 1``; on a rejected reading it is 0.0.
-        valid: 1 iff the sensor-side gate passed (``range_status == 0`` and the
+        valid: 1 iff the sensor-side gate passed (``range_status == 0x09`` and the
             distance is within the configured min/max), 0 otherwise. Kept as an int
             (not bool) so the wire stays a fixed POD and the FC's range_valid flag
             maps 1:1.

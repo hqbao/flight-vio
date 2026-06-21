@@ -771,11 +771,11 @@ def main() -> int:
                          "lidar.main). 0 = lidar.main's default (50 Hz).")
     ap.add_argument("--lidar-i2c-bus", type=int, default=None,
                     help="lidar Linux I2C bus number (default: lidar.main's, =1 / "
-                         "/dev/i2c-1). The TOF400F wiring is HIL-unknown.")
+                         "/dev/i2c-1).")
     ap.add_argument("--lidar-i2c-address", default=None,
                     help="lidar VL53L1X 7-bit I2C address (e.g. 0x29). Default = "
-                         "lidar.main's 0x29; the TOF400F may strap a different one "
-                         "(HIL-unknown until bench).")
+                         "lidar.main's 0x29 (the bare breakout's factory address; "
+                         "override only if re-strapped).")
     ap.add_argument("--lidar-mock", action="store_true",
                     help="run the lidar process with its hardware-free MOCK reader "
                          "(no I2C bus) -- for a deviceless integration dry-run.")

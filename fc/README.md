@@ -74,7 +74,7 @@ checksum).
 | 32 | `age_us` | u32 | measurement age, microseconds (capture → send elapsed) |
 | 36 | `reset_counter` | u8 | bumped on a pose discontinuity (re-lock / jump) — wraps mod-256 |
 | 37 | `flags` | u8 | bit0 `pos_valid`, bit1 `att_valid`, bit2 `degraded`, bit3 `range_valid` (`VIO_FLAG_RANGE_VALID = 0x08` — the trailing `range_m` is meaningful) |
-| 38 | `range_m` | f32 | downward rangefinder (VL53L1X / TOF400F) AGL range, **metres**. **BUNDLED into this VIO-pose message — NOT a separate dblink frame.** Meaningful **only** when `flags` bit3 (`range_valid`) is set; `0.0` otherwise |
+| 38 | `range_m` | f32 | downward rangefinder (bare VL53L1X over I2C) AGL range, **metres**. **BUNDLED into this VIO-pose message — NOT a separate dblink frame.** Meaningful **only** when `flags` bit3 (`range_valid`) is set; `0.0` otherwise |
 
 The trailing `range_m` (offset 38) carries the downward rangefinder reading
 **inside** the VIO-pose frame; the FC reads it from the same 42-byte payload, gated
@@ -86,7 +86,7 @@ validity) into the payload. `sky/fc/dblink.py` **owns** the `range_valid` bit (b
 it clears whatever the caller passed there and OR-s it back **only** from the
 sender's `range_valid`, and zeroes `range_m` whenever invalid — so a dropped flag or
 a stale/rejected reading can never expose a live range to the FC. See
-[Bundled downward range](#bundled-downward-range-vl53l1x--tof400f) below.
+[Bundled downward range](#bundled-downward-range-vl53l1x) below.
 
 The pose carries the **full attitude quaternion**, not a heading scalar: the FC
 extracts heading (and roll/pitch) from it itself, which is **gimbal-lock-free** (a
@@ -208,21 +208,22 @@ over-confident sigma.
 > re-trusts a large sigma** — a bigger sigma must monotonically *reduce* the Kalman
 > gain toward zero. If the FC ever floored R, this defence is void.
 
-## Bundled downward range (VL53L1X / TOF400F)
+## Bundled downward range (VL53L1X)
 
 The drone's downward-facing rangefinder rides **inside** the VIO-pose frame, not on a
-separate channel. The Pi's standalone [`lidar`](../lidar/) process reads a VL53L1X (a
-TOF400F breakout) over **I2C** and publishes each gated reading on the `lidar.range`
-IPC topic; with `--lidar-endpoint` (auto-wired by the launcher unless `--no-lidar`)
+separate channel. The Pi's standalone [`lidar`](../lidar/) process reads a bare VL53L1X
+over **I2C** (a pure-`smbus2` register driver) and publishes each gated reading on the
+`lidar.range` IPC topic; with `--lidar-endpoint` (auto-wired by the launcher unless `--no-lidar`)
 `fc` opens a **read-only** client there, keeps the freshest reading latest-wins, and
 folds `range_m` (+ its validity) into the payload (`range_m` @ offset 38, `flags`
 bit3 `range_valid`).
 
 Two independent gates must both pass for the FC to see a live range:
 
-1. **Sensor-side** (in `lidar`): `valid = (range_status == 0) AND (30 mm ≤ dist ≤
-   4000 mm)`. A non-zero VL53L1X status (sigma/signal fail, wrap-around,
-   out-of-bounds) or an out-of-band distance → `valid=0`, `range_m=0.0`.
+1. **Sensor-side** (in `lidar`): `valid = (range_status == 0x09) AND (30 mm ≤ dist ≤
+   4000 mm)`. `0x09` is the VL53L1X `RESULT__RANGE_STATUS` completed-range code; any
+   other status (sigma/signal fail, wrap-around, out-of-bounds) or an out-of-band
+   distance → `valid=0`, `range_m=0.0`.
 2. **fc-side freshness** (`UartSender._range_for`): the reading must be no older than
    `_RANGE_STALE_S` (**200 ms**) by the local receive clock. A stale / rejected /
    absent reading → the frame goes out with `range_valid=0` and `range_m=0.0`.

@@ -15,13 +15,14 @@ Layers
 * :mod:`lidar.comms` -- the FROZEN vendored comms contract (byte-identical to the
   other copies; this project only consumes its client/server API).
 * :mod:`lidar.io` -- the swappable I2C reader: :class:`~lidar.io.vl53l1x_reader.
-  VL53L1XReader` (real ``pimoroni-vl53l1x`` + ``smbus2``) and
+  VL53L1XReader` (a bare VL53L1X driven register-level with ``smbus2`` only) and
   :class:`~lidar.io.vl53l1x_reader.MockRangeReader` (hardware-free, for host tests).
 * :mod:`lidar.main` -- the standalone lidar process: read loop -> publish
   ``lidar.range`` on an :class:`~lidar.comms.IPCPubSub` server.
 * :mod:`lidar.tools.characterize` -- an I2C bench tool: stream dist + range_status
   + signal and, on the ground, print the recommended FC ``disarm_range``.
 
-cv2-free: only ``smbus2`` + ``pimoroni-vl53l1x`` (both pure-Python) -- nothing
-here imports OpenCV, so the lean Pi flight image stays clean.
+cv2-free: the only third-party dep is ``smbus2`` (pure-Python; it IS the whole
+VL53L1X driver, register-level) -- nothing here imports OpenCV, so the lean Pi
+flight image stays clean.
 """

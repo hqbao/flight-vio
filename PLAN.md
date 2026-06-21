@@ -440,14 +440,16 @@ u8 flags, f32 range_m @ offset 38. CMD = 0x0C. VIO_FLAG_RANGE_VALID = 0x08.
 2. comms contract: add `LIDAR_RANGE` topic + `WireRange` POD + registry entry to ALL
    copies (anchor `imu_camera` + depth/vio/slam/ui/launcher/netbridge/ba/fc) and the
    NEW `lidar/comms` (`cp -r imu_camera/comms`). diff -r stays EMPTY. [DONE]
-3. `lidar/` project: `io/vl53l1x_reader.py` (real I2C via pimoroni-vl53l1x+smbus2 +
-   MOCK), `main.py` (read->publish `lidar.range`, bridge to `oak.lidar`),
-   `requirements.txt`, `tools/characterize.py` (I2C, prints FC `disarm_range`). [DONE]
+3. `lidar/` project: `io/vl53l1x_reader.py` (real I2C via a pure-`smbus2`
+   register-level driver for a bare VL53L1X + MOCK), `main.py` (read->publish
+   `lidar.range`, bridge to `oak.lidar`), `requirements.txt`, `tools/characterize.py`
+   (I2C, prints FC `disarm_range`). [DONE]
 4. `fc/main.py`: `LatestRange` 1-slot holder + `lidar.range` client + bundle range into
    `UartSender.send_once()`; freshness-gated. NO second frame. [DONE]
 5. `launcher/main.py`: `build_lidar_args` + `--no-lidar` spawn gate + `oak.lidar`
    endpoint + spawn lidar (after slam, before fc). [DONE]
-6. `requirements-flight.txt`: + `pimoroni-vl53l1x` + `smbus2` (after pyserial). [DONE]
+6. `requirements-flight.txt`: + `smbus2` (after pyserial) — the bare-VL53L1X register
+   driver needs no other sensor dep. [DONE]
 7. selftests: `fc_dblink_selftest` + `fc_sil_selftest` -> 42B + 0x08; lidar mock
    selftest; add `"lidar"` to `ipc_comms_selftest` COPIES + a `WireRange` vector. [DONE]
 
@@ -466,9 +468,14 @@ u8 flags, f32 range_m @ offset 38. CMD = 0x0C. VIO_FLAG_RANGE_VALID = 0x08.
   lidar.range (valid+invalid gated) ..................... [GREEN]
 - depth proc smoke (comms copies still functional) ....... [GREEN]
 
-## HIL-unknown (flag to user)
-- TOF400F exact I2C address (default 0x29) + I2C mode is HIL-unknown (user's Pi +
-  sensor). Reader is SWAPPABLE + has a MOCK for host tests; I2C errors -> valid=0,
-  never crash. `--characterize` prints the recommended FC `disarm_range`.
+## Driver: FINAL + verified on-device (2026-06-22)
+- bare VL53L1X @ 0x29, pure-`smbus2` register driver (`VL53L1XReader`): writes the
+  91-byte ST/Adafruit default config block, long mode @ 50 ms; gate = status 0x09 +
+  30..4000 mm. Verified on-device (model id EA CC 10, RESULT__RANGE_STATUS 0x09, live
+  distance). No `pimoroni-vl53l1x` (404 on PyPI) / no C-ext (no aarch64-py3.13 wheel) /
+  no Blinka -- `smbus2` is the whole driver. Reader is still SWAPPABLE + has a MOCK;
+  I2C errors -> valid=0, never crash. `--characterize` prints the FC `disarm_range`.
+- Remaining: run `--characterize` on the ground for `disarm_range`; full-rig HIL
+  (lidar -> fc -> dblink on the assembled drone).
 
 ## Blockers: none.
