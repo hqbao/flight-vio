@@ -86,7 +86,7 @@ def _make_ctx(*, loop_correct: bool, kf_every: int = KF_EVERY) -> ModuleContext:
     return ctx
 
 
-def _vision_pose(p: np.ndarray, R: np.ndarray | None = None) -> np.ndarray:
+def _vio_pose(p: np.ndarray, R: np.ndarray | None = None) -> np.ndarray:
     """``step.pose`` (camera->world, T_world_cam) for a body at world position
     ``p`` with optional attitude ``R`` (identity by default)."""
     R = np.eye(3) if R is None else R
@@ -168,7 +168,7 @@ def _run_profile(ts, accel, gyro, pos_truth, *, loop_correct: bool,
                                                           "n_inliers": 64}
         z_vis = true_z_at(int(fts))
         st = _Step(_Frame(seq, int(fts)),
-                   _vision_pose(np.array([0.0, 0.0, z_vis])), info)
+                   _vio_pose(np.array([0.0, 0.0, z_vis])), info)
         out = step_obj(ctx, st)
         live_z.append(float(out.pose[2, 3]))
         prev_ts = int(fts)
@@ -230,7 +230,7 @@ def _check_zupt(loop_correct: bool) -> None:
         ca = np.tile(rest, (N_PER_FRAME, 1))
         ctx.state["imu_segs"][seq] = (cts, cg, ca)
         out = step_obj(ctx, _Step(_Frame(seq, int(cts[-1])),
-                                      _vision_pose(np.zeros(3)), {}))
+                                      _vio_pose(np.zeros(3)), {}))
         poses.append(out.pose[:3, 3].copy())
         seq += 1
     pos = np.array(poses)
@@ -250,7 +250,7 @@ def _check_shake(loop_correct: bool) -> None:
         cts, cg, ca = _per_frame_cut(ts, gyro, accel, prev_ts, int(fts))
         ctx.state["imu_segs"][seq] = (cts.astype(np.int64), cg, ca)
         # vision stays near origin (the shake has no net travel), valid solve.
-        st = _Step(_Frame(seq, int(fts)), _vision_pose(np.zeros(3)),
+        st = _Step(_Frame(seq, int(fts)), _vio_pose(np.zeros(3)),
                    {"ok": True, "n_inliers": 64})
         out = step_obj(ctx, st)
         poses.append(out.pose[:3, 3].copy())
@@ -337,7 +337,7 @@ def _run_loop_drift(apply_correction: bool):
         ctx.state["imu_segs"][seq] = (cts, cg, ca)
         # Covered vision the whole run (isolates the loop correction).
         st = _Step(_Frame(seq, int(cts[-1])),
-                   _vision_pose(np.zeros(3)), {"ok": False, "n_inliers": 0})
+                   _vio_pose(np.zeros(3)), {"ok": False, "n_inliers": 0})
 
         # On the FINAL frame (the revisit), if correcting, inject the loop
         # correction BEFORE running the step: SLAM rewrites the revisited
@@ -376,7 +376,7 @@ def _run_loop_drift(apply_correction: bool):
         cg = np.zeros((N_PER_FRAME, 3))
         ctx.state["imu_segs"][seq] = (cts, cg, ca)
         st = _Step(_Frame(seq, int(cts[-1])),
-                   _vision_pose(np.zeros(3)), {"ok": False, "n_inliers": 0})
+                   _vio_pose(np.zeros(3)), {"ok": False, "n_inliers": 0})
         out = step_obj(ctx, st)
         pub = out.pose[:3, 3].copy()
         step_mag = float(np.linalg.norm(pub - prev_pub))

@@ -4,7 +4,7 @@ Subscribes (over IPC) to the ``vio`` endpoint for ``pose.odom`` + the retained
 ``calib.bundle`` (used ONLY as a readiness barrier -- proof VIO is up), converts
 each pose to the FC's NED earth frame via the shared SSOT
 (:func:`sky.fc.fc_earth_pose.earth_pose_from_T_world_cam`), and writes it to the
-serial port as a ``dblink`` ``DB_CMD_VISION_POSE`` frame (the in-house FC wire
+serial port as a ``dblink`` ``DB_CMD_VIO_POSE`` frame (the in-house FC wire
 protocol, :mod:`sky.fc.dblink`).
 
 This is the FLIGHT-SAFETY output seam, so its structure is deliberate and the
@@ -116,7 +116,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from fc.comms import IPCPubSub, topics                              # noqa: E402
 from fc.comms.messages import END                                  # noqa: E402
 from fc.comms.wire import WireCalibBundle, WireEnd                 # noqa: E402
-from sky.fc.dblink import pack_vision_pose                         # noqa: E402
+from sky.fc.dblink import pack_vio_pose                            # noqa: E402
 from sky.fc.fc_earth_pose import earth_pose_from_T_world_cam       # noqa: E402
 
 LOG = logging.getLogger("fc.main")
@@ -163,7 +163,7 @@ _AGE_CEIL_US = 1_000_000
 #: low forever (which would inflate every subsequent age). age is still computed
 #: from the existing ``o_est`` for that frame.
 _OFFSET_OUTLIER_S = 0.5
-#: dblink vision-pose flag bits (matched on the FC side).
+#: dblink VIO-pose flag bits (matched on the FC side).
 _FLAG_POS_VALID = 1 << 0
 _FLAG_ATT_VALID = 1 << 1
 _FLAG_DEGRADED = 1 << 2
@@ -235,7 +235,7 @@ def _sigma_for(info: dict | None) -> float:
 
 
 def _flags_for(info: dict | None, *, att_valid: bool = True) -> int:
-    """Assemble the dblink vision-pose flags byte for this frame.
+    """Assemble the dblink VIO-pose flags byte for this frame.
 
     * bit0 pos_valid -- the solve's ``info["ok"]`` (default True when unstated).
     * bit1 att_valid -- the body->NED quaternion is valid once tracking; the caller
@@ -427,8 +427,8 @@ class UartSender(threading.Thread):
         try:
             # pack is INSIDE the try: the leaf is engineered not to raise, but an
             # unforeseen error here must never escape run() and kill the thread.
-            frame = pack_vision_pose(pos_ned, q_ned, sigma, age_us,
-                                     self.reset_counter, flags)
+            frame = pack_vio_pose(pos_ned, q_ned, sigma, age_us,
+                                  self.reset_counter, flags)
             self._ser.write(frame)
         except Exception as e:                                      # noqa: BLE001
             self.n_write_err += 1
@@ -550,7 +550,7 @@ def run_fc(*,
 
     sender.start()
     in_client.start()
-    LOG.info("fc[%s] streaming dblink DB_CMD_VISION_POSE -> %s (quaternion attitude; "
+    LOG.info("fc[%s] streaming dblink DB_CMD_VIO_POSE -> %s (quaternion attitude; "
              "RELATIVE heading, no mag)", vio_endpoint, port)
 
     sender_died_logged = False
@@ -608,7 +608,7 @@ def main() -> int:
     ap.add_argument("--baud", type=int, default=DEFAULT_BAUD,
                     help=f"UART baud rate (default: {DEFAULT_BAUD})")
     ap.add_argument("--rate", type=float, default=DEFAULT_RATE_HZ,
-                    help=f"dblink vision-pose send cadence in Hz, clamped "
+                    help=f"dblink VIO-pose send cadence in Hz, clamped "
                          f"[{int(_RATE_MIN_HZ)},{int(_RATE_MAX_HZ)}] "
                          f"(default: {DEFAULT_RATE_HZ:g})")
     ap.add_argument("--mount", default=None,

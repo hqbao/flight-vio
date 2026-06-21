@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Byte-correctness selftest for the self-owned ``dblink`` vision-pose packer.
+"""Byte-correctness selftest for the self-owned ``dblink`` VIO-pose packer.
 
 The packer (``sky/fc/dblink.py``) ships in the flight runtime, so its correctness
 is anchored three independent ways here:
@@ -23,7 +23,7 @@ import struct
 import sys
 
 from sky.fc.dblink import (
-    DB_CMD_VISION_POSE, VISION_POSE_LEN, build_db_frame, pack_vision_pose,
+    DB_CMD_VIO_POSE, VIO_LEN, build_db_frame, pack_vio_pose,
 )
 
 
@@ -74,30 +74,30 @@ def _checksum(cmd_id: int, payload: bytes) -> int:
 
 
 def main() -> int:
-    print("[1] pack_vision_pose -> parse_db_stream framing round-trip")
+    print("[1] pack_vio_pose -> parse_db_stream framing round-trip")
     pos = (1.5, -2.25, 0.125)
     quat = (0.9961947, 0.0871557, 0.0, 0.0)     # ~10 deg roll, unit
     sigma = 0.07
     age_us = 4321
     rc = 5
     flags = 0b101                                # pos_valid + degraded
-    frame = pack_vision_pose(pos, quat, sigma, age_us, rc, flags)
+    frame = pack_vio_pose(pos, quat, sigma, age_us, rc, flags)
 
     _check(frame[:2] == b"db", "frame starts with the 'db' magic")
-    _check(frame[2] == DB_CMD_VISION_POSE == 0x0C, "CMD byte == DB_CMD_VISION_POSE (0x0C)")
+    _check(frame[2] == DB_CMD_VIO_POSE == 0x0C, "CMD byte == DB_CMD_VIO_POSE (0x0C)")
     _check(frame[3] == 0x00, "CLASS byte == 0x00")
     wire_len = frame[4] | (frame[5] << 8)
-    _check(wire_len == VISION_POSE_LEN == 38, "LEN field == 38 (payload size)")
+    _check(wire_len == VIO_LEN == 38, "LEN field == 38 (payload size)")
 
     frames, tail = parse_db_stream(frame)
     _check(len(frames) == 1 and tail == b"", "exactly one frame parses, no tail")
     msg_id, payload = frames[0]
-    _check(msg_id == DB_CMD_VISION_POSE, "parsed msg_id == DB_CMD_VISION_POSE")
-    _check(len(payload) == VISION_POSE_LEN, "parsed payload is 38 bytes")
+    _check(msg_id == DB_CMD_VIO_POSE, "parsed msg_id == DB_CMD_VIO_POSE")
+    _check(len(payload) == VIO_LEN, "parsed payload is 38 bytes")
 
     print("[2] checksum == independent recompute")
     got_cksum = frame[-2] | (frame[-1] << 8)
-    _check(got_cksum == _checksum(DB_CMD_VISION_POSE, payload),
+    _check(got_cksum == _checksum(DB_CMD_VIO_POSE, payload),
            "trailing checksum matches the independent 16-bit sum")
 
     print("[3] all payload fields round-trip (struct '<8fIBB')")
@@ -110,8 +110,8 @@ def main() -> int:
     _check(f[10] == flags, "flags exact (u8)")
 
     print("[4] integer-field saturation (age u32, reset/flags u8)")
-    big = pack_vision_pose((0.0, 0.0, 0.0), (1.0, 0.0, 0.0, 0.0),
-                           sigma, 10 ** 12, 300, 0x1FF)
+    big = pack_vio_pose((0.0, 0.0, 0.0), (1.0, 0.0, 0.0, 0.0),
+                        sigma, 10 ** 12, 300, 0x1FF)
     big_frames, _ = parse_db_stream(big)
     g = struct.Struct("<8fIBB").unpack(big_frames[0][1])
     _check(g[8] == 0xFFFFFFFF, "age_us 1e12 saturates to u32 max")
@@ -120,15 +120,15 @@ def main() -> int:
 
     print("[5] build_db_frame is the framing primitive (arbitrary payload)")
     raw = bytes(range(7))
-    fr = build_db_frame(DB_CMD_VISION_POSE, raw)
+    fr = build_db_frame(DB_CMD_VIO_POSE, raw)
     frs, _ = parse_db_stream(fr)
-    _check(frs == [(DB_CMD_VISION_POSE, raw)], "build_db_frame round-trips a raw payload")
-    _check((fr[-2] | (fr[-1] << 8)) == _checksum(DB_CMD_VISION_POSE, raw),
+    _check(frs == [(DB_CMD_VIO_POSE, raw)], "build_db_frame round-trips a raw payload")
+    _check((fr[-2] | (fr[-1] << 8)) == _checksum(DB_CMD_VIO_POSE, raw),
            "build_db_frame checksum matches the independent recompute")
 
     print("[6] NON-FINITE / out-of-f32-range fuzz: packer never raises, wire all finite")
     # This codebase genuinely produces exploding / NaN poses (--tight on shake,
-    # --direct divergence). pack_vision_pose is a LEAF backstop: every float field
+    # --direct divergence). pack_vio_pose is a LEAF backstop: every float field
     # must come out finite no matter what the caller passes, and it must NOT raise
     # (raw float() into struct '<f' would OverflowError on |x| > ~3.4e38).
     poison = [
@@ -137,12 +137,12 @@ def main() -> int:
     ]
     for bad in poison:
         # bad in all 8 float slots at once (pos x3, quat x4, sigma).
-        frame_bad = pack_vision_pose((bad, bad, bad), (bad, bad, bad, bad),
-                                     bad, age_us, rc, flags)
+        frame_bad = pack_vio_pose((bad, bad, bad), (bad, bad, bad, bad),
+                                  bad, age_us, rc, flags)
         bf, btail = parse_db_stream(frame_bad)
         _check(len(bf) == 1 and btail == b"",
                f"poison={bad!r}: still exactly one well-formed frame")
-        _check(len(bf[0][1]) == VISION_POSE_LEN,
+        _check(len(bf[0][1]) == VIO_LEN,
                f"poison={bad!r}: payload is 38 bytes")
         floats = struct.Struct("<8fIBB").unpack(bf[0][1])[0:8]
         _check(all(math.isfinite(v) for v in floats),
@@ -150,12 +150,12 @@ def main() -> int:
         # The checksum must still be self-consistent (a NaN byte pattern would still
         # be summed, but the frame must remain parseable + correctly summed).
         got = frame_bad[-2] | (frame_bad[-1] << 8)
-        _check(got == _checksum(DB_CMD_VISION_POSE, bf[0][1]),
+        _check(got == _checksum(DB_CMD_VIO_POSE, bf[0][1]),
                f"poison={bad!r}: checksum still matches the independent recompute")
     # Mixed case: one good + several poison fields in the same frame.
-    mixed = pack_vision_pose((1.0, float("nan"), float("inf")),
-                             (float("-inf"), 0.0, 1e300, -3.5e38),
-                             float("nan"), age_us, rc, flags)
+    mixed = pack_vio_pose((1.0, float("nan"), float("inf")),
+                          (float("-inf"), 0.0, 1e300, -3.5e38),
+                          float("nan"), age_us, rc, flags)
     mf, _ = parse_db_stream(mixed)
     mfloats = struct.Struct("<8fIBB").unpack(mf[0][1])[0:8]
     _check(all(math.isfinite(v) for v in mfloats),
@@ -163,7 +163,7 @@ def main() -> int:
     _check(mfloats[0] == _f32(1.0),
            "mixed frame: the FINITE field (pos_n=1.0) passes through unchanged")
 
-    print("\nPASS -- self-owned dblink vision-pose packer is byte-correct "
+    print("\nPASS -- self-owned dblink VIO-pose packer is byte-correct "
           "(FC-framing round-trip + independent checksum + field saturation + "
           "non-finite/overflow fuzz never raises and never emits NaN/inf).")
     return 0

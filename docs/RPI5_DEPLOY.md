@@ -205,7 +205,7 @@ tearing down so a second press can never abort cleanup or print a traceback.
 The real FC output is the **`--fc PORT[:BAUD]`** flag: it spawns the consumer-only
 `fc` process (after `slam`), which subscribes the VIO's `pose.odom`, converts each
 pose to the FC's **NED** earth frame via the shared SSOT, and writes it to the serial
-port as a **dblink `DB_CMD_VISION_POSE`** frame — the in-house FC protocol
+port as a **dblink `DB_CMD_VIO_POSE`** frame — the in-house FC protocol
 (`../flight-controller`), **not** MAVLink. It is additive + **non-fatal** (a bad /
 missing port logs + exits without taking the stack down) and independent of `--no-ui`.
 
@@ -254,7 +254,7 @@ pose: pos WORLD=(+0.005 -0.027 -0.003) m  quat wxyz=(+0.003 +0.017 -0.025 +0.999
 > future work since the FC floors the value.
 
 **Still open (FC side):** the FC-side dblink vision *receiver* + EKF fusion does not
-exist yet — that is separate work in `../flight-controller`. The `DB_CMD_VISION_POSE`
+exist yet — that is separate work in `../flight-controller`. The `DB_CMD_VIO_POSE`
 value (`0x0C`) is proposed; the FC header owns the final value. HIL on the Pi is
 pending.
 

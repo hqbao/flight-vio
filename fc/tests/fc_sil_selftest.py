@@ -7,7 +7,7 @@ Drives the real :class:`fc.main.UartSender` against a pty pair (``os.openpty``)
 device:
 
   (a) WIRE FRAMES -- the bytes on the pty parse as well-formed ``dblink`` frames
-      (``'db'`` magic, CMD == DB_CMD_VISION_POSE 0x0C, correct LEN + checksum) and
+      (``'db'`` magic, CMD == DB_CMD_VIO_POSE 0x0C, correct LEN + checksum) and
       the pos_n/e/d carry the expected NED position for a known optical-world pose.
   (b) AGE -- ``age_us`` is small + plausible for a just-captured pose, and tracks
       the capture->send elapsed (a pose with an OLD device ts reports a larger age).
@@ -47,11 +47,11 @@ from fc.main import (                                            # noqa: E402
     LatestPose, UartSender, _SIGMA_DEGRADED, _STALE_S,
 )
 from sky.fc.dblink import (                                      # noqa: E402
-    DB_CMD_VISION_POSE, VISION_POSE_LEN,
+    DB_CMD_VIO_POSE, VIO_LEN,
 )
 from sky.fc.fc_earth_pose import earth_pose_from_T_world_cam    # noqa: E402
 
-#: The dblink vision-pose payload layout (mirrors sky.fc.dblink._PAYLOAD_STRUCT).
+#: The dblink VIO-pose payload layout (mirrors sky.fc.dblink._PAYLOAD_STRUCT).
 _POSE_STRUCT = struct.Struct("<8fIBB")
 _FLAG_DEGRADED = 1 << 2
 
@@ -189,8 +189,8 @@ def test_wire_and_degraded() -> bool:
     # Framing + checksum + CMD on every frame.
     ok = True
     for msg_id, payload, cksum in frames[:2]:
-        ok &= (msg_id == DB_CMD_VISION_POSE == 0x0C)
-        ok &= (len(payload) == VISION_POSE_LEN == 38)
+        ok &= (msg_id == DB_CMD_VIO_POSE == 0x0C)
+        ok &= (len(payload) == VIO_LEN == 38)
         ok &= (cksum == _checksum(msg_id, payload))
     _check(ok, "CMD==0x0C, LEN==38, checksum correct on both frames")
 
@@ -449,7 +449,7 @@ def test_nonfinite_pose_survives() -> bool:
     # non-finite ones must advertise pos_valid=0 + degraded=1.
     n_invalid = 0
     for msg_id, payload, cksum in frames:
-        _check(msg_id == DB_CMD_VISION_POSE and len(payload) == VISION_POSE_LEN
+        _check(msg_id == DB_CMD_VIO_POSE and len(payload) == VIO_LEN
                and cksum == _checksum(msg_id, payload),
                "frame well-formed (CMD/LEN/checksum) even on a bad-pose cycle")
         g = _POSE_STRUCT.unpack(payload)

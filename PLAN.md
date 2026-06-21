@@ -356,7 +356,7 @@ structure (latest-wins, UART-off-callback, safety floors, reset_counter) — onl
   sum(payload)) & 0xFFFF`, LE. FC routes by the CMD byte (`data[0]`); FC does NOT verify the DB
   checksum (only UBX) but the frame must be well-formed. FC has **no vision receiver yet** → a
   matching FC-side module + EKF wiring is SEPARATE work in `../flight-controller` (user owns).
-- **CMD = `DB_CMD_VISION_POSE` = 0x0C** (proposed; FC header owns the final value).
+- **CMD = `DB_CMD_VIO_POSE` = 0x0C** (proposed; FC header owns the final value).
 - **Payload (38B, little-endian, `struct '<8f I 2B'`):** `pos_n,pos_e,pos_d` (f32 NED m);
   `q_w,q_x,q_y,q_z` (f32 quaternion body→NED, Hamilton, unit — **FC extracts heading itself**, no
   Euler imposed, gimbal-lock-free); `pos_sigma_m` (f32 1-σ → √R; inflated when degraded);
@@ -405,8 +405,8 @@ structure (latest-wins, UART-off-callback, safety floors, reset_counter) — onl
   staleness floor, reset_counter edge logic, calib barrier — all present (MAVLink-flavored).
 - ✅ launcher `--fc PORT[:BAUD]` + `--fc-rate` + `--fc-mount`, `parse_fc_port`, `build_fc_args`,
   gated spawn after slam — wired (docstrings still say MAVLink → update).
-- **(1) NEW `sky/fc/dblink.py`:** `DB_CMD_VISION_POSE=0x0C`, `build_db_frame` (verbatim checksum),
-  `pack_vision_pose(pos_ned, q_wxyz, pos_sigma_m, age_us, reset_counter, flags) -> frame bytes`.
+- **(1) NEW `sky/fc/dblink.py`:** `DB_CMD_VIO_POSE=0x0C`, `build_db_frame` (verbatim checksum),
+  `pack_vio_pose(pos_ned, q_wxyz, pos_sigma_m, age_us, reset_counter, flags) -> frame bytes`.
 - **(2) `fc/main.py` swap:** import dblink (not mavlink_vpe); `send_once` packs the dblink frame
   (now carries the FULL quaternion + age_us + flags); add the age/offset computation above; degraded
   → inflate `pos_sigma_m` + set flag bit2 (NOT a NaN on the wire). Keep latest-wins/staleness/
@@ -418,4 +418,4 @@ structure (latest-wins, UART-off-callback, safety floors, reset_counter) — onl
   roundtrip + checksum parity), rewrite `fc/tests/fc_sil_selftest.py` for dblink (frame bytes + age
   + reset edge + latest-wins-under-load + degraded floor), `./run.sh` replay `--fc <pty>` + offscreen UI.
 - **(7) T3 fan-out before in-flight send:** safety + security + math reviewers on the diff. (8) docs.
-- **OPEN (user):** final `DB_CMD_VISION_POSE` value (FC header); who writes the FC-side receiver+EKF fusion.
+- **OPEN (user):** final `DB_CMD_VIO_POSE` value (FC header); who writes the FC-side receiver+EKF fusion.

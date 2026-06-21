@@ -190,7 +190,7 @@ capture process's `imu_cam` thread, so the launcher never spawns a depth process
   `--fc`, below). Independent of `--fc`.
 - **`--fc PORT[:BAUD]` — stream the pose to the drone FC over UART (dblink).** Spawns
   the consumer-only `fc` process (after `slam`), which converts each VIO pose to the
-  FC's NED earth frame and writes it as a **dblink `DB_CMD_VISION_POSE`** frame over
+  FC's NED earth frame and writes it as a **dblink `DB_CMD_VIO_POSE`** frame over
   the serial port — the in-house FC protocol, **not** MAVLink. Additive + **non-fatal**
   (a bad / missing port logs + exits without taking the stack down). The position
   noise `pos_sigma_m` is only populated on `--direct`, so the recipe for a *usable* FC
@@ -426,7 +426,7 @@ flowchart LR
 | `ba` | windowed BA — loose `WindowedBAMap` / tight `WindowedVIOMap` (`--tight`) | `keyframe`, `calib.bundle` (from VIO) | `pose.refined`, `ba.window` (`--ba-window`, loose-only), `ba.state` (`--tight` bias) |
 | `slam` | ORB loop closure + SE(3) pose-graph (the SLAM map) | `keyframe`, `calib.bundle` (from VIO) | `loop.correction`, `slam.map` (live-only) |
 | `ui` | Qt `MainWindow`, one 5-line `Viewer3D`, Visualize/Calibration windows | `pose.odom`/`pose.vo`/`pose.refined`/`ba.window`/`calib.bundle` (vio); `slam.map`/`calib.bundle` (slam); on-demand `imu.raw`/`imucam.sample`/`frame.depth` (capture) + `frame.tracks`/`frame.inliers`/`keyframe` (vio) | — (sink) |
-| `fc` | drone-FC UART output (`--fc`): pose → NED → **dblink** `DB_CMD_VISION_POSE` over serial; consumer-only sink (no server). See [fc/README.md](fc/README.md) | `pose.odom`, `calib.bundle` (from VIO) | — (writes UART, not IPC) |
+| `fc` | drone-FC UART output (`--fc`): pose → NED → **dblink** `DB_CMD_VIO_POSE` over serial; consumer-only sink (no server). See [fc/README.md](fc/README.md) | `pose.odom`, `calib.bundle` (from VIO) | — (writes UART, not IPC) |
 | `launcher` | process lifecycle (spawn / restart loop / orphan cleanup; `--no-ba`/`--no-slam` spawn gates) | — | — |
 | `depth` | standalone SGM depth-as-a-process harness | `cam.sync`, `calib.bundle` (capture) | `frame.depth` |
 
@@ -931,7 +931,7 @@ clobber each other, and `imu_camera/device/camera_calib_store.py`
       a real OAK-D; harness in `verification/`
 - [~] Link to flight-controller — the **`--fc PORT[:BAUD]`** flag spawns the
       consumer-only `fc` process, which converts the VIO pose to the FC's NED earth
-      frame and streams it over UART as a **dblink `DB_CMD_VISION_POSE`** frame (the
+      frame and streams it over UART as a **dblink `DB_CMD_VIO_POSE`** frame (the
       in-house FC protocol, not MAVLink), with the staleness / non-finite / sigma /
       `reset_counter` safety floors — see [fc/README.md](fc/README.md). The TX side is
       built + bench-verified; the **FC-side dblink receiver + EKF fusion** (in

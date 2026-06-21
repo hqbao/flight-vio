@@ -131,7 +131,7 @@ def _make_ctx() -> ModuleContext:
     return ctx
 
 
-def _vision_pose(z: float) -> np.ndarray:
+def _vio_pose(z: float) -> np.ndarray:
     """``step.pose`` (camera->world, T_world_cam) for a body at forward +z.
 
     PropagateImu reads the vision pose as
@@ -220,7 +220,7 @@ def _run_live(lag_frames: int = 0, covered_window=None):
                    and covered_window[0] <= fi < covered_window[1])
         info = {"ok": False, "n_inliers": 0} if covered \
             else {"ok": True, "n_inliers": 64}
-        st = _Step(_Frame(seq, int(fts)), _vision_pose(z_vis), info)
+        st = _Step(_Frame(seq, int(fts)), _vio_pose(z_vis), info)
         out = step_obj(ctx, st)
         # out.pose is T_world_cam (camera->world); body == camera, so the
         # body->world forward position is its translation column directly.
@@ -299,7 +299,7 @@ def test_pure_rest_no_drift() -> None:
         ca = np.tile(rest, (N_PER_FRAME, 1))
         ctx.state["imu_segs"][seq] = (cts, cg, ca)
         # vision sits at the origin (device truly still).
-        st = _Step(_Frame(seq, int(cts[-1])), _vision_pose(0.0), {})
+        st = _Step(_Frame(seq, int(cts[-1])), _vio_pose(0.0), {})
         out = step_obj(ctx, st)
         poses.append(out.pose[:3, 3].copy())
         seq += 1

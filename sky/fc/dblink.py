@@ -1,9 +1,9 @@
-"""Self-owned ``dblink`` serializer for the VIO->FC vision-pose message.
+"""Self-owned ``dblink`` serializer for the VIO->FC pose message.
 
 ``dblink`` is the in-house wire protocol the drone flight controller (FC) speaks
 on its UART (sibling repo ``../flight-controller``). This is the flight-runtime,
 dependency-free (stdlib :mod:`struct` only) packer for the ONE dblink message the
-VIO->FC link emits: the vision pose. It maps 1:1 onto the roadmap's future C
+VIO->FC link emits: the VIO pose. It maps 1:1 onto the roadmap's future C
 ``fc_link_dblink.c`` and keeps the lean Pi flight image (no pymavlink, no third-
 party serializer).
 
@@ -14,7 +14,7 @@ Every dblink frame is::
     'd' 'b' | CMD(1B) | CLASS(1B, =0x00) | LEN(2B LE) | payload | checksum(2B LE)
 
 * ``CMD`` selects the message. The FC routes purely by this byte (``data[0]``
-  after the ``'db'`` magic); see :data:`DB_CMD_VISION_POSE`.
+  after the ``'db'`` magic); see :data:`DB_CMD_VIO_POSE`.
 * ``CLASS`` is the log/message class, fixed ``0x00`` for the host->FC commands.
 * ``LEN`` is the payload byte count, little-endian.
 * ``checksum`` = ``(cmd + class + len_lo + len_hi + sum(payload)) & 0xFFFF``,
@@ -25,8 +25,8 @@ Every dblink frame is::
   always passes the gate; the framing + checksum here are VERBATIM the FC's own
   ``build_db_frame`` (``flight-controller/tools/_dblink.py``).
 
-Vision-pose payload (38 bytes, little-endian ``struct '<8fIBB'``)
------------------------------------------------------------------
+VIO-pose payload (38 bytes, little-endian ``struct '<8fIBB'``)
+--------------------------------------------------------------
 =====  ============  =======================================================
 off    field         meaning
 =====  ============  =======================================================
@@ -43,7 +43,7 @@ off    field         meaning
 37     flags         u8 -- bit0 pos_valid, bit1 att_valid, bit2 degraded
 =====  ============  =======================================================
 
-The pose carries the FULL attitude quaternion, NOT a heading scalar: the FC
+The VIO pose carries the FULL attitude quaternion, NOT a heading scalar: the FC
 extracts heading (and roll/pitch) from it itself, which is gimbal-lock-free (a
 scalar yaw is undefined near pitch = +/-90 deg). Heading is still RELATIVE -- the
 optical world's gravity-aligned X axis defines "North" -- but that is the
@@ -63,15 +63,15 @@ import struct
 DB_MAGIC = b"db"
 #: Host->FC message class for the command frames (fixed 0x00).
 DB_CLASS = 0x00
-#: CMD byte for the vision-pose message. The FC routes on this byte; the FC
+#: CMD byte for the VIO-pose message. The FC routes on this byte; the FC
 #: header owns the final value (proposed 0x0C, kept in sync with the FC).
-DB_CMD_VISION_POSE = 0x0C
+DB_CMD_VIO_POSE = 0x0C
 
-#: Vision-pose payload layout: pos_n/e/d, q_w/x/y/z, pos_sigma_m (8x f32),
+#: VIO-pose payload layout: pos_n/e/d, q_w/x/y/z, pos_sigma_m (8x f32),
 #: age_us (u32), reset_counter (u8), flags (u8). Little-endian.
 _PAYLOAD_STRUCT = struct.Struct("<8fIBB")
-#: Vision-pose payload size in bytes (8*4 + 4 + 1 + 1 = 38).
-VISION_POSE_LEN = _PAYLOAD_STRUCT.size
+#: VIO-pose payload size in bytes (8*4 + 4 + 1 + 1 = 38).
+VIO_LEN = _PAYLOAD_STRUCT.size
 
 #: u32 / u8 ceilings: age_us clamps (saturates) to u32; reset_counter / flags are
 #: MASKED to u8 (``& 0xFF`` -- a wrap, not a clamp; both fields are designed to wrap).
@@ -126,7 +126,7 @@ def build_db_frame(cmd_id: int, payload: bytes) -> bytes:
 
     Args:
         cmd_id: the dblink CMD byte (the FC routes on it), e.g.
-            :data:`DB_CMD_VISION_POSE`.
+            :data:`DB_CMD_VIO_POSE`.
         payload: the message body bytes (already serialized).
 
     Returns:
@@ -140,7 +140,7 @@ def build_db_frame(cmd_id: int, payload: bytes) -> bytes:
     return header + payload + struct.pack("<H", cksum)
 
 
-def pack_vision_pose(
+def pack_vio_pose(
     pos_ned,
     q_wxyz,
     pos_sigma_m: float,
@@ -148,10 +148,10 @@ def pack_vision_pose(
     reset_counter: int,
     flags: int,
 ) -> bytes:
-    """Serialize one vision-pose into a complete dblink frame -- NEVER raises.
+    """Serialize one VIO pose into a complete dblink frame -- NEVER raises.
 
     Builds the 38-byte little-endian payload (see the module docstring) and wraps
-    it with :func:`build_db_frame` under :data:`DB_CMD_VISION_POSE`. This packer is
+    it with :func:`build_db_frame` under :data:`DB_CMD_VIO_POSE`. This packer is
     AUTHORITATIVE about wire well-formedness and is a total function -- it cannot
     raise and cannot put a poisoned value on the wire, regardless of the caller:
 
@@ -202,4 +202,4 @@ def pack_vision_pose(
         rc_u8,
         flags_u8,
     )
-    return build_db_frame(DB_CMD_VISION_POSE, payload)
+    return build_db_frame(DB_CMD_VIO_POSE, payload)

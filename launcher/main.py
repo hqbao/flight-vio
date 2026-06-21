@@ -478,7 +478,7 @@ def _start_pose_logger(vio_ep: str, target_fps: int = 0, width: int = 0,
     """``--no-ui`` FC-output preview: subscribe to the vio pose, print pos + quat.
 
     A READ-ONLY consumer on the vio endpoint -- the ours FC-output HOOK, the
-    single place a real ``dblink`` ``DB_CMD_VISION_POSE`` send will go (mirrors
+    single place a real ``dblink`` ``DB_CMD_VIO_POSE`` send will go (mirrors
     baseline's ``_on_pose``). Prints the RAW pose (position + quaternion; the FC
     derives heading itself), throttled to ~2 Hz. Best-effort: returns the
     ``IPCPubSub`` client to ``stop()`` on teardown, or ``None`` if it cannot
@@ -501,7 +501,7 @@ def _start_pose_logger(vio_ep: str, target_fps: int = 0, width: int = 0,
           "low": 0}
 
     def _on_pose(wm) -> None:
-        # === FC OUTPUT HOOK (ours) -- wire the dblink DB_CMD_VISION_POSE send here.
+        # === FC OUTPUT HOOK (ours) -- wire the dblink DB_CMD_VIO_POSE send here.
         st["n"] += 1
         now = time.monotonic()
         # --- OVERLOAD watch: end-to-end pose rate vs the target fps (live only).
@@ -598,7 +598,7 @@ def build_fc_args(args, vio_ep: str) -> list[str]:
 
     Mirrors :func:`build_forward_args`: ``fc`` is a pure CONSUMER of VIO's
     ``pose.odom`` -- it subscribes the VIO endpoint (``--vio-endpoint``), converts
-    each pose to NED, and streams ``dblink`` ``DB_CMD_VISION_POSE`` frames to the FC
+    each pose to NED, and streams ``dblink`` ``DB_CMD_VIO_POSE`` frames to the FC
     over the serial ``--port`` at ``--baud``. ``args.fc`` is ``PORT[:BAUD]`` (parsed
     by :func:`parse_fc_port`); the optional ``args.fc_mount`` forwards the
     ``R_body_cam`` mount extrinsic. No rings, no server -- ``fc`` opens neither.
@@ -696,12 +696,12 @@ def main() -> int:
                     help="ALSO stream the VIO pose to a drone FC over UART: spawn "
                          "fc.main on the serial PORT (e.g. /dev/ttyAMA0 or "
                          "/dev/ttyUSB0:921600; default baud 115200) writing dblink "
-                         "DB_CMD_VISION_POSE frames. Additive + NON-FATAL: a bad / "
+                         "DB_CMD_VIO_POSE frames. Additive + NON-FATAL: a bad / "
                          "missing port makes fc log + exit WITHOUT taking the stack "
                          "down (like a failed --forward). Spawned after slam; "
                          "consumer-only (no IPC server). Heading is RELATIVE (no mag).")
     ap.add_argument("--fc-rate", type=float, default=0.0,
-                    help="with --fc: dblink vision-pose send cadence in Hz (clamped "
+                    help="with --fc: dblink VIO-pose send cadence in Hz (clamped "
                          "[10,50] by fc.main). 0 = fc.main's default (30 Hz).")
     ap.add_argument("--fc-mount", default=None, metavar="R11,..,R33",
                     help="with --fc: the R_body_cam mount extrinsic as 9 "

@@ -24,7 +24,7 @@ process is never spawned (`gap = 0`, the rest of the stack unchanged).
 |------|------|
 | `fc/comms/` | the **FROZEN** vendored comms contract (8th copy, byte-identical to `imu_camera/comms`) — used only as an IPC *client* |
 | `fc/main.py` | the FC process: latest-wins UART sender thread off the IPC callback, the safety floors, `reset_counter`, the device→host clock-offset estimator behind `age_us`, and `run_fc` |
-| `sky/fc/dblink.py` | the pure, leaf dblink packer (`build_db_frame`, `pack_vision_pose`); stdlib `struct` only |
+| `sky/fc/dblink.py` | the pure, leaf dblink packer (`build_db_frame`, `pack_vio_pose`); stdlib `struct` only |
 | `sky/fc/fc_earth_pose.py` | the pure, stateless **SSOT** pose→NED+quaternion conversion, **shared with the UI** (`ui/main.py`) so they can never drift |
 
 The conversion math (`sky/fc/fc_earth_pose.py`) and the wire packer
@@ -33,7 +33,7 @@ time / I/O / counters / comms) — trivially testable and on the `libsky*` port
 boundary. All the *stateful* concerns (serial I/O, staleness, `reset_counter`,
 clock-offset, `age_us`) live in `fc/main.py`, the consumer.
 
-## Wire contract — dblink `DB_CMD_VISION_POSE`
+## Wire contract — dblink `DB_CMD_VIO_POSE`
 
 Carried **verbatim** from the FC's own `build_db_frame`
 (`../flight-controller/tools/dblink_test.py`). Every dblink frame is:
@@ -45,21 +45,21 @@ Carried **verbatim** from the FC's own `build_db_frame`
 | Field | Bytes | Value |
 |-------|-------|-------|
 | magic | 2 | `'d' 'b'` (`DB_MAGIC`) |
-| CMD | 1 | `DB_CMD_VISION_POSE = 0x0C` — the FC routes purely on this byte (`data[0]`) |
+| CMD | 1 | `DB_CMD_VIO_POSE = 0x0C` — the FC routes purely on this byte (`data[0]`) |
 | CLASS | 1 | `0x00` (`DB_CLASS`, fixed for host→FC commands) |
 | LEN | 2 (LE) | payload byte count = **38** |
-| payload | 38 | the vision pose (below) |
+| payload | 38 | the VIO pose (below) |
 | checksum | 2 (LE) | `(cmd + class + len_lo + len_hi + sum(payload)) & 0xFFFF` |
 
-Full vision-pose frame on the wire = **46 bytes** (6 header + 38 payload + 2
+Full VIO-pose frame on the wire = **46 bytes** (6 header + 38 payload + 2
 checksum).
 
-> **The FC does NOT verify the dblink checksum for vision frames** — it routes on
+> **The FC does NOT verify the dblink checksum for VIO frames** — it routes on
 > the CMD byte and parses the payload (it CRC-checks only UBX). We still emit the
 > correct checksum so the link is byte-clean and a future FC-side validator (or the
 > `parse_db_stream` test) accepts it. **Only well-formedness matters on the wire.**
 
-### Vision-pose payload (38 bytes, little-endian `struct '<8fIBB'`)
+### VIO-pose payload (38 bytes, little-endian `struct '<8fIBB'`)
 
 | off | field | type | meaning / units |
 |-----|-------|------|-----------------|
@@ -208,7 +208,7 @@ flowchart LR
         UART["UartSender thread<br/>fixed cadence [10,50] Hz"]
         SSOT["earth_pose_from_T_world_cam<br/>(sky.fc.fc_earth_pose, SSOT)"]
         FLOORS["safety floors:<br/>staleness 250ms · age ceiling 1s<br/>sigma inflate · finiteness guard<br/>reset_counter edges"]
-        PACK["pack_vision_pose<br/>(sky.fc.dblink → DB_CMD_VISION_POSE)"]
+        PACK["pack_vio_pose<br/>(sky.fc.dblink → DB_CMD_VIO_POSE)"]
     end
     DEV[("drone FC<br/>(../flight-controller)")]
 
@@ -266,7 +266,7 @@ Wiring: Pi **pin 8 (TXD0)** → FC **RX**, Pi **pin 10 (RXD0)** ← FC **TX**, P
 
 | Launcher flag | Effect |
 |---|---|
-| `--fc PORT[:BAUD]` | spawn `fc.main` on the serial PORT writing dblink `DB_CMD_VISION_POSE` frames. Additive + **non-fatal**: a bad / missing port makes `fc` log + exit without taking the stack down. Spawned **after** `slam`. |
+| `--fc PORT[:BAUD]` | spawn `fc.main` on the serial PORT writing dblink `DB_CMD_VIO_POSE` frames. Additive + **non-fatal**: a bad / missing port makes `fc` log + exit without taking the stack down. Spawned **after** `slam`. |
 | `--fc-rate HZ` | UART send cadence, Hz — **clamped `[10, 50]`** by `fc.main` (`0` = the default 30 Hz). Below 10 the FC fusion starves; above 50 a 115200-baud link (~one 46-byte frame per ~4 ms) can't keep up. |
 | `--fc-mount R11,..,R33` | the `R_body_cam` mount extrinsic: 9 comma-separated row-major values (OpenCV-camera body → FRD airframe body, relative to the nominal forward mount). Default = identity. |
 
@@ -286,6 +286,6 @@ SIGTERM / SIGINT / `os._exit` lifecycle as the template.
 - **The FC-side receiver + EKF fusion does NOT exist yet.** A matching dblink vision
   receiver and the EKF wiring are separate work in `../flight-controller` (the FC
   owns that). Today this link only *transmits*; nothing fuses it.
-- **Finalize `DB_CMD_VISION_POSE`.** `0x0C` is proposed here — the FC header owns the
-  final value; keep `sky/fc/dblink.py:DB_CMD_VISION_POSE` in sync with it.
+- **Finalize `DB_CMD_VIO_POSE`.** `0x0C` is proposed here — the FC header owns the
+  final value; keep `sky/fc/dblink.py:DB_CMD_VIO_POSE` in sync with it.
 - **HIL on the Pi is pending.** Bench/SIL-verified; not yet flown on real hardware.

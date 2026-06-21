@@ -4,7 +4,7 @@ The sixth sibling process. It subscribes to the ``vio`` process over IPC
 (``pose.odom`` + the retained ``calib.bundle`` readiness barrier), converts the
 VIO earth-frame pose to NED via the shared SSOT
 (:func:`sky.fc.fc_earth_pose.earth_pose_from_T_world_cam`), and streams it to a
-drone flight controller over UART as a ``dblink`` ``DB_CMD_VISION_POSE`` frame
+drone flight controller over UART as a ``dblink`` ``DB_CMD_VIO_POSE`` frame
 (the FC's in-house wire protocol, packed by :mod:`sky.fc.dblink`).
 
 CONSUMER-ONLY: unlike every other project, ``fc`` opens NO IPC server and

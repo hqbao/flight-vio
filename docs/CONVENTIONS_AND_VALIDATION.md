@@ -42,9 +42,9 @@ they cannot drift apart. Heading is RELATIVE (no compass) → the FC handles it 
   R_ned   = M @ R_opt @ P @ R_body_cam.T     # P = opencv-cam → FRD; R_body_cam = mount offset (default I)
   q_ned   = rot_to_quat(R_ned)
   ```
-  Called at `fc/main.py:388` BEFORE `pack_vision_pose` → **on the wire it is true NED + quat body→NED.**
+  Called at `fc/main.py:388` BEFORE `pack_vio_pose` → **on the wire it is true NED + quat body→NED.**
 - **RELATIVE heading** (no mag): the FC re-anchors with `ψ0 = yaw_FC − yaw_VIO`, fuses
-  `fused = Rz(ψ0)·(vio_pos − anchor) + offset`, D goes straight through. `vision_pose_rx/vision_pose_math.h:43-69`.
+  `fused = Rz(ψ0)·(vio_pos − anchor) + offset`, D goes straight through. `base/foundation/vio_math.h:43-69`.
   - **SE1**: fuses POSITION only (heading is owned by the FC compass) → relative-North is harmless.
   - **SE2**: uses the position DERIVATIVE (velocity) → origin-invariant, no anchor needed; rotates NED→body via the fusion3 yaw (has mag). `vio_body_vel_math.h:45-51`.
 
@@ -83,7 +83,7 @@ fusion5_z runs POSITIVE-UP internally → **negate** at the publish boundary to 
 | Gravity 6-face | accel calib tracks \|g\|=9.81 | `imu_camera/tests/gravity_sphere_selftest.py` |
 | Preint covariance | analytic Σ == Monte-Carlo | `vio/tests/imu_preint_cov_selftest.py` |
 | **fc_earth_pose SSOT** (optical→NED) | **known axes + pitch-90 → correct** | `verification/fc_earth_pose_selftest.py` ✅ |
-| anchor + body-vel (FC) | yaw, transform, gate correct (hand-checked) | `tools/vision_pose_rx/test_vision_pose_math.c`, `test_vio_body_vel.c` |
+| anchor + body-vel (FC) | yaw, transform, gate correct (hand-checked) | `tools/test_vio_math.c`, `test_vio_body_vel.c` |
 
 ### B.3 Regression gold (matches the frozen reference) → YES
 - gap=0 oracle byte-parity vs Basalt: `verification/oracle_replay_selftest.py` (TOL 1e-6 mm).
@@ -102,9 +102,9 @@ e2e harness can be built later (replay a known session → compare the FC estima
 > Goal: visually confirm the SIGN of each axis is correct, end-to-end. Requires the FC powered + AP `/dev/cu.usbmodem2101`,
 > and (for VIO) the Pi running the VIO stack (320x200, no --tight/BA/SLAM).
 
-### C.1 Validate IMU→body (FC, board h7v1) — `state_estimation_view.py` / `attitude_control_view.py`
+### C.1 Validate IMU→body (FC, board h7v1) — `se1_view.py` / `attitude_control_view.py`
 ```bash
-cd /Users/bao/skydev/flight-controller && python3 tools/state_estimation_view.py
+cd /Users/bao/skydev/flight-controller && python3 tools/se1_view.py
 ```
 Hold the FC, perform each motion, confirm the SIGN:
 | Physical motion | Expected | Meaning |
@@ -142,9 +142,9 @@ cd /Users/bao/skydev/flight-vio && ./run-ui-remote.sh    # or ./run.sh ... then 
 not rotating; if you rotate, N/E decompose along the init-fixed axes (mathematically correct, not a bug).
 **ABSOLUTE North: VIO cannot provide it — by design, the FC compass owns the absolute yaw.**
 
-### C.3 Validate the VIO→FC link (0x34) — `tools/vision_pose_rx/vision_pose_rx_view.py`
+### C.3 Validate the VIO→FC link (0x34) — `tools/vio_rx_view.py`
 ```bash
-cd /Users/bao/skydev/flight-controller && python3 tools/vision_pose_rx/vision_pose_rx_view.py
+cd /Users/bao/skydev/flight-controller && python3 tools/vio_rx_view.py
 ```
 The Pi sends the real VIO over `--fc /dev/ttyAMA0`. Move the rig → watch `rx (VIO world)` N/E/D
 move in the CORRECT direction + SIGN as in C.2. Confirm the FC receives exactly what the VIO sends.
