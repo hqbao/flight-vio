@@ -70,17 +70,19 @@ def _clamp_rate(rate_hz: float) -> float:
     return float(min(max(float(rate_hz), _RATE_MIN_HZ), _RATE_MAX_HZ))
 
 
-def _build_reader(*, mock: bool, i2c_bus: int, i2c_address: int) -> RangeReader:
+def _build_reader(*, mock: bool, i2c_bus: int, i2c_address: int,
+                  sensor_id: str) -> RangeReader:
     """Construct the real I2C reader or the host mock.
 
     Kept tiny + separate so ``run_lidar`` is testable against the mock without an
     I2C bus. A real-reader open failure propagates (run_lidar decides it is fatal).
+    ``sensor_id`` selects which stored calibration ``_init_sensor`` loads + applies.
     """
     if mock:
         LOG.info("lidar: MOCK reader (no hardware) -- scripted readings")
         return MockRangeReader()
     return VL53L1XReader(i2c_bus=i2c_bus, i2c_address=i2c_address,
-                         distance_mode=DIST_MODE_SHORT)
+                         distance_mode=DIST_MODE_SHORT, sensor_id=sensor_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -90,6 +92,7 @@ def run_lidar(*,
               mock: bool = False,
               i2c_bus: int = DEFAULT_I2C_BUS,
               i2c_address: int = DEFAULT_I2C_ADDRESS,
+              sensor_id: str = "default",
               max_reads: int = 0,
               reader: RangeReader | None = None) -> int:
     """Run the standalone lidar process until SIGTERM / Ctrl-C (or ``max_reads``).
@@ -108,7 +111,7 @@ def run_lidar(*,
         # a known valid+invalid mix); production passes None -> build from mock/I2C.
         if reader is None:
             reader = _build_reader(mock=mock, i2c_bus=i2c_bus,
-                                   i2c_address=i2c_address)
+                                   i2c_address=i2c_address, sensor_id=sensor_id)
     except Exception as e:                                          # noqa: BLE001
         # NON-FATAL to the stack (mirror fc's failed-serial-open): log + exit
         # non-zero. The launcher does not take the pipeline down on a lidar fault.
@@ -207,6 +210,9 @@ def main() -> int:
                     help=f"VL53L1X 7-bit I2C address (default: "
                          f"0x{DEFAULT_I2C_ADDRESS:02X}, the bare breakout's factory "
                          f"address; override only if re-strapped)")
+    ap.add_argument("--sensor-id", default="default",
+                    help="sensor id whose stored calibration the reader loads + "
+                         "applies from .cache/lidar_calib.json (default: 'default')")
     ap.add_argument("--max-reads", type=int, default=0,
                     help="stop after publishing this many readings (0 = run forever)")
     args = ap.parse_args()
@@ -217,6 +223,7 @@ def main() -> int:
         mock=args.mock,
         i2c_bus=args.i2c_bus,
         i2c_address=args.i2c_address,
+        sensor_id=args.sensor_id,
         max_reads=args.max_reads,
     )
 

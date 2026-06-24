@@ -479,3 +479,67 @@ u8 flags, f32 range_m @ offset 38. CMD = 0x0C. VIO_FLAG_RANGE_VALID = 0x08.
   (lidar -> fc -> dblink on the assembled drone).
 
 ## Blockers: none.
+
+---
+
+# PLAN — VL53L1X short-range validity fix (2026-06-25) · Tier T3
+
+**Symptom (user, on the bench):** downward range reads `valid=no` at ~3cm; only ~38%
+valid overall (even mid-range to 24cm). This is the FC takeoff/landing/disarm HEIGHT
+REFERENCE → mode-0/1 takeoff is gated off when range is untrusted.
+
+**User scope decision (2026-06-25): FULL PACKAGE (corrected for the 4cm floor).**
+
+## KEY FINDING (researcher, ST datasheet) — premise correction
+VL53L1X has a **hard 4cm minimum ranging distance**. **3cm is below the optical floor —
+NOT accurately measurable on this sensor, period.** We do NOT chase sub-4cm. We make
+≥4cm reliable + set the gate floor to the datasheet floor. Operator must keep the lidar
+standoff ≥ ~4–5cm (gear/mount), else takeoff height ref is unusable by physics.
+
+## Verified spec (researcher — HIGH confidence unless flagged)
+1. **STATUS-MASK BUG (the ~62% loss):** gate tests RAW reg 0x0089 `== 0x09`; bits 7..5 are
+   non-zero flags → valid frames rejected nondeterministically. ST ULD masks `& 0x1F`;
+   device "valid" code = 9. FIX: `(raw & 0x1F) == 9`. Accept ONLY 9 (NOT 8/clipped — a
+   near-floor clipped reading must not pass as a valid height). Highest-value, no cal needed.
+2. **LIDAR_MIN_MM 30 → 40** (the datasheet floor; 30 admitted sub-floor crosstalk garbage).
+3. **SHORT mode** (sensor stuck LONG; `distance_mode` param IGNORED — real bug): write
+   0x0060=07,0x0063=05,0x0069=38,0x0078=07,0x0079=05,0x007A=06,0x007B=06; THEN recompute
+   timing macro-periods (mandatory): SHORT-50ms 0x005E=01AE / 0x0061=01E8 (SHORT-33ms
+   00D6/006E). LONG path keeps 00AD/00C6. [timing constants MEDIUM-conf → bench-verify.]
+4. **Offset cal** (run FIRST): 17% grey @140mm, avg 50, `offset_mm = 140 - mean`. APPLY:
+   0x001E=(int16)(offset*4) signed BE, 0x0020=0, 0x0022=0.
+5. **Xtalk cal** (after offset, IN THE DARK): 17% grey @~600mm, avg 50,
+   `xtalk = 512*AvgSignal*(1-AvgDist/600)/AvgSpad`. APPLY: 0x0018=0,0x001A=0,
+   0x0016=((xtalk<<9)+500)//1000 BE. [measure-side regs being confirmed by researcher.]
+
+## Architecture (architecture-reviewer: APPROVE_WITH_NITS)
+- Persistence: NEW `lidar/io/lidar_calib_store.py` mirroring `imu_camera/device/
+  camera_calib_store.py` VERBATIM — `.cache/lidar_calib.json`, sensor-id-keyed, atomic
+  tmp.replace, load→None on absent/corrupt/invalid, NEVER raises. Schema {xtalk_kcps,
+  offset_mm, distance_mode, min_mm, timing_budget_us, n, ts}.
+- Safe fallback: cal missing/corrupt/sensor-id-mismatch → run UNCALIBRATED + loud warn,
+  do NOT refuse (honest valid reading is safe; FC gates on valid).
+- Real ctor params (kill the hardcode): distance_mode/min_mm/timing_budget_us. Init order:
+  default block → set mode+timing → apply cal → start continuous. read() keeps never-raise.
+- gate_reading STAYS PURE: `gate_reading(dist, status, *, min_mm=LIDAR_MIN_MM, max_mm=...)`;
+  reader passes its instance bound; module const stays default; do NOT mutate a global
+  (would break MockRangeReader/SIL).
+- Cal routine = `VL53L1XReader.calibrate_xtalk_offset()` (register dance in the reader);
+  extend `characterize.py` with a thin `--calibrate --sensor-id` mode that persists.
+
+## Agent sequence & verdicts
+- [x] researcher (register spec) — DONE, verified vs ST datasheet/UM2510/3 ULD copies.
+- [ ] researcher (xtalk measure-side regs: SignalRate/SpadNb/Distance) — IN FLIGHT.
+- [x] architecture-reviewer — APPROVE_WITH_NITS (decisions above are binding).
+- [x] developer — implemented to spec (gate `&0x1F`/code-9-only, MIN_MM 40, SHORT mode+timing honored, offset+xtalk cal store/apply/bench, characterize `--calibrate`, main `--sensor-id`). Evidence: lidar selftest PASS (gate boundaries 39/40/4000/4001 + raw 0x29 + calib-store round-trip/corrupt/mismatch), import smoke OK, pyflakes lidar/ 0. FLAG: xtalk scale uses `(raw<<9)//1000` truncating (per task spec, NOT PLAN §5's `+500`); SHORT timing constants MEDIUM-conf → bench cadence read-back.
+- [x] developer — **review fixes applied** (consolidated safety+schematic+math change-list, 2026-06-25): F1 `lidar_calib_store.load` now magnitude-bounds `offset_mm` (±2000) + `xtalk` (uint16) → reject WHOLE entry → None (run uncalibrated); F2 `calibrate_offset`/`calibrate_xtalk` guard `target_mm>0`/`n>=1` (ValueError) + `avg_spad<=0` RuntimeError BEFORE divide; F3 `read()` FAILS CLOSED on data-ready timeout (invalid sample, never reads stale result regs); F4 xtalk apply SATURATES `min(.,0xFFFF)` (no wrap); F5 SHORT writes add ULD `0x004B=0x14` (PHASECAL_CONFIG__TIMEOUT_MACROP); F6 `characterize --calibrate` confirmed it never `read()`s the stopped device (live main re-instantiates → fresh init applies cal + restarts). Evidence: extended `lidar_mock_selftest` 7/7 PASS incl. F1 (offset 100000/-5000→None, xtalk 200000→None, bounds load), F2 (zero-SPAD→RuntimeError not ZeroDivisionError, target_mm=0→ValueError), F3 (timeout→valid=0, result regs never read); import smoke OK; pyflakes lidar/ 0. SHORT timing + `0x004B` still MEDIUM-conf → bench-verify.
+- [ ] safety-reviewer — height-ref impact, uncalibrated-fallback FMEA, phantom-ground   [BLOCK]
+- [ ] schematic-reviewer — VL53L1X I2C/mount/coverglass-xtalk boundary.
+- [ ] math-reviewer — the floor value + short-mode sigma vs disarm margin.
+- [x] tester — host SIL **APPROVE** (final sign-off GATED on bench Job 2). Independently re-ran lidar_mock_selftest **8/8 PASS** (was 7; added block [h] _apply_calibration), import smoke OK (5 mods), pyflakes lidar/ **0**. HARDENED the suite to close real gaps: mask vectors 0xA9(valid)/0x28(reject); MIN_RANGE_CLIPPED at (35,8)&(200,8); xtalk=-1→None; calibrate_xtalk(n=0)→ValueError; and a NEW apply-path block proving offset −20mm→int16 mm*4 two's-complement `ff b0`, saturating xtalk (200000→`ff ff`, no wrap — negative-control verified vs wrap=`90 00`), uncalibrated path = NO cal write + exactly ONE loud warning, and sensor-id mismatch ('A' stored, 'B' reader)→NO cal applied (B never inherits A's). HW-only (pushed to bench): SHORT cadence/macro-periods+0x004B, real-surface VALID% jump, physical offset/xtalk solves, end-to-end FC state. Protocol: `lidar/BENCH_CALIBRATION.md`.   [VETO held — software unblocked]
+- [x] docs-writer — lidar/README.md updated (SHORT mode + 0x004B, masked gate `&0x1F`/code-9-only + ~38%→>90% rationale, LIDAR_MIN_MM=40 / 4cm floor, calibration store/apply/never-refuse + BENCH_CALIBRATION.md ref, read() fail-closed; Mermaid added for init cal-load + read→gate→publish). FC comment-only fix in flight-controller/modules/flight_state/flight_state.c: Modbus→I2C(smbus2)/TOF400F→VL53L1X interface wording, 10mm→40mm floor + unsatisfiable-`<`-disarm consequence, tof400f_probe→`lidar.tools.characterize`, ~33Hz→~20Hz SHORT cadence. NO code/threshold lines changed. FLAG: SHORT timing constants + cadence still MEDIUM-conf (bench-verify per BENCH_CALIBRATION §2) — documented as such, not asserted.
+
+## Open blockers
+- SHORT-50/33 timing constants: MEDIUM confidence → bench read-back to confirm cadence.
+- Bench-only steps (offset @140mm, xtalk @600mm dark, 17% grey target) = USER hardware.
+- Operator standoff must be ≥4–5cm — 3cm is below the sensor's physics floor.

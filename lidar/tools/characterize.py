@@ -16,10 +16,17 @@ It replaces the old UART-probe characterize tool (the rangefinder is now on the
 Pi's I2C bus, not a UART). For a deviceless dry-run / to see the OUTPUT FORMAT,
 pass ``--mock`` (the hardware-free reader).
 
+``--calibrate`` runs the bench OFFSET-then-XTALK routine (operator prompts for a 17%
+grey target @140 mm, then @~600 mm IN THE DARK) and persists the solve to
+``.cache/lidar_calib.json`` keyed by ``--sensor-id``, so the live reader auto-applies
+it. The register dance lives in the reader; this tool only prompts + orchestrates +
+persists (it needs a REAL sensor -- ``--mock`` is not supported for ``--calibrate``).
+
 Run (on the Pi, rig on the ground)::
 
     python -m lidar.tools.characterize --seconds 5
     python -m lidar.tools.characterize --mock          # no hardware (format demo)
+    python -m lidar.tools.characterize --calibrate     # bench offset + xtalk solve
 """
 from __future__ import annotations
 
@@ -32,10 +39,18 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from lidar.io import lidar_calib_store                            # noqa: E402
 from lidar.io.vl53l1x_reader import (                             # noqa: E402
-    DEFAULT_I2C_ADDRESS, DEFAULT_I2C_BUS, DIST_MODE_SHORT,
-    MockRangeReader, RangeSample, VL53L1XReader,
+    DEFAULT_I2C_ADDRESS, DEFAULT_I2C_BUS, DEFAULT_TIMING_BUDGET_US,
+    DIST_MODE_SHORT, LIDAR_MIN_MM, MockRangeReader, RangeSample, VL53L1XReader,
 )
+
+#: Bench calibration target standoffs (mm). ST: offset against a 17% grey card at
+#: ~140 mm; crosstalk against the same card at ~600 mm with NO ambient IR (dark).
+OFFSET_TARGET_MM = 140
+XTALK_TARGET_MM = 600
+#: Frames averaged per bench step (matches the reader's default + the stored ``n``).
+CALIB_FRAMES = 50
 
 #: Default safety margin (metres) added to the measured ground floor to get the
 #: recommended FC ``disarm_range``. Generous so sensor noise + a slightly uneven
@@ -140,6 +155,54 @@ def run_characterize(*, seconds: float, rate_hz: float, margin_m: float,
     return 0
 
 
+def run_calibrate(*, sensor_id: str, i2c_bus: int, i2c_address: int) -> int:
+    """Bench OFFSET-then-XTALK calibration; persist to ``.cache/lidar_calib.json``.
+
+    THIN orchestrator: prompts the operator, calls the reader's bench routines (which
+    own the register dance), then persists via :mod:`lidar.io.lidar_calib_store`. ST
+    order is offset first, then crosstalk. Needs a real sensor (no ``--mock``).
+
+    The bench routines each END on ``_stop_ranging`` and we ``close()`` the reader in
+    the ``finally`` BEFORE persisting -- so this tool deliberately does NOT ``read()``
+    the (now-stopped) device afterward (a read on a stopped device would just time out
+    -> a fail-closed invalid sample, but it is still a footgun). The newly-persisted
+    cal is picked up by the LIVE ``lidar.main`` process, which constructs a FRESH
+    :class:`VL53L1XReader` whose ``_init_sensor`` applies it + restarts continuous
+    ranging. Do NOT add a post-calibrate ``read()`` here.
+    """
+    print(f"lidar CALIBRATE -- VL53L1X over I2C  bus={i2c_bus}  "
+          f"addr=0x{i2c_address:02X}  sensor_id={sensor_id!r}")
+    print("  (offset first, then crosstalk -- ST order)\n")
+    try:
+        reader = VL53L1XReader(i2c_bus=i2c_bus, i2c_address=i2c_address,
+                               distance_mode=DIST_MODE_SHORT, sensor_id=sensor_id)
+    except Exception as e:                                          # noqa: BLE001
+        print(f"  ERROR: could not open the rangefinder ({e})")
+        return 1
+    try:
+        input(f"  [1/2] OFFSET: place a 17% grey target flat at {OFFSET_TARGET_MM}mm, "
+              "then press Enter...")
+        offset_mm = reader.calibrate_offset(OFFSET_TARGET_MM, n=CALIB_FRAMES)
+        print(f"        -> offset_mm = {offset_mm}")
+        input(f"  [2/2] XTALK: place the 17% grey target at ~{XTALK_TARGET_MM}mm in "
+              "the DARK (no ambient IR), then press Enter...")
+        xtalk_raw = reader.calibrate_xtalk(XTALK_TARGET_MM, n=CALIB_FRAMES)
+        print(f"        -> xtalk_raw = {xtalk_raw}")
+    except Exception as e:                                          # noqa: BLE001
+        print(f"  ERROR: calibration aborted ({e}) -- nothing saved")
+        return 1
+    finally:
+        reader.close()
+
+    path = lidar_calib_store.save(
+        sensor_id, xtalk=xtalk_raw, offset_mm=offset_mm,
+        distance_mode=DIST_MODE_SHORT, min_mm=LIDAR_MIN_MM,
+        timing_budget_us=DEFAULT_TIMING_BUDGET_US, n=CALIB_FRAMES)
+    print(f"\n  >>> saved calibration for sensor_id={sensor_id!r} -> {path}")
+    print("      the live lidar reader auto-applies it on the next ranging start.")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--seconds", type=float, default=5.0,
@@ -160,7 +223,19 @@ def main() -> int:
                          f"0x{DEFAULT_I2C_ADDRESS:02X})")
     ap.add_argument("--quiet", action="store_true",
                     help="don't stream per-reading lines, only print the summary")
+    ap.add_argument("--calibrate", action="store_true",
+                    help="run the bench OFFSET-then-XTALK calibration (prompts for a "
+                         "17%% grey target @140mm then @~600mm DARK) and persist it")
+    ap.add_argument("--sensor-id", default="default",
+                    help="sensor id the calibration is keyed under in "
+                         ".cache/lidar_calib.json (default: 'default')")
     args = ap.parse_args()
+    if args.calibrate:
+        if args.mock:
+            print("  ERROR: --calibrate needs a real sensor (not --mock)")
+            return 2
+        return run_calibrate(sensor_id=args.sensor_id, i2c_bus=args.i2c_bus,
+                             i2c_address=args.i2c_address)
     return run_characterize(
         seconds=args.seconds, rate_hz=args.rate, margin_m=args.margin,
         mock=args.mock, i2c_bus=args.i2c_bus, i2c_address=args.i2c_address,

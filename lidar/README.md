@@ -12,12 +12,28 @@ sender opens a read-only client on `oak.lidar`, keeps the freshest reading, and
 pack_vio_pose`: the trailing `range_m` @ offset 38 + the `VIO_FLAG_RANGE_VALID` =
 `0x08` flag bit). See [`fc/README.md` → Bundled downward range](../fc/README.md#bundled-downward-range-vl53l1x).
 
-```
-                        lidar.main (oak.lidar)
-                        ----------------------
-  VL53L1X --I2C--> RangeReader.read() -> gate -> WireRange --lidar.range--> fc client
-                                                                            (bundles into
-                                                                             DB_CMD_VIO_POSE)
+```mermaid
+flowchart LR
+    subgraph init["VL53L1XReader.__init__ / _init_sensor (once)"]
+        D[default 91B block<br/>boots LONG] --> M[apply SHORT mode<br/>+ timing macro-periods]
+        M --> C{".cache/lidar_calib.json<br/>entry for sensor_id?"}
+        C -- "valid" --> A[apply offset + crosstalk]
+        C -- "missing / corrupt /<br/>out-of-range" --> U[run UNCALIBRATED<br/>+ loud warning]
+        A --> R0[start continuous ranging]
+        U --> R0
+    end
+    subgraph loop["read loop @ rate_hz (oak.lidar)"]
+        R0 --> P{data-ready<br/>within 0.12 s?}
+        P -- "no" --> FC0[fail closed: valid=0]
+        P -- "yes" --> RD[read status + dist_mm]
+        RD --> G{"gate: (status & 0x1F)==9<br/>AND 40 <= dist_mm <= 4000"}
+        G -- "reject" --> INV[range_m=0.0, valid=0]
+        G -- "pass" --> OK[range_m = dist_mm*1e-3, valid=1]
+        FC0 --> W[WireRange seq,ts_ns,range_m,valid]
+        INV --> W
+        OK --> W
+        W -- "lidar.range" --> FCC[fc client<br/>bundles into DB_CMD_VIO_POSE]
+    end
 ```
 
 `lidar` is a **pure producer**: unlike `depth` / `vio` / `slam` it subscribes to
@@ -45,12 +61,13 @@ chip's register map directly. Nothing here imports OpenCV, so the lean Pi flight
 | Item | Value |
 |------|-------|
 | Sensor | bare VL53L1X breakout, downward-facing, AGL rangefinder |
-| Driver | pure-`smbus2` register-level (`VL53L1XReader`): writes the 91-byte ST/Adafruit default config block at init, then reads `RESULT__RANGE_STATUS` + distance directly. Verified on-device (model id `EA CC 10`, status `0x09`, live distance) |
+| Driver | pure-`smbus2` register-level (`VL53L1XReader`): writes the 91-byte ST/Adafruit default config block at init (which boots LONG), applies SHORT mode + timing, applies the stored calibration (if any), then reads `RESULT__RANGE_STATUS` + distance directly. Verified on-device (model id `EA CC 10`, status `0x09`, live distance) |
 | Bus | **I2C** — Pi `/dev/i2c-1` (the 40-pin header bus; `DEFAULT_I2C_BUS = 1`) |
 | Address | **`0x29`** (the VL53L1X default 7-bit address; `DEFAULT_I2C_ADDRESS = 0x29`) |
 | Pi pins | **pin 3 (SDA1 / GPIO2)** → sensor SDA, **pin 5 (SCL1 / GPIO3)** → sensor SCL, **3V3** (pin 1) → VIN, **GND** (pin 6/9) → GND |
-| Distance mode | **long @ 50 ms** (the bench-proven config the register init writes, ~4 m range; `DIST_MODE_SHORT` ~1.3 m is a future tuning) |
-| Timing budget | 50 ms inter-measurement (set by the macro-period registers in `_init_sensor`) → continuous ranging at ~20 Hz |
+| Distance mode | **SHORT** (`DIST_MODE_SHORT = 1`, the `VL53L1XReader` default; `main.py` + `characterize.py` both construct with it). Range up to ~1.3 m — correct for a 0–1.3 m downward sensor; best ambient-light immunity + tightest near-floor accuracy. The 91-byte default block boots LONG, so `_apply_mode_timing` writes the SHORT vcsel/phase block (`_SHORT_MODE_WRITES`, incl. **`0x004B = 0x14`** = `PHASECAL_CONFIG__TIMEOUT_MACROP`) **then** the SHORT timing macro-period pair (mandatory — the LONG defaults are invalid in SHORT). |
+| Timing budget | 50 ms inter-measurement (`DEFAULT_TIMING_BUDGET_US = 50_000`) → continuous ranging at ~20 Hz. Selects the SHORT macro-period pair `_MACROP[(SHORT, 50_000)] = (0x01AE, 0x01E8)` (33 ms = `(0x00D6, 0x006E)` is also supported). **The SHORT timing constants are MEDIUM-confidence → bench-verified** (cadence read-back, [`BENCH_CALIBRATION.md`](BENCH_CALIBRATION.md) §2). |
+| Calibration | per-sensor **offset + crosstalk**, persisted by `lidar_calib_store` in `.cache/lidar_calib.json`, keyed by `--sensor-id`, applied at init. See [Calibration](#calibration-offset--crosstalk) + [`BENCH_CALIBRATION.md`](BENCH_CALIBRATION.md). |
 
 > ℹ️ **Wiring is overridable.** The bare VL53L1X answers at its factory address `0x29`
 > (verified on-device); the reader is behind a tiny `RangeReader` interface, so override
@@ -64,28 +81,82 @@ chip's register map directly. Nothing here imports OpenCV, so the lean Pi flight
 `gate_reading(dist_mm, range_status)` is a pure function (unit-testable in isolation):
 
 ```
-valid = (range_status == 0x09) AND (LIDAR_MIN_MM <= dist_mm <= LIDAR_MAX_MM)
-        # RANGE_STATUS_OK = 0x09,  LIDAR_MIN_MM = 30,  LIDAR_MAX_MM = 4000  (millimetres)
+valid = ((range_status & 0x1F) == 0x09) AND (LIDAR_MIN_MM <= dist_mm <= LIDAR_MAX_MM)
+        # RANGE_STATUS_MASK = 0x1F,  RANGE_STATUS_OK = 0x09  (device code 9)
+        # LIDAR_MIN_MM = 40,  LIDAR_MAX_MM = 4000  (millimetres)
 ```
 
-`range_status == 0x09` is the VL53L1X `RESULT__RANGE_STATUS` (reg `0x0089`) code for a
-completed range (verified on-device); **any** other status (sigma fail, signal fail,
-wrap-around, out-of-bounds, …) rejects the reading. The distance band additionally
-rejects a reading below the sensor's near dead-zone / a spurious zero and above trusted
-range **even when** `range_status == 0x09`. The chip reports **millimetres**; the
-published / wire value is **metres** (`range_m`). On a reject, `range_m` is forced to
-`0.0`.
+**Mask first, then accept ONLY device code 9.** `RESULT__RANGE_STATUS` (reg `0x0089`)
+carries the device range-status code in **bits 4..0**; **bits 7..5 are unrelated flags**
+the ST ULD strips with `& 0x1F` before comparing. The prior gate compared the **raw**
+byte (`== 0x09`), so whenever a high bit happened to be set a perfectly valid frame was
+rejected nondeterministically — this dropped the bulk of the readings (the user's
+**~38% valid** baseline). Masking recovers them (**> 90%** on a real matte surface;
+proven on hardware in [`BENCH_CALIBRATION.md`](BENCH_CALIBRATION.md) §3).
 
-> ℹ️ **The status gate reads the raw register.** `VL53L1XReader.read()` reads
-> `RESULT__RANGE_STATUS` (reg `0x0089`) directly over `smbus2` and compares it to
-> `RANGE_STATUS_OK = 0x09` — there is no driver-accessor dependency to verify, and the
-> status gate always applies (it never degrades to distance-band-only). The register
-> map is confirmed present on-device (model id `EA CC 10`).
+Only the masked code **9** (a completed range) passes. **Code 8 (`MIN_RANGE_CLIPPED`) is
+rejected** — a near-floor clipped reading must **not** pass as a valid height. Any other
+masked code (sigma fail, signal fail, wrap-around, …) also rejects. The distance band
+additionally rejects below the floor / above trusted range **even when** the masked
+status is 9. The chip reports **millimetres**; the published / wire value is **metres**
+(`range_m`). On any reject, `range_m` is forced to `0.0`.
+
+### `LIDAR_MIN_MM = 40` — the 4 cm hardware floor
+
+`LIDAR_MIN_MM = 40` is the VL53L1X **minimum ranging distance (4 cm, ST datasheet)**.
+**Ranges below 4 cm read invalid by sensor physics** — below the optical floor the chip
+still detects but is inaccurate and admits crosstalk garbage, so the gate drops it. This
+is **not** a bug: the operating standoff must be **≥ 40 mm**. Mount the sensor so that,
+with the gear on the ground, the cover-glass-to-ground distance is ≥ 40 mm (≥ 50 mm for
+margin); a 3 cm standoff reads `valid=0` at rest, by physics. The previous floor (30 mm)
+admitted sub-floor crosstalk garbage. The FC owns the flight-relevant ground/disarm
+thresholds; this is only the sensor sanity band.
+
+> ℹ️ **The status gate reads the raw register; the mask is in the gate.**
+> `VL53L1XReader.read()` reads `RESULT__RANGE_STATUS` (reg `0x0089`) directly over
+> `smbus2` and passes the **raw** byte to `gate_reading`, which applies `& 0x1F` then
+> compares to `RANGE_STATUS_OK = 0x09`. There is no driver-accessor dependency, and the
+> status gate always applies (it never degrades to distance-band-only). The register map
+> is confirmed present on-device (model id `EA CC 10`).
 
 `WireRange` (the `lidar.range` POD) carries `{ seq, ts_ns, range_m, valid }` — `seq`
 is a monotone reading counter (drop detection), `ts_ns` is the host `monotonic_ns`
 capture instant the `fc` side uses for its freshness gate, `range_m` is metres,
 `valid` is `0/1` (kept an int so it maps 1:1 onto the FC's `range_valid` flag).
+
+## Calibration (offset + crosstalk)
+
+Each physical sensor has its own **part-to-part range offset** (near-range bias) and
+**crosstalk** (the reflection off the cover glass / window in front of it). These are
+solved on the bench and persisted, so the live reader auto-applies them at init.
+
+- **Persistence** — `lidar/io/lidar_calib_store.py` writes `.cache/lidar_calib.json`
+  (gitignored, repo root), **keyed by `--sensor-id`** so several rangefinders never
+  clobber each other. One entry per sensor: `{ xtalk, offset_mm, distance_mode, min_mm,
+  timing_budget_us, n, ts }`. `xtalk` is the **raw uint16** the ULD `CalibrateXtalk`
+  formula returns (stored unscaled); the reader scales it to the plane-offset register on
+  apply (`(xtalk_raw << 9) // 1000`). Atomic write (`tmp.replace`) — never a half-written
+  cache.
+- **Load + apply at init** — `_init_sensor` calls `_apply_calibration` after setting the
+  mode/timing and before starting continuous ranging. When an entry is present: offset
+  first (ST order, written to `ALGO__PART_TO_PART_RANGE_OFFSET_MM` as signed `mm × 4`),
+  then crosstalk (X/Y plane gradients zeroed, plane offset written). It logs
+  `applied calibration sensor_id=… (offset=…mm, xtalk_raw=…)`.
+- **Never refuses to range** — a **missing / corrupt / out-of-range** entry, or a
+  `sensor_id` with no entry, logs a **loud warning** and runs **UNCALIBRATED**. An honest
+  valid reading is safe (the FC gates on `valid`), so the reader never refuses to range
+  over a bad cache. Magnitude guards in `lidar_calib_store.load` bound a corrupt cache and
+  reject the **whole** entry: `|offset_mm| ≤ 2000` (a larger offset would overflow the
+  int16 `mm × 4` pack and inject a huge constant height bias) and `xtalk` ∈ `[0, 0xFFFF]`.
+  Type checks reject non-int / `bool` fields.
+
+The **bench procedure** (operator-run, real sensor) lives in
+[`BENCH_CALIBRATION.md`](BENCH_CALIBRATION.md): **offset @ 140 mm** against a 17% grey
+card (run first, ST order), then **crosstalk @ 600 mm in the dark** with the **flight
+cover glass mounted** (crosstalk is the cover-glass reflection — calibrate it bare and it
+is a near-no-op, then invalidated by the cover you add afterward). Drive it with
+`characterize --calibrate --sensor-id <id>` (see below); use the **same `--sensor-id`**
+at flight time or the reader silently runs uncalibrated.
 
 ## Run
 
@@ -96,8 +167,8 @@ python -m lidar.main --endpoint oak.lidar --rate 50
 # Deviceless dry-run / host smoke (the hardware-free MOCK reader, no I2C bus):
 python -m lidar.main --mock
 
-# Override the (HIL-unknown) wiring once the bench address/bus is known:
-python -m lidar.main --i2c-bus 1 --i2c-address 0x29
+# Apply a calibrated sensor's stored cal, override the wiring if re-strapped:
+python -m lidar.main --sensor-id dn0 --i2c-bus 1 --i2c-address 0x29
 ```
 
 | Flag | Effect |
@@ -106,13 +177,26 @@ python -m lidar.main --i2c-bus 1 --i2c-address 0x29
 | `--rate HZ` | I2C read + publish cadence, **clamped `[1, 100]`** (default 50). The VL53L1X short-mode budget is ~20 ms, so ~50 Hz is the practical ceiling. |
 | `--i2c-bus N` | Linux I2C bus number (default 1 → `/dev/i2c-1`) |
 | `--i2c-address A` | VL53L1X 7-bit I2C address (default `0x29`; accepts `0x..`) |
+| `--sensor-id ID` | sensor id whose stored calibration the reader loads + applies from `.cache/lidar_calib.json` (default `'default'`). Use the **same** id you calibrated under, else it runs uncalibrated. |
 | `--mock` | use the hardware-free MOCK reader (host dry-run / smoke, **not** flight) |
 | `--max-reads N` | stop after publishing N readings (0 = run forever) |
 
 The lidar process is **non-fatal**: a real-reader open failure is logged and the
 process exits non-zero (the launcher does **not** take the pipeline down — `fc` just
-keeps sending `range_valid=0`). A per-read I2C error never raises; it becomes a
-`valid=0` sample so a flaky sensor cannot crash the flight loop.
+keeps sending `range_valid=0`). `read()` **never raises** and **fails closed** to a
+`valid=0` sample on either fault:
+
+- **I2C error** (any exception while reading the result registers) → `valid=0`, so a
+  flaky sensor cannot crash the flight loop.
+- **Data-ready timeout** — if no fresh frame arrives within `_READ_READY_TIMEOUT_S =
+  0.12 s`, `read()` returns an **invalid** sample instead of reading the result
+  registers. Reading them anyway would return the **previous** frame's distance with a
+  stale-but-OK status — a stuck-but-"valid" height the FC's trust gate could not catch.
+  An invalid sample (`range_m 0`, `valid=0`) **is** catchable.
+
+(The bench calibration loops use `_wait_data_ready`, which **raises** on timeout instead
+— a calibration fault must be operator-visible, never silently averaged over stale
+frames.)
 
 ### In the live pipeline (launcher)
 
@@ -163,6 +247,29 @@ the margin (default **0.10 m**, `--margin`) is generous so sensor noise + a slig
 uneven floor never reads as "airborne" while sat on the ground. Set the printed value
 on the FC (`PARAM_ID_DISARM_RANGE`) so it treats `≤ disarm_range` as "on the ground".
 
+> **Note (FC default is unsatisfiable):** because a valid reading is always ≥ 40 mm (the
+> 4 cm floor) and the FC compares with a strict `<`, the FC's default `disarm_range` of
+> 10 mm can **never** fire the touchdown auto-disarm. Set `PARAM_ID_DISARM_RANGE` to the
+> printed value (≈ ground floor + margin, typically ~60–80 mm). RC-disarm and angle-disarm
+> are range-independent, so the vehicle is never stuck armed regardless.
+
+### `--calibrate` — bench offset + crosstalk solve
+
+`characterize --calibrate --sensor-id <id>` runs the bench **offset-then-crosstalk**
+routine (ST order) and **persists** the solve to `.cache/lidar_calib.json` under that id,
+so the live reader auto-applies it. It is a thin orchestrator — it prompts the operator,
+calls the reader's `calibrate_offset` / `calibrate_xtalk` (the register dance lives in
+the reader), then saves. It needs a **real sensor** (`--mock` is rejected for
+`--calibrate`).
+
+```bash
+python -m lidar.tools.characterize --calibrate --sensor-id dn0
+#  [1/2] OFFSET: 17% grey target flat @ 140 mm, press Enter
+#  [2/2] XTALK:  17% grey target @ ~600 mm IN THE DARK (cover glass mounted), press Enter
+```
+
+Full bench protocol, targets, and PASS/FAIL criteria: [`BENCH_CALIBRATION.md`](BENCH_CALIBRATION.md).
+
 ## Self-test
 
 ```bash
@@ -177,10 +284,20 @@ distance — yield `valid=0`); (b) `MockRangeReader` producing `RangeSample`s wi
 both valid + invalid readings round-tripping the exact contract the `fc` sender
 consumes.
 
-The bare VL53L1X + `smbus2` register driver is **final and verified on-device** (model
-id `EA CC 10`, `RESULT__RANGE_STATUS = 0x09`, live distance). Remaining bring-up items
-are rig integration, not the driver:
+The bare VL53L1X + `smbus2` register driver is **verified on-device** (model id
+`EA CC 10`, `RESULT__RANGE_STATUS = 0x09`, live distance) and the host SIL suite
+(`lidar/tests/lidar_mock_selftest.py`) proves the software logic: the masked gate, the
+calibration-store guards, offset/xtalk packing, the fail-closed read, and the bench-routine
+guards. The remaining checks need real hardware and are the operator's — the full bench
+HIL + calibration protocol is **[`BENCH_CALIBRATION.md`](BENCH_CALIBRATION.md)**:
 
-- **Run `lidar.tools.characterize` on the ground** → set the FC `PARAM_ID_DISARM_RANGE`.
-- **Full-rig HIL** — the driver reads on-device; running the whole launcher pipeline
-  (lidar → fc → dblink) on the assembled drone is the remaining integration check.
+- **SHORT-mode cadence read-back** — confirm the MEDIUM-confidence SHORT macro-period
+  constants + `0x004B = 0x14` produce the expected ~20 Hz frame rate (§2).
+- **Mask-fix regression** — VALID% must jump from the ~38% baseline to **> 90%** on a real
+  matte surface (§3).
+- **Offset + crosstalk calibration** — offset @ 140 mm, then crosstalk @ 600 mm in the dark
+  with the flight cover glass mounted; persist + confirm auto-apply on live start (§4–§5b).
+- **Run `lidar.tools.characterize` on the ground** → set the FC `PARAM_ID_DISARM_RANGE`
+  (§7).
+- **End-to-end FC** — lidar → fc → dblink → `flight_state`: valid+fresh range permits
+  takeoff, invalid/sub-40 mm holds, range-loss does not false-disarm (§8).
