@@ -522,6 +522,32 @@ def _start_pose_logger(vio_ep: str, target_fps: int = 0, width: int = 0,
     st = {"last": 0.0, "n": 0, "rate_t": 0.0, "rate_n": 0, "warn_t": 0.0,
           "low": 0}
 
+    # Flight log (live only): EVERY pose at full rate -> a CSV under the repo's
+    # flight_logs/, so VIO drift / noise / dropouts can be analysed offline (fetch
+    # with deploy/pi-logs.sh). Line-buffered (buffering=1) so a SIGTERM/SIGKILL from
+    # pi-stop loses nothing already written (only a power-cut could). The logged
+    # pose is T_world_cam (gravity-aligned WORLD frame); drift magnitude is
+    # frame-agnostic, so this is exactly what reveals a drifting / noisy VIO.
+    if live:
+        try:
+            import datetime
+            _dir = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "flight_logs")
+            os.makedirs(_dir, exist_ok=True)
+            _ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            _path = os.path.join(_dir, f"vio_{_ts}.csv")
+            st["log"] = open(_path, "w", buffering=1)
+            st["log"].write(
+                "# flight-vio pose log; t = seconds since logger start; "
+                "pose = T_world_cam (WORLD frame, m); quat body->world (w,x,y,z)\n"
+                "t,pos_x,pos_y,pos_z,qw,qx,qy,qz,sigma_m,ok,degraded,sensor_gap_s,frame_n\n")
+            import atexit
+            atexit.register(lambda: st.get("log") and not st["log"].closed and st["log"].close())
+            LOG.info("launcher: flight-log -> %s", _path)
+        except Exception as e:                                          # noqa: BLE001
+            LOG.warning("launcher: could not open flight-log: %s", e)
+
     def _on_pose(wm) -> None:
         # === FC OUTPUT HOOK (ours) -- wire the dblink DB_CMD_VIO_POSE send here.
         st["n"] += 1
@@ -534,6 +560,23 @@ def _start_pose_logger(vio_ep: str, target_fps: int = 0, width: int = 0,
                     "pipeline OVERLOADED: pose.odom only ~%.1f Hz vs %d target at "
                     "%dx%d -- the box can't keep up at this resolution; lower it "
                     "(e.g. --width 320 --height 200).", r, target_fps, width, height)
+        # Full-rate flight log (every pose), independent of the throttled text log.
+        lg = st.get("log")
+        if lg is not None:
+            if "log_t0" not in st:
+                st["log_t0"] = now
+            T = wm.T_world_cam
+            info = wm.info if isinstance(wm.info, dict) else {}
+            try:
+                qw, qx, qy, qz = rot_to_quat(T[:3, :3])
+            except Exception:                                          # noqa: BLE001
+                qw = qx = qy = qz = float("nan")
+            sig = info.get("pos_sigma_m")
+            lg.write("%.6f,%.5f,%.5f,%.5f,%.6f,%.6f,%.6f,%.6f,%s,%d,%d,%.4f,%d\n" % (
+                now - st["log_t0"], T[0, 3], T[1, 3], T[2, 3], qw, qx, qy, qz,
+                ("nan" if sig is None else "%.5f" % sig),
+                int(bool(info.get("ok", 0))), int(bool(info.get("vio_degraded", 0))),
+                float(info.get("sensor_gap_s", 0.0) or 0.0), st["n"]))
         if now - st["last"] < 0.5:
             return
         st["last"] = now

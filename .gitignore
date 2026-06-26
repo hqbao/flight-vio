@@ -4,5 +4,6 @@ __pycache__/
 .DS_Store
 *.log
 logs/
+flight_logs/
 .cache/
 sessions/
