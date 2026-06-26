@@ -7,6 +7,12 @@ threshold in the pipeline — corner spacing, the KLT window, the PnP
 reprojection gate, the stereo disparity range, the ORB budget — so the baseline
 numbers become too coarse and feature tracking / depth / pose quality degrade.
 
+> **Thinking of raising fps to cut latency? Read [`LATENCY_BUDGET.md`](LATENCY_BUDGET.md) first.**
+> The RP5 is throughput-bound at ~28 pose/s: 60 fps overloads it, the pose queue
+> backs up to multiple seconds, and the FC drops VIO entirely. Higher fps does cut
+> the *camera* stage (47→20 ms) but the host solve can't keep up. Stereo depth is
+> fps-independent, so accuracy is not the constraint — compute is.
+
 `comms/lib/config/resolution.py` (`ResolutionProfile`, the data-only profile) is
 the single place that scales those parameters from the baseline to the live
 `(width, height)`; the math-coupled builders that turn it into the live
