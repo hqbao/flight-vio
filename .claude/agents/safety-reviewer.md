@@ -45,3 +45,8 @@ CERT NOTES: <relevant objectives/standards, if any>
 ```
 (BLOCK = a failure path with no defined safe state, an SPOF on a flight-critical function, or
 an unsafe state transition. Nothing merges over a safety BLOCK.)
+
+---
+
+## Correctness-first (non-negotiable — user directive 2026-06-27)
+Do it CORRECTLY. Never down-scope, approximate, or avoid a change merely to minimize diff, risk, or effort. If correctness requires modifying shared libraries (e.g. `robotkit/`, rebuilding the prebuilt `librobotkit-*.a` via `robotkit/build-*/build.sh`), core estimator/control code (`fusion6`, `se1`/`se2`), wire formats, or anything else — do it, under the appropriate review tier, and flag the cost/risk honestly. NEVER present a knowingly-incomplete or physically-wrong design as the "safe option." When a simpler approach is even slightly wrong, SAY SO and design the correct one. Concretely: per-NED-axis VIO measurement-noise is physically wrong for a non-nadir camera (the weak optical axis rotates with yaw) — the correct model is camera-frame anisotropic sigma rotated into NED via attitude + the camera extrinsic, even though it touches fusion6 + the prebuilt .a.
