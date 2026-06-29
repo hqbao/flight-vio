@@ -129,7 +129,8 @@ from fc.comms import IPCPubSub, topics                              # noqa: E402
 from fc.comms.messages import END                                  # noqa: E402
 from fc.comms.wire import WireCalibBundle, WireEnd                 # noqa: E402
 from sky.fc.dblink import pack_vio_pose                            # noqa: E402
-from sky.fc.fc_earth_pose import earth_pose_from_T_world_cam       # noqa: E402
+from sky.fc.fc_earth_pose import (                                # noqa: E402
+    earth_pose_from_T_world_cam, R_body_cam_from_angles, MOUNT_PRESETS)
 
 LOG = logging.getLogger("fc.main")
 
@@ -715,17 +716,39 @@ def run_fc(*,
 
 # --------------------------------------------------------------------------- #
 def _parse_mount(spec: str | None) -> np.ndarray | None:
-    """Parse the optional ``--mount`` extrinsic: 9 comma-separated R_body_cam
-    values (row-major 3x3). ``None`` -> the default identity (nominal forward
-    mount). Raises ValueError on a malformed spec (fail fast, don't fly a bad
-    mount silently)."""
+    """Parse the optional ``--mount`` camera extrinsic. Accepts, in order:
+
+      * a PRESET name -- one of MOUNT_PRESETS
+        (forward / backward / forward-down-45 / backward-down-45 / down);
+      * ANGLES ``azimuth,tilt`` or ``azimuth,tilt,image_roll`` in degrees
+        (azimuth: 0=fwd/90=right/180=back, CW from above; tilt: down-depression
+        0=level/90=down) -> built via R_body_cam_from_angles;
+      * 9 comma-separated row-major R_body_cam values (power users / exact matrix).
+
+    ``None`` -> identity (nominal forward mount). Raises ValueError on a malformed
+    spec (fail fast -- never fly a bad mount silently)."""
     if not spec:
         return None
-    vals = [float(v) for v in spec.replace(" ", "").split(",") if v != ""]
-    if len(vals) != 9:
+    s = spec.strip().lower()
+    if s in MOUNT_PRESETS:
+        return R_body_cam_from_angles(*MOUNT_PRESETS[s])
+    try:
+        vals = [float(v) for v in s.replace(" ", "").split(",") if v != ""]
+    except ValueError:
         raise ValueError(
-            f"--mount needs 9 row-major R_body_cam values, got {len(vals)}")
-    return np.asarray(vals, dtype=np.float64).reshape(3, 3)
+            f"--mount {spec!r}: unknown preset. Choose {sorted(MOUNT_PRESETS)}, "
+            f"or 'azimuth,tilt[,image_roll]' degrees, or 9 row-major matrix values.")
+    if len(vals) in (2, 3):                         # azimuth,tilt[,image_roll] deg
+        if abs(vals[1] - 90.0) < 5.0 and len(vals) < 3 and abs(vals[0]) > 1e-6:
+            LOG.warning("fc: --mount tilt~90 (down): azimuth aliases into "
+                        "image_roll; pass 'azimuth,tilt,image_roll' or use the "
+                        "'down' preset to be explicit")
+        return R_body_cam_from_angles(*vals)
+    if len(vals) == 9:                              # exact row-major R_body_cam
+        return np.asarray(vals, dtype=np.float64).reshape(3, 3)
+    raise ValueError(
+        f"--mount needs a preset name, 'azimuth,tilt[,image_roll]' degrees, or 9 "
+        f"row-major R_body_cam values; got {len(vals)} numbers")
 
 
 def main() -> int:
@@ -743,10 +766,13 @@ def main() -> int:
                          f"[{int(_RATE_MIN_HZ)},{int(_RATE_MAX_HZ)}] "
                          f"(default: {DEFAULT_RATE_HZ:g})")
     ap.add_argument("--mount", default=None,
-                    help="optional R_body_cam mount extrinsic: 9 comma-separated "
-                         "row-major values (OpenCV-camera body -> FRD airframe body, "
-                         "relative to the nominal forward mount). Default = identity "
-                         "(camera faces forward). Heading is RELATIVE (no mag).")
+                    help="camera mount orientation. PRESET (forward|backward|"
+                         "forward-down-45|backward-down-45|down), or ANGLES "
+                         "'azimuth,tilt[,image_roll]' deg (azimuth 0=fwd/90=right/"
+                         "180=back CW-from-above; tilt 0=level/90=down), or 9 "
+                         "row-major R_body_cam values. Default = forward (identity). "
+                         "REQUIRED if the camera is not forward-facing, else heading "
+                         "leaks roll (no mag; heading is relative).")
     ap.add_argument("--lidar-endpoint", default=None,
                     help="optional: the lidar process's IPC endpoint (e.g. "
                          f"{DEFAULT_LIDAR_ENDPOINT!r}). When given, subscribe "

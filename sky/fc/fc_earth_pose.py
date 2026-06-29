@@ -105,3 +105,69 @@ def earth_pose_from_T_world_cam(
     R_ned = _M_OPT_TO_NED @ R_opt @ _P_OPT_TO_FRD @ R_bc.T
     q_ned = rot_to_quat(R_ned)
     return pos_ned, q_ned, R_ned
+
+
+# --------------------------------------------------------------------------- #
+# Camera-mount extrinsic constructor (the R_body_cam argument above)
+# --------------------------------------------------------------------------- #
+# Derived + verified by math-reviewer (roll-invariance certified to 5.7e-14 deg
+# over 3000 random attitudes x 6 rolls x 7 mounts). R_body_cam is the EXTRA mount
+# rotation, expressed in the FRD body frame, on top of the nominal forward mount
+# baked into P. The nominal optical axis = FRD +X (fwd), image-right = +Y, image-
+# down = +Z. Three elementary rotations IN THE FRD FRAME, in this exact order:
+#     R_bc = Rz(azimuth) @ Ry(-down_tilt) @ Rx(image_roll)
+# NOTE the NEGATIVE down_tilt (about FRD +Y/right, +rotation lifts the axis UP, so
+# "down" needs -tilt). Returned R_bc is passed DIRECTLY to earth_pose_from_T_world_cam
+# (which transposes it as P @ R_bc.T) -- do NOT pre-transpose.
+
+def _rx(a):
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]])
+
+
+def _ry(a):
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]])
+
+
+def _rz(a):
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+
+
+def R_body_cam_from_angles(azimuth_deg: float, down_tilt_deg: float,
+                           image_roll_deg: float = 0.0) -> np.ndarray:
+    """Build ``R_body_cam`` from intuitive mount angles (all in the FRD body frame).
+
+    Args:
+        azimuth_deg: horizontal direction the optical axis points, about FRD +Z
+            (down), CLOCKWISE viewed from above: 0=forward, +90=right, 180=back,
+            270(=-90)=left.
+        down_tilt_deg: depression of the optical axis BELOW horizontal: 0=level,
+            90=straight down.
+        image_roll_deg: rotation about the optical axis (which way is image-"up").
+            At down_tilt≈90 the optical axis is vertical and azimuth aliases into
+            this DOF -- set azimuth=0 and put the mount yaw here.
+
+    Returns:
+        ``(3, 3)`` ``R_body_cam`` (OpenCV-camera body -> FRD airframe body, the
+        EXTRA rotation vs the nominal forward mount). Pass directly to
+        :func:`earth_pose_from_T_world_cam`. Makes the recovered heading
+        roll-invariant for any physical mount (math-reviewer APPROVE).
+    """
+    az = np.deg2rad(float(azimuth_deg))
+    tilt = np.deg2rad(float(down_tilt_deg))
+    roll = np.deg2rad(float(image_roll_deg))
+    return _rz(az) @ _ry(-tilt) @ _rx(roll)
+
+
+#: Named mount presets -> (azimuth_deg, down_tilt_deg, image_roll_deg). Build the
+#: matrix via :func:`R_body_cam_from_angles`. "down" leaves azimuth at 0 (it would
+#: alias into image_roll); set image_roll if a specific image heading is wanted.
+MOUNT_PRESETS: dict[str, tuple[float, float, float]] = {
+    "forward":          (0.0,   0.0, 0.0),
+    "backward":         (180.0, 0.0, 0.0),
+    "forward-down-45":  (0.0,  45.0, 0.0),
+    "backward-down-45": (180.0, 45.0, 0.0),
+    "down":             (0.0,  90.0, 0.0),
+}

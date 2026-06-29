@@ -777,11 +777,14 @@ def main() -> int:
     ap.add_argument("--fc-rate", type=float, default=0.0,
                     help="with --fc: dblink VIO-pose send cadence in Hz (clamped "
                          "[10,50] by fc.main). 0 = fc.main's default (30 Hz).")
-    ap.add_argument("--fc-mount", default=None, metavar="R11,..,R33",
-                    help="with --fc: the R_body_cam mount extrinsic as 9 "
-                         "comma-separated row-major values (OpenCV-camera body -> "
-                         "FRD airframe body, relative to the nominal forward mount). "
-                         "Default = identity (camera faces forward).")
+    ap.add_argument("--fc-mount", "--mount", dest="fc_mount", default=None,
+                    metavar="PRESET|az,tilt",
+                    help="with --fc: camera mount orientation. PRESET (forward|"
+                         "backward|forward-down-45|backward-down-45|down), or ANGLES "
+                         "'azimuth,tilt[,image_roll]' deg (azimuth 0=fwd/90=right/"
+                         "180=back; tilt 0=level/90=down), or 9 row-major R_body_cam "
+                         "values. Default = forward (identity). REQUIRED if the camera "
+                         "is not forward-facing, else heading leaks roll.")
     ap.add_argument("--vl53l9cx", action="store_true",
                     help="simulate a VL53L9CX-class ToF camera in the capture "
                          "process: compute depth at the source resolution then "
