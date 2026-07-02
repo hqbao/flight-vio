@@ -114,9 +114,24 @@ pi_key_works() {
   ssh $SSH_O -i "$SSH_KEY" "$PI_USER@$PI_IP" true 2>/dev/null
 }
 
+# A re-imaged Pi (or a DHCP IP reused by another box) presents a NEW host key, so
+# SSH refuses with "REMOTE HOST IDENTIFICATION HAS CHANGED" and wedges discovery.
+# pi_install_key is the deliberate re-trust step (operator picked this device and
+# typed its password), so drop the stale known_hosts entry here instead of making
+# the operator run ssh-keygen -R by hand. Only THIS IP is touched, and only on the
+# changed-key error -- a matching key (or a merely-unknown host) is left alone.
+pi_untrust_stale_host() {
+  local ip="$1"
+  ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=yes \
+      "$PI_USER@$ip" true 2>&1 | grep -q "IDENTIFICATION HAS CHANGED" || return 0
+  pi_warn "host key for $ip changed (Pi re-imaged or IP reused) -- refreshing known_hosts"
+  ssh-keygen -R "$ip" >/dev/null 2>&1
+}
+
 pi_install_key() {
   command -v sshpass >/dev/null 2>&1 || pi_die \
     "sshpass not found -- install it: brew install sshpass"
+  pi_untrust_stale_host "$PI_IP"
   [ -f "$SSH_KEY" ] || ssh-keygen -t ed25519 -N '' -f "$SSH_KEY" -q
   sshpass -p "$PI_PASS" ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8 \
     "$PI_USER@$PI_IP" \
